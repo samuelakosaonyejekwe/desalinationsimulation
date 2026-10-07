@@ -9,9 +9,9 @@ const CMAPS = {
   coolwarm: ['#3b4cc0', '#6f92f3', '#aac7fd', '#dddcdc', '#f7b89c', '#e7745b', '#b40426'],
   salinity: ['#f7fcf0', '#ccebc5', '#7bccc4', '#43a2ca', '#0868ac', '#084081', '#3f007d', '#7a0177'],
   // below the midpoint: sea (deep → shallow); above it: land (lowland → mountain)
-  topo: ['#08306b', '#08519c', '#2171b5', '#4292c6', '#6baed6', '#9ecae1', '#c6dbef', '#e3f0fa', '#a8d08d', '#c9dd9a', '#e9e3a0', '#d9bf77', '#b98f55', '#96673f', '#7a5a4a', '#5a463f'],
+  topo: ['#08306b', '#0a4a90', '#1565a8', '#2a7fbf', '#4a9bd0', '#72b7dc', '#9bd0e6', '#bfe6ee', '#a8d08d', '#c9dd9a', '#e9e3a0', '#d9bf77', '#b98f55', '#96673f', '#7a5a4a', '#5a463f'],
   land: ['#a8d08d', '#c9dd9a', '#e9e3a0', '#d9bf77', '#b98f55', '#96673f', '#7a5a4a', '#5a463f'],
-  sea: ['#08306b', '#08519c', '#2171b5', '#4292c6', '#6baed6', '#9ecae1', '#c6dbef', '#e3f0fa'],
+  sea: ['#08306b', '#0a4a90', '#1565a8', '#2a7fbf', '#4a9bd0', '#72b7dc', '#9bd0e6', '#bfe6ee'],
   thermal: ['#042333', '#2c3395', '#744992', '#b15f82', '#eb7958', '#fbb43d', '#e8fa5b'],
 };
 const hex = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
@@ -213,7 +213,9 @@ function drawField(canvas, spec) {
   const L = lut(spec.cmap || 'viridis');
   // optional two-slope scale: values below zmid use the lower half of the colour map, values above it the upper half
   const mid = spec.zmid !== undefined && spec.zmid > lo && spec.zmid < hi ? spec.zmid : null;
-  const norm = (v) => (mid === null ? (v - lo) / (hi - lo) : v < mid ? (0.5 * (v - lo)) / (mid - lo) : 0.5 + (0.5 * (v - mid)) / (hi - mid));
+  // the 'topo' map has separate sea and land halves: values never blend across the shoreline
+  const sA = spec.cmap === 'topo' ? 7 / 15 : 0.5, sB = spec.cmap === 'topo' ? 8 / 15 : 0.5;
+  const norm = (v) => (mid === null ? (v - lo) / (hi - lo) : v < mid ? (sA * (v - lo)) / (mid - lo) : sB + ((1 - sB) * (v - mid)) / (hi - mid));
   const inv = (t) => (mid === null ? lo + t * (hi - lo) : t < 0.5 ? lo + (t / 0.5) * (mid - lo) : mid + ((t - 0.5) / 0.5) * (hi - mid));
   // Smooth fields are resampled to screen resolution by bilinear interpolation of the VALUES (then coloured),
   // which keeps colour boundaries such as a shoreline sharp; masked fields stay cell-exact.
@@ -267,7 +269,9 @@ function drawField(canvas, spec) {
     ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.lineWidth = 0.8;
     const levels = Array.isArray(spec.contours) ? spec.contours : Array.from({ length: spec.contours }, (_, k) => lo + ((k + 1) * (hi - lo)) / (spec.contours + 1));
     const px = (i) => m.l + (i / (nx - 1)) * pw, py = (j) => m.t + ph - (j / (ny - 1)) * ph;
-    for (const lv of levels) {
+    for (const lvRaw of levels) {
+      const lv = typeof lvRaw === 'object' ? lvRaw.level : lvRaw;
+      ctx.strokeStyle = (typeof lvRaw === 'object' && lvRaw.color) || 'rgba(255,255,255,.55)'; ctx.lineWidth = (typeof lvRaw === 'object' && lvRaw.width) || 0.8;
       ctx.beginPath();
       for (let j = 0; j < ny - 1; j++) for (let i = 0; i < nx - 1; i++) {
         const a = z[j][i], b = z[j][i + 1], c = z[j + 1][i + 1], d = z[j + 1][i];
