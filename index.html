@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob: https://tile.openstreetmap.org; connect-src 'self' https://api.open-meteo.com https://marine-api.open-meteo.com https://geocoding-api.open-meteo.com https://api.bigdatacloud.net https://pae-paha.pacioos.hawaii.edu https://gis.ngdc.noaa.gov https://erddap.emodnet-physics.eu https://api.worldbank.org https://open.er-api.com https://ourworldindata.org https://power.larc.nasa.gov https://api.openalex.org https://api.crossref.org https://samuelakosaonyejekwe.github.io https://raw.githack.com https://cdn.statically.io; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; worker-src 'self'; manifest-src 'self'">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#0b3a5b">
+<meta name="description" content="BrineLab — an integrated, installable, offline-capable desalination simulation suite: reverse osmosis, brine chemistry and scaling, whole-plant balances, CFD, sea discharge, thermal, electrodialysis, FO/MD, ZLD, fouling, optimisation, pumps and economics.">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="BrineLab">
+<title>BrineLab · Integrated desalination simulation suite</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="assets/icon-180.png">
+<link rel="stylesheet" href="css/app.css">
+<link rel="modulepreload" href="js/app.js">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button id="menuBtn" class="icon-btn" type="button" aria-label="Open navigation menu" title="Menu">☰</button>
+  <a class="brand" href="#/home" aria-label="BrineLab overview">
+    <img src="assets/icon.svg" alt="" width="30" height="30">
+    <span class="brand-name">BrineLab</span>
+  </a>
+  <div class="arrows" role="group" aria-label="Page navigation">
+    <button id="navPrev" class="arrow-btn" type="button" aria-label="Previous page">←</button>
+    <button id="navNext" class="arrow-btn" type="button" aria-label="Next page">→</button>
+  </div>
+  <div id="crumb" class="crumb" aria-live="polite"></div>
+  <a id="caseChip" class="case-chip" href="#/case" title="Active case — click to edit"></a>
+  <span id="net" class="net" role="status"></span>
+  <button id="themeBtn" class="icon-btn" type="button" aria-label="Switch between light and dark theme" title="Light / dark">◐</button>
+  <button id="installBtn" class="install-btn" type="button" title="Install this application on your device">⬇ <span>Install</span></button>
+</header>
+<div id="scrim" class="scrim"></div>
+<div class="layout">
+  <nav id="nav" class="nav" aria-label="Main"></nav>
+  <div class="content">
+    <main id="main" tabindex="-1"><div class="loading"><div class="spinner"></div>Starting BrineLab…</div></main>
+    <nav id="pager" class="pager" aria-label="Previous and next page"></nav>
+    <footer class="foot">BrineLab · integrated desalination simulation suite · runs entirely on your device</footer>
+  </div>
+</div>
+<noscript><p class="noscript">BrineLab needs JavaScript to run its calculation engines.</p></noscript>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

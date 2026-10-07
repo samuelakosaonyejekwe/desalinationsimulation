@@ -1,0 +1,12 @@
+{
+  "name": "brinelab",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "BrineLab — integrated desalination simulation suite (installable, offline-capable web app)",
+  "scripts": {
+    "test": "node tests/run.mjs",
+    "build": "node tools/build.mjs",
+    "serve": "python3 -m http.server 8080"
+  }
+}

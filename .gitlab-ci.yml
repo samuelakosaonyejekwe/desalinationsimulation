@@ -1,0 +1,10 @@
+# GitLab Pages mirror: serves the repository root as a static site.
+pages:
+  stage: deploy
+  script:
+    - mkdir public
+    - cp -r index.html standalone.html manifest.webmanifest sw.js version.json css js assets public/ 2>/dev/null || true
+  artifacts:
+    paths: [public]
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
