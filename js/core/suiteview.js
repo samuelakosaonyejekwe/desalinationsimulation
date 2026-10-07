@@ -1,7 +1,7 @@
 // Generic suite workspace. A suite module only declares its inputs and engine (see docs/SUITE_CONTRACT.md);
 // this file turns that declaration into the full workflow: guide → inputs → model setup → mesh →
 // run → results → mesh-sensitivity → calibration → verification & validation → theory.
-import { h, clear, btn, tabs, fieldRow, kpiGrid, dataTable, toast, badge, emptyState, help, fill } from './ui.js';
+import { h, clear, btn, tabs, fieldRow, kpiGrid, dataTable, toast, badge, emptyState, help, fill, importBtn } from './ui.js';
 import { plotCard } from './plot.js';
 import { store, sanitize } from './store.js';
 import { fmt, gci, levenbergMarquardt, metrics, isNum } from './num.js';
@@ -10,6 +10,8 @@ import { CATALOG } from '../data/catalog.js';
 import { geometryTab } from './geomview.js';
 import { advicePanel } from './advisorview.js';
 import { wording } from '../data/wording.js';
+import { solve, cancelRun } from './runner.js';
+import { readTable } from './io.js';
 
 const lastResult = new Map(); // suite id -> full result of the last run (kept in memory)
 const bigValues = new Map(); // `${suite}.${key}` -> large imported objects (geometry) kept out of localStorage
@@ -65,7 +67,8 @@ export function applyLinks(suite, items = linkItems(suite)) {
 /** Run a suite with the current case inputs; stores its outputs for the other suites. */
 export async function runSuite(suite, ctxExtra) {
   const v = values(suite), t0 = performance.now();
-  const res = (await suite.run(v, context(ctxExtra))) || {};
+  const solved = await solve(suite, v, context(ctxExtra)), res = solved.res || {};
+  res._threaded = solved.threaded;
   res.kpis ||= []; res.tables ||= []; res.plots ||= []; res.warnings ||= []; res.outputs ||= {};
   res._ms = performance.now() - t0; res._inputs = v;
   lastResult.set(suite.id, res);
@@ -116,23 +119,24 @@ export function renderSuite(suite, root, app) {
   const bar = h('div', { class: 'progress', hidden: true }, h('i'));
 
   const doRun = async () => {
-    runBtn.disabled = true; bar.hidden = false; bar.firstChild.style.width = '4%';
+    runBtn.disabled = true; cancelBtn.hidden = false; bar.hidden = false; bar.firstChild.style.width = '4%';
     status.textContent = 'Running…';
     try {
       if (store.case.autolink) applyLinks(suite);
       const res = await runSuite(suite, { progress: (f, msg) => { bar.firstChild.style.width = Math.round(4 + 96 * Math.max(0, Math.min(1, f))) + '%'; if (msg) status.textContent = msg; } });
-      status.textContent = `Solved in ${res._ms < 1000 ? Math.round(res._ms) + ' ms' : (res._ms / 1000).toFixed(1) + ' s'}`;
+      status.textContent = `Solved in ${res._ms < 1000 ? Math.round(res._ms) + ' ms' : (res._ms / 1000).toFixed(1) + ' s'}${res._threaded ? ' · background thread' : ''}`;
       const bad = res.warnings.filter((w) => w.level === 'bad').length;
       toast(bad ? `Run finished with ${bad} limit violation${bad > 1 ? 's' : ''}.` : 'Run finished.', bad ? 'warn' : 'ok');
       tabset.show('results');
     } catch (e) {
-      console.error(e);
-      status.textContent = 'Run failed';
-      toast('Run failed: ' + (e.message || e), 'bad', 9000);
-    } finally { runBtn.disabled = false; setTimeout(() => (bar.hidden = true), 500); }
+      if (e.cancelled) { status.textContent = 'Cancelled'; toast('Run cancelled.', 'warn'); }
+      else { console.error(e); status.textContent = 'Run failed'; toast('Run failed: ' + (e.message || e), 'bad', 9000); }
+    } finally { runBtn.disabled = false; cancelBtn.hidden = true; setTimeout(() => (bar.hidden = true), 500); }
   };
   const runBtn = btn('▶  ' + L.run, doRun, 'primary', 'Solve this suite with the current inputs (shortcut: Ctrl/⌘ + Enter)');
 
+  const cancelBtn = btn('✕  Cancel', () => cancelRun(), 'ghost danger', 'Stop the running calculation');
+  cancelBtn.hidden = true;
   const presetSel = suite.presets?.length ? h('select', { 'aria-label': 'Load an example case', onchange: (e) => {
     const p = suite.presets[+e.target.value];
     if (p) { store.setInputs(suite.id, { ...defaults(suite), ...p.values }); toast(`Loaded example: ${p.name}`); tabset.show(tabset.active()); }
@@ -340,6 +344,52 @@ export function renderSuite(suite, root, app) {
     h('details', { class: 'ref' }, h('summary', null, 'Input data this suite accepts'), h('p', null, cat.inputs || '')),
     h('details', { class: 'ref' }, h('summary', null, 'Output data this suite produces'), h('p', null, cat.outputs || '')));
 
+  // -- live data feed: follow a file on this computer that the plant historian / SCADA export keeps appending to
+  let liveTimer = null, liveHandle = null, liveSeen = '';
+  const stopLive = () => { clearInterval(liveTimer); liveTimer = null; };
+  const liveTab = () => {
+    const L2 = suite.live, field = allFields(suite).find((f) => f.key === L2.key), log = h('ul', { class: 'linklist' }), state = h('div');
+    const period = h('select', { 'aria-label': 'Check interval' }, [[2, 'every 2 seconds'], [5, 'every 5 seconds'], [15, 'every 15 seconds'], [60, 'every minute']].map(([v, t]) => h('option', { value: v, selected: v === 5 }, t)));
+    const auto = h('input', { type: 'checkbox', checked: true, id: 'live_auto' });
+    const norm = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const note = (msg, kind) => { log.prepend(h('li', { class: kind || '' }, `${new Date().toLocaleTimeString()} — ${msg}`)); while (log.children.length > 12) log.lastChild.remove(); };
+    const paint = (extra) => fill(state, kpiGrid([{ label: 'Feed', value: liveTimer ? 'following' : liveHandle ? 'paused' : 'not linked', status: liveTimer ? 'ok' : '' }, { label: 'File', value: liveHandle?.name || '—' }, { label: 'Rows loaded', value: (store.inputs(suite.id)[L2.key] || field.value || []).length }, ...(extra || [])]));
+    const ingest = async (file, why) => {
+      const sig = file.size + ':' + file.lastModified;
+      if (sig === liveSeen) return false;
+      liveSeen = sig;
+      const t = await readTable(file);
+      const map = field.columns.map((c, i) => t.headers.find((hd) => norm(hd) === norm(c.key) || norm(hd) === norm(c.label) || (c.aliases || []).some((al) => norm(al) === norm(hd))) ?? (t.headers.length === field.columns.length ? t.headers[i] : undefined));
+      const rows = t.records.map((r) => Object.fromEntries(field.columns.map((c, i) => [c.key, map[i] === undefined ? null : r[map[i]]])));
+      const before = (store.inputs(suite.id)[L2.key] || []).length;
+      store.setInput(suite.id, L2.key, rows);
+      note(`${why}: ${rows.length} rows (${rows.length - before >= 0 ? '+' : ''}${rows.length - before}) from ${file.name}`, 'ok');
+      paint([{ label: 'Last update', value: new Date().toLocaleTimeString() }]);
+      if (auto.checked) await doRunLive();
+      return true;
+    };
+    const poll = async () => { try { await ingest(await liveHandle.getFile(), 'New data'); } catch (e) { note('Could not read the file: ' + (e.message || e), 'bad'); } };
+    const start = () => { stopLive(); liveTimer = setInterval(poll, 1000 * +period.value); paint(); };
+    period.addEventListener('change', () => { if (liveTimer) start(); });
+    const canFollow = typeof window.showOpenFilePicker === 'function';
+    const link = btn('Link a live file…', async () => {
+      try {
+        const [hd] = await window.showOpenFilePicker({ multiple: false, types: [{ description: 'Operating data', accept: { 'text/csv': ['.csv', '.tsv', '.txt'], 'application/json': ['.json'], 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] } }] });
+        liveHandle = hd; liveSeen = ''; await poll(); start(); toast(`Following ${hd.name}. New rows are analysed as they arrive.`, 'ok');
+      } catch (e) { if (e.name !== 'AbortError') toast('Could not link the file: ' + (e.message || e), 'bad'); }
+    }, 'primary', 'Choose the export file your historian or SCADA system writes to. It stays on this computer.');
+    const once = importBtn('Load a snapshot…', async (file) => { liveSeen = ''; liveHandle = null; stopLive(); await ingest(file, 'Snapshot loaded'); }, '.csv,.tsv,.txt,.json,.xlsx');
+    paint();
+    return h('div', { class: 'groups' },
+      h('p', { class: 'summary' }, L2.help || `Follow a file on this computer that your plant historian or SCADA export keeps appending to. Each time it grows, the new rows are loaded into “${field.label}” and the suite is re-run, so trends, alarms and forecasts stay current.`),
+      h('fieldset', { class: 'group' }, h('legend', null, 'Live feed', help('The file is read locally through a permission you grant for that one file. Nothing is uploaded and no network connection to the plant is opened.')),
+        h('div', { class: 'row-tools' }, canFollow ? link : null, once, btn(liveTimer ? 'Pause' : 'Resume', (e) => { if (!liveHandle) return toast('Link a file first.', 'warn'); if (liveTimer) { stopLive(); e.target.textContent = 'Resume'; } else { start(); e.target.textContent = 'Pause'; } paint(); }, 'ghost'), h('label', { class: 'inline' }, 'Check ', period), h('label', { class: 'inline', for: 'live_auto' }, auto, ' re-run automatically')),
+        canFollow ? null : h('p', { class: 'note' }, 'This browser cannot keep a file open for following (Chrome and Edge on a computer can). Use “Load a snapshot…” each time the export is refreshed; everything else works the same.'),
+        state, h('h3', null, 'Activity'), log),
+      h('details', { class: 'ref' }, h('summary', null, 'Expected columns'), h('p', null, field.columns.map((c) => `${c.label}${c.unit ? ' (' + c.unit + ')' : ''}`).join(' · ') + '. Columns are matched by name; order does not matter.')));
+  };
+  const doRunLive = async () => { try { if (store.case.autolink) applyLinks(suite); await runSuite(suite, {}); status.textContent = `Live update solved at ${new Date().toLocaleTimeString()}`; if (tabset.active() === 'results') tabset.show('results'); } catch (e) { status.textContent = 'Live update failed: ' + (e.message || e); } };
+
   const has = (t) => suite.inputs.some((g) => (g.tab || 'inputs') === t);
   const defs = [
     { id: 'guide', label: L.guide, render: guideTab, tip: 'What this suite does and how to use it' },
@@ -347,6 +397,7 @@ export function renderSuite(suite, root, app) {
     has('setup') && { id: 'setup', label: L.setup, render: groupTab('setup'), tip: 'Model choices, initial and boundary conditions, solver settings' },
     (has('mesh') || suite.mesh) && { id: 'mesh', label: L.mesh, render: groupTab('mesh'), tip: 'Discretisation and sensitivity study' },
     { id: 'geometry', label: L.geometry, render: () => geometryTab(suite, { fields: allFields(suite), values: () => values(suite), setValue: (k, val) => setValue(suite, k, val) }), tip: 'Import CAD, mesh, GIS, point-cloud, image or network geometry, or generate one' },
+    suite.live && allFields(suite).some((f) => f.key === suite.live.key && f.type === 'table') && { id: 'live', label: 'Live feed', render: liveTab, tip: 'Follow a plant export file and re-analyse as new data arrive' },
     { id: 'results', label: L.results, render: resultsTab, tip: 'KPIs, plots, tables and exports' },
     ...(suite.views || []).map((v) => ({ id: 'x_' + v.id, label: v.label, tip: v.tip, render: () => { const el = h('div', { class: 'groups' }); try { v.render(el, { values: () => values(suite), set: (k, val) => setValue(suite, k, val), result: () => lastResult.get(suite.id), run: doRun, h, plotCard: (p) => plotCard(p, { onDownload: download }), dataTable, kpiGrid, toast, download, store }); } catch (e) { el.append(h('p', { class: 'bad' }, e.message)); } return el; } })),
     { id: 'cal', label: L.cal, render: calTab, tip: 'Parameter estimation and independent validation' },
@@ -360,7 +411,7 @@ export function renderSuite(suite, root, app) {
   fill(root, 
     h('header', { class: 'suite-head' },
       h('div', { class: 'suite-title' }, h('span', { class: 'suite-num' }, suite.num), h('div', null, h('h1', null, suite.title), h('p', null, suite.tagline))),
-      h('div', { class: 'actions' }, presetSel, btn('Reset', () => { store.clearInputs(suite.id); bigValues.forEach((_, k) => k.startsWith(suite.id + '.') && bigValues.delete(k)); toast('Inputs reset to defaults.'); tabset.show(tabset.active()); }, 'ghost', 'Restore the default inputs of this suite'), runBtn)),
+      h('div', { class: 'actions' }, presetSel, btn('Reset', () => { store.clearInputs(suite.id); bigValues.forEach((_, k) => k.startsWith(suite.id + '.') && bigValues.delete(k)); toast('Inputs reset to defaults.'); tabset.show(tabset.active()); }, 'ghost', 'Restore the default inputs of this suite'), cancelBtn, runBtn)),
     h('div', { class: 'statusline' }, status, bar), tabset);
-  return () => document.removeEventListener('keydown', onKey);
+  return () => { document.removeEventListener('keydown', onKey); stopLive(); };
 }

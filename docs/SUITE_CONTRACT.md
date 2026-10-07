@@ -76,6 +76,9 @@ export default {
   // Code/equation verification: conservation, limiting cases, analytical or hand calculations.
   verify() { return [{ name: 'Water balance closes', expected: 0, got: 1e-12, tol: 1e-9, pass: true, note: 'Qf = Qp + Qc' }]; },
 
+  // Optional live feed: the shell lets the user follow a local export file and reloads this table input as it grows.
+  live: { key: 'log', label: 'Plant operating log', help: '…' },
+
   // Optional extra tabs with custom content. `el` is an empty container; build DOM only with api.h(...)
   views: [{ id: 'flowsheet', label: 'Flowsheet', tip: '…', render(el, api) { /* api = { h, values(), set(k,v), result(), run(), plotCard(spec), dataTable(spec), kpiGrid(items), toast, download } */ } }],
 };
