@@ -135,7 +135,8 @@ export function sitePage(root) {
   const latI = h('input', { type: 'number', step: 'any', min: -90, max: 90, value: s.lat ?? '', id: 's_lat', placeholder: 'e.g. 25.05' }), lonI = h('input', { type: 'number', step: 'any', min: -180, max: 180, value: s.lon ?? '', id: 's_lon', placeholder: 'e.g. 55.05' });
   const srcBox = h('div', { class: 'sources' }), dataBox = h('div'), results = h('ul', { class: 'search-results' });
   const map = slippyMap(s.lat, s.lon, (la, lo) => { latI.value = la.toFixed(4); lonI.value = lo.toFixed(4); });
-  const paintSources = (live = {}) => fill(srcBox, SOURCES.map((src) => { const st = live[src.id] || store.case.site.status?.[src.id]; return h('div', { class: 'source ' + (st === 'loading' ? 'loading' : st?.ok ? 'ok' : st ? 'fail' : '') }, h('b', null, src.name), h('span', null, src.gives), h('small', null, src.provider + ' · ' + src.host), h('em', null, st === 'loading' ? 'fetching…' : st ? (st.ok ? 'live · ' + ago(st.at) : 'unavailable — ' + st.message) : 'not fetched')); }));
+  const paintSources = (live = {}) => fill(srcBox, SOURCES.map((src) => { const st = live[src.id] || store.case.site.status?.[src.id]; return h('div', { class: 'source ' + (st === 'loading' ? 'loading' : st?.ok ? 'ok' : st ? 'fail' : '') }, h('b', null, src.name), h('span', null, src.gives), h('small', null, src.provider + ' · ' + src.host), h('em', null, st === 'loading' ? 'fetching…' : st ? (st.ok ? (st.cached ? 'on this device · fetched ' : 'live · ') + ago(st.at) : 'unavailable — ' + st.message) : 'not fetched')); }));
+  let plotCache = new Map();
   const paintData = () => {
     const site = store.case.site, d = site.data || {};
     clear(dataBox);
@@ -161,28 +162,38 @@ export function sitePage(root) {
     if (d.currents) { const now = d.currents.nowHour ?? 72; plots.push({ type: 'line', title: 'Ocean-current speed — past 3 days and forecast', xlabel: 'Hours from now (negative = past)', ylabel: 'm/s', zeroY: true, series: [{ name: 'Current speed', x: d.currents.t.map((t) => t - now), y: d.currents.speed, mode: 'step' }], vlines: [{ x: 0, label: 'now', color: '#f97316' }], hlines: [{ y: d.currentSpeed, label: 'mean', color: '#64748b' }],
       note: `The ocean model publishes currents in steps of 0.1 km/h (about 0.03 m/s), which is why the trace is stepped at low speeds.${d.currents.gaps ? ` ${d.currents.gaps} missing hours in the source were bridged by interpolation.` : ''} Mean ${fmt(d.currentSpeed, 2)} m/s, peak ${fmt(d.currentMax, 2)} m/s.` }); }
     if (d.salinityMonthly) plots.push({ type: 'line', title: 'Monthly climatology near the site', xlabel: 'Month', ylabel: 'Salinity (g/kg) · temperature (°C)', legendBelow: true, series: [{ name: 'Salinity', x: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], y: d.salinityMonthly, mode: 'both' }, { name: 'Temperature', x: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], y: d.sstMonthly, mode: 'both' }] });
-    if (plots.length) dataBox.append(h('div', { class: 'plots' }, plots.map(pc)));
+    if (plots.length) { // reuse chart cards whose data are unchanged, so progressive updates do not redraw everything
+      const sig = (p) => p.title + '|' + (p.type === 'field' ? p.z.length + ':' + p.z[0][0] + ':' + p.z[p.z.length - 1][p.z[0].length - 1] + ':' + (p.markers?.[0]?.x ?? '') + ':' + (p.markers?.[0]?.y ?? '') : p.series.map((q) => q.y.length + ':' + q.y[0] + ':' + q.y[q.y.length - 1] + ':' + q.x[0]).join(','));
+      const next = new Map(); dataBox.append(h('div', { class: 'plots' }, plots.map((p) => { const k = sig(p), card = plotCache.get(k) || pc(p); next.set(k, card); return card; }))); plotCache = next;
+    }
     dataBox.append(card(h('h2', null, 'Where these values go'), h('p', { class: 'note' }, 'Open any suite: matching inputs appear in its “linked data” bar and, with auto-link on, are applied when you run. Use the buttons below to also set the case feed water from the site.'),
       h('div', { class: 'row-tools' },
         d.salinity ? btn(`Set case feed to seawater at ${fmt(d.salinity, 3)} g/kg${d.sst ? ' and ' + fmt(d.sst, 3) + ' °C' : ''}`, () => { const base = WATERS.seawater.ions, tdsT = d.salinity * 1000 * 1.025, f = tdsT / ION_IDS.reduce((a, k) => a + base[k], 0); store.setFeed({ ions: cloneIons(Object.fromEntries(ION_IDS.map((k) => [k, +(base[k] * f).toPrecision(5)]))), T: d.sst ?? store.case.feed.T, name: `Seawater at ${site.name || 'site'}`, source: 'site' }); toast('Case feed water updated from site data.', 'ok'); }, 'primary') : null,
         btn('Download site data (JSON)', () => download(JSON.stringify(site, null, 1), 'site-data.json', 'application/json')))));
   };
-  const doFetch = async () => {
+  const doFetch = async (opt = {}) => {
     const la = +latI.value, lo = +lonI.value;
     if (!Number.isFinite(la) || !Number.isFinite(lo) || latI.value === '' || lonI.value === '' || Math.abs(la) > 90 || Math.abs(lo) > 180) return toast('Enter a valid latitude (−90…90) and longitude (−180…180), or click the map.', 'warn');
     if (!navigator.onLine) return toast('You are offline. Stored site data stay available; live data refresh when you reconnect.', 'warn');
-    fetchBtn.disabled = true; const live = {};
+    const t0 = performance.now(), live = {}, old = store.case.site, same = old.lat !== null && Math.abs(old.lat - la) < 0.02 && Math.abs(old.lon - lo) < 0.02;
+    fetchBtn.disabled = true; fetchBtn.textContent = 'Fetching…';
+    let raf = 0, latest = null, first = true;
+    const commit = (site) => { // keep earlier answers of sources that are down right now, then repaint
+      if (same) site.data = { ...old.data, ...site.data };
+      store.setSite(site);
+    };
+    const paintSoon = (site) => { latest = site; if (raf) return; raf = requestAnimationFrame(() => { raf = 0; commit(latest); if (first) { map.setView(latest.lat, latest.lon); first = false; } paintSources(live); paintData(); }); };
     try {
-      const site = await fetchSite(la, lo, (id, st, msg) => { live[id] = st === 'loading' ? 'loading' : { ok: st === 'ok', message: msg, at: new Date().toISOString() }; paintSources(live); });
-      const old = store.case.site, same = old.lat !== null && Math.abs(old.lat - site.lat) < 0.02 && Math.abs(old.lon - site.lon) < 0.02;
-      if (same) site.data = { ...old.data, ...site.data, ...(site.data.salinityEstimated && old.data?.salinity && !old.data.salinityEstimated ? { salinity: old.data.salinity, salinityEstimated: false } : {}) }; // keep earlier answers of sources that are down right now
-      store.setSite(site); map.setView(site.lat, site.lon);
-      const ok = Object.values(site.status).filter((x) => x.ok).length;
-      toast(`Site data updated: ${ok} of ${SOURCES.length} sources answered.`, ok ? 'ok' : 'bad');
+      const site = await fetchSite(la, lo, (id, st, msg) => { live[id] = st === 'loading' ? 'loading' : { ok: st === 'ok', message: msg, at: new Date().toISOString() }; paintSources(live); }, paintSoon, opt);
+      if (raf) { cancelAnimationFrame(raf); raf = 0; }
+      commit(site); map.setView(site.lat, site.lon);
+      const ok = Object.values(site.status).filter((x) => x.ok).length, stored = Object.values(site.status).filter((x) => x.cached).length;
+      toast(`Site data ready in ${((performance.now() - t0) / 1000).toFixed(1)} s: ${ok} of ${SOURCES.length} sources${stored ? ` (${stored} from the copy kept on this device)` : ''}.`, ok ? 'ok' : 'bad');
     } catch (e) { toast('Could not fetch site data: ' + e.message, 'bad'); }
-    fetchBtn.disabled = false; paintSources(); paintData();
+    fetchBtn.disabled = false; fetchBtn.textContent = 'Fetch live site data'; paintSources(); paintData();
   };
-  const fetchBtn = btn('Fetch live site data', doFetch, 'primary');
+  const fetchBtn = btn('Fetch live site data', () => doFetch(), 'primary', 'Each source fills in as soon as it answers; answers already on this device appear instantly');
+  const freshBtn = btn('Force refresh', () => doFetch({ fresh: true }), 'ghost', 'Ignore the copies kept on this device and ask every source again');
   const q = h('input', { type: 'search', placeholder: 'Search a city, port or plant location…', 'aria-label': 'Search place', maxlength: 80 });
   const doSearch = async () => {
     if (!q.value.trim()) return;
@@ -198,7 +209,7 @@ export function sitePage(root) {
       h('div', { class: 'site-bar' },
         h('div', { class: 'site-search' }, q, btn('Search', doSearch)),
         h('label', { class: 'site-coord', for: 's_lat' }, h('span', null, 'Latitude °N'), latI), h('label', { class: 'site-coord', for: 's_lon' }, h('span', null, 'Longitude °E'), lonI),
-        fetchBtn, btn('Use my location', () => navigator.geolocation?.getCurrentPosition((p) => { latI.value = p.coords.latitude.toFixed(4); lonI.value = p.coords.longitude.toFixed(4); map.setView(p.coords.latitude, p.coords.longitude, 9); }, () => toast('Location permission was not granted.', 'warn')), 'ghost')),
+        fetchBtn, freshBtn, btn('Use my location', () => navigator.geolocation?.getCurrentPosition((p) => { latI.value = p.coords.latitude.toFixed(4); lonI.value = p.coords.longitude.toFixed(4); map.setView(p.coords.latitude, p.coords.longitude, 9); }, () => toast('Location permission was not granted.', 'warn')), 'ghost')),
       results, map,
       h('p', { class: 'note' }, 'Click or tap the map to place the site. For an outfall study choose a point in the sea a few hundred metres offshore; for a plant on land the marine sources report the nearest sea cell.'),
       h('h3', null, 'Live sources'), srcBox),

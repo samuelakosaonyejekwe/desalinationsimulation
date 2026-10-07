@@ -220,9 +220,11 @@ function drawField(canvas, spec) {
   // Smooth fields are resampled to screen resolution by bilinear interpolation of the VALUES (then coloured),
   // which keeps colour boundaries such as a shoreline sharp; masked fields stay cell-exact.
   const smooth = !spec.mask && nx > 2 && ny > 2 && spec.interpolate !== false;
-  const dprF = Math.min(window.devicePixelRatio || 1, 2), W = smooth ? Math.max(nx, Math.min(900, Math.round(pw * dprF))) : nx, H = smooth ? Math.max(ny, Math.min(900, Math.round(ph * dprF))) : ny;
-  const off = document.createElement('canvas'); off.width = W; off.height = H;
-  const octx = off.getContext('2d'), img = octx.createImageData(W, H);
+  const dprF = Math.min(window.devicePixelRatio || 1, 2), cap = spec.shade ? 520 : 640, W = smooth ? Math.max(nx, Math.min(cap, Math.round(pw * dprF))) : nx, H = smooth ? Math.max(ny, Math.min(cap, Math.round(ph * dprF))) : ny;
+  let off = spec._raster && spec._raster.W === W && spec._raster.H === H && spec._raster.lo === lo && spec._raster.hi === hi ? spec._raster.canvas : null;
+  const reuse = !!off;
+  if (!off) { off = document.createElement('canvas'); off.width = W; off.height = H; }
+  const octx = off.getContext('2d'), img = reuse ? null : octx.createImageData(W, H);
   const cellx = Math.abs(dx) / (nx - 1 || 1), celly = Math.abs(dy) / (ny - 1 || 1), geo = spec.shade === 'geo', kx = geo ? 111320 * Math.cos((((ys[0] + ys[ny - 1]) / 2) * Math.PI) / 180) : 1, ky = geo ? 110540 : 1;
   const zAt = (i, j) => z[Math.max(0, Math.min(ny - 1, j))][Math.max(0, Math.min(nx - 1, i))];
   // slope at every grid node by central differences; interpolating these (not the per-cell slope) gives smooth, natural shading
@@ -231,8 +233,7 @@ function drawField(canvas, spec) {
     GX = z.map((row, j) => row.map((_, i) => (zAt(i + 1, j) - zAt(i - 1, j)) / ((i === 0 || i === nx - 1 ? 1 : 2) * cellx * kx)));
     GY = z.map((row, j) => row.map((_, i) => (zAt(i, j + 1) - zAt(i, j - 1)) / ((j === 0 || j === ny - 1 ? 1 : 2) * celly * ky)));
   }
-  const cubic = (p0, p1, p2, p3, t) => p1 + 0.5 * t * (p2 - p0 + t * (2 * p0 - 5 * p1 + 4 * p2 - p3 + t * (3 * (p1 - p2) + p3 - p0))); // Catmull–Rom
-  for (let r = 0; r < H; r++) {
+  for (let r = 0; r < (reuse ? 0 : H); r++) {
     const fj = smooth ? ((H - 1 - r) / (H - 1)) * (ny - 1) : ny - 1 - r, j0 = Math.min(ny - 2 < 0 ? 0 : ny - 2, Math.floor(fj)), b = smooth ? fj - j0 : 0;
     for (let cI = 0; cI < W; cI++) {
       const o = (r * W + cI) * 4;
@@ -241,10 +242,7 @@ function drawField(canvas, spec) {
         const fi = (cI / (W - 1)) * (nx - 1), i0 = Math.min(nx - 2, Math.floor(fi)), a = fi - i0;
         const v00 = z[j0][i0], v10 = z[j0][i0 + 1], v01 = z[j0 + 1][i0], v11 = z[j0 + 1][i0 + 1];
         v = Number.isFinite(v00 + v10 + v01 + v11) ? v00 * (1 - a) * (1 - b) + v10 * a * (1 - b) + v01 * (1 - a) * b + v11 * a * b : z[Math.round(fj)][Math.round(fi)];
-        if (spec.shade && Number.isFinite(v)) { // smooth surface (bicubic) lit from the north-west using interpolated node slopes
-          const rowAt = (jj) => cubic(zAt(i0 - 1, jj), zAt(i0, jj), zAt(i0 + 1, jj), zAt(i0 + 2, jj), a);
-          const vc = cubic(rowAt(j0 - 1), rowAt(j0), rowAt(j0 + 1), rowAt(j0 + 2), b);
-          if (Number.isFinite(vc) && (mid === null || (vc - mid) * (v - mid) > 0)) v = vc; // never let smoothing move the shoreline
+        if (spec.shade && Number.isFinite(v)) { // lit from the north-west using smoothly interpolated node slopes
           const gx = GX[j0][i0] * (1 - a) * (1 - b) + GX[j0][i0 + 1] * a * (1 - b) + GX[j0 + 1][i0] * (1 - a) * b + GX[j0 + 1][i0 + 1] * a * b;
           const gy = GY[j0][i0] * (1 - a) * (1 - b) + GY[j0][i0 + 1] * a * (1 - b) + GY[j0 + 1][i0] * (1 - a) * b + GY[j0 + 1][i0 + 1] * a * b, ex = spec.exaggeration || 1;
           shade = Math.max(0.62, Math.min(1.22, 1 + 0.75 * ((-gx + gy) * ex) / Math.sqrt(1 + (gx * ex) ** 2 + (gy * ex) ** 2)));
@@ -258,7 +256,7 @@ function drawField(canvas, spec) {
       img.data[o] = Math.min(255, L[t * 3] * shade); img.data[o + 1] = Math.min(255, L[t * 3 + 1] * shade); img.data[o + 2] = Math.min(255, L[t * 3 + 2] * shade); img.data[o + 3] = 255;
     }
   }
-  octx.putImageData(img, 0, 0);
+  if (!reuse) { octx.putImageData(img, 0, 0); Object.defineProperty(spec, '_raster', { value: { canvas: off, W, H, lo, hi }, enumerable: false, configurable: true }); }
   ctx.imageSmoothingEnabled = smooth;
   ctx.drawImage(off, m.l, m.t, pw, ph);
   const X = (v) => m.l + ((v - xs[0]) / dx) * pw, Y = (v) => m.t + ph - ((v - ys[0]) / dy) * ph;

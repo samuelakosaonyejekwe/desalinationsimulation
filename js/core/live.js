@@ -105,7 +105,7 @@ const connectors = {
     try { // primary: one multipoint sample request against the NOAA global DEM mosaic
       const points = lats.flatMap((la) => lons.map((lo) => [+lo.toFixed(5), +la.toFixed(5)]));
       const flat = new Array(n * n).fill(null), CH = 1000, jobs = []; // the service returns at most 1000 samples per request
-      for (let o = 0; o < points.length; o += CH) jobs.push(getJSON('https://gis.ngdc.noaa.gov/arcgis/rest/services/DEM_mosaics/DEM_global_mosaic/ImageServer/getSamples', 25000,
+      for (let o = 0; o < points.length; o += CH) jobs.push(getJSON('https://gis.ngdc.noaa.gov/arcgis/rest/services/DEM_mosaics/DEM_global_mosaic/ImageServer/getSamples', 12000,
         { geometry: JSON.stringify({ points: points.slice(o, o + CH), spatialReference: { wkid: 4326 } }), geometryType: 'esriGeometryMultipoint', returnFirstValueOnly: 'true', f: 'json' })
         .then((j) => { for (const sm of j.samples || []) { const v = parseFloat(sm.value), id = o + sm.locationId; if (Number.isInteger(sm.locationId) && id >= 0 && id < n * n && Number.isFinite(v) && Math.abs(v) < 12000) flat[id] = v; } }));
       await Promise.all(jobs);
@@ -124,7 +124,7 @@ const connectors = {
     const g = (v) => Math.round(v * 4) / 4, la = clamp(g(lat), -79.5, 79.5), lo = clamp(g(lon), -179.5, 179.25);
     const q = `%5B0:1:11%5D%5B0%5D%5B(${la - 0.25}):1:(${la + 0.25})%5D%5B(${lo - 0.25}):1:(${lo + 0.25})%5D`;
     const url = `https://erddap.emodnet-physics.eu/erddap/griddap/SDC_GLO_CLIM_TS_V2_1.json?Salinity${q},Temperature${q}`;
-    const j = await getJSON(url, 18000).catch(() => getJSON(url, 22000)); // the climatology server is sometimes slow: one retry
+    const j = await getJSON(url, 20000); // slow server: its answer is cached on the device for 90 days, so this wait happens once per place
     const rows = (j.table?.rows || []).filter((r) => num(r[4]) !== null && r[4] > 0 && r[4] < 60);
     if (!rows.length) throw new Error('No ocean cell near this point');
     const byMonth = Array.from({ length: 12 }, () => ({ s: [], t: [] }));
@@ -174,34 +174,73 @@ const connectors = {
   },
 };
 
+// ---- response cache ---------------------------------------------------------------------------------
+// Slow-changing answers (relief, climatologies, national indicators) are kept on the device so that a
+// repeat fetch of the same place is instant; fast-changing ones (weather, sea state) are kept briefly.
+const CACHE_KEY = 'brinelab.live.v2', H = 3600e3;
+const TTL = { place: 30 * 24 * H, weather: 0.5 * H, marine: 0.5 * H, bathy: 90 * 24 * H, salinity: 90 * 24 * H, economy: 7 * 24 * H, fx: 12 * H, energy: 7 * 24 * H, climate: 90 * 24 * H };
+let memCache = null;
+function cacheAll() {
+  if (memCache) return memCache;
+  try { memCache = JSON.parse(localStorage.getItem(CACHE_KEY) || '{}') || {}; } catch { memCache = {}; }
+  return memCache;
+}
+function cacheGet(key, ttl) { const e = cacheAll()[key]; return e && Date.now() - e.t < ttl ? e : null; }
+function cachePut(key, v) {
+  const all = cacheAll(); all[key] = { t: Date.now(), v };
+  const keys = Object.keys(all);
+  if (keys.length > 160) keys.sort((a, b) => all[a].t - all[b].t).slice(0, keys.length - 120).forEach((k) => delete all[k]);
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify(all)); }
+  catch { try { for (const k of Object.keys(all)) if (k.startsWith('bathy')) delete all[k]; localStorage.setItem(CACHE_KEY, JSON.stringify(all)); } catch { /* storage unavailable: memory cache only */ } }
+}
+/** Cache key of a connector: grid-cell for site data, country for national data. */
+function keyOf(id, lat, lon, site) {
+  if (id === 'economy' || id === 'energy') return site.countryCode ? `${id}:${site.countryCode}` : null;
+  if (id === 'fx') return `fx:${site.data?.currency || site.countryCode || 'USD'}`;
+  const r = id === 'salinity' ? 4 : id === 'climate' ? 2 : id === 'bathy' ? 250 : id === 'place' ? 100 : 20; // cells per degree
+  return `${id}:${Math.round(lat * r)}:${Math.round(lon * r)}`;
+}
+
 /**
- * Pull everything for one location. Connectors run in parallel and fail independently.
- * Returns { meta, data, status: { id: { ok, message, at } } }.
+ * Pull everything for one location, as fast as the sources allow:
+ *  - every connector starts at once (national data start the moment the country is known);
+ *  - answers already on the device are used immediately;
+ *  - onData(site) is called after each answer so the page fills in progressively instead of waiting for the slowest source.
+ * Returns { meta, data, status: { id: { ok, message, at, cached } } }.
  */
-export async function fetchSite(lat, lon, onStatus = () => {}) {
+export async function fetchSite(lat, lon, onStatus = () => {}, onData = () => {}, { fresh = false } = {}) {
   lat = clamp(+lat, -90, 90); lon = ((((+lon + 180) % 360) + 360) % 360) - 180;
   const site = { lat, lon, data: {}, name: '', country: '', countryCode: '' }, status = {};
+  const snapshot = () => ({ ...site, data: { ...site.data }, status: { ...status }, fetchedAt: new Date().toISOString() });
+  const absorb = (r) => { for (const [k, v] of Object.entries(r.data || {})) if (v !== null && v !== undefined) site.data[k] = v; if (r.meta) Object.assign(site, r.meta); };
   const run = async (id) => {
+    const key = keyOf(id, lat, lon, site), hit = !fresh && key ? cacheGet(key, TTL[id]) : null;
+    if (hit) { absorb(hit.v); status[id] = { ok: true, message: 'Live', at: new Date(hit.t).toISOString(), cached: true }; onStatus(id, 'ok', 'Live'); onData(snapshot()); return; }
     onStatus(id, 'loading');
     try {
       const r = await connectors[id](lat, lon, site);
-      for (const [k, v] of Object.entries(r.data || {})) if (v !== null && v !== undefined) site.data[k] = v;
-      if (r.meta) Object.assign(site, r.meta);
+      absorb(r);
+      if (key) cachePut(key, { data: r.data, meta: r.meta });
       status[id] = { ok: true, message: 'Live', at: new Date().toISOString() };
     } catch (e) {
-      status[id] = { ok: false, message: e.name === 'AbortError' ? 'Timed out' : txt(e.message || 'Unavailable', 90), at: new Date().toISOString() };
+      const stale = key ? cacheAll()[key] : null; // an older stored answer beats no answer
+      if (stale) { absorb(stale.v); status[id] = { ok: true, message: 'Stored copy', at: new Date(stale.t).toISOString(), cached: true }; }
+      else status[id] = { ok: false, message: e.name === 'AbortError' ? 'Timed out' : txt(e.message || 'Unavailable', 90), at: new Date().toISOString() };
     }
     onStatus(id, status[id].ok ? 'ok' : 'fail', status[id].message);
+    finish(); onData(snapshot());
   };
-  await run('place'); // country first: the economy and currency connectors depend on it
-  await Promise.all(['weather', 'marine', 'bathy', 'salinity', 'fx', 'climate', run('economy').then(() => run('energy'))].map((x) => (typeof x === 'string' ? run(x) : x)));
-  if (site.data.ghiAnnual != null) site.data.ghiDaily = site.data.ghiAnnual; // long-term mean is the better design basis than this week's weather
-  if (site.data.electricityPrice == null && site.data.electricityPriceWB != null) site.data.electricityPrice = site.data.electricityPriceWB;
-  const d = site.data;
-  // Density-driven fallbacks so downstream suites always get usable numbers.
-  if (d.salinity == null) { d.salinity = regionalSalinity(lat, lon); d.salinityEstimated = true; }
-  if (d.sst == null && d.sstMonthly) d.sst = d.sstMonthly[new Date().getUTCMonth()] || null;
-  return { ...site, status, fetchedAt: new Date().toISOString() };
+  const finish = () => {
+    const d = site.data;
+    if (d.salinity == null) { d.salinity = regionalSalinity(lat, lon); d.salinityEstimated = true; } else if (status.salinity?.ok) d.salinityEstimated = false;
+    if (d.sst == null && d.sstMonthly) d.sst = d.sstMonthly[new Date().getUTCMonth()] || null;
+    if (d.ghiAnnual != null) d.ghiDaily = d.ghiAnnual; // the long-term mean is the better design basis than this week's weather
+    if (d.electricityPrice == null && d.electricityPriceWB != null) d.electricityPrice = d.electricityPriceWB;
+  };
+  const national = run('place').then(() => Promise.all([run('fx'), run('economy').then(() => run('energy'))])); // these need the country
+  await Promise.all([national, ...['weather', 'marine', 'bathy', 'salinity', 'climate'].map(run)]);
+  finish();
+  return snapshot();
 }
 
 /** Coarse regional climatology used only when the live salinity service cannot be reached. */
