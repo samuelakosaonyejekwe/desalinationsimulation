@@ -1,6 +1,6 @@
 // Application shell: routing, navigation (including back/forward arrows), theme, install,
 // offline status, update checks and background refresh of live site data.
-import { h, clear, toast, btn } from './core/ui.js';
+import { h, clear, fill, toast, btn } from './core/ui.js';
 import { store } from './core/store.js';
 import { SUITES, byId, loadSuite, downstream } from './suites/index.js';
 import { renderSuite } from './core/suiteview.js';
@@ -53,7 +53,7 @@ function offerReload() {
 const current = () => { const p = location.hash.replace(/^#\/?/, '') || 'home'; return PAGES.find((x) => x.path === p) ? p : 'home'; };
 function buildNav() {
   const group = (title, items) => h('div', { class: 'nav-group' }, h('div', { class: 'nav-title' }, title), items.map((p) => h('a', { href: '#/' + p.path, class: 'nav-link', dataset: { path: p.path }, title: p.full || p.label }, h('span', { class: 'nav-ico', 'aria-hidden': 'true' }, p.icon), h('span', { class: 'nav-label' }, p.label), p.suite ? h('span', { class: 'nav-dot', dataset: { suite: p.suite }, title: 'Solved in this case' }) : null)));
-  clear(nav).append(group('Start', PAGES.slice(0, 4)), group('Simulation suites', PAGES.filter((p) => p.suite)), group('Whole case', PAGES.slice(-3)));
+  fill(nav, group('Start', PAGES.slice(0, 4)), group('Simulation suites', PAGES.filter((p) => p.suite)), group('Whole case', PAGES.slice(-3)));
   markSolved();
 }
 function markSolved() { for (const d of nav.querySelectorAll('.nav-dot')) d.classList.toggle('on', !!store.case.outputs[d.dataset.suite]); }
@@ -66,7 +66,7 @@ async function route() {
   document.title = `${page.full || page.label} · ${APP.name}`;
   const prev = PAGES[i - 1], next = PAGES[i + 1];
   const arrow = (p, dir) => (p ? h('a', { class: 'pager-btn ' + dir, href: '#/' + p.path, rel: dir === 'prev' ? 'prev' : 'next', 'aria-label': (dir === 'prev' ? 'Previous page: ' : 'Next page: ') + p.label }, h('span', { class: 'pg-arrow', 'aria-hidden': 'true' }, dir === 'prev' ? '←' : '→'), h('span', { class: 'pg-text' }, h('small', null, dir === 'prev' ? 'Previous' : 'Next'), h('b', null, `${p.icon} ${p.label}`))) : h('span', { class: 'pager-btn disabled ' + dir }));
-  clear(pager).append(arrow(prev, 'prev'), h('span', { class: 'pager-pos' }, `${i + 1} / ${PAGES.length}`), arrow(next, 'next'));
+  fill(pager, arrow(prev, 'prev'), h('span', { class: 'pager-pos' }, `${i + 1} / ${PAGES.length}`), arrow(next, 'next'));
   const set = (id, p) => { const el = document.getElementById(id); el.disabled = !p; el.title = p ? p.label + '  (Alt + ' + (id === 'navPrev' ? '←' : '→') + ')' : ''; el.onclick = () => p && (location.hash = '#/' + p.path); };
   set('navPrev', prev); set('navNext', next);
   document.getElementById('crumb').textContent = page.full || page.label;
@@ -76,11 +76,11 @@ async function route() {
     try {
       const suite = await loadSuite(page.suite);
       if (current() !== path) return;
-      const host = h('div', { class: 'suite' }); clear(main).append(host);
+      const host = h('div', { class: 'suite' }); fill(main, host);
       cleanup = renderSuite(suite, host, app);
     } catch (e) {
       console.error(e);
-      clear(main).append(h('div', { class: 'empty' }, h('h3', null, 'This suite could not be loaded'), h('p', null, navigator.onLine ? String(e.message || e) : 'You are offline and this suite has not been stored on the device yet. Connect once and it will be saved for offline use.'), btn('Try again', route, 'primary')));
+      fill(main, h('div', { class: 'empty' }, h('h3', null, 'This suite could not be loaded'), h('p', null, navigator.onLine ? String(e.message || e) : 'You are offline and this suite has not been stored on the device yet. Connect once and it will be saved for offline use.'), btn('Try again', route, 'primary')));
     }
   } else {
     const host = h('div', { class: 'page' }); main.append(host);

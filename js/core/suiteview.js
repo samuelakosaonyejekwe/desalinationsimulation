@@ -1,7 +1,7 @@
 // Generic suite workspace. A suite module only declares its inputs and engine (see docs/SUITE_CONTRACT.md);
 // this file turns that declaration into the full workflow: guide → inputs → model setup → mesh →
 // run → results → mesh-sensitivity → calibration → verification & validation → theory.
-import { h, clear, btn, tabs, fieldRow, kpiGrid, dataTable, toast, badge, emptyState, help } from './ui.js';
+import { h, clear, btn, tabs, fieldRow, kpiGrid, dataTable, toast, badge, emptyState, help, fill } from './ui.js';
 import { plotCard } from './plot.js';
 import { store, sanitize } from './store.js';
 import { fmt, gci, levenbergMarquardt, metrics, isNum } from './num.js';
@@ -175,7 +175,7 @@ export function renderSuite(suite, root, app) {
     const sel = h('select', { 'aria-label': 'Study' }, studies.map((s, i) => h('option', { value: i }, s.name || 'Spatial grid')));
     const go = btn('Run 3-level sensitivity study', async () => {
       const st = studies[+sel.value], r = Math.max(1.2, Math.min(2.5, +ratio.value || 1.5)), base = values(suite);
-      go.disabled = true; clear(out).append(h('p', { class: 'note' }, 'Solving coarse, medium and fine levels…'));
+      go.disabled = true; fill(out, h('p', { class: 'note' }, 'Solving coarse, medium and fine levels…'));
       try {
         const levels = [];
         for (const fac of [1 / r, 1, r]) {
@@ -194,11 +194,11 @@ export function renderSuite(suite, root, app) {
           plots.push({ type: 'line', title: `${mt.label} versus resolution`, xlabel: st.refine === 'divide' ? st.keys[0] : 'Normalised cell size h', ylabel: mt.unit || mt.label, height: 240,
             series: [{ name: 'Computed', x: [c.size, m.size, f.size], y: [c.vals[i], m.vals[i], f.vals[i]], mode: 'both' }, { name: 'Richardson extrapolation (h → 0)', x: [0, f.size], y: [g.fExact, f.vals[i]], dash: true }] });
         });
-        clear(out).append(
+        fill(out, 
           dataTable({ title: `Grid-convergence study — ${st.name || 'spatial grid'}`, columns: ['Quantity', 'Coarse', 'Medium', 'Fine', 'Extrapolated', 'Observed order p', 'GCI fine %', 'GCI medium %', 'Convergence', 'Verdict'], rows,
             note: `Levels: ${st.keys.map((k) => `${k} = ${levels.map((l) => fmt(l.v[k])).join(' / ')}`).join('; ')}. Numerical uncertainty is the grid-convergence index (safety factor 1.25) from Richardson extrapolation on three systematically refined levels.` }),
           h('div', { class: 'plots' }, plots.map((p) => plotCard(p, { onDownload: download }))));
-      } catch (e) { clear(out).append(h('p', { class: 'bad' }, 'Study failed: ' + e.message)); }
+      } catch (e) { fill(out, h('p', { class: 'bad' }, 'Study failed: ' + e.message)); }
       go.disabled = false;
     }, 'primary');
     return h('fieldset', { class: 'group' }, h('legend', null, 'Mesh and step sensitivity', help('Solves the model on three systematically refined levels and quantifies the numerical uncertainty with Richardson extrapolation and the grid-convergence index (GCI), instead of simply declaring the mesh “independent”.')),
@@ -270,7 +270,7 @@ export function renderSuite(suite, root, app) {
         const r = levenbergMarquardt((p) => fn(p, active), active.map((a) => base[a.p.key]), { lo: active.map((a) => +a.lo.value), hi: active.map((a) => +a.hi.value) });
         const fitted = { ...base }; active.forEach((a, i) => (fitted[a.p.key] = r.p[i]));
         const ps = parity(rows, predictRows(fitted, rows), 'Calibration');
-        clear(out).append(
+        fill(out, 
           dataTable({ title: 'Fitted parameters', columns: ['Parameter', 'Initial', 'Fitted', '± Std. error', 'Relative error %', 'Identifiability'], rows: active.map((a, i) => [a.p.label, base[a.p.key], r.p[i], r.se[i], Math.abs((100 * r.se[i]) / (r.p[i] || 1)), !Number.isFinite(r.se[i]) ? 'Not identifiable' : Math.abs(r.se[i] / (r.p[i] || 1)) < 0.25 ? 'Well identified' : 'Weakly identified']), note: `Levenberg–Marquardt least squares, ${r.iterations} iterations, ${rows.length} data rows. Standard errors come from the parameter covariance matrix; a weakly identified parameter means the data do not constrain it — add operating points that span pressure, recovery, temperature and salinity.` }),
           metricTable('Goodness of fit on the calibration data (not a validation)', ps),
           h('div', { class: 'row-tools' }, btn('Apply fitted parameters to this case', () => { active.forEach((a, i) => setValue(suite, a.p.key, r.p[i])); toast('Fitted parameters applied to the inputs.', 'ok'); }, 'primary')),
@@ -282,7 +282,7 @@ export function renderSuite(suite, root, app) {
       if (!rows.length) return toast('Add independent validation rows first.', 'warn');
       try {
         const ps = parity(rows, predictRows(values(suite), rows), 'Validation');
-        clear(vout).append(metricTable('Validation metrics against independent data', ps), h('div', { class: 'plots' }, ps.flatMap((q) => q.plots).map((p) => plotCard(p, { onDownload: download }))));
+        fill(vout, metricTable('Validation metrics against independent data', ps), h('div', { class: 'plots' }, ps.flatMap((q) => q.plots).map((p) => plotCard(p, { onDownload: download }))));
       } catch (e) { toast('Validation failed: ' + e.message, 'bad'); }
     };
     const setT = (k, v) => store.setInput(suite.id, k, v);
@@ -302,14 +302,14 @@ export function renderSuite(suite, root, app) {
   const verifyTab = () => {
     const out = h('div');
     const run = async () => {
-      clear(out).append(h('p', { class: 'note' }, 'Running verification checks…'));
+      fill(out, h('p', { class: 'note' }, 'Running verification checks…'));
       try {
         const checks = (await suite.verify?.()) || [];
         const pass = checks.filter((c) => c.pass).length;
-        clear(out).append(
+        fill(out, 
           h('p', { class: 'summary' }, badge(`${pass} / ${checks.length} passed`, pass === checks.length ? 'ok' : 'bad'), ' Code and equation verification: conservation, limiting cases and independent hand calculations, executed live on this device.'),
           dataTable({ title: 'Verification checks', columns: ['Check', 'Expected', 'Computed', 'Tolerance', 'Result', 'Basis'], rows: checks.map((c) => [c.name, c.expected, c.got, c.tol, c.pass ? '✓ pass' : '✗ FAIL', c.note || '']) }));
-      } catch (e) { clear(out).append(h('p', { class: 'bad' }, 'Verification failed to run: ' + e.message)); }
+      } catch (e) { fill(out, h('p', { class: 'bad' }, 'Verification failed to run: ' + e.message)); }
     };
     const res = lastResult.get(suite.id);
     return h('div', { class: 'groups' },
@@ -355,7 +355,7 @@ export function renderSuite(suite, root, app) {
   tabset = tabs(defs, store.pref('tab.' + suite.id) || 'guide', (id) => store.pref('tab.' + suite.id, id));
   const onKey = (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && root.isConnected) { e.preventDefault(); doRun(); } };
   document.addEventListener('keydown', onKey);
-  clear(root).append(
+  fill(root, 
     h('header', { class: 'suite-head' },
       h('div', { class: 'suite-title' }, h('span', { class: 'suite-num' }, suite.num), h('div', null, h('h1', null, suite.title), h('p', null, suite.tagline))),
       h('div', { class: 'actions' }, presetSel, btn('Reset', () => { store.clearInputs(suite.id); bigValues.forEach((_, k) => k.startsWith(suite.id + '.') && bigValues.delete(k)); toast('Inputs reset to defaults.'); tabset.show(tabset.active()); }, 'ghost', 'Restore the default inputs of this suite'), runBtn)),

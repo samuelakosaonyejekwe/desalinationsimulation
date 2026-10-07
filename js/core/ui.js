@@ -3,7 +3,7 @@
 import { fmt } from './num.js';
 import { IONS, ION_IDS, WATERS, cloneIons, summarize } from './water.js';
 import { readTable, toCSV, download, checkFile } from './io.js';
-import { importGeometry, FORMATS } from './geom.js';
+import { importGeometry, FORMATS } from './geom.preview.js';
 import { asOutline, asBathy } from './geomlinks.js';
 
 export function h(tag, attrs, ...kids) {
@@ -22,6 +22,8 @@ export function h(tag, attrs, ...kids) {
   return el;
 }
 export const clear = (el) => { while (el.firstChild) el.firstChild.remove(); return el; };
+/** Replace the content of an element; null / false children are skipped and arrays are flattened. */
+export function fill(el, ...kids) { clear(el); for (const k of kids.flat(Infinity)) if (k !== null && k !== undefined && k !== false) el.append(k.nodeType ? k : document.createTextNode(String(k))); return el; }
 
 let toastBox;
 export function toast(msg, kind = 'info', ms = 4200) {

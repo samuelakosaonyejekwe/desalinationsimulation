@@ -162,7 +162,7 @@ label.inline { display: inline-flex; align-items: center; gap: 6px; font-size: 1
 .kpi.ok { border-left-color: var(--ok); } .kpi.warn { border-left-color: var(--warn); background: var(--warn-bg); } .kpi.bad { border-left-color: var(--bad); background: var(--bad-bg); }
 .kpi-l { font-size: 12px; color: var(--muted); } .kpi-v { font-size: 1.22rem; font-weight: 700; overflow-wrap: anywhere; } .kpi-v small { font-size: .72rem; font-weight: 500; color: var(--muted); }
 .warns { display: grid; gap: 6px; margin-bottom: 12px; }
-.warn.info, .warn.bad, .warn.warn { padding: 8px 12px; border-radius: 9px; font-size: 13.5px; color: var(--text); }
+.warns > .warn { padding: 8px 12px; border-radius: 9px; font-size: 13.5px; color: var(--text); }
 .warns .info { background: var(--ok-bg); } .warns .warn { background: var(--warn-bg); } .warns .bad { background: var(--bad-bg); } .warns b { margin-right: 4px; }
 .recs { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 16px; margin-bottom: 12px; } .recs ul { margin: 4px 0 0; padding-left: 1.2em; }
 .plots { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 440px), 1fr)); gap: 14px; margin-bottom: 16px; }
@@ -255,3 +255,28 @@ label.inline { display: inline-flex; align-items: center; gap: 6px; font-size: 1
 .pillar-top { display: flex; align-items: center; gap: 8px; } .pillar-top b { flex: 1; min-width: 0; } .pillar-score { font-size: 1.3rem; font-weight: 800; }
 .meter { height: 9px; background: var(--line); border-radius: 999px; overflow: hidden; margin-top: 6px; } .meter i { display: block; height: 100%; border-radius: 999px; background: var(--muted); }
 .pillar.ok .meter i { background: var(--ok); } .pillar.mid .meter i { background: var(--warn); } .pillar.low .meter i { background: var(--bad); } .pillar.na { opacity: .75; }
+
+/* top-bar page arrows: one glass capsule with two round keys */
+.arrows { display: inline-flex; align-items: center; gap: 0; margin-left: 6px; padding: 3px; border-radius: 999px; background: rgba(255, 255, 255, .1); border: 1px solid rgba(255, 255, 255, .22); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .25), 0 4px 14px rgba(0, 0, 0, .25); backdrop-filter: blur(6px); }
+.arrow-sep { width: 1px; height: 18px; margin: 0 3px; background: rgba(255, 255, 255, .28); }
+.arrow-btn { position: relative; width: 34px; min-width: 34px; height: 34px; border-radius: 50%; border: 0; display: grid; place-items: center; color: #fff; cursor: pointer; overflow: hidden;
+  background: radial-gradient(120% 120% at 30% 20%, #7dd3fc 0%, #0ea5e9 45%, #0369a1 100%); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .55), inset 0 -3px 6px rgba(3, 60, 100, .45), 0 2px 6px rgba(0, 0, 0, .3); transition: transform .18s cubic-bezier(.3, 1.6, .5, 1), box-shadow .18s, filter .18s; }
+.arrow-btn::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: linear-gradient(180deg, rgba(255, 255, 255, .38), rgba(255, 255, 255, 0) 52%); pointer-events: none; }
+.arrow-btn svg { position: relative; z-index: 1; filter: drop-shadow(0 1px 1px rgba(0, 0, 0, .35)); transition: transform .18s; }
+.arrow-btn:hover:not(:disabled) { transform: scale(1.1); background: radial-gradient(120% 120% at 30% 20%, #bae6fd 0%, #38bdf8 45%, #0284c7 100%); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .6), 0 0 0 4px rgba(56, 189, 248, .28), 0 4px 12px rgba(14, 165, 233, .55); }
+.arrow-btn.prev:hover:not(:disabled) svg { transform: translateX(-2px); } .arrow-btn.next:hover:not(:disabled) svg { transform: translateX(2px); }
+.arrow-btn:active:not(:disabled) { transform: scale(.94); }
+.arrow-btn:disabled { background: rgba(255, 255, 255, .12); color: rgba(255, 255, 255, .45); box-shadow: none; opacity: 1; cursor: default; } .arrow-btn:disabled::after { display: none; }
+
+/* install button: warm gradient pill with an icon well and a passing shine */
+.install-btn { position: relative; display: inline-flex; align-items: center; gap: 9px; height: 38px; padding: 0 16px 0 5px; border: 0; border-radius: 999px; color: #fff; font-weight: 700; letter-spacing: .2px; cursor: pointer; white-space: nowrap; overflow: hidden;
+  background: linear-gradient(135deg, #fbbf24 0%, #f97316 45%, #ea580c 100%); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .5), inset 0 -2px 5px rgba(154, 52, 18, .45), 0 4px 14px rgba(249, 115, 22, .45); text-shadow: 0 1px 1px rgba(124, 45, 18, .45); transition: transform .18s cubic-bezier(.3, 1.6, .5, 1), box-shadow .18s, filter .18s; }
+.install-ico { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; background: rgba(255, 255, 255, .24); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .55), inset 0 -1px 3px rgba(154, 52, 18, .35); font-style: normal; }
+.install-ico svg { animation: nudge 2.4s ease-in-out infinite; }
+.install-btn::before { content: ""; position: absolute; top: 0; bottom: 0; left: -60%; width: 45%; background: linear-gradient(100deg, rgba(255, 255, 255, 0), rgba(255, 255, 255, .45), rgba(255, 255, 255, 0)); transform: skewX(-20deg); animation: shine 4.5s ease-in-out infinite; pointer-events: none; }
+.install-btn:hover { transform: translateY(-1px) scale(1.03); filter: saturate(1.1); box-shadow: inset 0 1px 0 rgba(255, 255, 255, .55), 0 0 0 4px rgba(251, 146, 60, .28), 0 8px 20px rgba(249, 115, 22, .55); }
+.install-btn:active { transform: scale(.97); }
+.install-btn.ready { animation: none; }
+@keyframes shine { 0%, 62% { left: -60%; } 100% { left: 130%; } }
+@keyframes nudge { 0%, 100% { transform: translateY(-1px); } 50% { transform: translateY(2px); } }
+@media (max-width: 720px) { .install-btn { padding: 0 5px; gap: 0; } .install-btn span { display: none; } }

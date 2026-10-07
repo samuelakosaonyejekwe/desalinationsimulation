@@ -5,7 +5,7 @@ import { h, clear, btn, kpiGrid, dataTable, toast, importBtn, help } from './ui.
 import { plotCard } from './plot.js';
 import { fmt } from './num.js';
 import { download, LIMITS } from './io.js';
-import { FORMATS, PATHWAYS, SUITE_GEOMETRY, formatOf, importGeometry, sectionOf, gridOf, microstructure, networkSummary, dimensions, generate } from './geom.js';
+import { FORMATS, PATHWAYS, SUITE_GEOMETRY, formatOf, importGeometry, sectionOf, gridOf, microstructure, networkSummary, dimensions, generate } from './geom.preview.js';
 import { geometryLinks } from './geomlinks.js';
 
 const attached = new Map(); // suite id -> Geometry (kept in memory for the session; files are never uploaded)

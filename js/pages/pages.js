@@ -1,11 +1,11 @@
 // Non-suite pages: home, case & feed water, global site data, data portal, integrated run, app & offline.
-import { h, clear, btn, kpiGrid, dataTable, toast, badge, fieldRow, importBtn, help } from '../core/ui.js';
+import { h, clear, btn, kpiGrid, dataTable, toast, badge, fieldRow, importBtn, help, fill } from '../core/ui.js';
 import { store } from '../core/store.js';
 import { SUITES, CHAIN, byId, loadSuite, downstream } from '../suites/index.js';
 import { runSuite, applyLinks, linkItems, allFields, setInputValue } from '../core/suiteview.js';
 import { readFiles, geometryCard, generatorPanel, formatCatalogue, attachGeometry, derive, ACCEPT } from '../core/geomview.js';
 import { geometryLinks } from '../core/geomlinks.js';
-import { SUITE_GEOMETRY, formatOf } from '../core/geom.js';
+import { SUITE_GEOMETRY, formatOf } from '../core/geom.preview.js';
 import { fetchSite, searchPlace, SOURCES } from '../core/live.js';
 import { plotCard } from '../core/plot.js';
 import { fmt } from '../core/num.js';
@@ -28,7 +28,7 @@ export function home(root) {
       k.length ? h('ul', { class: 'sc-kpi' }, k.map((q) => h('li', null, q.label + ': ', h('b', null, typeof q.value === 'number' ? fmt(q.value, 3) : String(q.value)), ' ' + q.unit))) : null,
       h('div', { class: 'sc-links' }, s.uses.length ? '⛓ uses ' + s.uses.map((u) => byId(u).short).join(', ') : '⛓ starts the chain'));
   });
-  clear(root).append(
+  fill(root, 
     h('section', { class: 'hero' },
       h('div', null, h('h1', null, 'One connected workspace for every desalination calculation'),
         h('p', null, 'Thirteen engineering suites — membranes, chemistry, whole-plant balances, CFD, sea discharge, thermal, electrochemical, emerging processes, ZLD, fouling, optimisation, pumping and economics — share one case. Results flow from suite to suite automatically, so a single industrial case can be analysed end to end.'),
@@ -43,13 +43,13 @@ export function home(root) {
 // ------------------------------------------------------------------------------------- case & feed
 export function casePage(root) {
   const c = store.case, f = c.feed, sumBox = h('div');
-  const paintSum = () => { const s = summarize(store.case.feed.ions, store.case.feed.T); clear(sumBox).append(kpiGrid([{ label: 'TDS', value: s.tds, unit: 'mg/L' }, { label: 'Salinity', value: s.salinity, unit: 'g/kg' }, { label: 'Osmotic pressure', value: s.osmoticBar, unit: 'bar' }, { label: 'Conductivity', value: s.conductivity, unit: 'µS/cm' }, { label: 'Density', value: s.density, unit: 'kg/m³' }, { label: 'Hardness', value: s.hardness, unit: 'mg/L CaCO₃' }, { label: 'Alkalinity', value: s.alkalinity, unit: 'mg/L CaCO₃' }, { label: 'Charge balance', value: s.chargeErrorPct, unit: '%', status: Math.abs(s.chargeErrorPct) > 5 ? 'warn' : 'ok' }])); };
+  const paintSum = () => { const s = summarize(store.case.feed.ions, store.case.feed.T); fill(sumBox, kpiGrid([{ label: 'TDS', value: s.tds, unit: 'mg/L' }, { label: 'Salinity', value: s.salinity, unit: 'g/kg' }, { label: 'Osmotic pressure', value: s.osmoticBar, unit: 'bar' }, { label: 'Conductivity', value: s.conductivity, unit: 'µS/cm' }, { label: 'Density', value: s.density, unit: 'kg/m³' }, { label: 'Hardness', value: s.hardness, unit: 'mg/L CaCO₃' }, { label: 'Alkalinity', value: s.alkalinity, unit: 'mg/L CaCO₃' }, { label: 'Charge balance', value: s.chargeErrorPct, unit: '%', status: Math.abs(s.chargeErrorPct) > 5 ? 'warn' : 'ok' }])); };
   const get = (k) => store.case.feed[k], set = (k, v) => { store.setFeed({ [k]: v }); paintSum(); };
   const F = (def) => fieldRow(def, get, set, {});
   const lib = store.library(), libSel = h('select', { 'aria-label': 'Saved cases' }, h('option', { value: '' }, Object.keys(lib).length ? 'Open a saved case…' : 'No saved cases yet'), Object.keys(lib).map((n) => h('option', { value: n }, n)));
   libSel.addEventListener('change', () => { if (libSel.value) { store.loadFromLibrary(libSel.value); toast('Case loaded.', 'ok'); casePage(root); } });
   paintSum();
-  clear(root).append(
+  fill(root, 
     h('header', { class: 'page-head' }, h('h1', null, 'Case & feed water'), h('p', null, 'A case is one industrial study: its site, its feed water and the inputs and results of every suite. Everything is stored on this device only.')),
     card(h('h2', null, 'Case'),
       h('div', { class: 'fields' },
@@ -109,7 +109,7 @@ export function sitePage(root) {
   const latI = h('input', { type: 'number', step: 'any', min: -90, max: 90, value: s.lat ?? '', id: 's_lat', placeholder: 'e.g. 25.05' }), lonI = h('input', { type: 'number', step: 'any', min: -180, max: 180, value: s.lon ?? '', id: 's_lon', placeholder: 'e.g. 55.05' });
   const srcBox = h('div', { class: 'sources' }), dataBox = h('div'), results = h('ul', { class: 'search-results' });
   const map = slippyMap(s.lat, s.lon, (la, lo) => { latI.value = la.toFixed(4); lonI.value = lo.toFixed(4); });
-  const paintSources = (live = {}) => clear(srcBox).append(...SOURCES.map((src) => { const st = live[src.id] || store.case.site.status?.[src.id]; return h('div', { class: 'source ' + (st === 'loading' ? 'loading' : st?.ok ? 'ok' : st ? 'fail' : '') }, h('b', null, src.name), h('span', null, src.gives), h('small', null, src.provider + ' · ' + src.host), h('em', null, st === 'loading' ? 'fetching…' : st ? (st.ok ? 'live · ' + ago(st.at) : 'unavailable — ' + st.message) : 'not fetched')); }));
+  const paintSources = (live = {}) => fill(srcBox, SOURCES.map((src) => { const st = live[src.id] || store.case.site.status?.[src.id]; return h('div', { class: 'source ' + (st === 'loading' ? 'loading' : st?.ok ? 'ok' : st ? 'fail' : '') }, h('b', null, src.name), h('span', null, src.gives), h('small', null, src.provider + ' · ' + src.host), h('em', null, st === 'loading' ? 'fetching…' : st ? (st.ok ? 'live · ' + ago(st.at) : 'unavailable — ' + st.message) : 'not fetched')); }));
   const paintData = () => {
     const site = store.case.site, d = site.data || {};
     clear(dataBox);
@@ -149,12 +149,12 @@ export function sitePage(root) {
   const q = h('input', { type: 'search', placeholder: 'Search a city, port or plant location…', 'aria-label': 'Search place', maxlength: 80 });
   const doSearch = async () => {
     if (!q.value.trim()) return;
-    try { const r = await searchPlace(q.value.trim()); clear(results).append(r.length ? r.map((p) => h('li', null, h('button', { type: 'button', class: 'linklike', onclick: () => { latI.value = p.lat.toFixed(4); lonI.value = p.lon.toFixed(4); map.setView(p.lat, p.lon, 9); clear(results); } }, `${p.name}${p.admin ? ', ' + p.admin : ''}, ${p.country}`))) : h('li', { class: 'note' }, 'No match — try another spelling.')); }
+    try { const r = await searchPlace(q.value.trim()); fill(results, r.length ? r.map((p) => h('li', null, h('button', { type: 'button', class: 'linklike', onclick: () => { latI.value = p.lat.toFixed(4); lonI.value = p.lon.toFixed(4); map.setView(p.lat, p.lon, 9); clear(results); } }, `${p.name}${p.admin ? ', ' + p.admin : ''}, ${p.country}`))) : h('li', { class: 'note' }, 'No match — try another spelling.')); }
     catch { toast('Search is unavailable (offline?). Type coordinates instead.', 'warn'); }
   };
   q.addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
   paintSources(); paintData();
-  clear(root).append(
+  fill(root, 
     h('header', { class: 'page-head' }, h('h1', null, 'Global site data'), h('p', null, 'Choose any location on Earth. Your browser pulls current sea state, tides, currents, seabed relief, salinity and temperature climatology, weather, solar resource and national economic indicators directly from open global data services, and offers them to every suite.')),
     card(h('div', { class: 'site-grid' },
       h('div', null, h('div', { class: 'row-tools' }, q, btn('Search', doSearch)), results, map),
@@ -197,7 +197,7 @@ export function portalPage(root) {
     const paintMap = () => {
       const { f } = targets[+sel.value] || {};
       if (!f) return;
-      clear(mapBox).append(h('table', { class: 'tbl' }, h('thead', null, h('tr', null, h('th', null, 'Destination column'), h('th', null, 'Take from file column'))),
+      fill(mapBox, h('table', { class: 'tbl' }, h('thead', null, h('tr', null, h('th', null, 'Destination column'), h('th', null, 'Take from file column'))),
         h('tbody', null, f.columns.map((c, i) => h('tr', null, h('td', { class: 'lead' }, c.label + (c.unit ? ` (${c.unit})` : '')), h('td', null, h('select', { dataset: { key: c.key } }, h('option', { value: '' }, '— leave empty —'), t.headers.map((hd, j) => h('option', { value: hd, selected: norm(hd) === norm(c.key) || norm(hd) === norm(c.label) || (j === i && !t.headers.some((x) => norm(x) === norm(c.key))) }, hd)))))))));
     };
     sel.addEventListener('change', paintMap); paintMap();
@@ -215,7 +215,7 @@ export function portalPage(root) {
   drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
   drop.addEventListener('dragleave', () => drop.classList.remove('over'));
   drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); if (e.dataTransfer.files.length) safe([...e.dataTransfer.files]); });
-  clear(root).append(
+  fill(root, 
     h('header', { class: 'page-head' }, h('h1', null, 'Data portal'), h('p', null, 'One place to bring case data in: geometry of every kind, laboratory analyses, plant historian logs, pump curves, cost tables and complete case files. Each import is recognised, previewed, measured and routed to the suites that can use it.')),
     card(drop, h('div', { class: 'formats' },
       h('div', null, h('b', null, 'CAD and surfaces'), h('span', null, 'STEP, IGES, STL, OBJ, PLY, OFF, 3MF, AMF, glTF/GLB, COLLADA, VRML/X3D, VTK')),
@@ -267,7 +267,7 @@ export function chainPage(root) {
     summary.append(h('div', { class: 'linkbar' }, 'Next: ', h('a', { class: 'btn mini primary', href: '#/advisor' }, 'See ranked recommendations and the sustainability scorecard →')));
     toast('Integrated run finished.', 'ok');
   }, 'primary');
-  clear(root).append(
+  fill(root, 
     h('header', { class: 'page-head' }, h('h1', null, 'Integrated run'), h('p', null, 'Solves the suites one after another in data-flow order. Before each suite runs, it receives the case feed water, the site data and the results of the suites before it — so one industrial case is analysed across all disciplines in a single pass.')),
     card(h('div', { class: 'row-tools' }, go, btn('Select all', () => CHAIN.forEach((id) => { sel[id].checked = true; store.pref('chain.' + id, true); }), 'ghost'), btn('Select none', () => CHAIN.forEach((id) => { sel[id].checked = false; store.pref('chain.' + id, false); }), 'ghost')), bar,
       h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl chain' }, h('thead', null, h('tr', null, ['', '#', 'Suite', 'Links', 'Status', 'Key results'].map((x) => h('th', null, x)))), rows))),
@@ -278,7 +278,7 @@ export function chainPage(root) {
 export function appPage(root, app) {
   const mirrorBox = h('div', { class: 'sources' }), stBox = h('div');
   const check = async () => {
-    clear(mirrorBox).append(...MIRRORS.map((m) => h('div', { class: 'source loading', dataset: { url: m.url } }, h('b', null, m.name), h('span', null, m.note), h('small', null, m.url), h('em', null, 'checking…'))));
+    fill(mirrorBox, MIRRORS.map((m) => h('div', { class: 'source loading', dataset: { url: m.url } }, h('b', null, m.name), h('span', null, m.note), h('small', null, m.url), h('em', null, 'checking…'))));
     for (const el of mirrorBox.children) {
       const url = el.dataset.url;
       try { const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 9000); const r = await fetch(url + 'version.json?t=' + Date.now(), { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'cors' }); clearTimeout(tm); const j = await r.json(); el.className = 'source ok'; el.lastChild.textContent = `online · build ${String(j.version).slice(0, 12)}`; }
@@ -289,11 +289,11 @@ export function appPage(root, app) {
   const paintStorage = async () => {
     let est = null; try { est = await navigator.storage?.estimate?.(); } catch { /* not supported */ }
     const persisted = await navigator.storage?.persisted?.().catch(() => false);
-    clear(stBox).append(kpiGrid([{ label: 'App build', value: app.version || 'dev' }, { label: 'Connection', value: navigator.onLine ? 'online' : 'offline', status: navigator.onLine ? 'ok' : 'warn' }, { label: 'Offline copy', value: app.offlineReady() ? 'ready' : 'preparing…', status: app.offlineReady() ? 'ok' : 'warn' }, { label: 'Installed', value: app.installed() ? 'yes' : 'not yet' }, est ? { label: 'Storage used', value: (est.usage || 0) / 1e6, unit: 'MB' } : null, { label: 'Protected storage', value: persisted ? 'yes' : 'no', help: 'Protected storage is not cleared automatically by the browser when the device runs low on space.' }].filter(Boolean)));
+    fill(stBox, kpiGrid([{ label: 'App build', value: app.version || 'dev' }, { label: 'Connection', value: navigator.onLine ? 'online' : 'offline', status: navigator.onLine ? 'ok' : 'warn' }, { label: 'Offline copy', value: app.offlineReady() ? 'ready' : 'preparing…', status: app.offlineReady() ? 'ok' : 'warn' }, { label: 'Installed', value: app.installed() ? 'yes' : 'not yet' }, est ? { label: 'Storage used', value: (est.usage || 0) / 1e6, unit: 'MB' } : null, { label: 'Protected storage', value: persisted ? 'yes' : 'no', help: 'Protected storage is not cleared automatically by the browser when the device runs low on space.' }].filter(Boolean)));
   };
   paintStorage();
   const ios = /iphone|ipad|ipod/i.test(navigator.userAgent);
-  clear(root).append(
+  fill(root, 
     h('header', { class: 'page-head' }, h('h1', null, 'Install, offline & availability'), h('p', null, `${APP.name} is a self-contained application: after the first visit it runs from this device, with or without a network, and keeps your cases locally.`)),
     card(h('h2', null, 'Install on this device'), stBox,
       h('div', { class: 'row-tools' }, btn('⬇  Install app', () => app.install(), 'primary'), btn('Check for updates', () => app.checkUpdate(true)), btn('Keep my data protected', async () => { const ok = await navigator.storage?.persist?.(); toast(ok ? 'Storage is now protected from automatic clean-up.' : 'The browser did not grant protected storage (install the app first).', ok ? 'ok' : 'warn'); paintStorage(); }, 'ghost'),

@@ -1,6 +1,6 @@
 // Decision-support UI: recommendation cards with live literature evidence, and the
 // decision-support & sustainability page.
-import { h, clear, btn, kpiGrid, dataTable, toast, badge } from './ui.js';
+import { h, clear, btn, kpiGrid, dataTable, toast, badge, fill } from './ui.js';
 import { plotCard } from './plot.js';
 import { fmt } from './num.js';
 import { download } from './io.js';
@@ -16,12 +16,12 @@ export function recCard(r) {
   const ev = h('div', { class: 'evidence' });
   const find = btn('Find current evidence', async () => {
     if (!navigator.onLine) return toast('Evidence look-up needs a connection; the recommendation itself does not.', 'warn');
-    find.disabled = true; clear(ev).append(h('p', { class: 'note' }, 'Searching the open research indexes…'));
+    find.disabled = true; fill(ev, h('p', { class: 'note' }, 'Searching the open research indexes…'));
     try {
       const res = await evidence(r.topic, 5);
-      clear(ev).append(res.items.length ? h('ul', { class: 'linklist' }, res.items.map((w) => h('li', null, w.url ? h('a', { href: w.url, target: '_blank', rel: 'noopener noreferrer' }, w.title) : w.title, h('small', null, ` · ${[w.venue, w.year, w.cited !== null ? w.cited + ' citations' : ''].filter(Boolean).join(' · ')}`)))) : h('p', { class: 'note' }, 'No recent indexed work matched this topic.'),
+      fill(ev, res.items.length ? h('ul', { class: 'linklist' }, res.items.map((w) => h('li', null, w.url ? h('a', { href: w.url, target: '_blank', rel: 'noopener noreferrer' }, w.title) : w.title, h('small', null, ` · ${[w.venue, w.year, w.cited !== null ? w.cited + ' citations' : ''].filter(Boolean).join(' · ')}`)))) : h('p', { class: 'note' }, 'No recent indexed work matched this topic.'),
         h('p', { class: 'note' }, `Source: ${res.source}, queried ${new Date().toLocaleString()}. Titles are shown as published; read the papers before relying on them.`));
-    } catch { clear(ev).append(h('p', { class: 'note' }, 'The research indexes could not be reached right now.')); }
+    } catch { fill(ev, h('p', { class: 'note' }, 'The research indexes could not be reached right now.')); }
     find.disabled = false;
   }, 'mini');
   const s = r.goTo && byId(r.goTo);
@@ -75,7 +75,7 @@ export function advisorPage(root) {
   const sc = S.pillars.filter((p) => p.score !== null);
   if (sc.length) plots.push(plotCard({ type: 'bar', title: 'Sustainability scores by pillar (0–100)', ylabel: 'Score', categories: sc.map((p) => p.title), series: [{ name: 'Score', values: sc.map((p) => Math.round(p.score)) }], colors: sc.map((p) => (p.score >= 80 ? '#10b981' : p.score >= 55 ? '#eab308' : '#ef4444')) }, { onDownload: download }));
   if (d.ghiMonthly) plots.push(plotCard({ type: 'line', title: 'Renewable resource through the year (long-term means)', xlabel: 'Month', ylabel: 'Solar kWh/m²·d · wind m/s', series: [{ name: 'Solar irradiation', x: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], y: d.ghiMonthly, mode: 'both' }, ...(d.windMonthly ? [{ name: 'Wind speed', x: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], y: d.windMonthly, mode: 'both' }] : [])] }, { onDownload: download }));
-  clear(root).append(
+  fill(root, 
     h('header', { class: 'page-head' }, h('h1', null, 'Decision support & sustainability'), h('p', null, 'Every result of this case is benchmarked against published industry practice and the live context of the site, then turned into ranked actions and a sustainability scorecard. Recommendations update each time a suite is run.')),
     kpiGrid([{ label: 'Suites solved', value: `${solved} / 13` }, { label: 'Recommendations', value: recs.length }, { label: 'Act now', value: recs.filter((r) => r.priority === 1).length, status: recs.some((r) => r.priority === 1) ? 'bad' : 'ok' },
       { label: 'Sustainability score', value: S.overall === null ? '—' : Math.round(S.overall), unit: S.overall === null ? '' : '/ 100', status: S.overall === null ? '' : S.overall >= 70 ? 'ok' : S.overall >= 45 ? 'warn' : 'bad' }, { label: 'Pillars assessed', value: `${S.assessed} / ${S.pillars.length}` }, { label: 'Site context', value: c.site.fetchedAt ? (c.site.country || 'pulled') : 'not pulled', status: c.site.fetchedAt ? 'ok' : 'warn' }]),

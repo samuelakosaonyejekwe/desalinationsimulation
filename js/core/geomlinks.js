@@ -1,7 +1,7 @@
 // Routing of imported geometry onto suite inputs. Each rule looks at what was imported (surface,
 // outlines, elevation grid, voxel microstructure, network, parameter table) and offers values only
 // for inputs that the suite really has. Every offer names where the number came from.
-import { sectionOf, gridOf } from './geom.js';
+import { sectionOf, gridOf } from './geom.preview.js';
 
 const UNIT = { mm: 1e-3, millimetre: 1e-3, cm: 1e-2, m: 1, metre: 1, in: 0.0254, inch: 0.0254, ft: 0.3048, um: 1e-6, micron: 1e-6 };
 const toM = (g) => UNIT[String(g.stats?.units || 'm').toLowerCase()] ?? 1;
