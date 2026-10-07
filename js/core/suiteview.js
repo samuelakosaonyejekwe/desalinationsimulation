@@ -150,7 +150,7 @@ export function renderSuite(suite, root, app) {
         if (g.showIf && !g.showIf(v)) continue;
         const fields = g.fields.filter((f) => !f.showIf || f.showIf(v));
         if (!fields.length) continue;
-        box.append(h('fieldset', { class: 'group' }, h('legend', null, g.group, help(g.help)),
+        box.append(h('fieldset', { class: 'group' + (fields.length <= 3 && !fields.some((f) => ['ions', 'table', 'file'].includes(f.type)) ? ' small' : '') }, h('legend', null, g.group, help(g.help)),
           h('div', { class: 'fields' }, fields.map((f) => fieldRow(f, (k) => v[k], (k, val) => { v[k] = val; setValue(suite, k, val); const l = store.inputs(suite.id)._links; if (l && l[k]) { delete l[k]; } }, { rerender: paint, linked, feed: () => store.case.feed })))));
       }
       if (tabName === 'mesh' && suite.mesh) box.append(meshStudyPanel());

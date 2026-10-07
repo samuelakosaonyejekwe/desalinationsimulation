@@ -34,9 +34,11 @@ export function home(root) {
         h('p', null, 'Thirteen engineering suites — membranes, chemistry, whole-plant balances, CFD, sea discharge, thermal, electrochemical, emerging processes, ZLD, fouling, optimisation, pumping and economics — share one case. Results flow from suite to suite automatically, so a single industrial case can be analysed end to end.'),
         h('div', { class: 'row-tools' }, h('a', { class: 'btn primary', href: '#/case' }, '1 · Define the case'), h('a', { class: 'btn', href: '#/site' }, '2 · Pull site data'), h('a', { class: 'btn', href: '#/chain' }, '3 · Run everything'), h('a', { class: 'btn', href: '#/advisor' }, '4 · Decide'))),
       h('div', { class: 'hero-stat' }, kpiGrid([{ label: 'Active case', value: c.name }, { label: 'Feed', value: `${fmt(c.feed.Q)} m³/h` }, { label: 'Feed TDS', value: summarize(c.feed.ions, c.feed.T).tds, unit: 'mg/L' }, { label: 'Site', value: c.site.name || (c.site.lat !== null ? `${fmt(c.site.lat, 4)}, ${fmt(c.site.lon, 4)}` : 'not set') }, { label: 'Suites solved', value: `${done} / 13` }, { label: 'Site data', value: c.site.fetchedAt ? ago(c.site.fetchedAt) : 'not pulled' }]))),
-    h('h2', { class: 'sect' }, 'The 13 suites'), h('div', { class: 'suite-grid' }, cards),
+    h('h2', { class: 'sect' }, 'The 13 suites'), h('div', { class: 'suite-grid' }, cards,
+      [['🌍', 'Global site data', 'Live sea, weather, seabed and economic data for any location', '#/site', c.site.fetchedAt ? 'pulled ' + ago(c.site.fetchedAt) : 'not pulled'], ['🔗', 'Integrated run', 'Solve all suites in sequence with results passed along', '#/chain', `${done} / 13 solved`], ['🧭', 'Decision support', 'Ranked recommendations and sustainability scorecard', '#/advisor', 'whole case']].map(([ico, t, b, href, st]) =>
+        h('a', { class: 'suite-card whole', href }, h('div', { class: 'sc-top' }, h('span', { class: 'sc-ico', 'aria-hidden': 'true' }, ico), h('span', { class: 'sc-num' }, ''), badge(st, '')), h('h3', null, t), h('p', null, b), h('div', { class: 'sc-links' }, 'whole case')))),
     h('h2', { class: 'sect' }, 'How the suites are wired together'),
-    card(h('div', { class: 'flowmap' }, CHAIN.map((id) => { const s = byId(id), d = downstream(id); return h('div', { class: 'fm-row' }, h('a', { class: 'chip on', href: '#/suite/' + id }, `${s.num}. ${s.short}`), h('span', { class: 'fm-arrow', 'aria-hidden': 'true' }, '→'), d.length ? d.map((x) => h('a', { class: 'chip', href: '#/suite/' + x.id }, `${x.num}. ${x.short}`)) : h('span', { class: 'note' }, 'final results')); })),
+    card(h('div', { class: 'flowmap' }, CHAIN.map((id) => { const s = byId(id), d = downstream(id); return h('div', { class: 'fm-row' }, h('a', { class: 'chip on', href: '#/suite/' + id }, `${s.num}. ${s.short}`), h('span', { class: 'fm-arrow', 'aria-hidden': 'true' }, '→'), h('div', { class: 'fm-to' }, d.length ? d.map((x) => h('a', { class: 'chip', href: '#/suite/' + x.id }, `${x.num}. ${x.short}`)) : h('span', { class: 'note' }, 'final results — feeds the decision report'))); })),
       h('p', { class: 'note' }, 'Each row reads “this suite feeds →”. For example the RO concentrate becomes the brine analysed by Chemistry, concentrated by ZLD and discharged by Outfall; its pressures and flows size the pumps; energy, membranes and chemicals end up in Economics.')));
 }
 
@@ -180,11 +182,14 @@ export function sitePage(root) {
   paintSources(); paintData();
   fill(root, 
     h('header', { class: 'page-head' }, h('h1', null, 'Global site data'), h('p', null, 'Choose any location on Earth. Your browser pulls current sea state, tides, currents, seabed relief, salinity and temperature climatology, weather, solar resource and national economic indicators directly from open global data services, and offers them to every suite.')),
-    card(h('div', { class: 'site-grid' },
-      h('div', null, h('div', { class: 'row-tools' }, q, btn('Search', doSearch)), results, map),
-      h('div', null, h('div', { class: 'fields one' }, h('div', { class: 'field' }, h('label', { for: 's_lat' }, 'Latitude (°N)'), h('div', { class: 'ctl' }, latI)), h('div', { class: 'field' }, h('label', { for: 's_lon' }, 'Longitude (°E)'), h('div', { class: 'ctl' }, lonI))),
-        h('div', { class: 'row-tools' }, fetchBtn, btn('Use my location', () => navigator.geolocation?.getCurrentPosition((p) => { latI.value = p.coords.latitude.toFixed(4); lonI.value = p.coords.longitude.toFixed(4); map.setView(p.coords.latitude, p.coords.longitude, 9); }, () => toast('Location permission was not granted.', 'warn')), 'ghost')),
-        h('p', { class: 'note' }, 'Tip: for an outfall study click a point in the sea a few hundred metres offshore; for a plant on land the marine sources report the nearest sea cell.'), srcBox))),
+    card(
+      h('div', { class: 'site-bar' },
+        h('div', { class: 'site-search' }, q, btn('Search', doSearch)),
+        h('label', { class: 'site-coord', for: 's_lat' }, h('span', null, 'Latitude °N'), latI), h('label', { class: 'site-coord', for: 's_lon' }, h('span', null, 'Longitude °E'), lonI),
+        fetchBtn, btn('Use my location', () => navigator.geolocation?.getCurrentPosition((p) => { latI.value = p.coords.latitude.toFixed(4); lonI.value = p.coords.longitude.toFixed(4); map.setView(p.coords.latitude, p.coords.longitude, 9); }, () => toast('Location permission was not granted.', 'warn')), 'ghost')),
+      results, map,
+      h('p', { class: 'note' }, 'Click or tap the map to place the site. For an outfall study choose a point in the sea a few hundred metres offshore; for a plant on land the marine sources report the nearest sea cell.'),
+      h('h3', null, 'Live sources'), srcBox),
     dataBox);
 }
 
