@@ -86,12 +86,15 @@ const connectors = {
     const keep = (a) => (a || []).map((x) => num(x));
     const eta = keep(hh.sea_level_height_msl), sp = keep(hh.ocean_current_velocity).map((x) => (x === null ? null : x / 3.6)), dir = keep(hh.ocean_current_direction), sst = keep(hh.sea_surface_temperature).filter((x) => x !== null);
     const etaOk = eta.filter((x) => x !== null), spOk = sp.filter((x) => x !== null);
+    // gaps in the source series are bridged by linear interpolation (never by zeros)
+    const bridge = (a) => { const o = a.slice(); let last = -1; for (let i = 0; i < o.length; i++) { if (o[i] === null) continue; if (last < 0) for (let k = 0; k < i; k++) o[k] = o[i]; else for (let k = last + 1; k < i; k++) o[k] = o[last] + ((o[i] - o[last]) * (k - last)) / (i - last); last = i; } if (last >= 0) for (let k = last + 1; k < o.length; k++) o[k] = o[last]; return o.map((x) => x ?? 0); };
+    const t0 = Date.parse(String(hh.time?.[0] || '') + 'Z'), nowHour = Number.isFinite(t0) ? clamp((Date.now() - t0) / 3600e3, 0, Math.max(0, n - 1)) : 72;
     const t = Array.from({ length: n }, (_, i) => i);
     const data = { waveHeight: num(c.wave_height), waveDir: num(c.wave_direction), wavePeriod: num(c.wave_period), sst: num(c.sea_surface_temperature) ?? (sst.length ? mean(sst) : null),
       currentSpeed: spOk.length ? mean(spOk) : c.ocean_current_velocity != null ? num(c.ocean_current_velocity) / 3.6 : null, currentMax: spOk.length ? Math.max(...spOk) : null, currentDir: num(c.ocean_current_direction),
       sstMin: sst.length ? Math.min(...sst) : null, sstMax: sst.length ? Math.max(...sst) : null };
-    if (etaOk.length > 24) { data.tideRange = quantile(etaOk, 0.98) - quantile(etaOk, 0.02); data.tide = { t, eta: eta.map((x) => x ?? 0) }; }
-    if (spOk.length > 24) data.currents = { t, speed: sp.map((x) => x ?? 0), dir: dir.map((x) => x ?? 0) };
+    if (etaOk.length > 24) { data.tideRange = quantile(etaOk, 0.98) - quantile(etaOk, 0.02); data.seaLevelMean = mean(etaOk); data.tide = { t, eta: bridge(eta), nowHour }; }
+    if (spOk.length > 24) data.currents = { t, speed: bridge(sp), dir: bridge(dir), nowHour, gaps: sp.length - spOk.length };
     if (data.sst === null && !etaOk.length && !spOk.length) throw new Error('No marine data at this point (inland site?)');
     return { data };
   },

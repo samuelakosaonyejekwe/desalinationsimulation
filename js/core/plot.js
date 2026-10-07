@@ -9,8 +9,8 @@ const CMAPS = {
   coolwarm: ['#3b4cc0', '#6f92f3', '#aac7fd', '#dddcdc', '#f7b89c', '#e7745b', '#b40426'],
   salinity: ['#f7fcf0', '#ccebc5', '#7bccc4', '#43a2ca', '#0868ac', '#084081', '#3f007d', '#7a0177'],
   // below the midpoint: sea (deep → shallow); above it: land (lowland → mountain)
-  topo: ['#08306b', '#08519c', '#2171b5', '#4292c6', '#6baed6', '#9ecae1', '#c6dbef', '#e3f0fa', '#a8d08d', '#c9dd9a', '#e9e3a0', '#d9bf77', '#b98f55', '#96673f', '#7a5a4a', '#f2efea'],
-  land: ['#a8d08d', '#c9dd9a', '#e9e3a0', '#d9bf77', '#b98f55', '#96673f', '#7a5a4a', '#f2efea'],
+  topo: ['#08306b', '#08519c', '#2171b5', '#4292c6', '#6baed6', '#9ecae1', '#c6dbef', '#e3f0fa', '#a8d08d', '#c9dd9a', '#e9e3a0', '#d9bf77', '#b98f55', '#96673f', '#7a5a4a', '#5a463f'],
+  land: ['#a8d08d', '#c9dd9a', '#e9e3a0', '#d9bf77', '#b98f55', '#96673f', '#7a5a4a', '#5a463f'],
   sea: ['#08306b', '#08519c', '#2171b5', '#4292c6', '#6baed6', '#9ecae1', '#c6dbef', '#e3f0fa'],
   thermal: ['#042333', '#2c3395', '#744992', '#b15f82', '#eb7958', '#fbb43d', '#e8fa5b'],
 };
@@ -72,7 +72,7 @@ function drawLine(canvas, spec) {
   const series = (spec.series || []).filter((s) => s && s.x && s.y);
   const m = { l: 62, r: 16, t: 14, b: 44 };
   let [x0, x1] = extent(series.map((s) => s.x), spec.logx), [y0, y1] = extent(series.map((s) => s.y).concat([(spec.hlines || []).map((q) => q.y)]), spec.logy);
-  if (!spec.logy) { const pad = (y1 - y0) * 0.06 || Math.abs(y1) * 0.1 || 1; y0 -= pad; y1 += pad; if (spec.zeroY && y0 > 0) y0 = 0; }
+  if (!spec.logy) { const pad = (y1 - y0) * 0.06 || Math.abs(y1) * 0.1 || 1; y0 -= pad; y1 += pad + (series.some((q) => q.name) ? (y1 - y0) * 0.12 : 0); if (spec.zeroY && y0 > 0) y0 = 0; }
   if (spec.xmin !== undefined) x0 = spec.xmin; if (spec.xmax !== undefined) x1 = spec.xmax;
   if (spec.ymin !== undefined) y0 = spec.ymin; if (spec.ymax !== undefined) y1 = spec.ymax;
   if (x1 === x0) { x0 -= 1; x1 += 1; }
@@ -309,7 +309,7 @@ function drawField(canvas, spec) {
   ctx.restore();
   ctx.strokeStyle = C.mute; ctx.lineWidth = 1; ctx.strokeRect(m.l, m.t, pw, ph);
   ctx.fillStyle = C.mute; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
-  for (const v of niceTicks(xs[0], xs[nx - 1], Math.max(3, Math.floor(pw / 90)))) if (v >= Math.min(xs[0], xs[nx - 1]) && v <= Math.max(xs[0], xs[nx - 1])) ctx.fillText(tickLabel(v), X(v), h - m.b + 5);
+  for (const v of niceTicks(xs[0], xs[nx - 1], Math.max(4, Math.floor(pw / 70)))) if (v >= Math.min(xs[0], xs[nx - 1]) && v <= Math.max(xs[0], xs[nx - 1])) ctx.fillText(tickLabel(v), X(v), h - m.b + 5);
   ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
   for (const v of niceTicks(ys[0], ys[ny - 1], Math.max(2, Math.floor(ph / 45)))) if (v >= Math.min(ys[0], ys[ny - 1]) && v <= Math.max(ys[0], ys[ny - 1])) ctx.fillText(tickLabel(v), m.l - 6, Y(v));
   ctx.fillStyle = C.fg; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
