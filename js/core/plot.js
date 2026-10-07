@@ -8,6 +8,10 @@ const CMAPS = {
   turbo: ['#30123b', '#4662d7', '#36aaf9', '#1ae4b6', '#72fe5e', '#c7ef34', '#faba39', '#f66b19', '#ca2a04', '#7a0403'],
   coolwarm: ['#3b4cc0', '#6f92f3', '#aac7fd', '#dddcdc', '#f7b89c', '#e7745b', '#b40426'],
   salinity: ['#f7fcf0', '#ccebc5', '#7bccc4', '#43a2ca', '#0868ac', '#084081', '#3f007d', '#7a0177'],
+  // below the midpoint: sea (deep → shallow); above it: land (lowland → mountain)
+  topo: ['#08306b', '#08519c', '#2171b5', '#4292c6', '#6baed6', '#9ecae1', '#c6dbef', '#e3f0fa', '#a8d08d', '#c9dd9a', '#e9e3a0', '#d9bf77', '#b98f55', '#96673f', '#7a5a4a', '#f2efea'],
+  land: ['#a8d08d', '#c9dd9a', '#e9e3a0', '#d9bf77', '#b98f55', '#96673f', '#7a5a4a', '#f2efea'],
+  sea: ['#08306b', '#08519c', '#2171b5', '#4292c6', '#6baed6', '#9ecae1', '#c6dbef', '#e3f0fa'],
   thermal: ['#042333', '#2c3395', '#744992', '#b15f82', '#eb7958', '#fbb43d', '#e8fa5b'],
 };
 const hex = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
@@ -207,13 +211,17 @@ function drawField(canvas, spec) {
   }
   if (!(hi > lo)) hi = lo + (Math.abs(lo) * 1e-6 || 1e-9);
   const L = lut(spec.cmap || 'viridis');
+  // optional two-slope scale: values below zmid use the lower half of the colour map, values above it the upper half
+  const mid = spec.zmid !== undefined && spec.zmid > lo && spec.zmid < hi ? spec.zmid : null;
+  const norm = (v) => (mid === null ? (v - lo) / (hi - lo) : v < mid ? (0.5 * (v - lo)) / (mid - lo) : 0.5 + (0.5 * (v - mid)) / (hi - mid));
+  const inv = (t) => (mid === null ? lo + t * (hi - lo) : t < 0.5 ? lo + (t / 0.5) * (mid - lo) : mid + ((t - 0.5) / 0.5) * (hi - mid));
   const off = document.createElement('canvas'); off.width = nx; off.height = ny;
   const octx = off.getContext('2d'), img = octx.createImageData(nx, ny);
   for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
     const v = z[j][i], o = ((ny - 1 - j) * nx + i) * 4;
     if (spec.mask && spec.mask[j][i]) { img.data[o] = 100; img.data[o + 1] = 116; img.data[o + 2] = 139; img.data[o + 3] = 255; continue; }
     if (!Number.isFinite(v)) { img.data[o + 3] = 0; continue; }
-    const t = Math.max(0, Math.min(255, Math.round(((v - lo) / (hi - lo)) * 255)));
+    const t = Math.max(0, Math.min(255, Math.round(norm(v) * 255)));
     img.data[o] = L[t * 3]; img.data[o + 1] = L[t * 3 + 1]; img.data[o + 2] = L[t * 3 + 2]; img.data[o + 3] = 255;
   }
   octx.putImageData(img, 0, 0);
@@ -312,7 +320,9 @@ function drawField(canvas, spec) {
   for (let k = 0; k < ph; k++) { const t = Math.round((1 - k / ph) * 255); ctx.fillStyle = `rgb(${L[t * 3]},${L[t * 3 + 1]},${L[t * 3 + 2]})`; ctx.fillRect(bx, m.t + k, bwid, 1.5); }
   ctx.strokeStyle = C.mute; ctx.strokeRect(bx, m.t, bwid, ph);
   ctx.fillStyle = C.mute; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-  for (const v of niceTicks(lo, hi, 5)) if (v >= lo && v <= hi) ctx.fillText(tickLabel(v), bx + bwid + 4, m.t + ph - ((v - lo) / (hi - lo)) * ph);
+  const barTicks = mid === null ? niceTicks(lo, hi, 5) : [...niceTicks(lo, mid, 3).filter((v) => v < mid - (mid - lo) * 0.12), mid, ...niceTicks(mid, hi, 3).filter((v) => v > mid + (hi - mid) * 0.12)];
+  for (const v of barTicks) if (v >= lo && v <= hi) ctx.fillText(tickLabel(v), bx + bwid + 4, m.t + ph - norm(v) * ph);
+  void inv;
   if (spec.zlabel) { ctx.save(); ctx.translate(w - 5, m.t + ph / 2); ctx.rotate(-Math.PI / 2); ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'; ctx.fillStyle = C.fg; ctx.fillText(spec.zlabel, 0, 0); ctx.restore(); }
   canvas._hover = (px, py) => {
     if (px < m.l || px > m.l + pw || py < m.t || py > m.t + ph) return null;

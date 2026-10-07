@@ -143,8 +143,10 @@ const connectors = {
   async energy(lat, lon, site) {
     const iso3 = site.data?.iso3, name = site.country;
     if (!iso3 && !name) throw new Error('Country unknown');
+    // The chart addresses are requested directly: the short aliases answer with a redirect that browsers refuse cross-origin.
+    const owid = (direct, alias) => getText('https://ourworldindata.org/grapher/' + direct).catch(() => getText('https://ourworldindata.org/grapher/' + alias));
     const pick = (csv) => { for (const line of csv.split('\n')) { const c = line.split(','); if ((iso3 && c[1] === iso3) || (!iso3 && c[0] === name)) { const v = parseFloat(c[3]); if (Number.isFinite(v)) return { value: v, year: txt(c[4] || c[2], 6) }; } } return null; };
-    const [ci, rn] = await Promise.allSettled([getText('https://ourworldindata.org/grapher/carbon-intensity-electricity.csv?csvType=filtered&time=latest'), getText('https://ourworldindata.org/grapher/share-electricity-renewables.csv?csvType=filtered&time=latest')]);
+    const [ci, rn] = await Promise.allSettled([owid('electricity-mix.csv?frequency=annual&metric=carbon_intensity&source=total&csvType=filtered&time=latest', 'carbon-intensity-electricity.csv?csvType=filtered&time=latest'), owid('electricity-mix.csv?frequency=annual&metric=share_of_generation&source=renewables&csvType=filtered&time=latest', 'share-electricity-renewables.csv?csvType=filtered&time=latest')]);
     const data = {}, a = ci.status === 'fulfilled' ? pick(ci.value) : null, b = rn.status === 'fulfilled' ? pick(rn.value) : null;
     if (a && a.value >= 0 && a.value < 1500) { data.gridCarbon = a.value / 1000; data.gridCarbonYear = a.year; data.gridCarbonLive = true; }
     if (b && b.value >= 0 && b.value <= 100) { data.renewableShare = b.value; data.renewableShareYear = b.year; }
