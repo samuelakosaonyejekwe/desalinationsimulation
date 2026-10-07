@@ -4,8 +4,8 @@
 // electrode kinetics, Faraday's law with co-ion leakage, back-diffusion, shunt currents and water transport.
 // Reduced-order models of bipolar-membrane ED (acid/base) and membrane capacitive deionisation are included,
 // together with a 1-D Nernst–Planck–Donnan profile solver across film | membrane | film.
-import { brent, clamp, linspace, logspace, sum, rng, fmt, rk4 } from '../core/num.js';
-import { R, F, KELVIN, density, viscosity } from '../core/props.js';
+import { brent, clamp, linspace, logspace, sum, rng, fmt, rk4, solveLinear, tridiag, newtonN, lhs } from '../core/num.js';
+import { R, F, KELVIN, density, viscosity, cp as cpWater } from '../core/props.js';
 import { IONS, ION_IDS, WATERS, cloneIons, tds, scaleIons, chargeBalance, balanceCharge } from '../core/water.js';
 
 const CH = ION_IDS.filter((k) => IONS[k].z !== 0), NI = CH.length; // charged species tracked through the membranes
@@ -36,7 +36,12 @@ export function electrolyte(c, T) {
 
 /** Spacer-channel hydraulics and mass transfer: Sh = a·Re^b·Sc^(1/3). */
 export function channel(u, h, eps, T, Ds, par) {
-  const rho = density(T, 0), mu = viscosity(T, 0), dh = (4 * eps) / (2 / h + ((1 - eps) * 8) / h), Re = (rho * u * dh) / mu, Sc = mu / (rho * Ds);
+  const rho = density(T, 0), mu = viscosity(T, 0);
+  if (par.ns) { // open channel: Sherwood number and friction of the Navier–Stokes / Nernst–Planck solution, rescaled with (Re·Sc)^⅓ (Lévêque) and with the velocity
+    const dh = 2 * h, Re = (rho * u * dh) / mu, Sc = mu / (rho * Ds), Sh = Math.max(par.ns.Sh * ((Re * Sc) / (par.ns.Re * par.ns.Sc)) ** (1 / 3), 8.235), k = (Sh * Ds) / dh;
+    return { dh, Re, Sc, Sh, k, delta: Ds / k, dpPerM: par.ns.dpPerM * (u / par.ns.U) * (mu / par.ns.mu) };
+  }
+  const dh = (4 * eps) / (2 / h + ((1 - eps) * 8) / h), Re = (rho * u * dh) / mu, Sc = mu / (rho * Ds);
   const Sh = Math.max(par.shA * Math.max(Re, 1e-6) ** par.shB * Sc ** (1 / 3), 3), k = (Sh * Ds) / dh;
   return { dh, Re, Sc, Sh, k, delta: Ds / k, dpPerM: (par.kdp * 6.23 * Math.max(Re, 1) ** -0.3 * rho * u * u) / (2 * dh) };
 }
@@ -54,21 +59,33 @@ export function cellPair(cd, cc, u, G, par, T) {
   const ilimC = (2 * F * d.ceq) / (hd.delta * kC.k1), ilimA = (2 * F * d.ceq) / (hd.delta * kA.k1), ilim = Math.min(ilimC, ilimA);
   const bulkD = Math.max(G.h - 2 * hd.delta, 0.2 * G.h), bulkC = Math.max(G.h - 2 * hc.delta, 0.2 * G.h);
   const Rohm = par.Rcem + par.Raem + (bulkD / d.kappa + bulkC / c.kappa) / G.shadow;
+  // membrane potential: permselectivity × Nernst (default) or the Goldman–Hodgkin–Katz constant-field potential solved ion by ion for the
+  // bulk compositions, with its local slope dE/d ln(ratio) carrying the concentration-polarisation correction
+  let ghk = null;
+  if (par.membModel === 'ghk') {
+    const pm = membranePermeabilities(cd, par), up = cc.map((x) => x * 1.02), ln = Math.log(1.02), EC = ghkPotential(pm.PC, Z, cd, cc, T), EA = -ghkPotential(pm.PA, Z, cd, cc, T);
+    ghk = { E: EC + EA, aC: (ghkPotential(pm.PC, Z, cd, up, T) - EC) / (V * ln), aA: (-ghkPotential(pm.PA, Z, cd, up, T) - EA) / (V * ln) };
+  }
   const parts = (i) => {
     const wdC = d.ceq * (1 - i / ilimC), wdA = d.ceq * (1 - i / ilimA), wcC = c.ceq + (i * hc.delta * kCc.k1) / (2 * F), wcA = c.ceq + (i * hc.delta * kAc.k1) / (2 * F);
-    const donnan = V * (par.alphaC + par.alphaA) * Math.log(c.ceq / d.ceq);
-    const memb = V * (par.alphaC * Math.log(wcC / wdC) + par.alphaA * Math.log(wcA / wdA));
+    const donnan = ghk ? ghk.E : V * (par.alphaC + par.alphaA) * Math.log(c.ceq / d.ceq);
+    const memb = ghk ? ghk.E + V * (ghk.aC * Math.log((wcC * d.ceq) / (wdC * c.ceq)) + ghk.aA * Math.log((wcA * d.ceq) / (wdA * c.ceq))) : V * (par.alphaC * Math.log(wcC / wdC) + par.alphaA * Math.log(wcA / wdA));
     const films = V * ((kC.k2 / kC.k1) * Math.log(d.ceq / wdC) + (kA.k2 / kA.k1) * Math.log(d.ceq / wdA) + (kCc.k2 / kCc.k1) * Math.log(wcC / c.ceq) + (kAc.k2 / kAc.k1) * Math.log(wcA / c.ceq));
     return { donnan, polar: memb - donnan + films, ohmMem: i * (par.Rcem + par.Raem), ohmD: (i * bulkD) / d.kappa / G.shadow, ohmC: (i * bulkC) / c.kappa / G.shadow, wd: Math.min(wdC, wdA), wc: Math.max(wcC, wcA), U: memb + films + i * Rohm };
   };
-  return { d, c, hd, hc, tC, tA, ilimC, ilimA, ilim, Rohm, parts, U: (i) => parts(i).U, E0: V * (par.alphaC + par.alphaA) * Math.log(c.ceq / d.ceq) };
+  return { d, c, hd, hc, tC, tA, ilimC, ilimA, ilim, Rohm, parts, V, ghk, U: (i) => parts(i).U, E0: ghk ? ghk.E : V * (par.alphaC + par.alphaA) * Math.log(c.ceq / d.ceq) };
 }
 
-/** Current density (A/m²) for a cell-pair voltage: film branch below the limiting current plus an empirical over-limiting branch. */
+/** Plateau length (V per cell pair) before over-limiting conduction: empirical input, or two depleted layers at the electroconvection threshold. */
+const plateauOf = (cp, par) => (par.ol ? 2 * par.ol.Vc * cp.V : par.plateau);
+/**
+ * Current density (A/m²) for a cell-pair voltage: film branch below the limiting current plus the over-limiting branch — empirical
+ * (plateau and conductance ratio) or from the electroconvection model, where i/i_lim − 1 = slope·(V − V_c) in each depleted layer.
+ */
 export function currentAt(cp, Ucp, par) {
   if (!(Ucp > cp.E0)) return { i: 0, iFilm: 0, iOver: 0 };
   const top = cp.ilim * (1 - 1e-9), hi = Math.min(top, (Ucp - cp.E0) / cp.Rohm), iFilm = cp.U(hi) <= Ucp ? hi : brent((i) => cp.U(i) - Ucp, 0, hi, 1e-13 * cp.ilim, 100); // U ≥ E₀ + i·R_ohm bounds the root
-  const Uol = cp.U(0.98 * cp.ilim) + par.plateau, iOver = Ucp > Uol ? (par.olSlope * (Ucp - Uol)) / cp.Rohm : 0;
+  const Uol = cp.U(0.98 * cp.ilim) + plateauOf(cp, par), iOver = !(Ucp > Uol) ? 0 : par.ol ? (cp.ilim * par.ol.slope * (Ucp - Uol)) / (2 * cp.V + cp.ilim * par.ol.slope * cp.Rohm) : (par.olSlope * (Ucp - Uol)) / cp.Rohm;
   return { i: iFilm + iOver, iFilm, iOver };
 }
 
@@ -111,10 +128,10 @@ export function marchStage(st0, Ucp, G, par, T, nSeg) {
   return { st, segs, I, Iws, iAvg: I / Awet, ratioMax: Math.max(...segs.map((s) => s.ratio)), dp: (sum(segs.map((s) => s.dpPerM)) * G.L) / nSeg };
 }
 
-/** Electrode pair: reversible water-electrolysis voltage + Butler–Volmer overpotentials + rinse-compartment ohmic drop, V. */
+/** Electrode pair: reversible water-electrolysis voltage + Butler–Volmer (or Tafel) overpotentials + rinse-compartment ohmic drop, V. */
 export function electrodeVoltage(i, par, T) {
-  const b = 2 * vt(T); // symmetric Butler–Volmer, transfer coefficient 0.5: η = (2RT/F)·asinh(i / 2i₀)
-  return 1.229 + b * Math.asinh(i / (2 * par.i0a)) + b * Math.asinh(i / (2 * par.i0c)) + i * par.Rrinse;
+  const a = par.aBV ?? 0.5, kin = par.kinetics || 'bv'; // symmetric Butler–Volmer (α = 0.5) has the closed form η = (2RT/F)·asinh(i / 2i₀)
+  return 1.229 + overpotential(i, par.i0a, T, a, kin) + overpotential(i, par.i0c, T, a, kin) + i * par.Rrinse;
 }
 
 /** Simple saturation ratios of the concentrate (Davies activity coefficients): gypsum and calcite. */
@@ -165,7 +182,8 @@ export function npProfile({ cd, cc, i, X, dm, Dp, Dm, DpM, DmM, deltaD, deltaC, 
 // ---- stack / train ----------------------------------------------------------------------------------------
 function params(v) {
   return { alphaC: v.alphaC, alphaA: v.alphaA, Rcem: v.Rcem * 1e-4, Raem: v.Raem * 1e-4, shA: v.shA, shB: v.shB, kdp: v.kdp, selDivC: v.selDivC, selDivA: v.selDivA, PsC: v.Ps * 1e-8, PsA: v.Ps * 1e-8,
-    tw: v.tw, Lp: (v.Lp * 1e-6) / 3600 / 1e5, plateau: v.plateau, olSlope: v.olSlope, fws: v.fws, i0a: v.i0a, i0c: v.i0c, Rrinse: v.Rrinse * 1e-4, shunt: clamp(v.shunt / 100, 0, 0.5) };
+    tw: v.tw, Lp: (v.Lp * 1e-6) / 3600 / 1e5, plateau: v.plateau, olSlope: v.olSlope, fws: v.fws, i0a: v.i0a, i0c: v.i0c, Rrinse: v.Rrinse * 1e-4, shunt: clamp(v.shunt / 100, 0, 0.5),
+    membModel: v.membModel || 'tms', kinetics: v.kinetics || 'bv', aBV: clamp(v.alphaBV ?? 0.5, 0.05, 0.95), ol: null, ns: null };
 }
 const geometry = (v) => ({ W: v.W, L: v.Lpath, h: v.hsp / 1000, eps: v.eps, shadow: v.shadow });
 
@@ -228,6 +246,7 @@ export function simulateED(v, ov = {}) {
   const p = { ...v, ...ov }, T = p.T, par = params(p), G = geometry(p), nSeg = Math.max(2, Math.round(p.nSeg));
   const ionsF = balanceCharge(scaleIons(cloneIons(p.ions), p.salinityFactor ?? 1)), cf = toMolar(ionsF), neutral = tds(ionsF) - tdsOf(cf), rec = clamp(p.recovery / 100, 0.3, 0.97);
   const Qd = p.Qp / 3600; // diluate flow through the stack ≈ product flow, m³/s
+  attachModels(p, par, G, T, cf, p.mode === 'design' ? p.uLin / 100 : Qd / Math.max(1, Math.round(p.Ncp)) / (G.W * G.h * G.eps));
   let Ncp, qd0, nSt = Math.max(1, Math.round(p.nStages)), tr, phi = null, reached = true;
   const mk = (n) => ({ G, par, T, Ncp: n, qd0: Qd / n, rec, tol: ov.tol, warm: {} });
   if (p.mode === 'design') {
@@ -275,6 +294,7 @@ export function simulateBatch(v) {
   const p = v, T = p.T, par = params(p), G = geometry(p), nSeg = clamp(Math.round(p.nSeg / 2), 2, 10), Ncp = Math.max(1, Math.round(p.Ncp)), nt = Math.max(4, Math.round(p.nt));
   const ionsF = balanceCharge(scaleIons(cloneIons(p.ions), p.salinityFactor ?? 1)), cf = toMolar(ionsF), neutral = tds(ionsF) - tdsOf(cf), rec = clamp(p.recovery / 100, 0.3, 0.97);
   const Vd0 = p.Vbatch, Vc0 = (Vd0 * (1 - rec)) / rec, qd0 = (p.uLin / 100) * G.W * G.h * G.eps, tEnd = p.tBatch * 60;
+  attachModels(p, par, G, T, cf, p.uLin / 100);
   const unpack = (y) => ({ Vd: y[2 * NI], Vc: y[2 * NI + 1], cd: y.slice(0, NI).map((n) => Math.max(n, 0) / y[2 * NI]), cc: y.slice(NI, 2 * NI).map((n) => Math.max(n, 0) / y[2 * NI + 1]) });
   const pass = (y) => { const s = unpack(y); return { s, m: marchStage({ qd: qd0, qc: qd0, cd: s.cd, cc: s.cc }, p.Ucp, G, par, T, nSeg) }; };
   const rhs = (t, y) => {
@@ -370,8 +390,616 @@ const stream = (Q, T, pH, ions) => ({ Q, T, P: 1, pH, tds: tds(ions), ions: roun
 
 /** Polarisation curve of one cell pair at fixed compositions: voltage versus current density through all regimes. */
 export function polarisation(cd, cc, u, G, par, T, n = 60) {
-  const cp = cellPair(cd, cc, u, G, par, T), Umax = cp.U(0.98 * cp.ilim) + par.plateau + 0.8, U = linspace(cp.E0, Umax, n);
-  return { cp, U, i: U.map((x) => currentAt(cp, x, par).i), Ulim: cp.U(0.98 * cp.ilim), Uover: cp.U(0.98 * cp.ilim) + par.plateau };
+  const cp = cellPair(cd, cc, u, G, par, T), pl = plateauOf(cp, par), Umax = cp.U(0.98 * cp.ilim) + pl + 0.8, U = linspace(cp.E0, Umax, n);
+  return { cp, U, i: U.map((x) => currentAt(cp, x, par).i), Ulim: cp.U(0.98 * cp.ilim), Uover: cp.U(0.98 * cp.ilim) + pl };
+}
+
+// ---- Poisson–Nernst–Planck (1-D, steady, Scharfetter–Gummel, Newton) ---------------------------------------------
+const EPS0 = 8.8541878128e-12;
+/** Bernoulli function B(u) = u / (eᵘ − 1) and its derivative (exponentially fitted fluxes). */
+const bern = (u) => (Math.abs(u) < 1e-5 ? 1 - u / 2 + (u * u) / 12 : u > 600 ? 0 : u / Math.expm1(u));
+const dbern = (u) => { if (Math.abs(u) < 1e-4) return -0.5 + u / 6; if (u > 600) return 0; if (u < -600) return -1; const e = Math.expm1(u); return (e - u * (e + 1)) / (e * e); };
+/** Debye length (m) of a solution holding Σ zᵢ²cᵢ = q (mol/m³). */
+export const debyeLength = (q, T = 25, epsr = 78.4) => Math.sqrt((epsr * EPS0 * R * (T + KELVIN)) / (F * F * Math.max(q, 1e-12)));
+/** Multi-ion Donnan potential (in units of RT/F) of a phase with signed fixed charge w (mol/m³) against a solution c: Σ zᵢcᵢe^(−zᵢψ) + w = 0. */
+export function donnanMulti(c, z, w) {
+  const f = (p) => sum(c.map((x, i) => z[i] * x * Math.exp(-z[i] * p))) + w;
+  if (Math.abs(w) < 1e-300) return 0;
+  let lo = -1, hi = 1, g = 0;
+  while (f(lo) < 0 && g++ < 80) lo *= 2;
+  g = 0; while (f(hi) > 0 && g++ < 80) hi *= 2;
+  return brent(f, lo, hi, 1e-14, 200);
+}
+function invSmall(A, m, X, off, M) { // Gauss–Jordan inverse of a small dense matrix (flat, row-major, partial pivoting) written to X at offset off; M is a 2m² work array
+  const w = 2 * m;
+  M.fill(0);
+  for (let i = 0; i < m; i++) { for (let j = 0; j < m; j++) M[i * w + j] = A[i * m + j]; M[i * w + m + i] = 1; }
+  for (let k = 0; k < m; k++) {
+    let p = k; for (let i = k + 1; i < m; i++) if (Math.abs(M[i * w + k]) > Math.abs(M[p * w + k])) p = i;
+    if (!(Math.abs(M[p * w + k]) > 1e-300)) throw new Error('singular block');
+    if (p !== k) for (let j = 0; j < w; j++) { const t = M[k * w + j]; M[k * w + j] = M[p * w + j]; M[p * w + j] = t; }
+    const d = 1 / M[k * w + k]; for (let j = 0; j < w; j++) M[k * w + j] *= d;
+    for (let i = 0; i < m; i++) if (i !== k) { const f = M[i * w + k]; if (f !== 0) for (let j = 0; j < w; j++) M[i * w + j] -= f * M[k * w + j]; }
+  }
+  for (let i = 0; i < m; i++) for (let j = 0; j < m; j++) X[off + i * m + j] = M[i * w + m + j];
+}
+/**
+ * Steady 1-D Poisson–Nernst–Planck problem on a stack of layers (solution films, charged membranes):
+ *   dJᵢ/dx = 0,  Jᵢ = −Dᵢ(dcᵢ/dx + zᵢcᵢ dψ/dx),  d/dx(ε dψ/dx) = −(F²/RT)(Σ zᵢcᵢ + ω),  ψ = Fφ/RT.
+ * spec = { z:[…], layers:[{ L (m), D:[…] (m²/s), X (signed fixed charge, mol/m³), epsr }], T, epsr, ratio, res,
+ *   left/right: { type:'bulk', c:[…], psi (V) } | { type:'wall', psi (V) or sigma (C/m²), flux:[…] (mol/m²·s, +x), cFix:[… or null] } }.
+ * Finite volumes on a geometrically graded mesh that resolves the Debye length at every interface, exponentially fitted
+ * (Scharfetter–Gummel) fluxes and a damped Newton iteration on (c₁…c_n, ψ) with a block-tridiagonal Jacobian.
+ */
+export function solvePNP(spec, warm = null) {
+  const T = spec.T ?? 25, z = spec.z, ns = z.length, m = ns + 1, epsr0 = spec.epsr ?? 78.4, Vt = vt(T), K0 = (F * F) / (EPS0 * R * (T + KELVIN)), ratio = clamp(spec.ratio ?? 1.25, 1.02, 3), res = spec.res ?? 5;
+  const Lb = spec.left, Rb = spec.right, lay = spec.layers, nl = lay.length, bulk = Lb.type === 'bulk' ? Lb.c : Rb.c, bulkR = Rb.type === 'bulk' ? Rb.c : Lb.c;
+  const q2 = (c) => sum(c.map((x, i) => z[i] * z[i] * x)), wallQ = (b) => (b.type !== 'wall' ? 0 : (b.cFix || []).some((x) => x != null) ? Math.max(...b.cFix.map((x) => x || 0)) : q2(bulk) * Math.exp(Math.min(Math.abs((b.psi ?? 0) / Vt), 12))); // counter-ion enrichment at a charged wall shortens the local screening length
+  const cref = Math.max(...bulk, ...bulkR, 1e-9);
+  let mesh = warm?.mesh;
+  if (spec.meshOnly || !mesh) { // two-sided geometric grading of every layer
+    const x = [0], fl = [];
+    lay.forEach((ly, q) => {
+      const hc = ly.L / (ly.n || 16), er = ly.epsr ?? epsr0;
+      const end = (nb, wall, c) => (nb ? Math.min(hc, debyeLength(Math.max(q2(c), Math.abs(ly.X || 0), Math.abs(nb.X || 0)), T, er) / res) : wall.type === 'wall' ? Math.min(hc, debyeLength(Math.max(q2(c), wallQ(wall), Math.abs(ly.X || 0)), T, er) / res) : hc);
+      let ha = end(lay[q - 1], Lb, bulk), hb = end(lay[q + 1], Rb, bulkR), tot = 0;
+      const a = [], b = [];
+      while (tot < ly.L && a.length + b.length < 4000) { if (ha <= hb) { a.push(ha); tot += ha; ha = Math.min(ha * ratio, hc); } else { b.push(hb); tot += hb; hb = Math.min(hb * ratio, hc); } }
+      const hs = [...a, ...b.reverse()], f = ly.L / tot;
+      for (const h of hs) { x.push(x[x.length - 1] + h * f); fl.push(q); }
+    });
+    mesh = { x, fl, N: x.length };
+    if (spec.meshOnly) return { warm: { mesh } };
+  }
+  const { x, fl, N } = mesh, nf = N - 1, h = new Float64Array(nf), ef = new Float64Array(nf), g = Array.from({ length: ns }, () => new Float64Array(nf)), om = new Float64Array(N);
+  for (let k = 0; k < nf; k++) { h[k] = x[k + 1] - x[k]; const ly = lay[fl[k]]; ef[k] = (ly.epsr ?? epsr0) / h[k]; for (let i = 0; i < ns; i++) g[i][k] = ly.D[i] / h[k]; }
+  for (let k = 0; k < N; k++) om[k] = 0.5 * ((k > 0 ? (lay[fl[k - 1]].X || 0) * h[k - 1] : 0) + (k < nf ? (lay[fl[k]].X || 0) * h[k] : 0)); // fixed charge of the control volume, mol/m²
+  // state: concentrations in units of cref, potential in units of RT/F
+  const c = Array.from({ length: ns }, () => new Float64Array(N)), ps = new Float64Array(N);
+  const psiL = (Lb.psi ?? 0) / Vt, psiR = (Rb.psi ?? 0) / Vt, Ltot = x[nf];
+  if (warm?.c) { for (let i = 0; i < ns; i++) c[i].set(warm.c[i]); ps.set(warm.ps); }
+  else for (let k = 0; k < N; k++) { // electroneutral / Donnan starting guess
+    const s = x[k] / Ltot, cb = bulk.map((v, i) => v + (bulkR[i] - v) * s), wv = k > 0 && k < nf ? (lay[fl[k - 1]].X || 0) * 0.5 + (lay[fl[k]].X || 0) * 0.5 : lay[fl[Math.min(k, nf - 1)]].X || 0, pd = donnanMulti(cb, z, wv);
+    ps[k] = psiL + (psiR - psiL) * s + pd;
+    for (let i = 0; i < ns; i++) c[i][k] = (cb[i] * Math.exp(-z[i] * pd)) / cref;
+  }
+  const A = new Float64Array(N * m * m), B = new Float64Array(N * m * m), C = new Float64Array(N * m * m), r = new Float64Array(N * m), Binv = new Float64Array(N * m * m), wk = new Float64Array(2 * m * m), tmp = new Float64Array(m * m), Bk = new Float64Array(m * m), rr = new Float64Array(N * m), dx = new Float64Array(N * m);
+  const flux = (i, k) => { const u = z[i] * (ps[k + 1] - ps[k]); return g[i][k] * (bern(u) * c[i][k] - bern(-u) * c[i][k + 1]); }; // in units of cref
+  const bcRow = (k, b, sgn) => { // boundary node k; sgn = +1 left (outward face k), −1 right (face k−1)
+    const o = k * m * m, kf = sgn > 0 ? k : k - 1, nb = sgn > 0 ? C : A, k2 = k + sgn;
+    for (let i = 0; i < ns; i++) {
+      const row = o + i * m;
+      if (b.type === 'bulk' || (b.cFix && b.cFix[i] != null)) { B[row + i] = 1; r[k * m + i] = c[i][k] - (b.type === 'bulk' ? b.c[i] : b.cFix[i]) / cref; continue; }
+      // prescribed flux through the wall (default: none): J_face − J_spec = 0, with J positive in +x
+      const ka = Math.min(k, k2), u = z[i] * (ps[ka + 1] - ps[ka]), gg = g[i][kf], bp = bern(u), bm = bern(-u), dJ = gg * z[i] * (dbern(u) * c[i][ka] + dbern(-u) * c[i][ka + 1]), sc = 1 / gg;
+      const dA = gg * bp * sc, dB_ = -gg * bm * sc; // ∂J/∂c at nodes ka and ka+1
+      if (sgn > 0) { B[row + i] = dA; nb[row + i] = dB_; B[row + ns] = -dJ * sc; nb[row + ns] = dJ * sc; } else { nb[row + i] = dA; B[row + i] = dB_; nb[row + ns] = -dJ * sc; B[row + ns] = dJ * sc; }
+      r[k * m + i] = (gg * (bp * c[i][ka] - bm * c[i][ka + 1]) - ((b.flux && b.flux[i]) || 0) / cref) * sc;
+    }
+    const row = o + ns * m;
+    if (b.type === 'bulk' || b.sigma == null) { B[row + ns] = 1; r[k * m + ns] = ps[k] - (sgn > 0 ? psiL : psiR); return; }
+    // surface-charge (Neumann) condition: ε dψ/dn + K0·(½ control-volume charge) + σF/(ε₀RT) = 0
+    const e = ef[kf], sc = 1 / e; let rho = om[k] / cref;
+    for (let i = 0; i < ns; i++) { rho += 0.5 * h[kf] * z[i] * c[i][k]; B[row + i] = K0 * cref * 0.5 * h[kf] * z[i] * sc; }
+    B[row + ns] = -1; nb[row + ns] = 1;
+    r[k * m + ns] = (e * (ps[k2] - ps[k]) + K0 * cref * rho + (b.sigma * F) / (EPS0 * R * (T + KELVIN))) * sc;
+  };
+  let it = 0, conv = false, upd = Infinity;
+  const maxIt = spec.maxIt ?? 80;
+  for (; it < maxIt; it++) {
+    A.fill(0); B.fill(0); C.fill(0);
+    for (let k = 1; k < nf; k++) {
+      const o = k * m * m, hb = 0.5 * (h[k - 1] + h[k]);
+      for (let i = 0; i < ns; i++) {
+        const row = o + i * m, uL = z[i] * (ps[k] - ps[k - 1]), uR = z[i] * (ps[k + 1] - ps[k]), gL = g[i][k - 1], gR = g[i][k], sc = 1 / Math.max(gL, gR);
+        const dL = gL * z[i] * (dbern(uL) * c[i][k - 1] + dbern(-uL) * c[i][k]), dR = gR * z[i] * (dbern(uR) * c[i][k] + dbern(-uR) * c[i][k + 1]);
+        A[row + i] = -gL * bern(uL) * sc; B[row + i] = (gR * bern(uR) + gL * bern(-uL)) * sc; C[row + i] = -gR * bern(-uR) * sc;
+        A[row + ns] = dL * sc; B[row + ns] = (-dR - dL) * sc; C[row + ns] = dR * sc;
+        r[k * m + i] = (flux(i, k) - flux(i, k - 1)) * sc;
+      }
+      const row = o + ns * m, sc = 1 / (ef[k - 1] + ef[k]); let rho = om[k] / cref;
+      for (let i = 0; i < ns; i++) { rho += hb * z[i] * c[i][k]; B[row + i] = K0 * cref * hb * z[i] * sc; }
+      A[row + ns] = ef[k - 1] * sc; B[row + ns] = -1; C[row + ns] = ef[k] * sc;
+      r[k * m + ns] = (ef[k] * (ps[k + 1] - ps[k]) - ef[k - 1] * (ps[k] - ps[k - 1]) + K0 * cref * rho) * sc;
+    }
+    bcRow(0, Lb, 1); bcRow(nf, Rb, -1);
+    // block Thomas elimination
+    try {
+      for (let k = 0; k < N; k++) {
+        const o = k * m * m;
+        for (let j = 0; j < m * m; j++) Bk[j] = B[o + j];
+        for (let j = 0; j < m; j++) rr[k * m + j] = r[k * m + j];
+        if (k > 0) {
+          const op = (k - 1) * m * m;
+          for (let a = 0; a < m; a++) for (let b = 0; b < m; b++) { let s = 0; for (let q = 0; q < m; q++) s += A[o + a * m + q] * Binv[op + q * m + b]; tmp[a * m + b] = s; } // M = A·B'⁻¹
+          for (let a = 0; a < m; a++) { let s = 0; for (let b = 0; b < m; b++) { s += tmp[a * m + b] * rr[(k - 1) * m + b]; let t = 0; for (let q = 0; q < m; q++) t += tmp[a * m + q] * C[op + q * m + b]; Bk[a * m + b] -= t; } rr[k * m + a] -= s; }
+        }
+        invSmall(Bk, m, Binv, o, wk);
+      }
+    } catch { break; }
+    for (let k = N - 1; k >= 0; k--) {
+      const o = k * m * m;
+      for (let a = 0; a < m; a++) { let s = rr[k * m + a]; if (k < nf) for (let b = 0; b < m; b++) s -= C[o + a * m + b] * dx[(k + 1) * m + b]; tmp[a] = s; }
+      for (let a = 0; a < m; a++) { let s = 0; for (let b = 0; b < m; b++) s += Binv[o + a * m + b] * tmp[b]; dx[k * m + a] = s; }
+    }
+    // damping: limit the potential change to two thermal voltages; large concentration changes are applied as factors (keeps c > 0)
+    let lam = 1, mp = 0, mc = 0;
+    for (let k = 0; k < N; k++) { mp = Math.max(mp, Math.abs(dx[k * m + ns])); for (let i = 0; i < ns; i++) mc = Math.max(mc, Math.abs(dx[k * m + i]) / (c[i][k] + 1e-9)); }
+    if (!Number.isFinite(mp) || !Number.isFinite(mc)) break;
+    if (mp > 2) lam = 2 / mp;
+    for (let k = 0; k < N; k++) { ps[k] -= lam * dx[k * m + ns]; for (let i = 0; i < ns; i++) { const q = (-lam * dx[k * m + i]) / (c[i][k] + 1e-300); c[i][k] = Math.max(Math.abs(q) > 0.3 ? c[i][k] * Math.exp(clamp(q, -3, 3)) : c[i][k] * (1 + q), 1e-200); } }
+    upd = Math.max(mp, mc);
+    if (lam === 1 && upd < (spec.tol ?? 1e-10)) { conv = true; it++; break; }
+  }
+  const J = z.map((_, i) => { let s = 0, lo = Infinity, hi = -Infinity; for (let k = 0; k < nf; k++) { const f = flux(i, k) * cref; s += f; lo = Math.min(lo, f); hi = Math.max(hi, f); } return { mean: s / nf, spread: hi - lo }; });
+  const cur = F * sum(J.map((j, i) => z[i] * j.mean)), rho = new Array(N), cOut = c.map((ci) => Array.from(ci, (v) => v * cref));
+  for (let k = 0; k < N; k++) { const lyX = k > 0 && k < nf ? 0.5 * ((lay[fl[k - 1]].X || 0) + (lay[fl[k]].X || 0)) : lay[fl[Math.min(k, nf - 1)]].X || 0; rho[k] = F * (sum(z.map((zi, i) => zi * cOut[i][k])) + lyX); }
+  const E0 = (-(ps[1] - ps[0]) * Vt) / h[0], En = (-(ps[nf] - ps[nf - 1]) * Vt) / h[nf - 1];
+  return { x: Array.from(x), c: cOut, psi: Array.from(ps, (p) => p * Vt), rho, J: J.map((j) => j.mean), fluxSpread: Math.max(...J.map((j) => j.spread)) / (Math.max(...J.map((j) => Math.abs(j.mean))) + 1e-300), current: cur, converged: conv, iterations: it, update: upd, nodes: N, fieldLeft: E0, fieldRight: En,
+    sigmaLeft: (lay[0].epsr ?? epsr0) * EPS0 * E0 - 0.5 * rho[0] * h[0], sigmaRight: -(lay[nl - 1].epsr ?? epsr0) * EPS0 * En - 0.5 * rho[nf] * h[nf - 1], lamD: debyeLength(q2(bulk), T, epsr0), warm: { mesh, c, ps } };
+}
+const pnpCopy = (w) => ({ mesh: w.mesh, c: w.c.map((a) => Float64Array.from(a)), ps: Float64Array.from(w.ps) });
+/** Continuation of a converged PNP solution from parameter s0 to s1 of the family specAt(s), with adaptive sub-steps. */
+export function pnpContinue(specAt, sol, s0, s1, ds0 = s1 - s0) {
+  let s = s0, ds = ds0, guard = 0;
+  while (Math.abs(s1 - s) > 1e-12 * (Math.abs(s1) + 1) && guard++ < 300) {
+    const sn = Math.abs(s1 - s) <= Math.abs(ds) ? s1 : s + ds, nx = solvePNP({ maxIt: 40, ...specAt(sn) }, pnpCopy(sol.warm));
+    if (nx.converged) { sol = nx; s = sn; ds *= 1.7; } else { ds *= 0.35; if (Math.abs(ds) < 1e-6 * Math.abs(s1 - s0)) return { ...sol, converged: false, reached: s }; }
+  }
+  return { ...sol, reached: s };
+}
+/** PNP with continuation: ramps the boundary potentials / wall data linearly from the easy state `from` to the target. */
+export function pnpRamp(spec, from = {}, steps = 4) {
+  const lerp = (a, b, s) => (a == null || b == null ? b : Array.isArray(b) ? b.map((v, i) => (v == null ? v : (a[i] ?? 0) + (v - (a[i] ?? 0)) * s)) : a + (b - a) * s);
+  const at = (s) => ({ ...spec, left: { ...spec.left, ...Object.fromEntries(Object.keys(from.left || {}).map((k) => [k, lerp(from.left[k], spec.left[k], s)])) }, right: { ...spec.right, ...Object.fromEntries(Object.keys(from.right || {}).map((k) => [k, lerp(from.right[k], spec.right[k], s)])) } });
+  const sol = solvePNP(at(0), solvePNP({ ...spec, meshOnly: true }).warm); // the mesh is graded for the target state
+  return sol.converged ? pnpContinue(at, sol, 0, 1, 1 / steps) : sol;
+}
+
+// ---- Goldman–Hodgkin–Katz constant-field membrane ---------------------------------------------------------------
+/** GHK flux of one ion (mol/m²·s for P in m/s, c in mol/m³): J = P·z·u·(c₁ − c₂e^(−zu)) / (1 − e^(−zu)), u = F(φ₁ − φ₂)/RT. */
+export const ghkFlux = (P, z, c1, c2, u) => P * (bern(-z * u) * c1 - bern(z * u) * c2);
+/** GHK zero-current membrane potential φ₁ − φ₂ (V) for any mixture of valences: Σ zᵢJᵢ(u) = 0 solved for u. */
+export function ghkPotential(P, z, c1, c2, T = 25) {
+  const cur = (u) => { let s = 0; for (let j = 0; j < z.length; j++) if (P[j] > 0 && (c1[j] > 0 || c2[j] > 0)) s += z[j] * ghkFlux(P[j], z[j], c1[j], c2[j], u); return s; };
+  let u = 0, ok = false; // Newton on the monotone current–voltage relation, bracketing fallback
+  for (let k = 0; k < 40; k++) {
+    let f = 0, df = 0;
+    for (let j = 0; j < z.length; j++) if (P[j] > 0 && (c1[j] > 0 || c2[j] > 0)) { const x = z[j] * u; f += z[j] * P[j] * (bern(-x) * c1[j] - bern(x) * c2[j]); df -= z[j] * z[j] * P[j] * (dbern(-x) * c1[j] + dbern(x) * c2[j]); }
+    if (df === 0 && f === 0) return 0; // no permeating ion on either side
+    if (!(df > 0)) break;
+    const d = clamp(f / df, -3, 3); u -= d;
+    if (Math.abs(d) < 1e-13) { ok = true; break; }
+  }
+  if (ok) return vt(T) * u;
+  let lo = -1, hi = 1, g = 0;
+  while (cur(lo) > 0 && g++ < 9) lo *= 2;
+  g = 0; while (cur(hi) < 0 && g++ < 9) hi *= 2;
+  return cur(lo) * cur(hi) > 0 ? 0 : vt(T) * brent(cur, lo, hi, 1e-13, 100);
+}
+
+// ---- electrode kinetics --------------------------------------------------------------------------------------------
+/** Activation overpotential (V) at current density i: Butler–Volmer i = i₀[e^(αFη/RT) − e^(−(1−α)Fη/RT)] or its Tafel limit η = (RT/αF)·ln(i/i₀). */
+export function overpotential(i, i0, T = 25, a = 0.5, kin = 'bv') {
+  const V = vt(T);
+  if (!(i > 0)) return 0;
+  if (kin === 'tafel') return i > i0 ? (V / a) * Math.log(i / i0) : 0;
+  let e = 2 * V * Math.asinh(i / (2 * i0));
+  if (Math.abs(a - 0.5) < 1e-9) return e;
+  e = Math.min(e, (V / a) * Math.log(1 + i / i0) + 1e-9);
+  for (let k = 0; k < 60; k++) { const p = Math.exp((a * e) / V), q = Math.exp((-(1 - a) * e) / V), d = (i0 * (p - q) - i) / ((i0 / V) * (a * p + (1 - a) * q)); e -= d; if (Math.abs(d) < 1e-15) break; }
+  return e;
+}
+
+// ---- Maxwell–Stefan transport in a charged membrane ------------------------------------------------------------------
+/**
+ * Steady Maxwell–Stefan (friction) transport of n ions through a membrane with fixed charge X (signed, mol/m³), water and polymer:
+ *   −(∇cᵢ + zᵢcᵢ∇ψ) = Σⱼ (xⱼNᵢ − xᵢNⱼ)/Đᵢⱼ + (x_wNᵢ − xᵢN_w)/Đᵢw + x_mNᵢ/Đᵢm,   Σ zᵢcᵢ + X = 0,   F Σ zᵢNᵢ = i,
+ * with Donnan equilibrium at both faces and the water flux N_w fixed by a zero hydrostatic pressure difference across the membrane
+ * (electro-osmotic drag). Shooting on the n + 1 constant fluxes (RK4 across the membrane, Newton). Đᵢⱼ may be a number or a matrix.
+ */
+export function msMembrane({ z, cL, cR, X, dm, Diw, Dim, Dij = Infinity, Dwm, cw, i, T = 25, n = 40 }) {
+  const ns = z.length, V = vt(T), pL = donnanMulti(cL, z, X), pR = donnanMulti(cR, z, X), mL = cL.map((c, j) => c * Math.exp(-z[j] * pL)), mR = cR.map((c, j) => c * Math.exp(-z[j] * pR)), aX = Math.abs(X);
+  const dij = (a, b) => (typeof Dij === 'number' ? Dij : Dij[a][b]), ref = mL.indexOf(Math.max(...mL)), idx = z.map((_, j) => j).filter((j) => j !== ref), h = dm / n;
+  const Dbar = sum(Diw) / ns, Nref = Math.abs(i) / F + (Dbar * Math.max(...mL, ...mR)) / dm, cs = Math.max(aX, ...mL, ...mR);
+  const grad = (c, N, Nw) => {
+    const ct = cw + sum(c) + aX, xw = cw / ct, xm = aX / ct, rhs = new Array(ns);
+    let zr = 0, zz = 0, wA = 0, wB = xm / Dwm;
+    for (let a = 0; a < ns; a++) {
+      let s = (xw * N[a] - (c[a] / ct) * Nw) / Diw[a] + (xm * N[a]) / Dim[a];
+      for (let b = 0; b < ns; b++) if (b !== a) { const d = dij(a, b); if (Number.isFinite(d)) s += ((c[b] / ct) * N[a] - (c[a] / ct) * N[b]) / d; }
+      rhs[a] = s; zr += z[a] * s; zz += z[a] * z[a] * c[a]; wA += (xw * N[a]) / Diw[a]; wB += c[a] / ct / Diw[a];
+    }
+    const dpsi = -zr / zz;
+    return { dc: rhs.map((s, a) => -z[a] * c[a] * dpsi - s), dpsi, wA, wB };
+  };
+  const shoot = (u, keep, iq = i) => {
+    const N = u.slice(0, ns).map((q) => q * Nref), Nw = u[ns] * Nref;
+    let c = [...mL], psi = 0, IA = 0, IB = 0;
+    const prof = keep ? { x: [0], c: [[...c]], psi: [0] } : null;
+    for (let k = 0; k < n; k++) {
+      const k1 = grad(c, N, Nw), c2 = c.map((v, a) => Math.max(v + 0.5 * h * k1.dc[a], 1e-12)), k2 = grad(c2, N, Nw), c3 = c.map((v, a) => Math.max(v + 0.5 * h * k2.dc[a], 1e-12)), k3 = grad(c3, N, Nw), c4 = c.map((v, a) => Math.max(v + h * k3.dc[a], 1e-12)), k4 = grad(c4, N, Nw);
+      c = c.map((v, a) => Math.max(v + (h / 6) * (k1.dc[a] + 2 * k2.dc[a] + 2 * k3.dc[a] + k4.dc[a]), 1e-12)); psi += (h / 6) * (k1.dpsi + 2 * k2.dpsi + 2 * k3.dpsi + k4.dpsi);
+      IA += (h / 6) * (k1.wA + 2 * k2.wA + 2 * k3.wA + k4.wA); IB += (h / 6) * (k1.wB + 2 * k2.wB + 2 * k3.wB + k4.wB);
+      if (keep) { prof.x.push((k + 1) * h); prof.c.push([...c]); prof.psi.push(psi * V); }
+    }
+    const res = idx.map((j) => (c[j] - mR[j]) / cs);
+    res.push((F * sum(N.map((q, a) => z[a] * q)) - iq) / (F * Nref)); res.push((Nw * IB - IA) / (Nref * IB)); // current and zero pressure difference
+    return { res, c, psi, N, Nw, prof };
+  };
+  // start: the friction equations are linear in (N, N_w, Δψ) for linear concentration profiles — solve that system at the mean composition
+  const cm = mL.map((v, a) => 0.5 * (v + mR[a])), ctm = cw + sum(cm) + aX, xwm = cw / ctm, xmm = aX / ctm, nn = ns + 2;
+  const guess = (iq) => {
+    const A = Array.from({ length: nn }, () => new Array(nn).fill(0)), bv = new Array(nn).fill(0);
+    for (let a = 0; a < ns; a++) {
+      A[a][a] = xwm / Diw[a] + xmm / Dim[a]; A[a][ns] = -(cm[a] / ctm) / Diw[a]; A[a][ns + 1] = (z[a] * cm[a]) / dm; bv[a] = -(mR[a] - mL[a]) / dm;
+      for (let b = 0; b < ns; b++) if (b !== a) { const d = dij(a, b); if (Number.isFinite(d)) { A[a][a] += cm[b] / ctm / d; A[a][b] -= cm[a] / ctm / d; } }
+      A[ns][a] = z[a]; A[ns + 1][a] = -xwm / Diw[a]; A[ns + 1][ns] += cm[a] / ctm / Diw[a];
+    }
+    bv[ns] = iq / F; A[ns + 1][ns] += xmm / Dwm;
+    for (let a = 0; a < nn; a++) { const sc = Math.max(...A[a].map(Math.abs)) || 1; for (let b = 0; b < nn; b++) A[a][b] /= sc; bv[a] /= sc; }
+    try { return solveLinear(A, bv).slice(0, ns + 1).map((q) => q / Nref); } catch { return new Array(ns + 1).fill(0); }
+  };
+  const u0 = guess(i);
+  let sol = newtonN((u) => shoot(u).res, u0, { tol: 1e-10, maxIter: 60, h: 1e-7 }), iEff = i;
+  if (!(sol.residual < 1e-7)) { // continuation in the current density from the diffusion-only state
+    let us = guess(0), f = 0, df = 0.25, okc = false;
+    const at = (fq, start) => newtonN((u) => shoot(u, false, fq * i).res, start, { tol: 1e-10, maxIter: 40, h: 1e-7 });
+    let sq = at(0, us);
+    if (sq.residual < 1e-6) { us = sq.x; for (let g = 0; g < 80 && f < 1; g++) { const fn = Math.min(1, f + df); sq = at(fn, us); if (sq.residual < 1e-6) { us = sq.x; f = fn; df *= 1.6; if (f >= 1) { sol = sq; okc = true; } } else { df *= 0.4; if (df < 1e-4) break; } } }
+    if (!okc && !(sol.residual < 1e-7)) { sol = { x: us, residual: 0, iterations: sol.iterations, converged: false }; iEff = f * i; } // keep the last converged current of the continuation
+  }
+  const out = shoot(sol.x, true, iEff);
+  const ct = cw + sum(mL) + aX;
+  return { N: out.N, Nw: out.Nw, iUsed: iEff, t: out.N.map((q, a) => (iEff !== 0 ? (z[a] * F * q) / iEff : 0)), tw: iEff !== 0 ? (F * out.Nw) / iEff : 0, mL, mR, donL: pL * V, donR: pR * V, potential: (pL - pR - out.psi) * V, x: out.prof.x, c: out.prof.c, psi: out.prof.psi,
+    Deff: Diw.map((d, a) => 1 / (cw / ct / d + aX / ct / Dim[a])), converged: iEff === i && (sol.converged || sol.residual < 1e-7), residual: sol.residual, iterations: sol.iterations };
+}
+
+// ---- electroconvection: Rubinstein–Zaltzman electro-osmotic slip model ---------------------------------------------
+/** Stokes mode of wavenumber k in the unit layer: W(0) = W(1) = W′(1) = 0, W′(0) = 1 (biharmonic solution). */
+export function stokesMode(k) {
+  const sh = Math.sinh(k), ch = Math.cosh(k), [a, b, d] = solveLinear([[k, 0, 1], [sh, sh, ch], [k * ch, sh + k * ch, ch + k * sh]], [1, 0, 0]);
+  return { W: (y) => (a + b * y) * Math.sinh(k * y) + d * y * Math.cosh(k * y), dW: (y) => b * Math.sinh(k * y) + (a + b * y) * k * Math.cosh(k * y) + d * Math.cosh(k * y) + d * y * k * Math.sinh(k * y) };
+}
+/** Marginal voltage (in RT/F) of the quiescent limiting state for wavenumber k: Pe·V²/8 = −1/(k²·g′(0)), g″ − k²g = W. */
+export function ecMarginal(k, Pe) {
+  const m = stokesMode(k), n = 400; let s = 0;
+  for (let q = 0; q <= n; q++) { const y = q / n, w = q === 0 || q === n ? 1 : q % 2 ? 4 : 2; s += w * m.W(y) * (Math.sinh(k * (1 - y)) / Math.sinh(k)); }
+  return Math.sqrt(8 / (Pe * k * k * (s / (3 * n))));
+}
+/**
+ * Non-linear electroconvection in the depleted diffusion layer (lengths in δ, time in δ²/D, c in bulk units, V in RT/F):
+ *   c_t + u·∇c = ∇²c,  c(x,0) = 0,  c(x,1) = 1,  Stokes flow driven by the slip u_s = −(Pe·V²/8)·∂ₓ ln(∂c/∂y) at the membrane.
+ * Periodic cell of one wavelength 2π/k; the Stokes problem is solved exactly per Fourier mode, the salt balance by explicit finite
+ * differences. Returns the time-averaged Sherwood number ⟨∂c/∂y⟩ = i / i_lim.
+ */
+export function ecSolve({ V, Pe, k, nx = 16, ny = 20, tEnd = 4, modes = 3, keep = false }) {
+  const Lx = (2 * Math.PI) / k, dxx = Lx / nx, dy = 1 / ny, M = Math.min(modes, Math.floor(nx / 2) - 1), amp = (Pe * V * V) / 8;
+  const kn = [], Wn = [], dWn = [], sn = [], cn = [];
+  for (let q = 1; q <= M; q++) { const kk = q * k, m = stokesMode(kk); kn.push(kk); Wn.push(Float64Array.from({ length: ny + 1 }, (_, j) => m.W(j * dy))); dWn.push(Float64Array.from({ length: ny + 1 }, (_, j) => m.dW(j * dy))); sn.push(Float64Array.from({ length: nx }, (_, i) => Math.sin(kk * i * dxx))); cn.push(Float64Array.from({ length: nx }, (_, i) => Math.cos(kk * i * dxx))); }
+  const st = nx, c = new Float64Array((ny + 1) * nx), cnw = new Float64Array((ny + 1) * nx), u = new Float64Array((ny + 1) * nx), w = new Float64Array((ny + 1) * nx), jw = new Float64Array(nx), lj = new Float64Array(nx), us = new Float64Array(nx);
+  for (let j = 0; j <= ny; j++) for (let i = 0; i < nx; i++) c[j * st + i] = j * dy + 0.02 * Math.sin(Math.PI * j * dy) * Math.cos(k * i * dxx);
+  const flow = () => {
+    let nu = 0;
+    for (let i = 0; i < nx; i++) { jw[i] = Math.max((4 * c[st + i] - c[2 * st + i]) / (2 * dy), 1e-6); lj[i] = Math.log(jw[i]); nu += jw[i]; }
+    for (let i = 0; i < nx; i++) us[i] = (-amp * (lj[(i + 1) % nx] - lj[(i + nx - 1) % nx])) / (2 * dxx);
+    u.fill(0); w.fill(0);
+    let umax = 0;
+    for (let q = 0; q < M; q++) {
+      let A = 0, B = 0; for (let i = 0; i < nx; i++) { A += us[i] * sn[q][i]; B += us[i] * cn[q][i]; }
+      A *= 2 / nx; B *= 2 / nx;
+      if (Math.abs(A) + Math.abs(B) < 1e-14) continue;
+      for (let j = 0; j <= ny; j++) { const dWj = dWn[q][j], Wj = kn[q] * Wn[q][j], o = j * st; for (let i = 0; i < nx; i++) { u[o + i] += (A * sn[q][i] + B * cn[q][i]) * dWj; w[o + i] += (-A * cn[q][i] + B * sn[q][i]) * Wj; } }
+    }
+    for (let q = 0; q < u.length; q++) umax = Math.max(umax, Math.abs(u[q]), Math.abs(w[q]));
+    return { nu: nu / nx, umax };
+  };
+  let t = 0, nuAvg = 0, tAvg = 0, steps = 0, nuLast = 1, steady = false, f = flow();
+  const hist = [];
+  while (t < tEnd && steps < 60000) {
+    const hmin = Math.min(dxx, dy), dt = Math.min(0.2 * hmin * hmin, (0.4 * hmin) / (f.umax + 1e-9), tEnd - t), up = f.umax * hmin > 1.8;
+    for (let j = 1; j < ny; j++) for (let i = 0; i < nx; i++) {
+      const o = j * st + i, ip = j * st + ((i + 1) % nx), im = j * st + ((i + nx - 1) % nx), jp = o + st, jm = o - st, uu = u[o], ww = w[o];
+      const cx = up ? (uu > 0 ? (c[o] - c[im]) / dxx : (c[ip] - c[o]) / dxx) : (c[ip] - c[im]) / (2 * dxx), cy = up ? (ww > 0 ? (c[o] - c[jm]) / dy : (c[jp] - c[o]) / dy) : (c[jp] - c[jm]) / (2 * dy);
+      cnw[o] = c[o] + dt * ((c[ip] - 2 * c[o] + c[im]) / (dxx * dxx) + (c[jp] - 2 * c[o] + c[jm]) / (dy * dy) - uu * cx - ww * cy);
+    }
+    for (let i = 0; i < nx; i++) { cnw[i] = 0; cnw[ny * st + i] = 1; }
+    c.set(cnw); t += dt; steps++;
+    f = flow();
+    if (!Number.isFinite(f.nu) || dt < 1e-8) return { nu: NaN, steps, ok: false };
+    if (t > 0.6 * tEnd) { nuAvg += f.nu * dt; tAvg += dt; }
+    if (steps % 200 === 0) { hist.push([t, f.nu]); if (t > 1.5 && Math.abs(f.nu - nuLast) < 2e-7 * (1 + f.nu)) { steady = true; break; } nuLast = f.nu; }
+  }
+  const nu = steady || tAvg <= 0 ? f.nu : nuAvg / tAvg, out = { nu, steps, t, steady, umax: f.umax, Lx, ok: true, hist };
+  if (keep) { const row = (a) => Array.from({ length: ny + 1 }, (_, j) => Array.from({ length: nx + 1 }, (_, i) => a[j * st + (i % nx)])); out.x = Array.from({ length: nx + 1 }, (_, i) => i * dxx); out.y = Array.from({ length: ny + 1 }, (_, j) => j * dy); out.c = row(c); out.u = row(u); out.w = row(w); out.jw = Array.from(jw); }
+  return out;
+}
+const ecCache = new Map();
+/** Electroconvection characteristics for the stack model: threshold voltage, vortex wavelength and over-limiting slope dSh/dV from two non-linear solutions. */
+export function electroconvection(Pe, opt = {}) {
+  const ny = opt.ny || 20, key = `${Pe.toPrecision(4)}|${ny}`;
+  if (ecCache.has(key)) return ecCache.get(key);
+  // vortex pair of wavelength 2δ: the limiting slip formula has no short-wave cut-off (marginal voltage → √(32/Pe) as k → ∞), so the
+  // wavelength is set to the layer scale observed in experiments and direct simulations and the flow is truncated to three harmonics
+  const kc = Math.PI, th = { kc, Vc: ecMarginal(kc, Pe), VcShort: Math.sqrt(32 / Pe) }, pts = [1.3, 1.7].map((f) => { const s = ecSolve({ V: f * th.Vc, Pe, k: kc, ny }); return { V: f * th.Vc, nu: Number.isFinite(s.nu) ? Math.max(1, s.nu) : 1, steady: !!s.steady }; });
+  const slope = Math.max(0, (pts[1].nu - 1) / (pts[1].V - th.Vc)), out = { Pe, ...th, pts, slope };
+  if (ecCache.size > 40) ecCache.clear();
+  ecCache.set(key, out);
+  return out;
+}
+/** Material electro-osmotic Péclet number Pe = ε(RT/F)² / (ηD). */
+export const ecPeclet = (T, D) => (78.4 * (1 - 0.0046 * (T - 25)) * EPS0 * vt(T) ** 2) / (viscosity(T, 0) * D);
+
+// ---- Navier–Stokes / Nernst–Planck in the open channel between two membranes --------------------------------------
+/**
+ * Developing laminar flow between parallel plates from a uniform inlet profile: boundary-layer (parabolised) Navier–Stokes
+ *   u u_x + v u_y = −p′/ρ + ν u_yy,  u_x + v_y = 0,  ∫u dy = U·h,  u = v = 0 at both walls,  p = pOut at the outlet,
+ * marched implicitly in x (pressure gradient from the mass constraint), coupled to the electroneutral Nernst–Planck (salt)
+ * balance u c_x + v c_y = D c_yy with a prescribed salt flux jw (mol/m²·s) leaving through each wall.
+ */
+export function channelNS({ U, h, L, T = 25, D, c0 = 1, jw = [0, 0], ny = 48, growth = 1.08, pOut = 0, keep = 12 }) {
+  const rho = density(T, 0), mu = viscosity(T, 0), nu = mu / rho, y = Float64Array.from({ length: ny + 1 }, (_, j) => 0.5 * h * (1 - Math.cos((Math.PI * j) / ny)));
+  const xs = [0]; let dxq = L * 2e-6; while (xs[xs.length - 1] < L) { xs.push(Math.min(L, xs[xs.length - 1] + dxq)); dxq *= growth; if (L - xs[xs.length - 1] < 0.3 * dxq) xs[xs.length - 1] = L; }
+  const n = ny + 1, a = new Array(n).fill(0), b = new Array(n).fill(1), cc = new Array(n).fill(0), wq = (f) => { let s = 0; for (let j = 1; j < n; j++) s += 0.5 * (f[j] + f[j - 1]) * (y[j] - y[j - 1]); return s; };
+  let u = Array.from({ length: n }, (_, j) => (j === 0 || j === ny ? 0 : U)), v = new Array(n).fill(0), c = new Array(n).fill(c0), p = 0;
+  const out = { x: [], uc: [], dpdx: [], p: [], cw0: [], cw1: [], cb: [], Sh: [], prof: [], y: Array.from(y), rho, mu };
+  const kp = new Set(Array.from({ length: keep }, (_, q) => Math.round(((xs.length - 1) * (q + 1)) / keep)));
+  for (let s = 1; s < xs.length; s++) {
+    const dx = xs[s] - xs[s - 1], r1 = new Array(n).fill(0), r2 = new Array(n).fill(0);
+    for (let j = 1; j < ny; j++) {
+      const hm = y[j] - y[j - 1], hp = y[j + 1] - y[j], dm = 2 / (hm * (hm + hp)), dp = 2 / (hp * (hm + hp)), am = -hp / (hm * (hm + hp)), ap = hm / (hp * (hm + hp)), a0 = (hp - hm) / (hm * hp);
+      a[j] = v[j] * am - nu * dm; cc[j] = v[j] * ap - nu * dp; b[j] = u[j] / dx + v[j] * a0 + nu * (dm + dp); r1[j] = (u[j] * u[j]) / dx; r2[j] = -1;
+    }
+    a[0] = 0; b[0] = 1; cc[0] = 0; a[ny] = 0; b[ny] = 1; cc[ny] = 0;
+    const ua = tridiag(a, b, cc, r1), ub = tridiag(a, b, cc, r2), P = (U * h - wq(ua)) / wq(ub), un = ua.map((q, j) => q + P * ub[j]); // P = p′/ρ
+    const vn = new Array(n).fill(0); for (let j = 1; j < n; j++) vn[j] = vn[j - 1] - 0.5 * ((un[j] - u[j]) / dx + (un[j - 1] - u[j - 1]) / dx) * (y[j] - y[j - 1]);
+    // salt: same operator with the new velocity field, flux boundary conditions at both walls
+    const rc = new Array(n).fill(0);
+    for (let j = 1; j < ny; j++) {
+      const hm = y[j] - y[j - 1], hp = y[j + 1] - y[j], dm = 2 / (hm * (hm + hp)), dp = 2 / (hp * (hm + hp)), am = -hp / (hm * (hm + hp)), ap = hm / (hp * (hm + hp)), a0 = (hp - hm) / (hm * hp);
+      a[j] = vn[j] * am - D * dm; cc[j] = vn[j] * ap - D * dp; b[j] = un[j] / dx + vn[j] * a0 + D * (dm + dp); rc[j] = (un[j] * c[j]) / dx;
+    }
+    a[0] = 0; b[0] = D / (y[1] - y[0]); cc[0] = -D / (y[1] - y[0]); rc[0] = -jw[0]; a[ny] = -D / (y[ny] - y[ny - 1]); b[ny] = D / (y[ny] - y[ny - 1]); cc[ny] = 0; rc[ny] = -jw[1];
+    c = tridiag(a, b, cc, rc); u = un; v = vn; p += rho * P * dx;
+    const cb = wq(u.map((q, j) => q * c[j])) / (U * h), jm = 0.5 * (jw[0] + jw[1]), cwm = 0.5 * (c[0] + c[ny]);
+    out.x.push(xs[s]); out.uc.push(Math.max(...u) / U); out.dpdx.push(rho * P); out.p.push(p); out.cw0.push(c[0]); out.cw1.push(c[ny]); out.cb.push(cb); out.Sh.push(jm !== 0 && cb - cwm !== 0 ? (jm / (cb - cwm)) * ((2 * h) / D) : NaN);
+    if (kp.has(s)) out.prof.push({ x: xs[s], u: u.map((q) => q / U), c: [...c] });
+  }
+  const dpTot = -p, dpFd = (12 * mu * U * L) / (h * h), iE = out.uc.findIndex((q) => q >= 0.99 * 1.5), Re = (rho * U * 2 * h) / mu;
+  let shInt = 0; for (let s = 1; s < out.x.length; s++) if (Number.isFinite(out.Sh[s]) && Number.isFinite(out.Sh[s - 1])) shInt += 0.5 * (out.Sh[s] + out.Sh[s - 1]) * (out.x[s] - out.x[s - 1]);
+  return { ...out, p: out.p.map((q) => pOut + (q - p)), pIn: pOut + dpTot, dp: dpTot, dpFd, Kinc: (dpTot - dpFd) / (0.5 * rho * U * U), fRe: (-out.dpdx[out.dpdx.length - 1] * 2 * (2 * h) * (2 * h)) / (mu * U), entrance: iE >= 0 ? out.x[iE] : L, developed: iE >= 0, Re, Sc: nu / D,
+    ShMean: shInt / (out.x[out.x.length - 1] - out.x[0]), ShEnd: out.Sh[out.Sh.length - 1], cwMin: Math.min(...out.cw0, ...out.cw1), saltIn: U * h * c0, saltOut: U * h * out.cb[out.cb.length - 1] + (jw[0] + jw[1]) * L };
+}
+
+// ---- fouling and scaling of the stack (reduced-order kinetics) ----------------------------------------------------
+/**
+ * Membrane fouling and scaling at constant current: organic deposit m_f (g/m², anion membrane) and mineral scale m_s (g/m², concentrate side)
+ *   dm_f/dt = k_dep·c_f·i_eff/100 − (k_det·u/u_ref + k_rev)·m_f,   dm_s/dt = k_s·[(S_g − 1)₊² + (√S_c − 1)₊²] − k_rev·m_s,   i_eff = i/(1 − b),
+ * with the blocked area fraction b = m_s/(m_s + m_b) and polarity reversal homogenised to k_rev = −ln(1 − η)/τ. Integrated with RK4 (time in days).
+ */
+export function foulingED({ i, u, cFoul, kDep, kDet, rFoul, Sg, Sc, kScale, rScale, mBlock, edr, revInterval, revEff, days, n = 200 }) {
+  const kRev = edr ? (-Math.log(1 - clamp(revEff, 0, 0.999)) / revInterval) * 1440 : 0, sup = Math.max(0, Sg - 1) ** 2 + Math.max(0, Math.sqrt(Math.max(Sc, 0)) - 1) ** 2;
+  const rhs = (t, y) => { const b = Math.max(y[1], 0) / (Math.max(y[1], 0) + mBlock); return [kDep * cFoul * (i / (1 - b) / 100) - (kDet * (u / 0.08) + kRev) * y[0], kScale * sup - kRev * y[1]]; };
+  const sub = clamp(Math.ceil((2 * days * (kDet * (u / 0.08) + kRev + (kScale * sup) / mBlock)) / n), 1, 400), sol = rk4(rhs, [0, 0], 0, days, n * sub); // sub-steps keep the explicit integration stable for fast removal rates
+  const t = [], mf = [], ms = []; for (let k = 0; k <= n; k++) { t.push(sol.t[k * sub]); mf.push(Math.max(sol.y[k * sub][0], 0)); ms.push(Math.max(sol.y[k * sub][1], 0)); }
+  const block = ms.map((m) => m / (m + mBlock));
+  const dR = mf.map((m, k) => (rFoul * m + rScale * ms[k]) * 1e-4), dU = dR.map((r, k) => (i * r) / (1 - block[k]) + 0); // Ω·m² and V per cell pair
+  return { t, mf, ms, block, dR, dU, kRev, sup, mfInf: kDet * (u / 0.08) + kRev > 0 ? (kDep * cFoul * (i / 100)) / (kDet * (u / 0.08) + kRev) : Infinity };
+}
+
+// ---- kernel (Gaussian-process type) surrogate of the mechanistic model ------------------------------------------------
+/** Kernel ridge regression with a squared-exponential kernel on inputs scaled to the unit cube; length scale by leave-one-out error. */
+export function kernelFit(X, y, lam = 1e-6) {
+  const n = X.length, d2 = (a, b) => { let s = 0; for (let q = 0; q < a.length; q++) s += (a[q] - b[q]) ** 2; return s; }, mean = sum(y) / n, yc = y.map((v) => v - mean);
+  let best = null;
+  for (const ell of [0.25, 0.4, 0.6, 0.9, 1.4]) {
+    const K = X.map((a, r) => X.map((b, s) => Math.exp(-d2(a, b) / (2 * ell * ell)) + (r === s ? lam : 0)));
+    let alpha, loo = 0;
+    try { alpha = solveLinear(K, yc); for (let q = 0; q < n; q++) { const e = new Array(n).fill(0); e[q] = 1; const col = solveLinear(K, e); loo += (alpha[q] / col[q]) ** 2; } } catch { continue; }
+    if (!best || loo < best.loo) best = { ell, alpha, loo };
+  }
+  if (!best) throw new Error('The surrogate could not be trained (singular kernel matrix).');
+  return { ...best, rmseLoo: Math.sqrt(best.loo / n), predict: (x) => mean + sum(X.map((a, q) => best.alpha[q] * Math.exp(-d2(a, x) / (2 * best.ell * best.ell)))) };
+}
+
+/** GHK permeabilities (m²/s, relative) of the cation and anion membranes for the tracked ions: counter-ions by diffusivity × selectivity; co-ions scaled so that the small-ratio slope for a single salt equals the permselectivity. */
+function membranePermeabilities(c, par) {
+  let eC = 0, eA = 0, pc = 0, pa = 0, pcs = 0, pas = 0;
+  const sel = Z.map((zj, j) => (DIV[j] ? (zj > 0 ? par.selDivC : par.selDivA) : 1));
+  for (let j = 0; j < NI; j++) { const e = AZ[j] * c[j]; if (Z[j] > 0) { eC += e; pc += e * DI[j]; pcs += e * DI[j] * sel[j]; } else { eA += e; pa += e * DI[j]; pas += e * DI[j] * sel[j]; } }
+  const mc = eC > 0 ? pc / eC : 1.33e-9, ma = eA > 0 ? pa / eA : 2.03e-9, mcs = eC > 0 ? pcs / eC : mc, mas = eA > 0 ? pas / eA : ma;
+  const rC = ((1 - par.alphaC) / (1 + par.alphaC)) * (mcs / ma), rA = ((1 - par.alphaA) / (1 + par.alphaA)) * (mas / mc);
+  return { PC: Z.map((zj, j) => DI[j] * (zj > 0 ? sel[j] : rC)), PA: Z.map((zj, j) => DI[j] * (zj < 0 ? sel[j] : rA)) };
+}
+
+// ---- coupling of the membrane-scale models to the stack ----------------------------------------------------------
+/** Reference Navier–Stokes / Nernst–Planck solution of the open channel at velocity U (unit wall flux: the Sherwood number does not depend on it). */
+function nsReference(U, G, T, Ds, pOut = 0) {
+  const s = channelNS({ U, h: G.h, L: G.L, T, D: Ds, c0: 1, jw: [(1e-3 * Ds) / G.h, (1e-3 * Ds) / G.h], pOut });
+  return { Sh: s.ShMean, Re: s.Re, Sc: s.Sc, dpPerM: s.dp / G.L, U, mu: s.mu, sol: s };
+}
+/** Attach the optional sub-models (channel Navier–Stokes, electroconvection) to the parameter set of a run. */
+function attachModels(p, par, G, T, cf, u0) {
+  const Ds = electrolyte(cf, T).Ds;
+  if (p.flowModel === 'ns') par.ns = nsReference(Math.max(u0, 1e-4), G, T, Ds, (p.pOut || 0) * 1e5);
+  if (p.olModel === 'rz') par.ol = electroconvection(ecPeclet(T, Ds), { ny: clamp(Math.round(p.ecN || 20), 12, 48) });
+  return par;
+}
+/** Electrochemical–thermal coupling: stack energy balance (Joule and polarisation heat, pumping dissipation, heat loss) iterated with the temperature-dependent conductivity, diffusivity and thermal voltage. */
+export function simulateEDThermal(v, ov = {}) {
+  const Tin = v.T, loss = clamp((v.thLoss || 0) / 100, 0, 1), hist = [];
+  let T = Tin, r = null, iso = null, th = null;
+  for (let it = 0; it < 8; it++) {
+    r = simulateED(v, { ...ov, T });
+    if (!iso) iso = { sec: r.sec, U: r.stages.map((s) => s.U), ncp: r.Ncp * r.nSt, kappa: electrolyte(r.cf, T).kappa };
+    const Wsep = r.wMin * 3.6e6 * r.Qprod, Qgen = Math.max(0, r.Pdc - Wsep) + r.Ppump * (v.etaPump / 100), mcp = r.tr.Qf * density(T, 0) * cpWater(T, 0), dT = (Qgen * (1 - loss)) / mcp, Tn = Math.min(Tin + 0.5 * dT, 60);
+    th = { Tin, Tmean: Tn, Tout: Tin + dT, dT, Qgen, Wsep, mcp, loss, iterations: it + 1, iso, kappa: electrolyte(r.cf, Tn).kappa };
+    hist.push([it + 1, T, dT, r.sec]);
+    if (Math.abs(Tn - T) < 5e-3) break;
+    T = Tn;
+  }
+  th.hist = hist;
+  return { ...r, th };
+}
+/** Single-pass rating of an nSt-stage stack at the same voltage on every stage (used for maps, the surrogate and the optimiser). */
+export function rateStack(cf, cc, U, uCm, nSt, G, par, T, nSeg = 4) {
+  const q = (uCm / 100) * G.W * G.h * G.eps; let s = { qd: q, qc: q, cd: cf, cc }, E = 0, I = 0;
+  for (let k = 0; k < nSt; k++) { const m = marchStage(s, U, G, par, T, nSeg); E += U * m.I; I += m.I; s = m.st; }
+  const t0 = tdsOf(cf), t1 = tdsOf(s.cd);
+  return { removal: 1 - t1 / t0, sec: E / (s.qd * 3.6e6), iAvg: I / (nSt * G.W * G.L), cd: s.cd, areaSpec: (2 * nSt * G.W * G.L) / (s.qd * 3600) };
+}
+/** Train and test the kernel surrogate of the stack rating: inputs feed-salinity multiplier, voltage per cell pair and velocity; outputs ln(SEC) and salt removal. */
+export function stackSurrogate(r, nTrain = 48, nTest = 16) {
+  const rg = { s: [0.4, 2.5], U: [0.25, 1.2], u: [3, 16] }, cc0 = r.tr.ccIn, T = r.T;
+  const at = (x) => { const sf = rg.s[0] * (rg.s[1] / rg.s[0]) ** x[0], U = rg.U[0] + (rg.U[1] - rg.U[0]) * x[1], u = rg.u[0] * (rg.u[1] / rg.u[0]) ** x[2], q = rateStack(r.cf.map((c) => c * sf), cc0.map((c) => c * sf), U, u, r.nSt, r.G, r.par, T); return { x, sf, U, u, sec: Math.max(q.sec, 1e-9), removal: q.removal }; };
+  const toX = (sf, U, u) => [Math.log(sf / rg.s[0]) / Math.log(rg.s[1] / rg.s[0]), (U - rg.U[0]) / (rg.U[1] - rg.U[0]), Math.log(u / rg.u[0]) / Math.log(rg.u[1] / rg.u[0])];
+  const tr = lhs(nTrain, 3, 11).map(at), te = lhs(nTest, 3, 29).map(at), X = tr.map((q) => q.x);
+  const mS = kernelFit(X, tr.map((q) => Math.log(q.sec))), mR = kernelFit(X, tr.map((q) => q.removal));
+  const pred = (sf, U, u) => { const x = toX(sf, U, u); return { sec: Math.exp(mS.predict(x)), removal: mR.predict(x) }; };
+  const stat = (a, b) => { const m = sum(a) / a.length, ss = sum(a.map((v) => (v - m) ** 2)), se = sum(a.map((v, k) => (v - b[k]) ** 2)); return { r2: ss > 0 ? 1 - se / ss : 1, rmse: Math.sqrt(se / a.length) }; };
+  const pt = te.map((q) => ({ ...q, p: pred(q.sf, q.U, q.u) })), ptr = tr.map((q) => pred(q.sf, q.U, q.u));
+  return { rg, train: tr, test: pt, pred, mS, mR, sec: stat(pt.map((q) => q.sec), pt.map((q) => q.p.sec)), removal: stat(pt.map((q) => q.removal), pt.map((q) => q.p.removal)), fitSec: stat(tr.map((q) => q.sec), ptr.map((q) => q.sec)), at: (sf, U, u) => at(toX(sf, U, u)) };
+}
+/** Unit cost used by the operating-condition optimiser: electricity plus straight-line membrane replacement, $/m³ of product. */
+export const edCost = (r, p) => p.cElecED * r.sec + (p.cMem * r.area) / (Math.max(p.memLife, 0.1) * 8760 * 0.9 * r.Qprod * 3600);
+/** Grid search over the operating fraction of the limiting current and the linear velocity for the lowest unit cost (design mode). */
+export function optimiseED(v, phis = [40, 55, 70, 85, 95], us = [4, 7, 10, 14]) {
+  const cells = [], z = us.map(() => phis.map(() => null));
+  us.forEach((u, a) => phis.forEach((ph, b) => { try { const q = simulateED({ ...v, mode: 'design' }, { safety: ph, uLin: u, nSeg: Math.min(Math.max(2, Math.round(v.nSeg)), 4), tol: 1e-4 }); if (q.reached) { const c = edCost(q, v); cells.push({ phi: ph, u, cost: c, sec: q.sec, area: q.area, nSt: q.nSt, Ncp: q.Ncp }); z[a][b] = c; } } catch { /* infeasible cell */ } }));
+  const best = cells.reduce((m, c) => (!m || c.cost < m.cost ? c : m), null);
+  return { cells, best, phis, us, z };
+}
+
+/** Results of the optional membrane-scale, thermal, fouling, surrogate and optimisation models for a continuous ED run. */
+function advancedED(r, p, W) {
+  const kpis = [], plots = [], tables = [], recs = [], out = {}, bal = [], T = r.T, st = r.stages, seg0 = st[0].segs[0], e0 = electrolyte(r.cf, T), eC = electrolyte(r.tr.ccIn, T), V = vt(T), i0 = Math.max(seg0.iFilm, 1e-6), delta = seg0.k > 0 ? e0.Ds / seg0.k : 5e-5;
+  const X = p.Xfix * 1000, dm = p.dMem * 1e-6, Dsol = [e0.Dc, e0.Da], Dmem = Dsol.map((d) => 0.05 * d), ratio = clamp(p.pnpRatio || 1.25, 1.05, 2);
+  // ---- always shown: GHK membrane potentials and electrode kinetics at the stack inlet
+  const pm = membranePermeabilities(r.cf, r.par), gC = ghkPotential(pm.PC, Z, r.cf, r.tr.ccIn, T), gA = -ghkPotential(pm.PA, Z, r.cf, r.tr.ccIn, T), lnr = Math.log(eC.ceq / e0.ceq);
+  tables.push({ title: 'Membrane potential and electrode kinetics (stack inlet)', columns: ['Quantity', 'Value', 'Unit'], rows: [
+    ['Cation membrane · Goldman–Hodgkin–Katz zero-current potential', 1000 * gC, 'mV'], ['Cation membrane · permselectivity × Nernst potential', 1000 * V * r.par.alphaC * lnr, 'mV'], ['Anion membrane · Goldman–Hodgkin–Katz zero-current potential', 1000 * gA, 'mV'], ['Anion membrane · permselectivity × Nernst potential', 1000 * V * r.par.alphaA * lnr, 'mV'],
+    ['Model used in the voltage balance', r.par.membModel === 'ghk' ? 'Goldman–Hodgkin–Katz' : 'Permselectivity × Nernst', ''], ['Anode overpotential', 1000 * overpotential(r.iAvg, r.par.i0a, T, r.par.aBV, r.par.kinetics), 'mV'], ['Cathode overpotential', 1000 * overpotential(r.iAvg, r.par.i0c, T, r.par.aBV, r.par.kinetics), 'mV'],
+    ['Tafel slope 2.303·RT/(αF)', (1000 * Math.LN10 * V) / r.par.aBV, 'mV per decade'], ['Kinetic law', r.par.kinetics === 'tafel' ? 'Tafel' : 'Butler–Volmer', '']],
+    note: 'The constant-field (GHK) potential is solved ion by ion for the inlet diluate and concentrate; it equals the permselectivity form for a single salt at small concentration ratios and adds the bi-ionic contribution of mixed feeds.' });
+  if (r.par.membModel === 'ghk') kpis.push({ label: 'GHK membrane potential (inlet, both membranes)', value: 1000 * (gC + gA), unit: 'mV', help: 'Zero-current potential of the cation plus the anion membrane from the Goldman–Hodgkin–Katz equation' });
+  // ---- electroconvection
+  if (r.par.ol) {
+    const ol = r.par.ol, Vs = linspace(0, 2.2 * ol.Vc, 23);
+    kpis.push({ label: 'Electroconvection threshold', value: ol.Vc * V, unit: 'V per depleted layer', help: `${fmt(ol.Vc, 3)} thermal voltages; electro-osmotic Péclet number ${fmt(ol.Pe, 3)}` }, { label: 'Over-limiting slope d(i/i_lim)/dV', value: ol.slope / V, unit: '1/V' });
+    let fld = null; try { fld = ecSolve({ V: 1.7 * ol.Vc, Pe: ol.Pe, k: ol.kc, ny: clamp(Math.round(p.ecN || 20), 12, 48), keep: true }); } catch { fld = null; }
+    plots.push({ type: 'line', title: 'Over-limiting current from electroconvection (Rubinstein–Zaltzman slip model)', xlabel: 'Voltage across one depleted diffusion layer (V)', ylabel: 'i / i_lim', series: [{ name: 'Stack model: 1 + slope·(V − V_c)', x: Vs.map((x) => x * V), y: Vs.map((x) => 1 + ol.slope * Math.max(0, x - ol.Vc)) }, { name: 'Non-linear vortex solutions', x: [ol.Vc, ...ol.pts.map((q) => q.V)].map((x) => x * V), y: [1, ...ol.pts.map((q) => q.nu)], mode: 'points' }], vlines: [{ x: ol.Vc * V, label: 'instability threshold' }], note: `Vortex pair of wavelength 2δ (k = π); the short-wave limit of the marginal curve is √(32/Pe) = ${fmt(Math.sqrt(32 / ol.Pe), 3)} thermal voltages.` });
+    if (fld && fld.ok && fld.c) plots.push({ type: 'field', title: 'Electroconvective vortices in the depleted layer at 1.7 × threshold', xlabel: 'Along the membrane (x/δ)', ylabel: 'Distance from the membrane (y/δ)', zlabel: 'Concentration', zunit: 'c / c_bulk', x: fld.x, y: fld.y, z: fld.c, u: fld.u, v: fld.w, stream: true, cmap: 'salinity', contours: 8, note: `Sherwood number ${fmt(fld.nu, 3)} (i / i_lim); slip velocity up to ${fmt(fld.umax, 3)} D/δ.` });
+    tables.push({ title: 'Electroconvection model', columns: ['Quantity', 'Value', 'Unit'], rows: [['Electro-osmotic Péclet number ε(RT/F)²/(ηD)', ol.Pe, '–'], ['Vortex wavenumber k·δ', ol.kc, '–'], ['Threshold voltage (linear stability)', ol.Vc, 'RT/F'], ['Threshold voltage', ol.Vc * V, 'V'], ['Plateau length per cell pair (two depleted layers)', 2 * ol.Vc * V, 'V'], ...ol.pts.map((q) => [`Sherwood number at ${fmt(q.V / ol.Vc, 3)} × threshold`, q.nu, '–']), ['Over-limiting slope d(i/i_lim)/dV', ol.slope, 'per RT/F']], note: 'These values replace the empirical plateau length and over-limiting conductance in the polarisation curve and in the stack solution.' });
+    out.electroconvectionThresholdV = ol.Vc * V;
+  }
+  // ---- Navier–Stokes / Nernst–Planck channel
+  if (r.par.ns) {
+    const tm = 0.5 * (1 + r.par.alphaC), ts = e0.Dc / (e0.Dc + e0.Da), u0 = r.par.ns.U, jw = ((tm - ts) * r.iAvg) / F;
+    const s = channelNS({ U: u0, h: r.G.h, L: r.G.L, T, D: e0.Ds, c0: e0.ceq, jw: [jw, jw], pOut: (p.pOut || 0) * 1e5 }), ilimNS = (F * s.ShMean * e0.Ds * e0.ceq) / (2 * r.G.h) / (tm - ts);
+    kpis.push({ label: 'Channel inlet pressure (Navier–Stokes)', value: s.pIn / 1e5, unit: 'bar', help: `Outlet pressure ${p.pOut || 0} bar plus the momentum-equation pressure drop of one stage` }, { label: 'Mean Sherwood number (Navier–Stokes–Nernst–Planck)', value: s.ShMean, unit: '–' }, { label: 'Hydrodynamic entrance length', value: s.entrance * 1000, unit: 'mm' });
+    if (s.cwMin <= 0) W.push({ level: 'warn', msg: 'The Navier–Stokes–Nernst–Planck channel solution reaches zero salt concentration at the membrane wall: the mean current exceeds the local limiting current of the open channel.' });
+    plots.push({ type: 'line', title: 'Developing velocity profile between the membranes (Navier–Stokes)', xlabel: 'u / U', ylabel: 'y / h', series: s.prof.filter((_, k) => k % 3 === 0 || k === s.prof.length - 1).map((q) => ({ name: `x = ${fmt(q.x * 1000, 3)} mm`, x: q.u, y: s.y.map((yy) => yy / r.G.h) })), note: `Uniform inflow at ${fmt(u0 * 100, 3)} cm/s, no slip at both membranes; Re = ${fmt(s.Re, 3)}, fully developed centre-line velocity 1.5 U, f·Re = ${fmt(s.fRe, 4)}.` },
+      { type: 'line', title: 'Pressure, Sherwood number and wall concentration along the channel', xlabel: 'Distance from the inlet (m)', ylabel: 'see legend', logx: true, series: [{ name: 'Pressure above outlet (mbar)', x: s.x, y: s.p.map((q) => (q - (p.pOut || 0) * 1e5) / 100) }, { name: 'Local Sherwood number', x: s.x, y: s.Sh }, { name: 'Wall ÷ bulk concentration × 10', x: s.x, y: s.cw0.map((q, k) => (10 * q) / s.cb[k]) }], note: 'Prescribed salt flux (t̄ − t)·i/F through both walls at the mean current density of the stack.' });
+    tables.push({ title: 'Channel hydrodynamics and mass transfer (Navier–Stokes–Nernst–Planck)', columns: ['Quantity', 'Value', 'Unit'], rows: [['Reynolds number (2h)', s.Re, '–'], ['Schmidt number', s.Sc, '–'], ['Entrance length', s.entrance * 1000, 'mm'], ['Pressure drop of one stage', s.dp / 1e5, 'bar'], ['Fully developed (Hagen–Poiseuille) pressure drop', s.dpFd / 1e5, 'bar'], ['Friction factor × Reynolds number at the outlet', s.fRe, '–'], ['Outlet pressure (boundary condition)', p.pOut || 0, 'bar'], ['Inlet pressure', s.pIn / 1e5, 'bar'], ['Mean Sherwood number', s.ShMean, '–'], ['Sherwood number at the outlet', s.ShEnd, '–'], ['Limiting current density from the mean Sherwood number', ilimNS, 'A/m²'], ['Lowest wall concentration', s.cwMin, 'eq/m³']], note: 'Open (spacer-free) channel. With this option the stack model takes its mass-transfer coefficient and pressure gradient from this solution instead of the spacer correlation.' });
+    bal.push({ name: 'Channel salt balance, Navier–Stokes–Nernst–Planck (mol/s per m width)', in: s.saltIn, out: s.saltOut });
+    out.channelInletPressureBar = s.pIn / 1e5;
+  }
+  // ---- Poisson–Nernst–Planck
+  if (p.pnp && p.pnp !== 'off') try {
+    const lam = debyeLength(2 * e0.ceq, T);
+    if (p.pnp === 'membrane') {
+      const base = { cd: e0.ceq, cc: eC.ceq, X, dm, Dp: e0.Dc, Dm: e0.Da, DpM: Dmem[0], DmM: Dmem[1], deltaD: delta, deltaC: delta, T, n: 80 };
+      let pf = npProfile({ ...base, i: i0 }), it = i0; if (!pf.ok) { it = 0.5 * i0; pf = npProfile({ ...base, i: it }); }
+      const spec = (Vv) => ({ z: [1, -1], T, ratio, layers: [{ L: delta, D: Dsol }, { L: dm, D: Dmem, X: -X }, { L: delta, D: Dsol }], left: { type: 'bulk', c: [e0.ceq, e0.ceq], psi: Vv }, right: { type: 'bulk', c: [eC.ceq, eC.ceq], psi: 0 } });
+      const cm = Math.sqrt(e0.ceq * eC.ceq); // continuation: equal concentrations and no voltage (exact Donnan equilibrium) → target concentrations and voltage
+      let Va = pf.ok ? pf.potential : 0.1, s = pnpRamp(spec(Va), { left: { psi: 0, c: [cm, cm] }, right: { c: [cm, cm] } }), Vb = Va, sb = s;
+      if (s.converged && pf.ok) for (let q = 0; q < 8 && Math.abs(sb.current - it) > 1e-7 * it; q++) { const Vn = clamp(q === 0 ? Va * (it / (s.current || it)) : Vb - ((sb.current - it) * (Vb - Va)) / (sb.current - s.current || 1e-30), 0.6 * Vb, 1.6 * Vb + 0.02); if (q > 0) { Va = Vb; s = sb; } const nx = pnpContinue(spec, sb, Vb, Vn); if (!nx.converged) break; Vb = Vn; sb = nx; }
+      s = sb;
+      if (!s.converged) W.push({ level: 'warn', msg: 'The Poisson–Nernst–Planck solver did not converge at the operating current; the last converged state is shown.' });
+      const um = s.x.map((x) => (x - delta) * 1e6), kI = s.x.findIndex((x) => x >= delta), win = s.x.map((x, k) => k).filter((k) => Math.abs(s.x[k] - delta) < 12 * lam), rhoMax = Math.max(...s.rho.map(Math.abs));
+      kpis.push({ label: 'Debye length in the diluate', value: lam * 1e9, unit: 'nm' }, { label: 'Membrane-system voltage, Poisson–Nernst–Planck', value: 1000 * Vb, unit: 'mV', help: `Electroneutral Nernst–Planck–Donnan model: ${pf.ok ? fmt(1000 * pf.potential, 4) : '–'} mV at the same current` }, { label: 'Counter-ion transport number (PNP)', value: s.current !== 0 ? (F * s.J[0]) / s.current : 0, unit: '–' });
+      plots.push({ type: 'line', title: 'Poisson–Nernst–Planck solution: diluate film | cation membrane | concentrate film', xlabel: 'Distance from the diluate-side membrane face (µm)', ylabel: 'mol/m³ · mV', series: [{ name: 'Co-ion, PNP (mol/m³)', x: um, y: s.c[1] }, { name: 'Counter-ion ÷ 20 inside the membrane, PNP', x: um, y: s.c[0].map((c, k) => (s.x[k] > delta && s.x[k] < delta + dm ? c / 20 : c)), dash: true }, { name: 'Potential, PNP (mV)', x: um, y: s.psi.map((q) => 1000 * (q - s.psi[0])) }, ...(pf.ok ? [{ name: 'Co-ion, electroneutral Nernst–Planck–Donnan', x: pf.x.map((x) => x * 1e6), y: pf.c, mode: 'points' }, { name: 'Potential, electroneutral (mV)', x: pf.x.map((x) => x * 1e6), y: pf.phi.map((q) => 1000 * q), mode: 'points' }] : [])], vlines: [{ x: 0, label: 'membrane' }, { x: dm * 1e6, label: '' }], note: `${s.nodes} nodes graded geometrically to ${fmt(Math.min(...s.x.slice(1).map((x, k) => x - s.x[k])) * 1e9, 2)} nm at the interfaces; Scharfetter–Gummel fluxes, Newton iteration (${s.iterations} iterations on the last step). Current ${fmt(s.current, 4)} A/m².` },
+        { type: 'line', title: 'Space-charge region at the diluate | membrane interface', xlabel: 'Distance from the interface (nm)', ylabel: 'see legend', series: [{ name: 'Space charge ρ/F in the solution, × 10 (mol/m³)', x: win.map((k) => (s.x[k] - delta) * 1e9), y: win.map((k) => (s.x[k] <= delta ? (10 * s.rho[k]) / F : 0)) }, { name: 'Space charge ρ/F in the membrane ÷ 10 (mol/m³)', x: win.map((k) => (s.x[k] - delta) * 1e9), y: win.map((k) => (s.x[k] > delta ? s.rho[k] / F / 10 : 0)) }, { name: 'Potential relative to the interface (mV)', x: win.map((k) => (s.x[k] - delta) * 1e9), y: win.map((k) => 1000 * (s.psi[k] - s.psi[kI])) }], note: 'The electroneutral model replaces this double layer by a Donnan potential jump.' });
+      tables.push({ title: 'Poisson–Nernst–Planck solution', columns: ['Quantity', 'Value', 'Unit'], rows: [['Mesh nodes', s.nodes, ''], ['Debye length, diluate', lam * 1e9, 'nm'], ['Debye length, membrane', debyeLength(X, T) * 1e9, 'nm'], ['Current density', s.current, 'A/m²'], ['Voltage across film | membrane | film', 1000 * Vb, 'mV'], ['Same, electroneutral Nernst–Planck–Donnan', pf.ok ? 1000 * pf.potential : null, 'mV'], ['Counter-ion flux', s.J[0], 'mol/m²·s'], ['Co-ion flux', s.J[1], 'mol/m²·s'], ['Co-ion flux, electroneutral model', pf.ok ? pf.Jm : null, 'mol/m²·s'], ['Flux non-uniformity over the mesh (current continuity)', s.fluxSpread, '–'], ['Largest space-charge density', rhoMax / F, 'mol/m³'], ['Field at the diluate-side interface', (-(s.psi[kI + 1] - s.psi[kI - 1]) / (s.x[kI + 1] - s.x[kI - 1])) / 1e6, 'MV/m']] });
+      out.pnpVoltage = Vb;
+    } else if (p.pnp === 'wall') {
+      const psi0 = (p.pnpPsi0 || 100) / 1000, s = pnpRamp({ z: [1, -1], T, ratio: Math.min(ratio, 1.15), res: 12, layers: [{ L: 40 * lam, D: Dsol, n: 30 }], left: { type: 'wall', psi: psi0, flux: [0, 0] }, right: { type: 'bulk', c: [e0.ceq, e0.ceq], psi: 0 } }, { left: { psi: 0 } }, 4);
+      const gc = (x) => 4 * V * Math.atanh(Math.tanh(psi0 / (4 * V)) * Math.exp(-x / lam)), sg = Math.sqrt(8 * 78.4 * EPS0 * R * (T + KELVIN) * e0.ceq) * Math.sinh(psi0 / (2 * V)), kk = s.x.map((x, k) => k).filter((k) => s.x[k] <= 8 * lam);
+      if (!s.converged) W.push({ level: 'warn', msg: 'The Poisson–Nernst–Planck solver did not converge for this wall potential.' });
+      kpis.push({ label: 'Debye length in the diluate', value: lam * 1e9, unit: 'nm' }, { label: 'Surface charge of the wall (PNP)', value: s.sigmaLeft * 1000, unit: 'mC/m²', help: `Grahame equation: ${fmt(sg * 1000, 4)} mC/m²` }, { label: 'Current through the insulating wall', value: s.current, unit: 'A/m²', help: 'Zero-flux (zero-current) boundary condition' });
+      plots.push({ type: 'line', title: 'Diffuse double layer at an insulating charged wall (Poisson–Nernst–Planck)', xlabel: 'Distance from the wall (nm)', ylabel: 'mV · c/c_bulk', series: [{ name: 'Potential, PNP (mV)', x: kk.map((k) => s.x[k] * 1e9), y: kk.map((k) => 1000 * s.psi[k]) }, { name: 'Potential, Gouy–Chapman (mV)', x: kk.map((k) => s.x[k] * 1e9), y: kk.map((k) => 1000 * gc(s.x[k])), mode: 'points' }, { name: 'Counter-ion c/c_bulk', x: kk.map((k) => s.x[k] * 1e9), y: kk.map((k) => s.c[1][k] / e0.ceq) }, { name: 'Co-ion c/c_bulk × 10', x: kk.map((k) => s.x[k] * 1e9), y: kk.map((k) => (10 * s.c[0][k]) / e0.ceq) }], vlines: [{ x: lam * 1e9, label: 'Debye length' }], note: 'No ion crosses the wall (zero-flux, zero-current boundary); the bulk boundary holds the diluate concentration.' });
+      tables.push({ title: 'Poisson–Nernst–Planck solution', columns: ['Quantity', 'Value', 'Unit'], rows: [['Mesh nodes', s.nodes, ''], ['Wall potential', 1000 * psi0, 'mV'], ['Debye length', lam * 1e9, 'nm'], ['Surface charge, PNP', s.sigmaLeft * 1000, 'mC/m²'], ['Surface charge, Grahame equation', sg * 1000, 'mC/m²'], ['Counter-ion enrichment at the wall', s.c[1][0] / e0.ceq, '×'], ['Boltzmann factor exp(Fψ₀/RT)', Math.exp(psi0 / V), '×'], ['Current', s.current, 'A/m²']] });
+      out.pnpSurfaceCharge = s.sigmaLeft;
+    } else {
+      const ilim = (2 * F * e0.Dc * e0.ceq) / delta, cw = X, dl = (Vv) => ({ z: [1, -1], T, ratio: Math.min(ratio, 1.15), layers: [{ L: delta, D: Dsol, n: 30 }], left: { type: 'bulk', c: [e0.ceq, e0.ceq], psi: 0 }, right: { type: 'wall', cFix: [cw, null], flux: [0, 0], psi: -(Math.log(cw / e0.ceq) * V + Vv) } });
+      let s = pnpRamp(dl(0), { right: { psi: 0, cFix: [e0.ceq, null] } }, 4), Vp = 0; const Vl = [0.5, 1, 2, 3, 4, 6, 8, 12, 16, 20, 25, 30, 40].map((x) => x * V), cur = [], done = [];
+      for (const Vv of Vl) { const nx = s.converged ? pnpContinue(dl, s, Vp, Vv) : s; if (!nx.converged) break; s = nx; Vp = Vv; cur.push(s.current / ilim); done.push(Vv); }
+      if (done.length < Vl.length) W.push({ level: 'info', msg: `The Poisson–Nernst–Planck sweep of the depleted layer stopped at ${fmt(Vp, 3)} V.` });
+      const xm = s.x.map((x) => (delta - x) * 1e6), esc = s.x.filter((x, k) => Math.abs(s.rho[k]) / F > 0.05 * e0.ceq), escW = esc.length ? delta - Math.min(...esc) : 0, G2 = done.length > 2 ? ((cur[cur.length - 1] - cur[cur.length - 2]) * ilim) / (done[done.length - 1] - done[done.length - 2]) : 0;
+      kpis.push({ label: 'Limiting current of the film (PNP plateau)', value: (cur.find((_, k) => done[k] >= 8 * V) ?? cur[cur.length - 1] ?? 0) * ilim, unit: 'A/m²', help: `Classical value 2·F·D₊·c/δ = ${fmt(ilim, 4)} A/m²` }, { label: 'Extended space-charge thickness', value: escW * 1e6, unit: 'µm', help: `At ${fmt(Vp, 3)} V across the layer; the equilibrium Debye length is ${fmt(lam * 1e9, 3)} nm` }, { label: 'Over-limiting conductance from space charge', value: G2, unit: 'S/m²' });
+      plots.push({ type: 'line', title: 'Current–voltage curve of the depleted diffusion layer (Poisson–Nernst–Planck)', xlabel: 'Voltage across the layer (V)', ylabel: 'i / i_lim', series: [{ name: 'Poisson–Nernst–Planck', x: done, y: cur, mode: 'both' }, { name: 'Electroneutral: 1 − exp(−FV/2RT)', x: done, y: done.map((q) => 1 - Math.exp(-q / (2 * V))), dash: true }], hlines: [{ y: 1, label: 'i_lim' }], note: 'Ideal cation-exchange surface: fixed counter-ion concentration, no co-ion flux. The slow rise above the plateau is carried by the extended space charge.' },
+        { type: 'line', title: `Ion profiles in the depleted layer at ${fmt(Vp, 3)} V`, xlabel: 'Distance from the membrane surface (µm)', ylabel: 'mol/m³', logx: true, logy: true, series: [{ name: 'Counter-ion', x: xm.slice(0, -1), y: s.c[0].slice(0, -1) }, { name: 'Co-ion', x: xm.slice(0, -1), y: s.c[1].slice(0, -1).map((c) => Math.max(c, 1e-12)) }], note: 'Where the two curves separate the solution carries a net space charge (non-equilibrium double layer).' });
+      tables.push({ title: 'Poisson–Nernst–Planck solution', columns: ['Voltage across the layer (V)', 'i / i_lim (PNP)', 'i / i_lim (electroneutral)'], rows: done.map((q, k) => [q, cur[k], 1 - Math.exp(-q / (2 * V))]), note: `${s.nodes} nodes; no-flux condition for the co-ion and prescribed concentration for the counter-ion at the membrane surface.` });
+      out.pnpLimitingCurrent = ilim;
+    }
+  } catch (e) { W.push({ level: 'warn', msg: `The Poisson–Nernst–Planck model could not be solved: ${e.message}` }); }
+  // ---- Maxwell–Stefan
+  if (p.msModel) try {
+    const eqT = e0.eqC + e0.eqA, act = CH.map((_, j) => j).filter((j) => AZ[j] * r.cf[j] > 1e-3 * eqT), z = act.map((j) => Z[j]), cL = act.map((j) => r.cf[j]), cR = act.map((j) => r.tr.ccIn[j]), fT = e0.Dc / (sum(act.map((j) => (Z[j] > 0 ? AZ[j] * r.cf[j] * DI[j] : 0))) / (e0.eqC || 1) || 1.33e-9);
+    const Diw = act.map((j) => p.msDw * DI[j] * fT), Dim = act.map((j) => p.msDm * DI[j] * fT), cw = p.msWater * 55500, arg = { z, cL, cR, X: -X, dm, Diw, Dim, cw, i: i0, T, n: Math.max(6, Math.round(p.nProf)) };
+    const ms = msMembrane({ ...arg, Dij: p.msDij * 1e-11, Dwm: p.msDwm * 1e-10 }), np = msMembrane({ ...arg, Dij: Infinity, Dwm: 1e-30, Diw: ms.Deff, Dim: act.map(() => Infinity), cw: 1e12 });
+    if (!ms.converged) W.push({ level: 'warn', msg: `The Maxwell–Stefan membrane model converged only up to ${fmt(ms.iUsed, 3)} A/m² instead of the inlet current density of ${fmt(i0, 3)} A/m²; its results are shown for that lower current.` });
+    const tCount = sum(ms.t.filter((_, a) => z[a] > 0)), tNP = sum(np.t.filter((_, a) => z[a] > 0));
+    kpis.push({ label: 'Counter-ion transport number (Maxwell–Stefan)', value: tCount, unit: '–', help: `Nernst–Planck with the same effective diffusivities: ${fmt(tNP, 4)}; stack input ${fmt(0.5 * (1 + r.par.alphaC), 4)}` }, { label: 'Electro-osmotic water transport (Maxwell–Stefan)', value: ms.tw, unit: 'mol H₂O per Faraday', help: 'Water dragged through the cation membrane by ion–water friction' });
+    plots.push({ type: 'line', title: 'Maxwell–Stefan ion profiles in the cation membrane (stack inlet)', xlabel: 'Position in the membrane (µm)', ylabel: 'mol/m³', logy: true, series: act.map((j, a) => ({ name: IONS[CH[j]].label, x: ms.x.map((x) => x * 1e6), y: ms.c.map((c) => Math.max(c[a], 1e-9)) })), note: `Fixed charge ${p.Xfix} mol/L, ${fmt(ms.iUsed, 3)} A/m²; Donnan equilibrium at both faces.` });
+    tables.push({ title: 'Maxwell–Stefan transport in the cation membrane (stack inlet)', columns: ['Ion', 'Diluate face (mol/m³)', 'Concentrate face (mol/m³)', 'Flux (mmol/m²·s)', 'Transport number', 'Transport number, Nernst–Planck', 'Effective diffusivity (10⁻¹¹ m²/s)'], rows: [...act.map((j, a) => [`${IONS[CH[j]].name} ${IONS[CH[j]].label}`, ms.mL[a], ms.mR[a], ms.N[a] * 1000, ms.t[a], np.t[a], ms.Deff[a] * 1e11]), ['Water', cw, cw, ms.Nw * 1000, ms.tw, 0, null]], note: 'Friction of every ion with water, polymer and the other ions; the water flux follows from a zero pressure difference across the membrane. The Nernst–Planck column drops ion–ion friction and water motion. Ions below 0.1 % of the feed equivalents are left out.' });
+    out.msCounterIonTransport = tCount; out.msWaterTransport = ms.tw;
+  } catch (e) { W.push({ level: 'warn', msg: `The Maxwell–Stefan membrane model could not be solved: ${e.message}` }); }
+  // ---- electrochemical–thermal
+  if (r.th) {
+    const th = r.th;
+    if (th.Tout > 45) W.push({ level: 'warn', msg: `The stack outlet reaches ${fmt(th.Tout, 3)} °C; most ion-exchange membranes are limited to about 40–45 °C.` });
+    kpis.push({ label: 'Stack temperature rise', value: th.dT, unit: 'K', help: `${fmt(th.Qgen / 1000, 3)} kW of Joule and polarisation heat; mean stack temperature ${fmt(th.Tmean, 4)} °C` }, { label: 'Specific energy, isothermal at inlet temperature', value: th.iso.sec, unit: 'kWh/m³', help: 'Without the conductivity feedback of the warmer stack' });
+    tables.push({ title: 'Electrochemical–thermal coupling', columns: ['Quantity', 'Value', 'Unit'], rows: [['Inlet temperature', th.Tin, '°C'], ['Mean stack temperature', th.Tmean, '°C'], ['Outlet temperature', th.Tout, '°C'], ['Heat released in the stack', th.Qgen / 1000, 'kW'], ['Reversible work stored in the streams', th.Wsep / 1000, 'kW'], ['Heat lost to the surroundings', 100 * th.loss, '%'], ['Feed conductivity at inlet temperature', th.iso.kappa, 'S/m'], ['Feed conductivity at stack temperature', th.kappa, 'S/m'], ['Specific energy, isothermal', th.iso.sec, 'kWh/m³'], ['Specific energy, with thermal feedback', r.sec, 'kWh/m³'], ['Iterations', th.iterations, '']], note: 'ρ·c_p·Q·ΔT = (1 − loss)·(DC power − reversible work + pumping dissipation); the stack is then re-solved at the mean temperature.' });
+    bal.push({ name: 'Stack energy (kW): heat released vs enthalpy rise + loss', in: th.Qgen / 1000, out: (th.mcp * th.dT + th.loss * th.Qgen) / 1000 });
+    out.stackTemperatureRise = th.dT;
+  }
+  // ---- fouling and scaling
+  if (p.foulModel) {
+    const f = foulingED({ i: r.iAvg, u: seg0.u, cFoul: p.cFoul, kDep: p.kDep, kDet: p.kDet, rFoul: p.rFoul, Sg: r.scWall.gypsum, Sc: r.scWall.calcite, kScale: p.kScale, rScale: p.rScale, mBlock: 50, edr: !!p.edr, revInterval: p.revInterval, revEff: p.revEff / 100, days: p.tCamp, n: 200 });
+    const Umean = sum(st.map((s) => s.U)) / r.nSt, Rcp = Umean / Math.max(r.iAvg, 1e-9), rel = f.dU.map((d) => (100 * d) / Umean), trig = p.cipTrig, kT = rel.findIndex((x) => x >= trig), tClean = kT > 0 ? f.t[kT - 1] + ((f.t[kT] - f.t[kT - 1]) * (trig - rel[kT - 1])) / (rel[kT] - rel[kT - 1]) : kT === 0 ? 0 : null;
+    const dSec = (f.dU[f.dU.length - 1] * sum(st.map((s) => s.I)) * r.Ncp) / (p.etaRect / 100) / 1000 / (r.Qprod * 3600);
+    if (tClean !== null) W.push({ level: tClean < 14 ? 'warn' : 'info', msg: `Fouling and scaling raise the cell-pair voltage by ${trig} % after ${fmt(tClean, 3)} days: plan a clean-in-place at that interval.` });
+    if (f.sup > 0 && !p.edr) W.push({ level: 'warn', msg: 'The concentrate is supersaturated at the membrane wall and no polarity reversal removes the scale: the scale layer grows without bound.' });
+    kpis.push({ label: 'Cell-pair voltage rise from fouling and scaling', value: rel[rel.length - 1], unit: '%', status: rel[rel.length - 1] > trig ? 'warn' : 'ok', help: `After ${p.tCamp} days at constant current` }, { label: 'Days to cleaning', value: tClean ?? p.tCamp, unit: 'd', help: tClean === null ? 'The cleaning trigger is not reached within the simulated campaign' : `Voltage rise of ${trig} %` }, { label: 'Energy increase at the end of the campaign', value: dSec, unit: 'kWh/m³' });
+    plots.push({ type: 'line', title: 'Fouling and scaling during the operating campaign', xlabel: 'Time (d)', ylabel: 'see legend', series: [{ name: 'Organic deposit on the anion membrane (g/m²)', x: f.t, y: f.mf }, { name: 'Mineral scale on the concentrate side (g/m²)', x: f.t, y: f.ms }, { name: 'Cell-pair voltage rise (%)', x: f.t, y: rel }, { name: 'Blocked membrane area (%)', x: f.t, y: f.block.map((b) => 100 * b) }], hlines: [{ y: trig, label: 'cleaning trigger' }], note: `Constant current ${fmt(r.iAvg, 3)} A/m²; wall saturation ratios: gypsum ${fmt(r.scWall.gypsum, 3)}, calcite ${fmt(r.scWall.calcite, 3)}${p.edr ? `; polarity reversal every ${p.revInterval} min removes ${p.revEff} % of the deposits (rate ${fmt(f.kRev, 3)} per day).` : '.'}` });
+    tables.push({ title: 'Fouling and scaling', columns: ['Quantity', 'Value', 'Unit'], rows: [['Organic deposit at the end', f.mf[f.mf.length - 1], 'g/m²'], ['Steady-state organic deposit', Number.isFinite(f.mfInf) ? f.mfInf : null, 'g/m²'], ['Mineral scale at the end', f.ms[f.ms.length - 1], 'g/m²'], ['Blocked area at the end', 100 * f.block[f.block.length - 1], '%'], ['Added area resistance at the end', f.dR[f.dR.length - 1] * 1e4, 'Ω·cm²'], ['Clean cell-pair resistance', Rcp * 1e4, 'Ω·cm²'], ['Voltage rise at the end', f.dU[f.dU.length - 1], 'V per cell pair'], ['Removal rate by polarity reversal', f.kRev, '1/d'], ['Scaling driving force Σ(S − 1)²', f.sup, '–']] });
+    out.daysToCleaningED = tClean; out.foulingVoltageRisePct = rel[rel.length - 1];
+  }
+  // ---- surrogate
+  if (p.surrogate) try {
+    const sg = stackSurrogate(r, clamp(Math.round(p.nTrain || 48), 16, 120)), Us = linspace(0.25, 1.2, 20), uNow = clamp(seg0.u * 100, 3, 16), mech = Us.map((U) => sg.at(1, U, uNow));
+    if (sg.sec.r2 < 0.95) W.push({ level: 'warn', msg: `The surrogate reproduces held-out model runs only with R² = ${fmt(sg.sec.r2, 3)} — increase the number of training runs.` });
+    kpis.push({ label: 'Surrogate R², specific energy (held-out)', value: sg.sec.r2, unit: '–', status: sg.sec.r2 < 0.95 ? 'warn' : 'ok', help: `${sg.train.length} training and ${sg.test.length} held-out runs of the mechanistic stack model` }, { label: 'Surrogate R², salt removal (held-out)', value: sg.removal.r2, unit: '–' });
+    plots.push({ type: 'line', title: 'Surrogate parity on held-out runs', xlabel: 'Mechanistic model', ylabel: 'Surrogate', series: [{ name: 'Specific DC energy (kWh/m³)', x: sg.test.map((q) => q.sec), y: sg.test.map((q) => q.p.sec), mode: 'points' }, { name: 'Salt removal (–)', x: sg.test.map((q) => q.removal), y: sg.test.map((q) => q.p.removal), mode: 'points' }, { name: '1 : 1', x: [0, Math.max(1, ...sg.test.map((q) => q.sec))], y: [0, Math.max(1, ...sg.test.map((q) => q.sec))], dash: true }], note: 'Squared-exponential kernel regression trained on a Latin-hypercube sample of feed salinity (0.4–2.5 ×), voltage (0.25–1.2 V) and velocity (3–16 cm/s).' },
+      { type: 'line', title: 'Surrogate versus mechanistic model along the voltage', xlabel: 'Voltage per cell pair (V)', ylabel: 'kWh/m³ · –', series: [{ name: 'Specific DC energy, mechanistic', x: Us, y: mech.map((q) => q.sec), mode: 'points' }, { name: 'Specific DC energy, surrogate', x: Us, y: Us.map((U) => sg.pred(1, U, uNow).sec) }, { name: 'Salt removal, mechanistic', x: Us, y: mech.map((q) => q.removal), mode: 'points' }, { name: 'Salt removal, surrogate', x: Us, y: Us.map((U) => sg.pred(1, U, uNow).removal) }], note: `Present feed, ${fmt(uNow, 3)} cm/s, ${r.nSt} stage${r.nSt > 1 ? 's' : ''}.` });
+    tables.push({ title: 'Surrogate model (kernel regression)', columns: ['Quantity', 'Specific DC energy', 'Salt removal'], rows: [['Kernel length scale (unit cube)', sg.mS.ell, sg.mR.ell], ['Leave-one-out RMSE (training; ln kWh/m³ · –)', sg.mS.rmseLoo, sg.mR.rmseLoo], ['Held-out R²', sg.sec.r2, sg.removal.r2], ['Held-out RMSE (kWh/m³ · –)', sg.sec.rmse, sg.removal.rmse], ['Training runs', sg.train.length, sg.train.length], ['Held-out runs', sg.test.length, sg.test.length]] },
+      { title: 'Surrogate held-out runs', columns: ['Salinity ×', 'Voltage (V)', 'Velocity (cm/s)', 'SEC model (kWh/m³)', 'SEC surrogate (kWh/m³)', 'Removal model (–)', 'Removal surrogate (–)'], rows: sg.test.map((q) => [q.sf, q.U, q.u, q.sec, q.p.sec, q.removal, q.p.removal]) });
+    out.surrogateR2 = sg.sec.r2;
+  } catch (e) { W.push({ level: 'warn', msg: `The surrogate could not be trained: ${e.message}` }); }
+  // ---- operating-condition optimisation
+  if (p.optimise && p.mode === 'design') {
+    const o = optimiseED(p), base = edCost(r, p);
+    if (o.best) {
+      const zf = o.z.flat().filter((x) => x !== null), zm = zf.length ? Math.max(...zf) : base;
+      kpis.push({ label: 'Lowest unit cost (optimised operation)', value: Math.min(o.best.cost, base), unit: '$/m³', help: `Present operating point: ${fmt(base, 3)} $/m³ (electricity + membrane replacement)` }, { label: 'Optimal i / i_lim', value: o.best.cost <= base ? o.best.phi : p.safety, unit: '%' }, { label: 'Optimal linear velocity', value: o.best.cost <= base ? o.best.u : p.uLin, unit: 'cm/s' });
+      plots.push({ type: 'field', title: 'Unit cost versus operating current fraction and velocity', xlabel: 'Operating current ÷ limiting current (%)', ylabel: 'Linear velocity (cm/s)', zlabel: 'Unit cost', zunit: '$/m³', x: o.phis, y: o.us, z: o.z.map((row) => row.map((x) => (x === null ? zm : x))), cmap: 'viridis', contours: 8, markers: [{ x: o.best.phi, y: o.best.u, label: 'optimum' }, { x: clamp(p.safety, o.phis[0], o.phis[o.phis.length - 1]), y: clamp(p.uLin, o.us[0], o.us[o.us.length - 1]), label: 'present' }], note: 'Each cell is a complete re-design for the same product target (coarse path resolution); cells that miss the target take the highest cost of the map.' });
+      tables.push({ title: 'Operating-condition optimisation', columns: ['i / i_lim (%)', 'Velocity (cm/s)', 'Unit cost ($/m³)', 'Specific energy (kWh/m³)', 'Membrane area (m²)', 'Stages', 'Cell pairs per stage'], rows: [...o.cells].sort((a, b) => a.cost - b.cost).slice(0, 8).map((c) => [c.phi, c.u, c.cost, c.sec, c.area, c.nSt, c.Ncp]), note: `Eight best of ${o.cells.length} feasible designs. A higher current fraction saves membrane area but costs energy; the optimum balances the two at ${p.cElecED} $/kWh and ${p.cMem} $/m² over ${p.memLife} years.` });
+      if (o.best.cost < 0.97 * base) recs.push(`Operating at ${o.best.phi} % of the limiting current and ${o.best.u} cm/s lowers the unit cost from ${fmt(base, 3)} to ${fmt(o.best.cost, 3)} $/m³.`);
+      out.optimalCurrentFraction = o.best.phi; out.optimalVelocity = o.best.u; out.optimalCost = o.best.cost;
+    } else W.push({ level: 'warn', msg: 'No operating point of the optimisation grid reaches the product target.' });
+  }
+  return { kpis, plots, tables, recs, out, bal };
 }
 
 const suite = {
@@ -384,12 +1012,11 @@ const suite = {
     'Check the membrane and spacer properties on Model setup; calibrate resistance, permselectivity and the Sherwood coefficient against stack data if you have them.',
     'Run. Keep the current below about 70–80 % of the limiting current density, and check the scaling ratios of the concentrate and the voltage breakdown.',
   ],
-  referenceOnly: ['poisson equation', 'poisson-nernst-planck', 'nernst-planck-poisson', 'electroconvection'],
-  implemented: ['nernst-planck equation', 'poisson equation', 'electroneutral nernst-planck', 'nernst equation', 'donnan-equilibrium', 'ohm', 'faraday', 'butler-volmer', 'tafel', 'charge-conservation', 'current-continuity', 'ionic mass balance', 'convection-diffusion', 'water-dissociation', 'membrane partition',
-    'donnan-nernst-planck', 'electro-osmosis-ion-transport', 'electrodialysis-water-splitting', 'bipolar-membrane', 'electrode-reaction-ion-transport',
-    'ion concentration', 'electric potential', 'membrane charge', 'temperature', 'velocity', 'electrode state', 'fixed-potential', 'imposed-current', 'electrode butler-volmer', 'donnan-interface', 'ion-partition', 'specified-concentration', 'inlet-flow', 'membrane-interface continuity',
-    'electrolyte chemistry', 'ionic-species transport', 'diffusion', 'electromigration', 'convection', 'electric-potential calculation', 'current-density prediction', 'ion-exchange membrane modelling', 'membrane selectivity', 'membrane resistance', 'electrode reactions', 'electrode compartments', 'concentration and diluate channels', 'concentration polarisation', 'limiting-current assessment', 'water transport', 'electro-osmosis', 'acid-base chemistry', 'electrochemical reactions', 'electrical-energy consumption', 'stack configuration', 'dynamic simulation'],
-  equationsNote: 'Channels are one-dimensional plug flow with a film (Sherwood) boundary layer; the film solution is the exact electroneutral Nernst–Planck result for an equivalent binary salt built from the equivalent-weighted ion diffusivities, so the space-charge region of the full Poisson problem is not resolved. Membrane transport numbers split the current between counter-ions in proportion to mobility × concentration × selectivity. The over-limiting branch (plateau length and slope) and the share of water splitting are empirical inputs. Activity coefficients are ideal except in the gypsum and calcite saturation ratios (Davies), which are screening values — use suite 2 for speciation; membrane fouling is not modelled. Bipolar-membrane ED and capacitive deionisation are reduced-order models (lumped unit voltage with empirical current efficiency; equilibrium modified-Donnan / Gouy–Chapman–Stern double layers with RC charging) intended for sizing, not for stack design. Valid for roughly 0.2–40 g/L and 5–45 °C.',
+  implemented: ['nernst-planck equation', 'poisson equation', 'electroneutral nernst-planck', 'nernst equation', 'donnan-equilibrium', 'ohm', 'faraday', 'butler-volmer', 'tafel', 'charge-conservation', 'current-continuity', 'ionic mass balance', 'convection-diffusion', 'water-dissociation', 'membrane partition', 'poisson-nernst-planck', 'goldman-hodgkin-katz', 'navier-stokes equation',
+    'donnan-nernst-planck', 'electro-osmosis-ion-transport', 'electrodialysis-water-splitting', 'bipolar-membrane', 'electrode-reaction-ion-transport', 'nernst-planck-poisson', 'nernst-planck-navier-stokes', 'maxwell-stefan-electrochemical', 'electroconvection model', 'electrochemical-thermal', 'electrochemical-machine-learning',
+    'ion concentration', 'electric potential', 'membrane charge', 'temperature', 'velocity', 'electrode state', 'fixed-potential', 'imposed-current', 'electrode butler-volmer', 'donnan-interface', 'ion-partition', 'specified-concentration', 'inlet-flow', 'membrane-interface continuity', 'insulating/zero-current', 'specified-ion-flux', 'no-flux', 'outlet-pressure',
+    'electrolyte chemistry', 'ionic-species transport', 'diffusion', 'electromigration', 'convection', 'electric-potential calculation', 'current-density prediction', 'ion-exchange membrane modelling', 'membrane selectivity', 'membrane resistance', 'electrode reactions', 'electrode compartments', 'concentration and diluate channels', 'concentration polarisation', 'limiting-current assessment', 'water transport', 'electro-osmosis', 'acid-base chemistry', 'electrochemical reactions', 'electrical-energy consumption', 'stack configuration', 'dynamic simulation', 'fouling and scaling', 'operating-condition optimisation'],
+  equationsNote: 'Stack model: channels are one-dimensional plug flow with a film (Sherwood) boundary layer; the film solution is the exact electroneutral Nernst–Planck result for an equivalent binary salt built from the equivalent-weighted ion diffusivities, and membrane transport numbers split the current between counter-ions in proportion to mobility × concentration × selectivity. Optional sub-models on Model setup resolve what this leaves out: (1) a steady 1-D Poisson–Nernst–Planck solver (finite volumes, Scharfetter–Gummel fluxes, Newton iteration, mesh graded to the Debye length) for a binary 1:1 electrolyte across film | membrane | film, at an insulating charged wall or in the depleted diffusion layer — it is a local analysis shown beside the stack result, not fed back into it; (2) the Goldman–Hodgkin–Katz constant-field membrane potential, solved ion by ion for the bulk compositions with its local slope carrying the polarisation correction; (3) Maxwell–Stefan friction transport of all feed ions in the cation membrane with electro-osmotic water drag (ideal activities, constant friction diffusivities); (4) electroconvection from the Rubinstein–Zaltzman limiting electro-osmotic slip model — linear-stability threshold and a 2-D non-linear Stokes / salt-transport solution for a vortex pair of wavelength 2δ with the flow truncated to three Fourier modes, which regularises the short-wave singularity of the limiting slip formula; it replaces the empirical plateau length and over-limiting conductance, while the share of water splitting stays an input; (5) boundary-layer (parabolised) Navier–Stokes with electroneutral Nernst–Planck salt transport for developing laminar flow in an open, spacer-free channel (no axial diffusion or recirculation), which then supplies the mass-transfer coefficient and pressure gradient of the stack; (6) a stack energy balance with temperature-dependent properties at the mean stack temperature; (7) reduced-order fouling and scaling kinetics at constant current with polarity reversal homogenised to a first-order removal rate; (8) a kernel-regression surrogate trained on the mechanistic single-pass rating; and (9) a grid search of current fraction and velocity for the lowest unit cost. Electrode kinetics follow Butler–Volmer with a selectable transfer coefficient or its Tafel limit. Activity coefficients are ideal except in the gypsum and calcite saturation ratios (Davies), which are screening values — use suite 2 for speciation. Bipolar-membrane ED and capacitive deionisation are reduced-order models (lumped unit voltage with empirical current efficiency; equilibrium modified-Donnan / Gouy–Chapman–Stern double layers with RC charging) intended for sizing, not for stack design. Valid for roughly 0.2–40 g/L and 5–45 °C.',
 
   inputs: [
     { group: 'Process and duty', help: 'What the electro-membrane system must do.', fields: [
@@ -463,13 +1090,49 @@ const suite = {
       { key: 'shB', label: 'Sherwood Reynolds exponent b', unit: '–', value: 0.5, min: 0.3, max: 0.9, help: 'Spacer-filled channels give 0.5–0.7.' },
       { key: 'kdp', label: 'Pressure-drop multiplier', unit: '×', value: 1, min: 0.2, max: 10, help: 'Scales the spacer friction factor f = 6.23 Re^−0.3.' },
       { key: 'dpManifold', label: 'Manifold and piping loss per stage', unit: 'bar', value: 0.3, min: 0, max: 3, showIf: (v) => v.process !== 'mcdi', help: 'Added to the channel pressure drop.' },
-      { key: 'plateau', label: 'Limiting-plateau length', unit: 'V per cell pair', value: 0.6, min: 0.05, max: 3, help: 'Extra voltage beyond the limiting current before over-limiting conduction sets in.' },
-      { key: 'olSlope', label: 'Over-limiting conductance ÷ ohmic conductance', unit: '–', value: 0.5, min: 0, max: 2, help: 'Slope of the over-limiting branch of the polarisation curve.' },
+      { key: 'plateau', label: 'Limiting-plateau length', unit: 'V per cell pair', value: 0.6, min: 0.05, max: 3, showIf: (v) => v.olModel !== 'rz', help: 'Extra voltage beyond the limiting current before over-limiting conduction sets in.' },
+      { key: 'olSlope', label: 'Over-limiting conductance ÷ ohmic conductance', unit: '–', value: 0.5, min: 0, max: 2, showIf: (v) => v.olModel !== 'rz', help: 'Slope of the over-limiting branch of the polarisation curve.' },
       { key: 'fws', label: 'Share of over-limiting current from water splitting', unit: '–', value: 0.5, min: 0, max: 1, help: 'The remainder is carried by salt through electro-convection.' },
+    ] },
+    { group: 'Membrane-scale and channel models', tab: 'setup', showIf: isED, help: 'Optional detailed models. The first three change the stack solution; the Poisson–Nernst–Planck and Maxwell–Stefan solvers are local analyses at the stack inlet (continuous operation).', fields: [
+      { key: 'membModel', label: 'Membrane potential', type: 'select', value: 'tms', options: [{ value: 'tms', label: 'Permselectivity × Nernst potential' }, { value: 'ghk', label: 'Goldman–Hodgkin–Katz constant-field equation' }], help: 'GHK solves the zero-current potential of each membrane ion by ion for the bulk compositions; concentration polarisation enters through its local slope.' },
+      { key: 'olModel', label: 'Over-limiting current', type: 'select', value: 'empirical', options: [{ value: 'empirical', label: 'Empirical plateau length and conductance' }, { value: 'rz', label: 'Electroconvection (Rubinstein–Zaltzman slip model)' }], help: 'The electroconvection model computes the instability threshold and the vortex-enhanced current from a 2-D Stokes / salt-transport solution (adds about a second).' },
+      { key: 'flowModel', label: 'Channel flow and mass transfer', type: 'select', value: 'corr', options: [{ value: 'corr', label: 'Spacer correlation Sh = a·Re^b·Sc^⅓' }, { value: 'ns', label: 'Navier–Stokes + Nernst–Planck, open channel' }], help: 'The Navier–Stokes option marches the developing laminar flow and the salt boundary layers between two membranes without a spacer and uses its Sherwood number and pressure drop.' },
+      { key: 'pOut', label: 'Channel outlet pressure', unit: 'bar', value: 0.2, min: 0, max: 5, showIf: (v) => v.flowModel === 'ns', help: 'Gauge pressure at the stage outlet (boundary condition of the momentum equation); the inlet pressure follows.' },
+      { key: 'pnp', label: 'Poisson–Nernst–Planck solver', type: 'select', value: 'off', options: [{ value: 'off', label: 'Off' }, { value: 'membrane', label: 'Film | cation membrane | film at the operating current' }, { value: 'wall', label: 'Double layer at an insulating charged wall' }, { value: 'depleted', label: 'Depleted diffusion layer: current–voltage curve with space charge' }], showIf: cont, help: 'Resolves the space-charge regions that the electroneutral model replaces by Donnan jumps. Equivalent 1:1 salt at the stack inlet.' },
+      { key: 'pnpPsi0', label: 'Wall potential', unit: 'mV', value: 100, min: 1, max: 300, showIf: (v) => cont(v) && v.pnp === 'wall', help: 'Potential of the insulating wall relative to the bulk solution.' },
+      { key: 'msModel', label: 'Maxwell–Stefan transport in the cation membrane', type: 'bool', value: false, showIf: cont, help: 'Multi-ion friction model with electro-osmotic water drag, compared with Nernst–Planck.' },
+      { key: 'msWater', label: 'Water volume fraction of the membrane', unit: '–', value: 0.3, min: 0.05, max: 0.7, showIf: (v) => cont(v) && v.msModel, help: 'Sets the water concentration inside the membrane.' },
+      { key: 'msDw', label: 'Ion–water diffusivity ÷ solution diffusivity', unit: '–', value: 0.06, min: 0.005, max: 1, showIf: (v) => cont(v) && v.msModel, help: 'Maxwell–Stefan ion–water friction in the membrane pores.' },
+      { key: 'msDm', label: 'Ion–polymer diffusivity ÷ solution diffusivity', unit: '–', value: 0.03, min: 0.002, max: 1, showIf: (v) => cont(v) && v.msModel, help: 'Friction of the ions with the fixed charges and the polymer matrix.' },
+      { key: 'msDij', label: 'Ion–ion diffusivity', unit: '10⁻¹¹ m²/s', value: 5, min: 0.05, max: 1000, showIf: (v) => cont(v) && v.msModel, help: 'Friction between different ions; large values recover Nernst–Planck.' },
+      { key: 'msDwm', label: 'Water–polymer diffusivity', unit: '10⁻¹⁰ m²/s', value: 1.2, min: 0.01, max: 100, showIf: (v) => cont(v) && v.msModel, help: 'Controls how easily the ions drag water through the membrane.' },
+    ] },
+    { group: 'Stack temperature, fouling, surrogate and optimisation', tab: 'setup', showIf: cont, help: 'Optional modules for continuous ED operation.', fields: [
+      { key: 'thermalModel', label: 'Electrochemical–thermal coupling', type: 'bool', value: false, help: 'Joule heat warms the stack; conductivity and diffusivity are re-evaluated at the mean stack temperature (re-solves the stack a few times).' },
+      { key: 'thLoss', label: 'Heat lost to the surroundings', unit: '% of heat released', value: 0, min: 0, max: 100, showIf: (v) => v.thermalModel, help: '0 = adiabatic stack.' },
+      { key: 'foulModel', label: 'Fouling and scaling module', type: 'bool', value: false, help: 'Growth of organic deposit and mineral scale at constant current, the voltage and energy rise, and the cleaning interval.' },
+      { key: 'cFoul', label: 'Charged organic foulant in the feed', unit: 'mg/L', value: 3, min: 0, max: 200, showIf: (v) => v.foulModel, help: 'Humic substances and other anionic organics that deposit on the anion membrane.' },
+      { key: 'kDep', label: 'Deposition coefficient', unit: 'g/m²·d per mg/L at 100 A/m²', value: 0.02, min: 0, max: 5, showIf: (v) => v.foulModel, help: 'Electro-deposition rate, proportional to foulant concentration and current density.' },
+      { key: 'kDet', label: 'Detachment rate at 8 cm/s', unit: '1/d', value: 0.05, min: 0, max: 20, showIf: (v) => v.foulModel, help: 'First-order shear removal, proportional to the velocity.' },
+      { key: 'rFoul', label: 'Resistance of the organic deposit', unit: 'Ω·cm² per g/m²', value: 2, min: 0, max: 100, showIf: (v) => v.foulModel, help: 'Added area resistance per unit deposit.' },
+      { key: 'kScale', label: 'Scale growth coefficient', unit: 'g/m²·d', value: 2, min: 0, max: 500, showIf: (v) => v.foulModel, help: 'Rate = k·[(S_gypsum − 1)² + (√S_calcite − 1)²] at the concentrate-side wall; zero below saturation.' },
+      { key: 'rScale', label: 'Resistance of the scale layer', unit: 'Ω·cm² per g/m²', value: 0.5, min: 0, max: 100, showIf: (v) => v.foulModel, help: 'Added area resistance per unit scale; scale also blocks membrane area.' },
+      { key: 'revEff', label: 'Deposit removed per polarity reversal', unit: '%', value: 60, min: 0, max: 99.9, showIf: (v) => v.foulModel && v.edr, help: 'Share of deposit and scale shed at every reversal.' },
+      { key: 'tCamp', label: 'Operating campaign', unit: 'd', value: 60, min: 1, max: 1000, showIf: (v) => v.foulModel, help: 'Simulated time between cleanings.' },
+      { key: 'cipTrig', label: 'Cleaning trigger: cell-pair voltage rise', unit: '%', value: 10, min: 1, max: 100, showIf: (v) => v.foulModel, help: 'Clean-in-place is planned when the voltage at constant current has risen by this much.' },
+      { key: 'surrogate', label: 'Train a surrogate (machine-learning) model', type: 'bool', value: false, help: 'Kernel regression of specific energy and salt removal versus feed salinity, voltage and velocity, trained on runs of the mechanistic stack model and tested on held-out runs.' },
+      { key: 'nTrain', label: 'Training runs', unit: '', value: 48, min: 16, max: 120, step: 1, showIf: (v) => v.surrogate, help: 'Latin-hypercube sample; 16 further runs are held out for the parity test.' },
+      { key: 'optimise', label: 'Optimise the operating conditions', type: 'bool', value: false, showIf: (v) => v.mode === 'design', help: 'Grid search of the allowed current fraction (which sets the number of stages) and the velocity (which sets the cell pairs) for the lowest unit cost: 20 re-designs, a few seconds.' },
+      { key: 'cElecED', label: 'Electricity price', unit: '$/kWh', value: 0.08, min: 0, max: 1, showIf: (v) => v.mode === 'design' && v.optimise, help: 'For the energy part of the unit cost.' },
+      { key: 'cMem', label: 'Installed membrane cost', unit: '$/m²', value: 100, min: 1, max: 2000, showIf: (v) => v.mode === 'design' && v.optimise, help: 'Membranes with spacers and stack hardware per m² of membrane.' },
+      { key: 'memLife', label: 'Membrane life', unit: 'y', value: 7, min: 0.5, max: 20, showIf: (v) => v.mode === 'design' && v.optimise, help: 'Straight-line replacement over this period at 90 % availability.' },
     ] },
     { group: 'Electrodes and power supply', tab: 'setup', showIf: (v) => v.process !== 'mcdi', help: 'Boundary conditions at the electrode compartments.', fields: [
       { key: 'i0a', label: 'Anode exchange current density', unit: 'A/m²', value: 0.001, min: 1e-6, max: 100, help: 'Oxygen evolution on a mixed-metal-oxide anode.' },
       { key: 'i0c', label: 'Cathode exchange current density', unit: 'A/m²', value: 0.1, min: 1e-5, max: 1000, help: 'Hydrogen evolution on stainless steel or nickel.' },
+      { key: 'kinetics', label: 'Electrode kinetics', type: 'select', value: 'bv', options: [{ value: 'bv', label: 'Butler–Volmer equation' }, { value: 'tafel', label: 'Tafel equation (high-overpotential limit)' }], help: 'Butler–Volmer: i = i₀[exp(αFη/RT) − exp(−(1−α)Fη/RT)]; Tafel: η = (RT/αF)·ln(i/i₀).' },
+      { key: 'alphaBV', label: 'Charge-transfer coefficient α', unit: '–', value: 0.5, min: 0.05, max: 0.95, help: '0.5 gives the symmetric Butler–Volmer equation; the Tafel slope is 2.303·RT/(αF).' },
       { key: 'Rrinse', label: 'Electrode-rinse compartment resistance', unit: 'Ω·cm²', value: 20, min: 0, max: 500, help: 'Both rinse compartments and end membranes together.' },
       { key: 'shunt', label: 'Shunt (manifold leakage) current', unit: '%', value: 2, min: 0, max: 30, help: 'Share of the electrode current bypassing the cells through the manifolds.' },
       { key: 'etaRect', label: 'Rectifier efficiency', unit: '%', value: 95, min: 60, max: 100, help: 'AC to DC conversion.' },
@@ -486,7 +1149,9 @@ const suite = {
     { group: 'Discretisation', tab: 'mesh', help: 'Numerical resolution along the flow path and in time.', fields: [
       { key: 'nSeg', label: 'Segments per stage along the flow path', unit: '', value: 12, min: 2, max: 200, step: 1, help: 'Midpoint (second-order) marching; use the sensitivity study to confirm convergence.' },
       { key: 'nt', label: 'Time steps (batch and CDI cycle)', unit: '', value: 120, min: 4, max: 2000, step: 1, help: 'RK4 steps for batch ED and for each CDI half-cycle.' },
-      { key: 'nProf', label: 'Points across the membrane (profile solver)', unit: '', value: 40, min: 6, max: 400, step: 1, help: 'RK4 steps of the Nernst–Planck–Donnan profile inside the membrane.' },
+      { key: 'nProf', label: 'Points across the membrane (profile solver)', unit: '', value: 40, min: 6, max: 400, step: 1, help: 'RK4 steps of the Nernst–Planck–Donnan and Maxwell–Stefan profiles inside the membrane.' },
+      { key: 'pnpRatio', label: 'Poisson–Nernst–Planck mesh growth ratio', unit: '–', value: 1.25, min: 1.05, max: 2, showIf: (v) => cont(v) && v.pnp && v.pnp !== 'off', help: 'Ratio of neighbouring cell sizes away from each interface; the first cell is a fifth of the local Debye length. Smaller = finer.' },
+      { key: 'ecN', label: 'Electroconvection grid cells across the layer', unit: '', value: 20, min: 12, max: 48, step: 1, showIf: (v) => isED(v) && v.olModel === 'rz', help: 'Finite-difference cells across the depleted diffusion layer in the 2-D vortex solution.' },
     ] },
   ],
 
@@ -569,6 +1234,80 @@ const suite = {
     add('CDI charge efficiency equals tanh(Δφ_D / 2) without attraction term', Math.tanh(e0.a.phiD / vt(25) / 2), e0.effCDI, 1e-9, 'Modified-Donnan model, μ_att = 0, discharge at 0 V');
     const gc = gcs(0.5, 20, d);
     add('Gouy–Chapman–Stern charge efficiency equals tanh(Δφ_d / 4)', Math.tanh(gc.phiD / vt(25) / 4), gc.w / gc.sigma, 1e-12, 'Salt excess ÷ surface charge of a planar double layer');
+    // ---- Poisson–Nernst–Planck solver
+    const V25 = vt(25), D2 = [IONS.Na.D, IONS.Cl.D], D2m = D2.map((x) => 0.05 * x), sys = (cl, cr, Vv) => ({ z: [1, -1], layers: [{ L: 5e-5, D: D2 }, { L: 130e-6, D: D2m, X: -3000 }, { L: 5e-5, D: D2 }], left: { type: 'bulk', c: [cl, cl], psi: Vv }, right: { type: 'bulk', c: [cr, cr], psi: 0 } });
+    const pq = solvePNP(sys(100, 100, 0)), kMid = pq.x.findIndex((x) => x >= 115e-6);
+    add('Poisson–Nernst–Planck: Donnan potential of the membrane at equilibrium', donnanPotential(100, 3000), pq.psi[kMid], 1e-9, `Potential in the membrane core against 0.1 mol/L on both sides (V); ${pq.nodes} nodes, zero applied voltage`);
+    add('Poisson–Nernst–Planck: no current at equilibrium', 0, pq.current, 1e-6, 'A/m²');
+    const lamV = debyeLength(20), gw = pnpRamp({ z: [1, -1], layers: [{ L: 40 * lamV, D: D2, n: 30 }], left: { type: 'wall', psi: 0.1, flux: [0, 0] }, right: { type: 'bulk', c: [10, 10], psi: 0 }, res: 20, ratio: 1.1 }, { left: { psi: 0 } });
+    add('Poisson equation: Gouy–Chapman potential decay at a charged wall', 0, Math.max(...gw.x.map((x, k) => Math.abs(gw.psi[k] - 4 * V25 * Math.atanh(Math.tanh(0.1 / (4 * V25)) * Math.exp(-x / lamV))))), 1e-4, 'Largest deviation from ψ = 4(RT/F)·atanh[tanh(Fψ₀/4RT)·exp(−x/λ_D)] for ψ₀ = 100 mV in 10 mol/m³ (V)');
+    const grah = Math.sqrt(8 * 78.4 * EPS0 * R * 298.15 * 10) * Math.sinh(0.1 / (2 * V25));
+    add('Poisson–Nernst–Planck: surface charge equals the Grahame equation', grah, gw.sigmaLeft, 3e-3 * grah, 'σ = √(8εRTc)·sinh(Fψ₀/2RT), C/m²');
+    add('Insulating wall: zero ion flux gives zero current', 0, gw.current, 1e-6, 'No-flux boundary for both ions (A/m²)');
+    const ljs = (Vv) => ({ z: [1, -1], layers: [{ L: 1e-4, D: D2, n: 60 }], left: { type: 'bulk', c: [100, 100], psi: Vv }, right: { type: 'bulk', c: [10, 10], psi: 0 } });
+    let ja = solvePNP(ljs(0)), Vq = 0.012, jb = pnpContinue(ljs, ja, 0, Vq), Vprev = 0;
+    for (let q = 0; q < 8 && Math.abs(jb.current) > 1e-9; q++) { const Vn = Vq - (jb.current * (Vq - Vprev)) / (jb.current - ja.current); ja = jb; Vprev = Vq; jb = pnpContinue(ljs, jb, Vq, Vn); Vq = Vn; }
+    add('Poisson–Nernst–Planck: diffusion potential of a salt gradient (Planck–Henderson)', (V25 * (D2[1] - D2[0]) * Math.log(10)) / (D2[0] + D2[1]), Vq, 4e-5, 'Zero-current potential (RT/F)·(D₋ − D₊)/(D₊ + D₋)·ln(c_L/c_R) of the electroneutral bulk (V)');
+    add('Poisson–Nernst–Planck: electroneutral salt flux in the bulk', (2 * D2[0] * D2[1] * 90) / (D2[0] + D2[1]) / 1e-4, jb.J[0], 2e-7, 'J = D_s·Δc/L with D_s = 2D₊D₋/(D₊ + D₋), mol/m²·s');
+    const pnE = npProfile({ cd: 50, cc: 100, i: 150, X: 3000, dm: 130e-6, Dp: D2[0], Dm: D2[1], DpM: D2m[0], DmM: D2m[1], deltaD: 5e-5, deltaC: 5e-5, n: 80 }), pnP = pnpRamp(sys(50, 100, pnE.potential), { left: { psi: 0, c: [70, 70] }, right: { c: [70, 70] } });
+    add('Poisson–Nernst–Planck agrees with the electroneutral Nernst–Planck–Donnan model', 150, pnP.current, 1.5, 'Current through film | membrane | film at the voltage the electroneutral model needs for 150 A/m² (the Debye length is far below every layer thickness)');
+    add('Poisson–Nernst–Planck: co-ion leakage through the membrane', pnE.Jm, pnP.J[1], 0.02 * Math.abs(pnE.Jm), 'Co-ion flux of both models (mol/m²·s)');
+    add('Poisson–Nernst–Planck: fluxes are uniform over the mesh', 0, pnP.fluxSpread, 1e-6, 'Current continuity: largest face-to-face difference of an ion flux ÷ largest flux');
+    const dls = (Vv) => ({ z: [1, -1], ratio: 1.15, layers: [{ L: 5e-5, D: D2, n: 30 }], left: { type: 'bulk', c: [50, 50], psi: 0 }, right: { type: 'wall', cFix: [3000, null], flux: [0, 0], psi: -(Math.log(60) * V25 + Vv) } });
+    const d0 = pnpRamp(dls(0), { right: { psi: 0, cFix: [50, null] } }), d1 = pnpContinue(dls, d0, 0, V25), d2 = pnpContinue(dls, d1, V25, 12 * V25), ilimP = (2 * F * D2[0] * 50) / 5e-5;
+    add('Poisson–Nernst–Planck: polarisation curve below the limiting current', 1 - Math.exp(-0.5), d1.current / ilimP, 2e-3, 'i/i_lim = 1 − exp(−FV/2RT) at V = RT/F for an ideal cation-exchange surface (specified counter-ion concentration, no co-ion flux)');
+    add('Poisson–Nernst–Planck: limiting current plateau 2·F·D₊·c/δ', 1, d2.current / ilimP, 0.01, 'At 12 thermal voltages; the small excess is carried by the extended space charge');
+    // ---- Goldman–Hodgkin–Katz, electrode kinetics
+    add('Goldman–Hodgkin–Katz potential reduces to the Nernst potential', nernst(10, 25), ghkPotential([1, 0], [1, -1], [10, 10], [100, 100], 25), 1e-10, 'Ideally selective membrane, single salt, tenfold ratio (V)');
+    add('Goldman–Hodgkin–Katz slope at small ratios equals the permselectivity', 0.95, ghkPotential([1, 0.05 / 1.95], [1, -1], [100, 100], [101, 101], 25) / (V25 * Math.log(1.01)), 1e-4, 'P₋/P₊ = (1 − α)/(1 + α)');
+    const gU = ghkPotential([1, 0.5, 0.02, 0.02], [1, 2, -1, -2], [10, 5, 10, 5], [40, 20, 40, 20], 25) / V25, gI = sum([1, 2, -1, -2].map((zz, j) => zz * ghkFlux([1, 0.5, 0.02, 0.02][j], zz, [10, 5, 10, 5][j], [40, 20, 40, 20][j], gU)));
+    add('Goldman–Hodgkin–Katz: no net current at the solved potential (mixed valences)', 0, gI, 1e-9, 'Σ zᵢJᵢ = 0 for a mono- and divalent mixture');
+    const gk = simulateED({ ...ideal, alphaC: 0.95, alphaA: 0.93, membModel: 'ghk' }), tk = simulateED({ ...ideal, alphaC: 0.95, alphaA: 0.93 });
+    add('GHK and permselectivity models give similar stack currents', 1, gk.iAvg / tk.iAvg, 0.1, 'Same stack at 0.5 V per cell pair; the difference is the bi-ionic potential of the mixed feed');
+    add('Tafel slope at α = 0.5 and 25 °C', 118.32, 1000 * (overpotential(1000, 1, 25, 0.5, 'tafel') - overpotential(100, 1, 25, 0.5, 'tafel')), 0.01, '2.303·RT/(αF), mV per decade');
+    add('Butler–Volmer approaches the Tafel line at high current', overpotential(1e4, 1, 25, 0.3, 'tafel'), overpotential(1e4, 1, 25, 0.3), 1e-9, 'α = 0.3, i/i₀ = 10⁴ (V)');
+    add('Butler–Volmer is linear at low current: η = RT·i/(F·i₀)', 1, overpotential(1e-4, 0.1, 25, 0.3) / (V25 * 1e-3), 1e-3, 'Ratio to the charge-transfer resistance, any α');
+    add('Butler–Volmer solution satisfies the rate equation', 100, (() => { const e = overpotential(100, 0.1, 25, 0.3); return 0.1 * (Math.exp((0.3 * e) / V25) - Math.exp((-0.7 * e) / V25)); })(), 1e-8, 'i₀[exp(αFη/RT) − exp(−(1−α)Fη/RT)] at the returned η (A/m²)');
+    // ---- Maxwell–Stefan
+    const msd = msMembrane({ z: [1, -1], cL: [50, 50], cR: [100, 100], X: -3000, dm: 130e-6, Diw: D2m, Dim: [Infinity, Infinity], Dwm: 1e-30, cw: 1e12, i: 100 }), npd = npProfile({ cd: 50, cc: 100, i: 100, X: 3000, dm: 130e-6, Dp: D2[0], Dm: D2[1], DpM: D2m[0], DmM: D2m[1], deltaD: 1e-12, deltaC: 1e-12, n: 40 });
+    add('Maxwell–Stefan reduces to Nernst–Planck in the dilute limit (co-ion flux)', npd.Jm, msd.N[1], 1e-4 * Math.abs(npd.Jm), 'No ion–ion friction, immobile water, ions dilute in the membrane water: compared with the independent Nernst–Planck–Donnan shooting solver (mol/m²·s)');
+    add('Maxwell–Stefan reduces to Nernst–Planck in the dilute limit (counter-ion flux)', npd.Jp, msd.N[0], 1e-6 * npd.Jp, 'mol/m²·s');
+    const msf = msMembrane({ z: [1, 2, -1, -2], cL: [40, 5, 40, 5], cR: [80, 10, 80, 10], X: -3000, dm: 130e-6, Diw: [1.33e-9, 0.79e-9, 2.03e-9, 1.07e-9].map((x) => 0.06 * x), Dim: [1.33e-9, 0.79e-9, 2.03e-9, 1.07e-9].map((x) => 0.03 * x), Dij: 5e-11, Dwm: 1.2e-10, cw: 16650, i: 100 });
+    add('Maxwell–Stefan: transport numbers sum to one', 1, sum(msf.t), 1e-9, 'Four ions with friction to water, polymer and each other; F·Σ zᵢNᵢ = i');
+    add('Maxwell–Stefan: ions drag water with them (electro-osmosis)', 1, msf.converged && msf.tw > 0.5 && msf.tw < 30 ? 1 : 0, 0, `Water transport number ${fmt(msf.tw, 3)} mol per Faraday (literature 2–12 per membrane)`);
+    // ---- electroconvection
+    const sm = stokesMode(Math.PI);
+    add('Stokes mode satisfies its wall conditions', 0, Math.abs(sm.W(0)) + Math.abs(sm.W(1)) + Math.abs(sm.dW(1)) + Math.abs(sm.dW(0) - 1), 1e-10, 'W(0) = W(1) = W′(1) = 0, W′(0) = 1');
+    add('Electroconvection: short-wave limit of the marginal voltage', Math.sqrt(32 / 0.32), ecMarginal(20, 0.32), 1e-3, 'Linear stability of the limiting slip model: Pe·V² → 32 as k → ∞ (thermal voltages)');
+    const vcE = ecMarginal(Math.PI, 0.32), eLo = ecSolve({ V: 0.85 * vcE, Pe: 0.32, k: Math.PI, ny: 16, tEnd: 3 }), eHi = ecSolve({ V: 1.5 * vcE, Pe: 0.32, k: Math.PI, ny: 16, tEnd: 3 });
+    add('Electroconvection: the quiescent layer is stable below the threshold', 1, eLo.nu, 2e-3, 'Non-linear 2-D solution at 0.85 × the linear-stability voltage decays to i = i_lim');
+    add('Electroconvection: vortices raise the current above the threshold', 1, eHi.nu > 1.15 && eHi.nu < 4 ? 1 : 0, 0, `i/i_lim = ${fmt(eHi.nu, 4)} at 1.5 × threshold (measured over-limiting currents reach 1.5–3 × i_lim)`);
+    const ecp = { ...par, ol: { Vc: vcE, slope: 0.1 } }, cpE = cellPair(na, na, 0.08, G, ecp, 25), uT = cpE.U(0.98 * cpE.ilim) + 2 * vcE * V25;
+    add('Electroconvection sets the plateau length of the cell pair', 0, currentAt(cpE, uT, ecp).iOver + (currentAt(cpE, uT + 0.2, ecp).iOver > 0 ? 0 : 1), 1e-12, 'No over-limiting current up to two depleted layers at the threshold voltage, some beyond');
+    // ---- Navier–Stokes / Nernst–Planck channel
+    const nsv = channelNS({ U: 0.3, h: 2e-3, L: 3, D: 1.6e-9, ny: 96, growth: 1.04 });
+    add('Navier–Stokes: fully developed friction f·Re = 96', 96, nsv.fRe, 0.1, 'Parallel plates, Darcy friction factor on the hydraulic diameter 2h');
+    add('Navier–Stokes: fully developed centre-line velocity 1.5·U', 1.5, nsv.uc[nsv.uc.length - 1], 2e-3, 'Parabolic profile at the outlet');
+    add('Navier–Stokes: entrance length L_e ≈ 0.011·Re·D_h', 0.011, nsv.entrance / (4e-3 * nsv.Re), 0.002, 'Distance to 99 % of the developed centre-line velocity');
+    add('Navier–Stokes: incremental pressure drop of the entrance', 0.67, nsv.Kinc, 0.08, '(Δp − Δp_Poiseuille)/(½ρU²); literature 0.64–0.69 for parallel plates');
+    const nsm = channelNS({ U: 0.01, h: 1e-3, L: 2, D: 1e-7, c0: 50, jw: [1e-5, 1e-5] });
+    add('Navier–Stokes–Nernst–Planck: developed Sherwood number 8.235', 8.235, nsm.ShEnd, 0.03, 'Uniform ion flux through both walls (specified-flux boundary), parallel plates');
+    add('Navier–Stokes–Nernst–Planck: salt balance of the channel', 0, (nsm.saltIn - nsm.saltOut) / nsm.saltIn, 2e-3, 'Inflow = outflow + wall fluxes');
+    add('Navier–Stokes: inlet pressure = outlet pressure + pressure drop', 0, channelNS({ U: 0.08, h: 0.75e-3, L: 1, D: 1.6e-9, pOut: 2e4 }).pIn - 2e4 - channelNS({ U: 0.08, h: 0.75e-3, L: 1, D: 1.6e-9 }).dp, 1e-6, 'Outlet-pressure boundary condition (Pa)');
+    // ---- thermal coupling, fouling, surrogate, optimisation
+    const tv = simulateEDThermal({ ...d, thLoss: 0 }, { nSeg: 4, tol: 1e-4 });
+    add('Thermal coupling: adiabatic temperature rise = heat ÷ heat-capacity flow', tv.th.Qgen / tv.th.mcp, tv.th.dT, 1e-9, `ΔT = ${fmt(tv.th.dT, 3)} K for ${fmt(tv.th.Qgen / 1000, 3)} kW released`);
+    add('Thermal coupling: a warmer stack conducts better and needs less energy', 1, tv.sec < tv.th.iso.sec && tv.th.kappa > tv.th.iso.kappa ? 1 : 0, 0, `${fmt(tv.sec, 5)} vs ${fmt(tv.th.iso.sec, 5)} kWh/m³ isothermal`);
+    const fo = foulingED({ i: 100, u: 0.08, cFoul: 5, kDep: 0.02, kDet: 0.05, rFoul: 2, Sg: 0.8, Sc: 0.5, kScale: 1, rScale: 5, mBlock: 50, edr: false, revInterval: 20, revEff: 0.9, days: 60 });
+    add('Fouling kinetics reproduce the analytical deposit growth', (0.02 * 5 / 0.05) * (1 - Math.exp(-3)), fo.mf[fo.mf.length - 1], 1e-6, 'm = (a/k)(1 − e^(−kt)) for constant deposition and first-order detachment (g/m²)');
+    add('No scale grows below saturation', 0, fo.ms[fo.ms.length - 1], 0, 'Gypsum ratio 0.8, calcite ratio 0.5');
+    add('Supersaturation and polarity reversal: scale reaches a finite steady level', 1, (() => { const q = foulingED({ i: 100, u: 0.08, cFoul: 0, kDep: 0, kDet: 0, rFoul: 0, Sg: 2, Sc: 0.5, kScale: 1, rScale: 5, mBlock: 50, edr: true, revInterval: 20, revEff: 0.5, days: 5 }); return q.ms[q.ms.length - 1] / (1 / q.kRev); })(), 1e-6, 'm_s → k_s(S − 1)²/k_rev');
+    const sgt = stackSurrogate(r, 40, 12);
+    add('Surrogate reproduces held-out mechanistic runs', 1, sgt.sec.r2, 0.03, `R² of the specific energy on ${sgt.test.length} runs not used for training (removal: ${fmt(sgt.removal.r2, 4)})`);
+    add('Surrogate interpolates its training runs', 1, sgt.fitSec.r2, 1e-3, 'Kernel regression with a small ridge term');
+    const og = optimiseED(d, [50, 90], [6, 12]), lo6 = og.cells.find((q) => q.phi === 50 && q.u === 12), hi6 = og.cells.find((q) => q.phi === 90 && q.u === 12);
+    add('Optimiser returns the cheapest feasible operating point', Math.min(...og.cells.map((q) => q.cost)), og.best.cost, 0, 'Grid search over current fraction and velocity ($/m³)');
+    add('Energy–area trade-off behind the optimum', 1, lo6 && hi6 && hi6.area < lo6.area && hi6.sec > lo6.sec ? 1 : 0, 0, 'A higher allowed current fraction saves a stage of membrane area but costs energy (12 cm/s)');
     return C;
   },
 };
@@ -592,7 +1331,7 @@ function scaleWarnings(W, sc, scWall, edr) {
 }
 
 function runED(v) {
-  const r = simulateED(v), W = [], p = v, t = r.tr, T = r.T, st = r.stages;
+  const r = v.thermalModel ? simulateEDThermal(v) : simulateED(v), W = [], p = v, t = r.tr, T = r.T, st = r.stages;
   const segs = st.flatMap((s, k) => s.segs.map((g) => ({ ...g, X: k * r.G.L + g.x, stage: k + 1 })));
   if (!r.reached) W.push({ level: 'bad', msg: `The target of ${p.targetTDS} mg/L is not reached in ${r.nSt} stages at ${p.safety} % of the limiting current (product ${fmt(r.tdsP, 4)} mg/L) — allow more stages, a longer flow path or a higher velocity.` });
   if (r.ratioMax > 1) W.push({ level: 'bad', msg: `The current exceeds the limiting current density (up to ${fmt(100 * r.ratioMax, 3)} %): water splitting, pH shifts and scaling on the membranes will occur. Lower the voltage or raise the velocity.` });
@@ -618,7 +1357,8 @@ function runED(v) {
   const rem = (j) => (r.cf[j] > 0 ? 100 * (1 - (t.Qp * t.cp[j]) / (t.Qd * r.cf[j])) : null), act = CH.map((k, j) => j).filter((j) => r.cf[j] > 1e-6);
   const xs = segs.map((g) => g.X), out = { streams: { diluate: stream(r.Qprod * 3600, T, r.pHd, r.ionsP), concentrate: stream(r.Qconc * 3600, T, r.pHc, r.ionsC) }, sec: r.sec, power: (r.Pel + r.Ppump) / 1000, area: r.area, cellPairs: r.Ncp * r.nSt, currentDensity: r.iAvg,
     stages: r.nSt, recovery: r.waterRec, currentEfficiency: r.eff, limitingRatio: r.ratioMax, voltagePerCellPair: st.map((s) => s.U), stackVoltage: st.map((s) => s.Ustack), saltRemoval: 1 - r.tdsP / r.tdsF, process: 'ed' };
-  const stageEdges = st.slice(1).map((_, k) => ({ x: (k + 1) * r.G.L, label: `stage ${k + 2}` }));
+  const stageEdges = st.slice(1).map((_, k) => ({ x: (k + 1) * r.G.L, label: `stage ${k + 2}` })), adv = advancedED(r, p, W);
+  Object.assign(out, adv.out);
   return {
     summary: `${fmt(r.Qprod * 3600, 4)} m³/h of product at ${fmt(r.tdsP, 4)} mg/L from ${fmt(r.tdsF, 4)} mg/L feed in ${r.nSt} stage${r.nSt > 1 ? 's' : ''} of ${r.Ncp} cell pairs (${fmt(r.area, 4)} m² of membrane), using ${fmt(r.sec, 3)} kWh/m³ at ${fmt(100 * r.eff, 3)} % current efficiency and ${fmt(100 * r.waterRec, 3)} % recovery.`,
     warnings: W,
@@ -632,6 +1372,7 @@ function runED(v) {
       { label: 'Total DC power', value: r.Pdc / 1000, unit: 'kW' }, { label: 'Pumping power', value: r.Ppump / 1000, unit: 'kW' },
       { label: 'Concentrate TDS', value: tds(r.ionsC), unit: 'mg/L' }, { label: 'Gypsum saturation (wall)', value: r.scWall.gypsum, unit: '–', status: r.scWall.gypsum > (p.edr ? 1.75 : 1) ? 'warn' : 'ok', help: 'Above 1 the concentrate is supersaturated with CaSO₄·2H₂O; EDR tolerates about 1.75' },
       { label: 'Pressure drop', value: r.dp / 1e5, unit: 'bar' }, { label: 'Diluate pH (estimated)', value: r.pHd, unit: '', status: r.hAdd > 1e-9 ? 'warn' : 'ok' },
+      ...adv.kpis,
     ],
     recommendations: [
       r.ratioMax > 0.8 ? 'Reduce the voltage of the last stage or raise the linear velocity: the limiting current is proportional to the diluate concentration and falls stage by stage.' : null,
@@ -639,18 +1380,20 @@ function runED(v) {
       r.scWall.gypsum > 1 && !p.edr ? 'Switch on polarity reversal (EDR) or lower the recovery to keep calcium sulphate below saturation in the concentrate.' : null,
       vb['Diluate channel (ohmic)'] > 0.45 * sum(Object.values(vb)) ? 'Most of the voltage is lost in the dilute channels: thinner spacers or conductive (ion-exchange resin filled) spacers lower the energy.' : null,
       r.eff < 0.85 ? 'Improve current efficiency with higher-permselectivity membranes or a lower concentrate salinity (lower recovery).' : null,
+      ...adv.recs,
       'Send the concentrate to suite 2 (Brine chemistry) for a full scaling check, and compare the cost of water with RO in suite 13 (Economics).',
     ].filter(Boolean),
     plots: [
       { type: 'line', title: 'Salinity along the flow path', xlabel: 'Path length through all stages (m)', ylabel: 'TDS (mg/L)', logy: true, series: [{ name: 'Diluate', x: xs, y: segs.map((g) => tdsOf(g.cd, r.neutral)) }, { name: 'Concentrate', x: xs, y: segs.map((g) => tdsOf(g.cc, r.neutral)) }, { name: 'Diluate at the membrane wall', x: xs, y: segs.map((g) => (tdsOf(g.cd, r.neutral) * g.wd) / g.ceqD), dash: true }], hlines: p.mode === 'design' ? [{ y: p.targetTDS, label: 'target' }] : [], vlines: stageEdges },
       { type: 'line', title: 'Current density and limiting current density', xlabel: 'Path length through all stages (m)', ylabel: 'A/m²', series: [{ name: 'Operating current density', x: xs, y: segs.map((g) => g.i) }, { name: 'Limiting current density', x: xs, y: segs.map((g) => g.ilim), dash: true }, { name: 'i / i_lim (%)', x: xs, y: segs.map((g) => 100 * g.ratio) }], hlines: [{ y: 80, label: '80 % guideline' }], vlines: stageEdges },
       { type: 'bar', title: 'Voltage breakdown per cell pair (path average)', ylabel: 'V', categories: Object.keys(vb), series: [{ name: 'Voltage', values: Object.values(vb) }] },
-      { type: 'line', title: 'Polarisation curve of one cell pair', xlabel: 'Voltage per cell pair (V)', ylabel: 'Current density (A/m²)', series: [{ name: 'Stack inlet', x: polIn.U, y: polIn.i }, { name: 'Stack outlet', x: polOut.U, y: polOut.i }], vlines: [{ x: polIn.Ulim, label: 'limiting plateau' }, { x: polIn.Uover, label: 'over-limiting' }, { x: st[0].U, label: 'operating' }], hlines: [{ y: polIn.cp.ilim, label: 'i_lim inlet' }], note: 'Ohmic region at low voltage, limiting plateau where the wall concentration approaches zero, then the over-limiting branch (water splitting and electro-convection; empirical slope).' },
+      { type: 'line', title: 'Polarisation curve of one cell pair', xlabel: 'Voltage per cell pair (V)', ylabel: 'Current density (A/m²)', series: [{ name: 'Stack inlet', x: polIn.U, y: polIn.i }, { name: 'Stack outlet', x: polOut.U, y: polOut.i }], vlines: [{ x: polIn.Ulim, label: 'limiting plateau' }, { x: polIn.Uover, label: 'over-limiting' }, { x: st[0].U, label: 'operating' }], hlines: [{ y: polIn.cp.ilim, label: 'i_lim inlet' }], note: r.par.ol ? 'Ohmic region at low voltage, limiting plateau where the wall concentration approaches zero, then the over-limiting branch with the threshold and slope of the electroconvection model.' : 'Ohmic region at low voltage, limiting plateau where the wall concentration approaches zero, then the over-limiting branch (water splitting and electro-convection; empirical slope).' },
       ...(prof ? [prof.plot] : []),
       { type: 'bar', title: 'Ion removal from the diluate', ylabel: '% removed', categories: act.map((j) => IONS[CH[j]].label), series: [{ name: 'Removal', values: act.map((j) => rem(j)) }] },
       ...(sw.length > 1 ? [{ type: 'line', title: 'Desalination energy versus feed salinity', xlabel: 'Feed TDS (g/L)', ylabel: 'kWh/m³', logx: true, series: [{ name: 'Specific energy (design re-solved)', x: sw.map((q) => q[0]), y: sw.map((q) => q[1]), mode: 'both' }, { name: 'Reversible minimum', x: sw.map((q) => q[0]), y: sw.map((q) => q[2]), mode: 'both', dash: true }, { name: 'Stages required', x: sw.map((q) => q[0]), y: sw.map((q) => q[3]), mode: 'points' }], note: 'Same product target and design rules; ED energy is nearly proportional to the salt removed.' }] : []),
       { type: 'field', title: 'Product TDS versus voltage and velocity (this stack)', xlabel: 'Voltage per cell pair (V)', ylabel: 'Linear velocity (cm/s)', zlabel: 'Product TDS', zunit: 'mg/L', x: Us, y: us, z: map, cmap: 'salinity', contours: 8, markers: [{ x: clamp(sum(st.map((s) => s.U)) / r.nSt, 0.2, 1.4), y: clamp(u0 * 100, 3, 16), label: 'operating' }], note: `${r.nSt} stage${r.nSt > 1 ? 's' : ''} with the same voltage on every stage; coarse grid (4 segments per stage).` },
       { type: 'line', title: 'Concentration-polarisation and water transport', xlabel: 'Path length through all stages (m)', ylabel: 'see legend', series: [{ name: 'Wall ÷ bulk concentration, diluate', x: xs, y: segs.map((g) => g.wd / g.ceqD) }, { name: 'Wall ÷ bulk concentration, concentrate', x: xs, y: segs.map((g) => g.wc / g.ceqC) }, { name: 'Water flux to concentrate (L/m²·h)', x: xs, y: segs.map((g) => g.jw * 3.6e6) }], vlines: stageEdges },
+      ...adv.plots,
     ],
     tables: [
       { title: 'Stage summary', columns: ['Stage', 'Diluate in (mg/L)', 'Diluate out (mg/L)', 'Concentrate out (mg/L)', 'V per cell pair', 'Electrode voltage (V)', 'Stack voltage (V)', 'Stack current (A)', 'Mean i (A/m²)', 'Max i / i_lim (%)', 'DC power (kW)', 'Pressure drop (bar)', 'Velocity (cm/s)', 'Reynolds'],
@@ -665,6 +1408,7 @@ function runED(v) {
         rows: [['DC energy', r.secDC, 'kWh/m³'], ['Rectifier loss', r.sec - r.secDC - r.secPump, 'kWh/m³'], ['Pumping energy', r.secPump, 'kWh/m³'], ['Total specific energy', r.sec, 'kWh/m³'], ['Energy per kg of salt removed', (r.sec * 1000) / Math.max(r.tdsF - r.tdsP, 1e-9), 'kWh/kg'],
           ['Current efficiency of the membranes', 100 * r.effMem, '%'], ['Shunt-current loss', 100 * r.par.shunt, '%'], ['Overall current efficiency', 100 * r.eff, '%'], ['Water transferred to the concentrate', (100 * (t.Qd - t.Qp)) / t.Qd, '% of diluate'],
           ['Gypsum saturation ratio, bulk concentrate', r.sc.gypsum, '–'], ['Gypsum saturation ratio, membrane wall', r.scWall.gypsum, '–'], ['Calcite saturation ratio, bulk concentrate', r.sc.calcite, '–'], ['Concentrate ionic strength', r.sc.I, 'mol/L'], ['Concentrate recycle flow', t.Qrec * 3600, 'm³/h'], ['Concentrate blow-down', t.Qbd * 3600, 'm³/h']] },
+      ...adv.tables,
     ],
     balances: [
       { name: 'Water (m³/h)', in: t.Qf * 3600, out: (t.Qp + t.Qbd) * 3600 },
@@ -672,6 +1416,7 @@ function runED(v) {
       { name: 'Sodium (mol/s)', in: t.Qf * r.cf[CH.indexOf('Na')], out: t.Qp * t.cp[CH.indexOf('Na')] + t.Qbd * t.ccOut[CH.indexOf('Na')] },
       { name: 'Chloride (mol/s)', in: t.Qf * r.cf[CH.indexOf('Cl')], out: t.Qp * t.cp[CH.indexOf('Cl')] + t.Qbd * t.ccOut[CH.indexOf('Cl')] },
       { name: 'Charge: cation vs anion equivalents removed (eq/s)', in: sum(t.tr.map((x, j) => (Z[j] > 0 ? x * AZ[j] : 0))), out: sum(t.tr.map((x, j) => (Z[j] < 0 ? x * AZ[j] : 0))) },
+      ...adv.bal,
     ],
     outputs: out,
   };

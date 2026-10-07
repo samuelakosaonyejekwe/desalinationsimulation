@@ -5,13 +5,16 @@
 // boiling-point elevation, non-equilibrium allowance, demister/line losses, distillate and brine flashing,
 // feed preheaters, a final condenser, published U(T) correlations, exergy accounting and a lumped start-up model.
 import { brent, clamp, linspace, sum, rng, fmt, rk4 } from '../core/num.js';
-import { density, cp, psat, tsat, antoine, latentHeat, bpe, enthalpyLiquid as hL, enthalpyVapour as hV, osmoticPressure, salinityFromTDS, tdsFromSalinity, KELVIN } from '../core/props.js';
+import { density, cp, psat, tsat, antoine, latentHeat, bpe, enthalpyLiquid as hL, enthalpyVapour as hV, osmoticPressure, osmoticCoefficient, salinityFromTDS, tdsFromSalinity, KELVIN, R as RGAS } from '../core/props.js';
 import { ION_IDS, WATERS, cloneIons, tds, scaleIons } from '../core/water.js';
+import roSuite, { simulateRO } from './s01_ro.js';
 
 const CPV = 1884, RW = 461.52, GAMMA = 1.32, RHO_REF = 994; // vapour cp J/kg·K, gas constant of steam, isentropic exponent, product density kg/m³
 const K = (T) => T + KELVIN;
 const fill = (n, x) => new Array(n).fill(x);
 const lmtd = (d1, d2) => (Math.abs(d1 - d2) < 1e-9 ? 0.5 * (d1 + d2) : (d1 - d2) / Math.log(d1 / d2));
+/** Density of saturated water vapour (ideal gas), kg/m³. */
+export const rhoV = (T) => psat(T) / (RW * K(T));
 const dPdT = (T) => (psat(T + 0.05) - psat(T - 0.05)) / 0.1;
 /** Temperature of liquid of salinity S with specific enthalpy h (inverse of props.enthalpyLiquid). */
 const tFromH = (h, S) => { let T = h / cp(40, S); for (let i = 0; i < 14; i++) { const d = (hL(T, S) - h) / cp(T, S); T -= d; if (Math.abs(d) < 1e-11) break; } return T; };
@@ -20,6 +23,21 @@ const tFromH = (h, S) => { let T = h / cp(40, S); for (let i = 0; i < 14; i++) {
 export const uEvaporator = (T) => 1e3 * (1.9695 + 1.2057e-2 * T - 8.5989e-5 * T * T + 2.5651e-7 * T ** 3);
 export const uCondenser = (T) => 1e3 * (1.7194 + 3.2063e-3 * T + 1.5971e-5 * T * T - 1.9918e-7 * T ** 3);
 const fouled = (U, o) => 1 / (1 / (U * o.fU) + o.Rf);
+
+const MOLAL_W = 55.508; // mol of water per kg
+/** Moles of dissolved ions per kg of water for sea-salt of salinity S (g/kg). */
+export const ionMolality = (S) => (31.843 * S) / (1000 - S);
+/** Water activity of the brine: 'ideal' = Raoult's law with the water mole fraction, 'activity' = Raoult's law corrected with the osmotic coefficient (a_w = exp(−φ·m/55.51)). */
+export function waterActivity(T, S, basis = 'activity') {
+  const m = ionMolality(Math.min(Math.max(S, 0), 400));
+  return basis === 'ideal' ? MOLAL_W / (MOLAL_W + m) : Math.exp((-osmoticCoefficient(T, S) * m) / MOLAL_W);
+}
+/** Vapour pressure above brine from Raoult's law, Pa: p = a_w·p_sat(T). */
+export const raoultPressure = (T, S, basis = 'activity') => waterActivity(T, S, basis) * psat(T);
+/** Boiling-point elevation from Raoult's law, K: brine at T is in equilibrium with vapour saturated at t_sat(a_w·p_sat(T)). */
+export const bpeRaoult = (T, S, basis = 'activity') => (S > 0 ? T - tsat(raoultPressure(T, S, basis)) : 0);
+/** Boiling-point elevation on the selected basis (o.bpeModel: 'corr' | 'ideal' | 'activity'), scaled by the user multiplier. */
+const bpeOf = (T, X, o) => o.fBPE * (o.bpeModel === 'ideal' || o.bpeModel === 'activity' ? bpeRaoult(T, X, o.bpeModel) : bpe(T, X));
 
 /** Pressure drop of a wire-mesh demister, Pa (El-Dessouky et al. 2000): packing density kg/m³, vapour velocity m/s, wire diameter mm, thickness m. */
 export const demisterDrop = (rhoP, V, dw, thick) => 3.88178 * rhoP ** 0.375798 * V ** 0.81317 * dw ** -1.56114147 * thick;
@@ -65,12 +83,12 @@ function effect(q, F, hf, Bin, Xin, hbin, T, Xf, o, Vg) {
   let V = Vg ?? q / latentHeat(T), B, X, be, Tv, hv, hb; // warm start from the previous pass when available
   for (let k = 0; k < 60; k++) {
     V = clamp(V, -0.5 * m, Vmax);
-    B = m - V; X = salt / B; be = o.fBPE * bpe(T, X); Tv = T - be; hv = hV(Tv) + CPV * be; hb = hL(T, X);
+    B = m - V; X = salt / B; be = bpeOf(T, X, o); Tv = T - be; hv = hV(Tv) + CPV * be; hb = hL(T, X);
     const Vn = clamp((q + F * hf + Bin * hbin - m * hb) / (hv - hb), -0.5 * m, Vmax);
     if (Math.abs(Vn - V) < 1e-12 * m) { V = Vn; break; }
     V = Vn;
   }
-  B = m - V; X = salt / B; be = o.fBPE * bpe(T, X); Tv = T - be; hv = hV(Tv) + CPV * be; hb = hL(T, X);
+  B = m - V; X = salt / B; be = bpeOf(T, X, o); Tv = T - be; hv = hV(Tv) + CPV * be; hb = hL(T, X);
   return { V, B, X, be, Tv, hv, hb };
 }
 
@@ -163,6 +181,10 @@ export function solveMED(c) {
       dT = dT.map((d, i) => d * clamp(r.A[i] / Am, 0.3, 3) ** 0.7);
       const S2 = sum(dT); dT = dT.map((d) => (d * S) / S2);
       err = Math.max(err, ...r.A.map((a) => Math.abs(a / Am - 1)));
+    } else if (c.areaMode === 'flux' && N > 1) { // prescribed equal heat flux q″ = U·ΔT in every effect: ΔT_i ∝ 1/U_i
+      const S = sum(dT), w = r.U.map((u) => 1 / u), ws_ = sum(w), fm = sum(r.U.map((u, i) => u * dT[i])) / N;
+      err = Math.max(err, ...r.U.map((u, i) => Math.abs((u * dT[i]) / fm - 1)));
+      dT = dT.map((d, i) => 0.3 * d + 0.7 * ((S * w[i]) / ws_));
     } else if (c.areaMode === 'rating') {
       dT = dT.map((d, i) => clamp(d * clamp(r.A[i] / c.Ades[i], 0.3, 3) ** 0.7, 0.05, 40));
       err = Math.max(err, ...r.A.map((a, i) => Math.abs(a / c.Ades[i] - 1)));
@@ -230,7 +252,7 @@ export function solveMSF(c) {
       const nea = nonEquilibriumAllowance(T[i], dTs, o);
       let D = (B * cp(T[i], X) * dTs) / latentHeat(T[i]), Bn, Xn, be, Tv, dl = 0, hv, hbn;
       for (let k = 0; k < 40; k++) {
-        Bn = B - D; Xn = (B * X) / Bn; be = o.fBPE * bpe(T[i], Xn); hbn = hL(T[i], Xn);
+        Bn = B - D; Xn = (B * X) / Bn; be = bpeOf(T[i], Xn, o); hbn = hL(T[i], Xn);
         Tv = T[i] - be - nea; dl = vapourLoss(Tv, o); Tv -= dl; hv = hV(Tv) + CPV * (T[i] - Tv);
         const Dn = (B * (hb - hbn)) / (hv - hbn);
         if (Math.abs(Dn - D) < 1e-13 * B) { D = Dn; break; }
@@ -289,7 +311,7 @@ const COLLECTORS = { flat: { name: 'Flat-plate collector', eta0: 0.76, a1: 3.6, 
 const ANTISCALANT = { poly: { name: 'Polyphosphate', tbt: 90 }, ht: { name: 'High-temperature polymer additive', tbt: 112 }, acid: { name: 'Acid dosing + decarbonation', tbt: 120 } };
 
 function options(p) {
-  return { fBPE: p.fBPE, fNEA: p.fNEA, neaH: p.neaH, neaVb: p.neaVb, neaL: p.neaL, dpDem: demisterDrop(p.rhoP, p.Vdem, p.dw, p.thick / 1000), linePct: p.linePct, fU: p.fU, Rf: p.Rf / 1000 };
+  return { fBPE: p.fBPE, bpeModel: p.bpeModel || 'corr', fNEA: p.fNEA, neaH: p.neaH, neaVb: p.neaVb, neaL: p.neaL, dpDem: demisterDrop(p.rhoP, p.Vdem, p.dw, p.thick / 1000), linePct: p.linePct, fU: p.fU, Rf: p.Rf / 1000 };
 }
 
 /** Run the selected process once. Returns one unified result object (SI units, flows in kg/s). */
@@ -314,7 +336,7 @@ export function simulateThermal(v, ov = {}) {
   } else {
     const mvc = proc === 'mvc', tvc = proc === 'medtvc', N = Math.max(1, Math.round(mvc ? p.Nmvc : p.N)), Xb = Math.max(p.Xb, Xf * 1.25), F = (MdT * Xb) / (Xb - Xf);
     const c = { proc: mvc ? 'mvc' : tvc ? 'tvc' : 'med', N, arr: p.arr, F, Xf, Tsw: T0, MdT, Ts: p.Ts, Tn: Math.min(p.Tn, p.Ts - 0.8 * N - 1), T1: p.Tmvc, dTm: p.dTmvc, preheat: !!p.preheat, ttdPh: p.ttdPh, ttdCond: p.ttdCond, loss, vent, o,
-      areaMode: ov.areaMode || (p.areaMode === 'equalArea' && !ov.fast ? 'equalArea' : 'equalDT'), Ades: ov.Ades, dT0: ov.dT0, tol: ov.fast ? 3e-7 : 1e-10, maxIt: ov.fast ? 60 : 250, warm: ov.warm, Pm: p.Pm * 1e5, nEnt: (Math.round(p.nEnt) > 0 ? Math.round(p.nEnt) : N) - 1, etaIs: p.etaIs / 100 };
+      areaMode: ov.areaMode || ((p.areaMode === 'equalArea' || p.areaMode === 'flux') && !ov.fast ? p.areaMode : 'equalDT'), Ades: ov.Ades, dT0: ov.dT0, tol: ov.fast ? 3e-7 : 1e-10, maxIt: ov.fast ? 60 : 250, warm: ov.warm, Pm: p.Pm * 1e5, nEnt: (Math.round(p.nEnt) > 0 ? Math.round(p.nEnt) : N) - 1, etaIs: p.etaIs / 100 };
     const r = solveMED(c), L = N - 1, Md = r.Md, Mb = r.B[L], Tprod = tFromH(mvc ? (r.Dacc * r.hD + r.cond * hL(r.Ts)) / Md : (r.Dacc * r.hD + r.cond * hL(r.Tc[L])) / Md, 0);
     Object.assign(R, { r, N, Md, Mf: F, Mb, Xb: r.X[L], Mcw: 0, Ttop: r.T[0], Tlast: r.T[L], Tsteam: r.Ts, Tprod, Tbrine: r.T[L], Tcw: T0, Qcond: 0, converged: r.converged, areaEvap: sum(r.A), areaAux: 0 });
     const effEx = sum(r.q.map((q, i) => Iq(q, r.Th[i], r.T[i], T0))), lossEx = sum(r.Vt.map((m, i) => Iq(m * latentHeat(r.Tv[i]), r.T[i], r.Tc[i], T0)));
@@ -376,10 +398,11 @@ export function simulateThermal(v, ov = {}) {
 /** Lumped thermal-inertia transient (RK4): start-up from seawater temperature, or cool-down from the design state after a steam trip (shutdown = true). */
 export function startUp(R, p, shutdown = false) {
   const N = R.N, T0 = R.T0, nt = Math.max(10, Math.round(p.nt)), tEnd = p.tEnd * 3600, ramp = Math.max(1, p.ramp * 60), cth = p.cth * 1000;
-  let f, Tdes, lam;
+  let f, Tdes, lam, Av, TvDes;
+  const vv = Math.max(0, p.vapVol ?? 0), vapC = (T, A) => vv * A * (latentHeat(T) * (rhoV(T + 0.5) - rhoV(T - 0.5)) + rhoV(T) * CPV); // J/K stored by the saturated vapour space as it warms
   if (R.proc === 'msf') {
-    const m = R.m, cpb = cp(70, m.Xr), C = m.stages.map((s) => s.A * cth + s.B * p.holdup * cpb), eps = m.stages.map((s) => (s.tout - s.tin) / (s.Tv - s.tin)), lossT = m.stages.map((s) => s.T - s.Tv);
-    Tdes = m.stages.map((s) => s.T);
+    const m = R.m, cpb = cp(70, m.Xr), C = m.stages.map((s) => s.A * cth + s.B * p.holdup * cpb + vapC(s.Tv, s.A)), eps = m.stages.map((s) => (s.tout - s.tin) / (s.Tv - s.tin)), lossT = m.stages.map((s) => s.T - s.Tv);
+    Tdes = m.stages.map((s) => s.T); Av = m.stages.map((s) => s.A); TvDes = m.stages.map((s) => s.Tv);
     lam = Math.max(...C.map((ci, i) => ((m.Mr + m.stages[i].m * eps[i]) * cpb) / ci)) * 2;
     f = (t, T) => {
       const tu = fill(N + 2, T0), ti = fill(N + 1, T0); // tube outlet of stage i (1-based) and its inlet
@@ -393,9 +416,9 @@ export function startUp(R, p, shutdown = false) {
     };
   } else {
     const r = R.r, UA = r.q.map((q, i) => q / r.dT[i]), dl = r.T.map((T, i) => T - r.Tc[i]), cpb = cp(60, R.Xf);
-    const C = r.A.map((a, i) => a * cth + r.B[i] * p.holdup * cpb), qOut = r.q.map((_, i) => (i < N - 1 ? r.q[i + 1] : r.q[i]));
+    const C = r.A.map((a, i) => a * cth + r.B[i] * p.holdup * cpb + vapC(r.Tv[i], a)), qOut = r.q.map((_, i) => (i < N - 1 ? r.q[i + 1] : r.q[i]));
     const sink = r.q.map((q, i) => (q - (i < N - 1 ? qOut[i] : 0)) / (r.T[i] - T0)), UAc = (R.proc === 'mvc' ? 0 : r.q[N - 1]) / Math.max(0.5, r.Tc[N - 1] - T0);
-    Tdes = r.T;
+    Tdes = r.T; Av = r.A; TvDes = r.Tv;
     lam = Math.max(...C.map((ci, i) => (UA[i] + (UA[i + 1] || UAc) + Math.abs(sink[i])) / ci)) * 2;
     f = (t, T) => {
       const qin = T.map((Ti, i) => (i === 0 ? (shutdown ? 0 : Math.min(r.q[0] * Math.min(1, t / ramp), UA[0] * Math.max(0, r.Ts - Ti) * 3)) : UA[i] * Math.max(0, T[i - 1] - dl[i - 1] - Ti)));
@@ -403,15 +426,126 @@ export function startUp(R, p, shutdown = false) {
     };
   }
   const sub = Math.max(1, Math.ceil(((tEnd / nt) * lam) / 2.2)), sol = rk4(f, shutdown ? [...Tdes] : fill(N, T0), 0, tEnd, nt * sub);
-  const ts = [], Ts = [], prod = [];
+  const ts = [], Ts = [], prod = [], inv = [], vol = Av.map((a) => vv * a), mDes = vol.map((V, i) => V * rhoV(TvDes[i])), mTot = sum(mDes);
   for (let k = 0; k <= nt; k++) {
     const y = sol.y[k * sub];
     ts.push(sol.t[k * sub] / 60); Ts.push(y);
     prod.push(100 * clamp(sum(y.map((T, i) => (T - T0) / (Tdes[i] - T0))) / N, 0, 1.5));
+    inv.push(mTot > 0 ? (100 * sum(y.map((T, i) => vol[i] * rhoV(Math.max(T0, T - (Tdes[i] - TvDes[i]))))) / mTot) : 0);
   }
   const lim = shutdown ? 50 : 95, i95 = prod.findIndex((x) => (shutdown ? x <= lim : x >= lim)); // 95 % approach on start-up, half of the temperature rise lost on cool-down
   const t95 = i95 > 0 ? ts[i95 - 1] + ((ts[i95] - ts[i95 - 1]) * (lim - prod[i95 - 1])) / (prod[i95] - prod[i95 - 1]) : i95 === 0 ? 0 : null;
-  return { t: ts, T: Ts, prod, t95, sub, Tdes, final: prod[prod.length - 1] };
+  return { t: ts, T: Ts, prod, t95, sub, Tdes, final: prod[prod.length - 1], vap: { vol, m0: vol.map((V) => V * rhoV(T0)), mDes, mTot, inv, TvDes } };
+}
+
+// ---- Raoult comparison, heat pump, cogeneration, costing, RO hybrid, design-grid optimisation -----------------
+/** Specific entropy of saturated liquid water relative to 0 °C, J/kg·K: s_f = ∫ c_p dT / T (Simpson's rule). */
+export function sLiquid(T) {
+  const n = 40, h = T / n; let a = cp(0, 0) / K(0) + cp(T, 0) / K(T);
+  for (let i = 1; i < n; i++) a += (i % 2 ? 4 : 2) * (cp(i * h, 0) / K(i * h));
+  return (a * h) / 3;
+}
+/** Specific entropy of saturated steam, J/kg·K: s_g = s_f + λ/T. */
+export const sVapour = (T) => sLiquid(T) + latentHeat(T) / K(T);
+/** Isentropic expansion of steam of entropy s into the two-phase region at saturation temperature T2: quality and enthalpy. */
+const expandTo = (s, T2) => { const x = (s - sLiquid(T2)) / (latentHeat(T2) / K(T2)); return { x, h: hL(T2) + x * latentHeat(T2) }; };
+
+/**
+ * Power–water cogeneration by turbine extraction (lost-work / power-loss method). Saturated steam at the throttle pressure
+ * expands with isentropic efficiency p.etaTurb to the extraction pressure p_sat(Text), where Qin (W) is withdrawn for the
+ * desalination plant; the same steam would otherwise expand on to the condenser at p.TcondPP.
+ */
+export function cogeneration(Qin, Text, Wel, p) {
+  const T1 = tsat(p.Pthr * 1e5), eta = clamp(p.etaTurb / 100, 0.05, 1), Tc = p.TcondPP, Te = clamp(Text, Tc + 0.5, T1 - 0.5), h1 = hV(T1), s1 = sVapour(T1);
+  const eS = expandTo(s1, Te), hE = h1 - eta * (h1 - eS.h), xE = (hE - hL(Te)) / latentHeat(Te), sE = sLiquid(Te) + (xE * latentHeat(Te)) / K(Te);
+  const cS = expandTo(sE, Tc), wLost = eta * (hE - cS.h), wFull = h1 - hE + wLost, qExt = hE - hL(Te); // J/kg
+  const mExt = Qin / qExt, Wlost = mExt * wLost, Pgross = p.Ppp * 1e6, m0 = Pgross / wFull, Pnet = Pgross - Wlost, etaB = clamp(p.etaBoiler / 100, 0.3, 1);
+  const fuel0 = (m0 * (h1 - hL(Tc))) / etaB, fuel = (m0 * h1 - (m0 - mExt) * hL(Tc) - mExt * hL(Te)) / etaB, fuelWater = (Wlost + Wel) * (fuel0 / Pgross);
+  return { T1, Te, Tc, eta, h1, hE, xE, xC: cS.x, wLost, wFull, qExt, mExt, m0, Wlost, Pgross, Pnet, Pexport: Pnet - Wel, fuel0, fuel, fuelWater, fuelShare: fuelWater / fuel, euf: (Pnet + Qin) / fuel, etaPower: Pgross / fuel0,
+    lostPerHeat: wLost / qExt, carnot: 1 - K(Tc) / K(Te), condensate: (hL(Te) - hL(Tc) - K(Tc) * (sLiquid(Te) - sLiquid(Tc))) / qExt, feasible: mExt <= m0 && Text < T1 - 0.5, clipped: Text >= T1 - 0.5 };
+}
+
+/**
+ * Heat-pump-driven desalination: the heat rejected in the final condenser / heat-rejection section is lifted to the heating-steam
+ * level. 'mhp' = mechanical (electric) heat pump, COP = η·T_h/(T_h − T_l); 'ahp' = absorption heat pump driven by heat at T_g,
+ * COP = 1 + η·(COP_rev − 1) with the reversible three-temperature limit COP_rev = (1 − T_l/T_g)/(1 − T_l/T_h).
+ */
+export function heatPump(R, p) {
+  const abs = p.source === 'ahp', a = Math.max(0, p.hpApproach), eta = clamp(p.hpEta / 100, 0.01, 1), Tsup = R.proc === 'medtvc' ? R.ej.Tm : R.Tsteam, Th = Tsup + a;
+  const Tsrc = R.proc === 'msf' ? R.m.Td : R.proc === 'mvc' ? R.T0 + a + 1 : R.r.Tc[R.N - 1], Tl = Math.min(Tsrc - a, Th - 2), Tg = Math.max(p.hpTg, Th + 10);
+  const carnot = K(Th) / (Th - Tl), copRev = abs ? ((Tg - Tl) / K(Tg)) * carnot : carnot, cop = abs ? 1 + eta * (copRev - 1) : Math.max(1, eta * copRev);
+  const Qneed = R.Qin, Qavail = Math.max(0, R.Qcond), Qe = Math.min(Qneed * (1 - 1 / cop), Qavail), Qhp = cop > 1 + 1e-12 ? Qe / (1 - 1 / cop) : 0, drive = Qhp - Qe, Qdirect = Qneed - Qhp;
+  const heatExt = Qdirect + (abs ? drive : 0), Wext = abs ? 0 : drive, carnotW = (T) => (p.etaTurb / 100) * Math.max(0, 1 - K(p.TcondPP) / K(T));
+  return { abs, Th, Tl, Tg, Tsup, carnot, copRev, cop, Qneed, Qavail, Qe, Qhp, drive, Qdirect, heatExt, Wext, share: Qneed > 0 ? Qhp / Qneed : 0, cwSaving: Qavail > 0 ? Qe / Qavail : 0,
+    sTh: heatExt / 1000 / R.Qd, sEl: (R.Wel + Wext) / 1000 / R.Qd, sEq: (R.Wel + Wext + Qdirect * carnotW(Tsup) + (abs ? drive * carnotW(Tg) : 0)) / 1000 / R.Qd, PR: heatExt > 1e-9 * (R.Md * 2326e3) ? (R.Md * 2326e3) / heatExt : null };
+}
+
+/** Capital-recovery factor for interest rate i (fraction per year) and n years. */
+export const crf = (i, n) => (i > 1e-12 ? (i * (1 + i) ** n) / ((1 + i) ** n - 1) : 1 / n);
+
+/** Thermodynamic–economic model: unit water cost from heat, electricity, annualised capital of the heat-transfer surface (and compressor), O&M and chemicals. Rates in $/h. */
+export function waterCost(R, p, ex = {}) {
+  const hrs = 8760 * clamp(p.avail / 100, 0.05, 1), A = crf(p.intRate / 100, p.life), capSurf = p.cArea * R.area * p.capFactor, capComp = ((R.Wcomp || 0) / 1000) * p.cComp * p.capFactor, capex = capSurf + capComp;
+  const heat = ex.heat ?? R.Qin, power = ex.power ?? R.Wel, Zcap = (capex * A) / hrs, Zom = (capex * (p.omPct / 100)) / hrs, Cheat = (p.cHeat * heat) / 1e6, Cel = (p.cElec * power) / 1000, Cchem = p.cChem * R.Qd;
+  const parts = { 'Capital recovery': Zcap / R.Qd, 'Heat': Cheat / R.Qd, 'Electricity': Cel / R.Qd, 'Operation and maintenance': Zom / R.Qd, 'Chemicals': p.cChem };
+  return { hrs, crf: A, capex, capSurf, capComp, Zcap, Zom, Cheat, Cel, Cchem, parts, total: sum(Object.values(parts)), rate: Zcap + Zom + Cheat + Cel + Cchem, perCapacity: capex / (R.Qd * 24) };
+}
+
+/**
+ * Exergy–economic (SPECO-type) analysis: the fuel is the exergy of the heat and electricity supplied, costed at its average unit cost
+ * c_F; every component is charged the cost of the exergy it destroys (Ċ_D = c_F·Ėx_D) plus its share of the capital and O&M rate Ż;
+ * the product is the minimum work of separation, so Ċ_P = Ċ_F + Ż and c_P = Ċ_P / Ėx_P.
+ */
+export function exergoEconomics(R, p, wc = waterCost(R, p)) {
+  const CF = wc.Cheat + wc.Cel, ExF = R.exTot / 1000, cF = CF / ExF, ExP = R.wMin * R.Qd, Z = wc.Zcap + wc.Zom; // $/h, kW, $/kWh
+  const comps = R.ex.map(([k, e]) => [k, e / 1000]), other = comps.find((c) => c[0].startsWith('Other'));
+  if (other) { other[0] = 'Other (flash boxes, mixing, heat loss)'; other[1] = Math.max(0, other[1] - ExP); }
+  comps.push(['Auxiliaries and unallocated remainder (pumps, vacuum system)', ExF - ExP - sum(comps.map((c) => c[1]))]);
+  const aux = Math.max(R.areaAux, 0), w = {}; // capital weights ($ of installed equipment) per component
+  if (R.proc === 'msf') { w['Stage condensers (ΔT)'] = wc.capSurf * (R.areaEvap / R.area); w['Brine heater'] = wc.capSurf * (aux / R.area); }
+  else if (R.proc === 'mvc') { w['Evaporator tubes (ΔT)'] = wc.capSurf * (R.areaEvap / R.area); w['Feed preheater'] = wc.capSurf * (aux / R.area); w['Compressor'] = wc.capComp; }
+  else { const ac = R.hx[0]?.area || 0; w['Effect tubes (ΔT)'] = wc.capSurf * (R.areaEvap / R.area); w['Final condenser'] = wc.capSurf * (ac / R.area); w['Feed preheaters'] = wc.capSurf * (Math.max(0, aux - ac) / R.area); }
+  const rows = comps.map(([k, e]) => { const Zk = (Z * (w[k] || 0)) / wc.capex, CD = cF * e; return { name: k, ExD: e, CD, Z: Zk, f: Zk + CD > 0 ? Zk / (Zk + Math.max(CD, 0)) : 0, share: e / ExF }; });
+  const CP = CF + Z, cP = CP / ExP;
+  return { CF, ExF, cF, ExP, Z, rows, CP, cP, r: cF > 0 ? (cP - cF) / cF : 0, CDtot: sum(rows.map((q) => q.CD)), perM3: CP / R.Qd, closure: (sum(rows.map((q) => q.CD + q.Z)) + cF * ExP - CP) / CP };
+}
+
+/**
+ * Thermal + RO hybrid sharing the seawater intake: the RO block (element-by-element model of suite 1) is fed with cold seawater or
+ * with the warm cooling water rejected by the thermal block, and the two products are blended.
+ */
+export function hybridRO(R, p, tdsD, ionsF) {
+  const share = clamp(p.roShare / 100, 0.02, 0.98), rec = clamp(p.roRec / 100, 0.1, 0.85), Qf = (R.Qd * share) / (1 - share) / rec, rhoS = density(R.T0, R.Xf);
+  const Qrej = (R.Mcw * 3600) / density(R.Tcw, R.Xf), warm = p.roFeed === 'reject' ? Math.min(Qf, Qrej) : 0, Tro = clamp((warm * R.Tcw + (Qf - warm) * R.T0) / Qf, 1, 45);
+  const roAt = (T) => simulateRO({ ...defaultsOf(roSuite), ions: ionsF, salinityFactor: 1, Qf, T, pH: 8.1, recovery: 100 * rec, targetFlux: p.roFlux, design: 'auto', mode: 'recovery', nSeg: 2 });
+  const ro = roAt(Tro), cold = warm > 0 && Tro > R.T0 + 0.5 ? roAt(clamp(R.T0, 1, 45)) : null, Qp = ro.product.Q, tdsP = tds(ro.product.ions), Qtot = R.Qd + Qp;
+  const QfTh = (R.Mf * 3600) / rhoS, intakeTh = ((R.Mf + R.Mcw) * 3600) / rhoS, intake = intakeTh + Qf - warm, Qb = (R.Mb * 3600) / density(R.Tbrine, R.Xb), tdsB = tdsFromSalinity(R.Xb, R.Tbrine), tdsC = tds(ro.conc.ions);
+  return { ro, cold, share: Qp / Qtot, rec, Qf, Tro, warm, Qrej, Qp, tdsP, tdsD, Qtot, tdsBlend: (R.Qd * tdsD + Qp * tdsP) / Qtot, ionsBlend: Object.fromEntries(ION_IDS.map((k) => [k, (R.Qd * (ionsF[k] || 0) * (tdsD / Math.max(tds(ionsF), 1e-9)) + Qp * (ro.product.ions[k] || 0)) / Qtot])),
+    QfTh, intakeTh, intake, intakeSaving: warm / (intakeTh + Qf), recFeed: Qtot / (QfTh + Qf), recIntake: Qtot / intake, Qbrine: Qb + ro.conc.Q, tdsBrine: (Qb * tdsB + ro.conc.Q * tdsC) / (Qb + ro.conc.Q),
+    secEl: (R.Wel / 1000 + ro.power) / Qtot, secTh: R.Qin / 1000 / Qtot, secEq: (R.sEq * R.Qd + ro.power) / Qtot, overPressure: ro.p1.Pf > ro.cfg.M.pmax };
+}
+
+/** Grid of fast re-designs over the two main design variables of the selected process (number of effects/stages × top temperature, or MVC temperature × ΔT). */
+export function designGrid(v, N = Math.max(1, Math.round(v.proc === 'msf' ? v.Nst : v.proc === 'mvc' ? v.Nmvc : v.N))) {
+  const p = v, proc = p.proc;
+  if (proc === 'msf') {
+    const xs = [12, 16, 20, 24, 28, 32].filter((n) => n > p.nRej + 1), ys = linspace(88, 118, 6);
+    return { xs, ys, x0: N, y0: p.TBT, xlabel: 'Number of stages', ylabel: 'Top brine temperature (°C)', title: 'Performance ratio versus stage count and top brine temperature', zlabel: 'Performance ratio', zunit: 'kg/2326 kJ', cmap: 'viridis', metric: (q) => q.PR, cells: ys.map((T) => xs.map((n) => tryRun(p, { Nst: n, TBT: T, fast: true }))) };
+  }
+  if (proc === 'mvc') {
+    const xs = linspace(45, 70, 6), ys = linspace(1.5, 5, 5);
+    return { xs, ys, x0: p.Tmvc, y0: p.dTmvc, xlabel: 'First-effect brine temperature (°C)', ylabel: 'Condensing − boiling ΔT (K)', title: 'Specific electricity versus evaporation temperature and ΔT', zlabel: 'Specific electricity', zunit: 'kWh/m³', cmap: 'thermal', metric: (q) => q.sEl, cells: ys.map((d) => xs.map((T) => tryRun(p, { Tmvc: T, dTmvc: d, fast: true }))) };
+  }
+  const xs = [4, 6, 9, 12], ys = linspace(58, 74, 4);
+  return { xs, ys, x0: N, y0: p.Ts, xlabel: 'Number of effects', ylabel: 'Heating-steam temperature (°C)', title: 'Gain-output ratio versus effects and heating-steam temperature', zlabel: 'GOR', zunit: 'kg/kg', cmap: 'viridis', metric: (q) => q.GOR, cells: ys.map((T) => xs.map((n) => tryRun(p, { N: n, Ts: T, fast: true, nEnt: p.nEnt > 0 ? Math.max(1, Math.round((p.nEnt * n) / N)) : 0 }))) };
+}
+
+/** Process optimisation: constrained grid search for the lowest unit water cost over the design grid (top brine temperature ≤ scale limit); the base design is a candidate. */
+export function optimiseGrid(grid, p, tLim, baseCost) {
+  const cost = grid.cells.map((row) => row.map((q) => (q ? waterCost(q, p).total : null)));
+  let best = { cost: baseCost, x: grid.x0, y: grid.y0, base: true }, nFeas = 0, nCells = 0;
+  grid.cells.forEach((row, j) => row.forEach((q, i) => { if (!q) return; nCells++; if (q.Ttop > tLim + 1e-9) return; nFeas++; if (cost[j][i] < best.cost) best = { cost: cost[j][i], x: grid.xs[i], y: grid.ys[j], base: false, q }; }));
+  return { cost, best, nFeas, nCells, saving: baseCost > 0 ? 1 - best.cost / baseCost : 0 };
 }
 
 const calWarm = new Map(); // converged trains of the calibration model, one per operating point
@@ -427,14 +561,14 @@ const suite = {
   guide: [
     'Choose the process (MED, MED-TVC, MSF or MVC), the distillate capacity and the seawater condition — or pull the case feed, the site sea temperature or an RO concentrate for a hybrid.',
     'Set the temperature window (heating steam or top brine temperature and the last effect/stage) and the number of effects or stages.',
-    'On Model setup choose equal-ΔT or equal-area design, fouling, temperature losses and scale limits.',
+    'On Model setup choose equal-ΔT, equal-area or equal-heat-flux design, the boiling-point-elevation basis, fouling, temperature losses, scale limits, an optional RO hybrid and the costing inputs.',
     'Run. Check the per-effect table, the scale warnings and the balances on the Verify tab; the distillate, brine and energy figures are offered to the plant, ZLD and economics suites.',
   ],
-  implemented: ['total and component mass', 'energy balance', 'steam-table', 'vapour-liquid equilibrium', 'boiling-point-elevation', 'antoine', 'clausius-clapeyron', 'flash-vaporization', 'heat-exchanger equation', 'overall heat-transfer', 'logarithmic-mean', 'effectiveness-ntu', 'condensation equation', 'evaporation equation', 'latent-heat', 'non-equilibrium allowance', 'demister pressure-drop', 'compressor equation', 'exergy equation',
-    'multi-effect mass-energy', 'multi-stage-flash stagewise', 'thermal-vapour-compression', 'mechanical-vapour-compression', 'med-tvc', 'solar-thermal desalination', 'waste-heat-desalination',
-    'stage/effect temperature', 'pressures', 'salinities', 'liquid inventories', 'wall temperature', 'feed-flow', 'feed-temperature and feed-salinity', 'heating-steam', 'condenser cooling-water', 'terminal vacuum', 'vapour-liquid interfacial', 'product/brine outlet',
-    'feed-water thermodynamics', 'evaporation', 'condensation', 'flashing', 'boiling-point elevation', 'heat transfer', 'heat-exchanger modelling', 'multi-stage and multi-effect', 'vapour compression', 'steam and utility', 'vacuum-system', 'brine recirculation', 'heat recovery', 'scaling assessment', 'condenser modelling', 'thermal-energy consumption', 'electrical-energy consumption', 'equipment sizing', 'transient operation', 'start-up and shutdown', 'waste-heat integration', 'solar-thermal integration', 'performance-ratio assessment'],
-  equationsNote: 'Steady-state design model with saturated heating steam. Seawater properties follow Sharqawy et al.; U(T), demister, non-equilibrium and CaSO₄-envelope correlations follow El-Dessouky & Ettouney and are valid for roughly 30–120 °C; the ejector fit holds for compression ratios ≥ 1.81 and entrainment ratios ≤ 4. Part-load results of MED/MVC are true ratings at fixed area, the MSF turndown curve is a re-design at lower top brine temperature. Start-up and cool-down after a steam trip are lumped thermal-inertia estimates (no vacuum pull-down, venting or level control). An RO concentrate can be pulled as feed, but RO–thermal hybrids are not optimised here. Scaling is screened with a CaSO₄ solubility envelope and top-temperature limits only — use suite 2 for speciation. Non-condensable gases enter only as a venting allowance; tube-bundle geometry and wetting rates are not resolved.',
+  implemented: ['total and component mass', 'energy balance', 'steam-table', 'vapour-liquid equilibrium', 'boiling-point-elevation', 'antoine', 'clausius-clapeyron', 'flash-vaporization', 'heat-exchanger equation', 'overall heat-transfer', 'logarithmic-mean', 'effectiveness-ntu', 'condensation equation', 'evaporation equation', 'latent-heat', 'non-equilibrium allowance', 'demister pressure-drop', 'compressor equation', 'exergy equation', 'raoult',
+    'multi-effect mass-energy', 'multi-stage-flash stagewise', 'thermal-vapour-compression', 'mechanical-vapour-compression', 'med-tvc', 'solar-thermal desalination', 'waste-heat-desalination', 'med-ro', 'msf-ro', 'heat-pump-desalination', 'thermal-electrical cogeneration', 'thermodynamic-economic', 'exergy-economic',
+    'stage/effect temperature', 'pressures', 'salinities', 'liquid inventories', 'vapour inventories', 'wall temperature', 'heat-flux condition', 'feed-flow', 'feed-temperature and feed-salinity', 'heating-steam', 'condenser cooling-water', 'terminal vacuum', 'vapour-liquid interfacial', 'product/brine outlet',
+    'feed-water thermodynamics', 'evaporation', 'condensation', 'flashing', 'boiling-point elevation', 'heat transfer', 'heat-exchanger modelling', 'multi-stage and multi-effect', 'vapour compression', 'steam and utility', 'vacuum-system', 'brine recirculation', 'heat recovery', 'scaling assessment', 'condenser modelling', 'thermal-energy consumption', 'electrical-energy consumption', 'equipment sizing', 'transient operation', 'start-up and shutdown', 'waste-heat integration', 'solar-thermal integration', 'process optimisation', 'performance-ratio assessment'],
+  equationsNote: 'Steady-state design model with saturated heating steam. Seawater properties follow Sharqawy et al.; U(T), demister, non-equilibrium and CaSO₄-envelope correlations follow El-Dessouky & Ettouney and are valid for roughly 30–120 °C; the ejector fit holds for compression ratios ≥ 1.81 and entrainment ratios ≤ 4. Part-load results of MED/MVC are true ratings at fixed area, the MSF turndown curve is a re-design at lower top brine temperature. Start-up and cool-down after a steam trip are lumped thermal-inertia estimates (no vacuum pull-down, venting or level control). The boiling-point elevation can be taken from the seawater correlation or from Raoult’s law (p = a_w·p_sat with the water mole fraction or the osmotic-coefficient activity); all three are tabulated. MED–RO / MSF–RO hybrids couple this model to the element-by-element RO engine of suite 1 through a shared intake (optionally the warm cooling-water reject) and product blending; the RO block uses the default seawater membrane and automatic array sizing and is not co-optimised with the thermal block. Heat pumps are reduced-order (second-law efficiency × reversible COP, no working-fluid cycle); cogeneration is a saturated-steam turbine expansion with one isentropic efficiency and the lost-work (power-loss) allocation, limited to 45 bar throttle pressure by the property correlations. The thermodynamic–economic cost is a single-year annualised model (surface cost × installation factor, heat, electricity, O&M, chemicals); the exergy–economic table applies one average fuel-exergy cost to every component (SPECO-type aggregate, no stream-by-stream cost matrix). Process optimisation is a constrained grid search over the equal-ΔT design map, not a continuous optimiser. The vapour inventory is a saturated ideal-gas hold-up added to the lumped start-up model. Scaling is screened with a CaSO₄ solubility envelope and top-temperature limits only — use suite 2 for speciation. Non-condensable gases enter only as a venting allowance; tube-bundle geometry and wetting rates are not resolved.',
 
   inputs: [
     { group: 'Process and capacity', help: 'Which thermal process is designed and for how much distillate.', fields: [
@@ -473,7 +607,13 @@ const suite = {
       { key: 'Uph', label: 'Feed-preheater overall U', unit: 'kW/m²·K', value: 1.8, min: 0.3, max: 6, help: 'Plate exchangers recovering heat from product and brine.' },
     ] },
     { group: 'Heat source', help: 'Where the heat comes from and how it is valued.', fields: [
-      { key: 'source', label: 'Heat source', type: 'select', value: 'steam', options: [{ value: 'steam', label: 'Boiler or turbine-extraction steam' }, { value: 'solar', label: 'Solar-thermal collector field' }, { value: 'waste', label: 'Industrial waste-heat stream' }], help: 'Adds a sizing table for a solar field or a waste-heat match to the results.' },
+      { key: 'source', label: 'Heat source', type: 'select', value: 'steam', options: [{ value: 'steam', label: 'Boiler or turbine-extraction steam' }, { value: 'cogen', label: 'Power-plant cogeneration (turbine extraction, lost-work allocation)' }, { value: 'mhp', label: 'Mechanical (electric) heat pump on the rejected heat' }, { value: 'ahp', label: 'Absorption heat pump on the rejected heat' }, { value: 'solar', label: 'Solar-thermal collector field' }, { value: 'waste', label: 'Industrial waste-heat stream' }], help: 'Adds the matching integration model to the results: turbine-extraction cogeneration, a heat pump that upgrades the condenser heat, a solar field or a waste-heat match.' },
+      { key: 'Pthr', label: 'Turbine throttle pressure (saturated steam)', unit: 'bar', value: 40, min: 3, max: 45, showIf: (v) => v.source === 'cogen', help: 'Saturated steam at this pressure expands in the turbine; the heating steam is extracted at the pressure the desalination plant needs. Property correlations limit the model to 45 bar.' },
+      { key: 'Ppp', label: 'Gross power without extraction', unit: 'MW', value: 300, min: 1, max: 3000, showIf: (v) => v.source === 'cogen', help: 'Rating of the steam turbine when all steam expands to the condenser.' },
+      { key: 'etaBoiler', label: 'Boiler efficiency', unit: '%', value: 90, min: 50, max: 99, showIf: (v) => v.source === 'cogen', help: 'Fuel heat converted into steam enthalpy.' },
+      { key: 'hpEta', label: 'Heat-pump second-law efficiency', unit: '%', value: 55, min: 10, max: 100, showIf: (v) => v.source === 'mhp' || v.source === 'ahp', help: 'Mechanical: share of the Carnot COP reached. Absorption: share of the reversible three-temperature gain (COP − 1) reached. 100 % gives the thermodynamic limit.' },
+      { key: 'hpApproach', label: 'Heat-pump exchanger approach', unit: 'K', value: 3, min: 0, max: 15, showIf: (v) => v.source === 'mhp' || v.source === 'ahp', help: 'Temperature difference in the heat-pump evaporator and condenser/absorber.' },
+      { key: 'hpTg', label: 'Driving-heat temperature (generator)', unit: '°C', value: 150, min: 80, max: 250, showIf: (v) => v.source === 'ahp', help: 'Temperature of the steam or hot gas that drives the absorption heat pump.' },
       { key: 'ghi', label: 'Daily solar irradiation', unit: 'kWh/m²·d', value: 5.8, min: 0.5, max: 10, showIf: (v) => v.source === 'solar', help: 'Annual-mean global horizontal irradiation at the site.' },
       { key: 'collector', label: 'Collector type', type: 'select', value: 'etc', options: Object.entries(COLLECTORS).map(([k, c]) => ({ value: k, label: c.name })), showIf: (v) => v.source === 'solar', help: 'Sets the optical efficiency and heat-loss coefficients of the collector.' },
       { key: 'solarFrac', label: 'Solar fraction of the heat demand', unit: '%', value: 70, min: 5, max: 100, showIf: (v) => v.source === 'solar', help: 'Share of the daily heat demand supplied by the collector field.' },
@@ -484,7 +624,7 @@ const suite = {
       { key: 'etaTurb', label: 'Turbine efficiency relative to Carnot', unit: '%', value: 85, min: 40, max: 100, help: 'Fraction of the Carnot work a real steam turbine would deliver.' },
     ] },
     { group: 'Heat-transfer model', tab: 'setup', help: 'How the heat-transfer areas are obtained.', fields: [
-      { key: 'areaMode', label: 'Effect sizing rule', type: 'select', value: 'equalArea', options: [{ value: 'equalArea', label: 'Equal area in every effect (iterated)' }, { value: 'equalDT', label: 'Equal temperature difference in every effect' }], showIf: (v) => v.proc !== 'msf', help: 'Equal-area designs are the industrial standard; the temperature differences are iterated until all areas match.' },
+      { key: 'areaMode', label: 'Effect sizing rule', type: 'select', value: 'equalArea', options: [{ value: 'equalArea', label: 'Equal area in every effect (iterated)' }, { value: 'equalDT', label: 'Equal temperature difference in every effect' }, { value: 'flux', label: 'Equal heat flux in every effect (prescribed-flux condition)' }], showIf: (v) => v.proc !== 'msf', help: 'Equal-area designs are the industrial standard; the temperature differences are iterated until all areas match. The heat-flux option instead imposes the same heat flux q″ = U·ΔT on every effect.' },
       { key: 'fU', label: 'Heat-transfer coefficient multiplier', unit: '×', value: 1, min: 0.3, max: 2, help: 'Scales the published U(T) correlations. Calibrate against plant data.' },
       { key: 'Rf', label: 'Additional fouling resistance', unit: 'm²·K/kW', value: 0.03, min: 0, max: 0.5, help: 'Added in series to the correlation value: 1/U = 1/U₀ + R_f.' },
       { key: 'heatLoss', label: 'Heat loss to surroundings', unit: '% of duty', value: 1, min: 0, max: 15, help: 'Share of every effect or brine-heater duty lost through the insulation.' },
@@ -493,6 +633,7 @@ const suite = {
       { key: 'ttdRej', label: 'Heat-rejection terminal difference', unit: 'K', value: 3, min: 0.5, max: 15, showIf: (v) => v.proc === 'msf' && v.msfType === 'br', help: 'Condensing temperature of the first rejection stage minus the seawater leaving it.' },
     ] },
     { group: 'Temperature losses and venting', tab: 'setup', help: 'Thermodynamic penalties between boiling brine and condensing vapour.', fields: [
+      { key: 'bpeModel', label: 'Boiling-point-elevation basis', type: 'select', value: 'corr', options: [{ value: 'corr', label: 'Seawater correlation (Sharqawy)' }, { value: 'activity', label: 'Raoult’s law with water activity (osmotic coefficient)' }, { value: 'ideal', label: 'Raoult’s law, ideal (water mole fraction)' }], help: 'Raoult’s law: the brine boils where a_w·p_sat(T) equals the stage pressure. All three bases are always compared in the results; this choice selects the one used in the balances.' },
       { key: 'fBPE', label: 'Boiling-point-elevation multiplier', unit: '×', value: 1, min: 0, max: 2, help: '0 gives the ideal pure-water limit.' },
       { key: 'fNEA', label: 'Non-equilibrium-allowance multiplier', unit: '×', value: 1, min: 0, max: 3, showIf: (v) => v.proc === 'msf', help: 'Scales the non-equilibrium allowance correlation of the flashing stages.' },
       { key: 'neaH', label: 'Flashing-brine pool depth', unit: 'm', value: 0.3, min: 0.05, max: 1, showIf: (v) => v.proc === 'msf', help: 'Depth of the flashing brine above the stage floor.' },
@@ -518,9 +659,30 @@ const suite = {
     { group: 'Start-up transient (initial conditions)', tab: 'setup', help: 'All effects/stages start at seawater temperature; the heating steam is ramped up linearly.', fields: [
       { key: 'transient', label: 'Simulate start-up and shutdown', type: 'bool', value: true, help: 'Integrates the warm-up of every effect/stage from a cold start.' },
       { key: 'cth', label: 'Thermal mass per m² of heat-transfer surface', unit: 'kJ/m²·K', value: 25, min: 2, max: 600, showIf: (v) => v.transient, help: 'Tubes, shell, internals and wetted film, referred to the heat-transfer area.' },
+      { key: 'vapVol', label: 'Vapour-space volume per m² of heat-transfer surface', unit: 'm³/m²', value: 0.03, min: 0, max: 0.5, showIf: (v) => v.transient, help: 'Vapour inventory of each effect/stage: it starts saturated at seawater temperature and its mass and latent energy grow as the unit warms up.' },
       { key: 'holdup', label: 'Brine hold-up time per effect/stage', unit: 's', value: 90, min: 0, max: 900, showIf: (v) => v.transient, help: 'Liquid inventory expressed as residence time of the brine flow.' },
       { key: 'ramp', label: 'Steam ramp-up time', unit: 'min', value: 30, min: 1, max: 600, showIf: (v) => v.transient, help: 'Time over which the heating steam is brought to its design flow.' },
       { key: 'tEnd', label: 'Simulated time', unit: 'h', value: 4, min: 0.2, max: 48, showIf: (v) => v.transient, help: 'Length of the simulated start-up; it is extended automatically if the plant is not yet warm.' },
+    ] },
+    { group: 'Hybrid with reverse osmosis', tab: 'setup', help: 'MED–RO / MSF–RO (or MVC–RO) plant: a reverse-osmosis block shares the seawater intake and the two products are blended.', fields: [
+      { key: 'hybrid', label: 'Plant configuration', type: 'select', value: 'none', options: [{ value: 'none', label: 'Thermal plant only' }, { value: 'ro', label: 'Thermal + RO hybrid with product blending' }], help: 'The RO block is solved element by element with the engine of suite 1 (default seawater membrane, automatic array sizing).' },
+      { key: 'roShare', label: 'RO share of the total product', unit: '%', value: 50, min: 5, max: 95, showIf: (v) => v.hybrid === 'ro', help: 'The thermal capacity above stays as entered; the RO block is sized to supply this share of the blended product.' },
+      { key: 'roRec', label: 'RO recovery', unit: '%', value: 42, min: 10, max: 85, showIf: (v) => v.hybrid === 'ro', help: 'Permeate ÷ RO feed.' },
+      { key: 'roFlux', label: 'RO design flux', unit: 'L/m²·h', value: 14, min: 5, max: 35, showIf: (v) => v.hybrid === 'ro', help: 'Average flux used to size the RO array.' },
+      { key: 'roFeed', label: 'RO feed taken from', type: 'select', value: 'reject', options: [{ value: 'reject', label: 'Warm cooling-water reject of the thermal block' }, { value: 'intake', label: 'Cold seawater from the shared intake' }], showIf: (v) => v.hybrid === 'ro', help: 'Feeding the RO with the warm reject saves intake flow and lowers the RO pressure.' },
+      { key: 'tdsLimit', label: 'Blended-product TDS limit', unit: 'mg/L', value: 500, min: 20, max: 2000, showIf: (v) => v.hybrid === 'ro', help: 'Blending with distillate lets a single-pass RO meet this limit.' },
+    ] },
+    { group: 'Costing (thermodynamic–economic and exergy–economic)', tab: 'setup', help: 'Prices and capital factors for the unit water cost, the exergy cost rates and the cost-optimal design on the sensitivity map.', fields: [
+      { key: 'cHeat', label: 'Price of heat', unit: '$/MWh', value: 8, min: 0, max: 200, help: 'Value of the heating steam per MWh of heat (about 2 $/GJ for low-pressure extraction steam).' },
+      { key: 'cElec', label: 'Price of electricity', unit: '$/kWh', value: 0.07, min: 0, max: 1, help: 'For pumps, vacuum system, vapour compressor and heat pump.' },
+      { key: 'cArea', label: 'Cost of heat-transfer surface', unit: '$/m²', value: 120, min: 5, max: 2000, help: 'Purchased cost of evaporator, condenser and preheater surface.' },
+      { key: 'cComp', label: 'Cost of the vapour compressor', unit: '$/kW', value: 900, min: 50, max: 5000, showIf: (v) => v.proc === 'mvc', help: 'Per kW of electrical compressor power.' },
+      { key: 'capFactor', label: 'Installed plant cost ÷ equipment cost', unit: '×', value: 2.2, min: 1, max: 6, help: 'Covers shells, pumps, piping, intake, civil works and engineering.' },
+      { key: 'intRate', label: 'Interest rate', unit: '%/y', value: 6, min: 0, max: 25, help: 'For the capital-recovery factor.' },
+      { key: 'life', label: 'Plant life', unit: 'y', value: 25, min: 3, max: 50, help: 'Amortisation period.' },
+      { key: 'avail', label: 'Availability', unit: '%', value: 92, min: 30, max: 100, help: 'Share of the year the plant produces.' },
+      { key: 'omPct', label: 'Operation and maintenance', unit: '% of capital per year', value: 3, min: 0, max: 15, help: 'Labour, spares and cleaning.' },
+      { key: 'cChem', label: 'Chemicals', unit: '$/m³', value: 0.03, min: 0, max: 1, help: 'Antiscalant, antifoam and post-treatment per m³ of distillate.' },
     ] },
     { group: 'Discretisation', tab: 'mesh', help: 'Numerical resolution of the tube-side integration and of the start-up integration.', fields: [
       { key: 'nSeg', label: 'Segments per condenser / preheater', unit: '', value: 4, min: 1, max: 60, step: 1, help: 'Heat exchangers are integrated in segments with local properties; one segment is the classical LMTD.' },
@@ -546,6 +708,7 @@ const suite = {
   site: (site) => [
     { key: 'Tsw', value: site?.data?.sst, from: 'Sea-surface temperature at site' }, { key: 'Xf', value: site?.data?.salinity, from: 'Sea-surface salinity at site' },
     { key: 'ghi', value: site?.data?.ghiDaily, from: 'Daily solar irradiation at site' }, { key: 'Tamb', value: site?.data?.airTemp, from: 'Air temperature at site' },
+    { key: 'cElec', value: site?.data?.electricityPrice, from: 'Electricity price at site' }, { key: 'intRate', value: site?.data?.lendingRate, from: 'Lending rate at site' },
   ],
 
   run(v) {
@@ -588,6 +751,38 @@ const suite = {
       if (!ok) W.push({ level: 'bad', msg: `The waste-heat stream (${p.Twh} °C) is colder than the ${fmt(Tneed, 3)} °C this design needs — lower the heating-steam temperature or use fewer effects.` });
       else if (cover < 1) W.push({ level: 'info', msg: `Waste heat covers ${fmt(100 * cover, 3)} % of the heat demand; the rest must come from steam.` });
     }
+    const Tsup = proc === 'medtvc' ? R.ej.Tm : R.Tsteam, extraKpis = [], extraPlots = [], extraTables = [], extraBal = [], extraOut = {};
+    let srcTitle = p.source === 'solar' ? 'Solar-thermal integration' : 'Waste-heat integration', costEx = {};
+    if (p.source === 'cogen') {
+      const cg = cogeneration(R.Qin, Tsup, R.Wel, p), mig = (R.Qd * 24) / 4546.09;
+      srcTitle = 'Thermal–electrical cogeneration (turbine extraction, power-loss method)';
+      srcRows.push(['Throttle steam temperature (°C)', cg.T1], ['Extraction (heating-steam) temperature (°C)', cg.Te], ['Extraction pressure (bar)', psat(cg.Te) / 1e5], ['Steam quality at extraction (–)', cg.xE], ['Turbine steam flow (kg/s)', cg.m0], ['Extraction steam flow (kg/s)', cg.mExt], ['Share of turbine steam extracted (%)', (100 * cg.mExt) / cg.m0],
+        ['Lost work per kg of extraction steam (kJ/kg)', cg.wLost / 1000], ['Lost work ÷ heat delivered (–)', cg.lostPerHeat], ['Carnot factor of the delivered heat, 1 − T_c/T_ext (–)', cg.carnot], ['Exergy returned with the hot condensate ÷ heat (–)', cg.condensate], ['Power lost by extraction (MW)', cg.Wlost / 1e6], ['Electricity used by the desalination plant (MW)', R.Wel / 1e6], ['Net power for export (MW)', cg.Pexport / 1e6],
+        ['Power-to-water ratio (MW per MIGD)', cg.Pexport / 1e6 / mig], ['Power-to-water ratio (kW per m³/d)', cg.Pexport / 1000 / (R.Qd * 24)], ['Fuel heat (MW)', cg.fuel / 1e6], ['Fuel charged to water, power-loss method (MW)', cg.fuelWater / 1e6], ['Share of fuel charged to water (%)', 100 * cg.fuelShare], ['Energy-utilisation factor (–)', cg.euf], ['Power-only cycle efficiency (%)', 100 * cg.etaPower],
+        ['Equivalent electricity of the water, lost work + auxiliaries (kWh/m³)', (cg.Wlost + R.Wel) / 1000 / R.Qd]);
+      srcNote = 'Saturated-steam Rankine expansion with the turbine efficiency entered under “Heat source”: s_g = ∫c_p dT/T + λ/T fixes the wet-steam states; the water is charged the turbine work its extraction steam would still have produced down to the condenser. For an ideal turbine that work equals the Carnot value of the heat plus the exergy of the hot condensate, which returns to the boiler and is credited in the fuel heat.';
+      if (!cg.feasible) W.push({ level: 'bad', msg: cg.clipped ? `The plant needs heat at ${fmt(Tsup, 3)} °C, which is not below the ${fmt(cg.T1, 3)} °C throttle steam — raise the throttle pressure.` : `The extraction (${fmt(cg.mExt, 3)} kg/s) exceeds the turbine steam flow (${fmt(cg.m0, 3)} kg/s) — the power plant is too small for this water capacity.` });
+      extraKpis.push({ label: 'Power lost by steam extraction', value: cg.Wlost / 1e6, unit: 'MW', status: cg.feasible ? 'ok' : 'bad' }, { label: 'Equivalent electricity (lost work)', value: (cg.Wlost + R.Wel) / 1000 / R.Qd, unit: 'kWh/m³', help: 'Turbine work lost by the extraction plus auxiliaries, per m³ of distillate' }, { label: 'Power-to-water ratio', value: cg.Pexport / 1e6 / mig, unit: 'MW/MIGD' }, { label: 'Energy-utilisation factor', value: cg.euf, unit: '–', help: '(Net power + process heat) ÷ fuel heat' });
+      const Te = linspace(Math.min(cg.Tc + 8, cg.T1 - 10), Math.min(130, cg.T1 - 5), 9), cc = Te.map((T) => cogeneration(1e6, T, 0, p));
+      extraPlots.push({ type: 'line', title: 'Cogeneration: turbine work lost per unit of extracted heat', xlabel: 'Extraction (heating-steam) temperature (°C)', ylabel: 'kWh of power per kWh of heat', series: [{ name: 'Lost work ÷ heat (turbine model)', x: Te, y: cc.map((q) => q.lostPerHeat), mode: 'both' }, { name: 'Reversible limit: Carnot factor + condensate exergy', x: Te, y: cc.map((q) => q.carnot + q.condensate), dash: true }], vlines: [{ x: cg.Te, label: 'this plant' }], note: 'Low-temperature processes (MED) take steam that has already done most of its work; MSF and TVC motive steam cost more power.' });
+      extraOut.powerLoss = cg.Wlost / 1000; extraOut.powerToWater = cg.Pexport / 1e6 / mig; extraOut.secLostWork = (cg.Wlost + R.Wel) / 1000 / R.Qd;
+    } else if (p.source === 'mhp' || p.source === 'ahp') {
+      const hp = heatPump(R, p);
+      srcTitle = hp.abs ? 'Absorption heat-pump desalination' : 'Mechanical heat-pump desalination';
+      srcRows.push(['Heat-pump source temperature (°C)', hp.Tl], ['Heat-pump delivery temperature (°C)', hp.Th], ...(hp.abs ? [['Driving-heat (generator) temperature (°C)', hp.Tg]] : []), ['Reversible COP (–)', hp.copRev], ['COP of the heat pump (–)', hp.cop], ['Heat demand of the plant (MW)', hp.Qneed / 1e6], ['Rejected heat available (MW)', hp.Qavail / 1e6], ['Heat taken from the reject (MW)', hp.Qe / 1e6],
+        [hp.abs ? 'Driving heat to the generator (MW)' : 'Compressor power (MW)', hp.drive / 1e6], ['Heat delivered by the heat pump (MW)', hp.Qhp / 1e6], ['Heat still supplied directly (MW)', hp.Qdirect / 1e6], ['Share of the heat demand covered (%)', 100 * hp.share], ['Cooling duty avoided (%)', 100 * hp.cwSaving],
+        ['External heat (kWh/m³)', hp.sTh], ['Electricity incl. heat pump (kWh/m³)', hp.sEl], ['Equivalent electricity (kWh/m³)', hp.sEq], ['Performance ratio on external heat (kg/2326 kJ)', hp.PR]);
+      srcNote = hp.abs ? 'COP = 1 + η·(COP_rev − 1), COP_rev = (1 − T_l/T_g)/(1 − T_l/T_h); the absorber and condenser heat (driving heat + lifted heat) goes to the first effect or brine heater.' : 'COP = η·T_h/(T_h − T_l); the compressor work and the lifted condenser heat go to the first effect or brine heater.';
+      if (hp.Qavail <= 0) W.push({ level: 'info', msg: mvc ? 'MVC is already a mechanical heat pump with no condenser reject — the heat-pump option has nothing to upgrade.' : 'This configuration rejects no heat to cooling water, so the heat pump has no low-temperature source; all heat is supplied directly.' });
+      else if (hp.share < 0.999) W.push({ level: 'info', msg: `The rejected heat limits the heat pump to ${fmt(100 * hp.share, 3)} % of the heat demand; the rest is supplied directly.` });
+      if (proc === 'medtvc') W.push({ level: 'info', msg: 'With a thermo-compressor the heat pump has to deliver motive steam at ' + fmt(hp.Th, 3) + ' °C — the large lift makes the COP low; plain MED suits a heat pump better.' });
+      extraKpis.push({ label: 'Heat-pump COP', value: hp.cop, unit: '–', help: `Reversible limit ${fmt(hp.copRev, 3)}` }, { label: hp.abs ? 'Heat-pump driving heat' : 'Heat-pump compressor power', value: hp.drive / 1e6, unit: 'MW' }, { label: 'Equivalent electricity with heat pump', value: hp.sEq, unit: 'kWh/m³' }, { label: 'Cooling duty avoided', value: 100 * hp.cwSaving, unit: '%' });
+      extraBal.push({ name: 'Heat pump: source heat + drive = heat delivered (MW)', in: (hp.Qe + hp.drive) / 1e6, out: hp.Qhp / 1e6 });
+      const ee = [20, 35, 50, 65, 80, 100];
+      extraPlots.push({ type: 'line', title: 'Heat-pump COP and equivalent electricity versus second-law efficiency', xlabel: 'Second-law efficiency (%)', ylabel: 'COP · kWh/m³', series: [{ name: 'COP', x: ee, y: ee.map((e) => heatPump(R, { ...p, hpEta: e }).cop), mode: 'both' }, { name: 'Equivalent electricity (kWh/m³)', x: ee, y: ee.map((e) => heatPump(R, { ...p, hpEta: e }).sEq), mode: 'both' }], hlines: [{ y: R.sEq, label: 'without heat pump' }], vlines: [{ x: p.hpEta, label: 'selected' }] });
+      costEx = { heat: hp.heatExt, power: R.Wel + hp.Wext };
+      extraOut.heatPumpCOP = hp.cop; extraOut.secEquivalentHeatPump = hp.sEq;
+    }
 
     // ---- sweeps (fast equal-ΔT designs; MED/MVC part load is a fixed-area rating)
     const base = { ...v }, pick = (q) => (q ? [nz(q.GOR), q.sArea / 1000, q.sEl, q.sTh] : [null, null, null, null]);
@@ -600,22 +795,18 @@ const suite = {
     let part;
     if (msf) part = loads.map((L) => { const q = tryRun(base, { TBT: p.TnMsf + ((p.TBT - p.TnMsf) * L) / 100, fast: true }); return q ? [L, q.PR, (100 * q.areaEvap) / R.areaEvap, p.TnMsf + ((p.TBT - p.TnMsf) * L) / 100, q.sTh] : [L, null, null, null, null]; });
     else part = loads.map((L) => { const q = tryRun(base, { Md: (p.Md * L) / 100, areaMode: 'rating', Ades: r.A, dT0: r.dT.map((d) => (d * L) / 100), fast: true }); return q ? [L, mvc ? q.sEl : q.GOR, q.Tsteam, q.Ttop, mvc ? q.comp.ratio : q.sTh] : [L, null, null, null, null]; });
-    // 2-D sensitivity map
-    let field;
-    if (msf) {
-      const xs = [12, 16, 20, 24, 28, 32].filter((n) => n > p.nRej + 1), ys = linspace(88, 118, 6);
-      field = { type: 'field', title: 'Performance ratio versus stage count and top brine temperature', xlabel: 'Number of stages', ylabel: 'Top brine temperature (°C)', zlabel: 'Performance ratio', zunit: 'kg/2326 kJ', x: xs, y: ys, z: ys.map((T) => xs.map((n) => tryRun(base, { Nst: n, TBT: T, fast: true })?.PR ?? null)), cmap: 'viridis', contours: 8, markers: [{ x: N, y: p.TBT, label: 'design' }] };
-    } else if (mvc) {
-      const xs = linspace(45, 70, 6), ys = linspace(1.5, 5, 5);
-      field = { type: 'field', title: 'Specific electricity versus evaporation temperature and ΔT', xlabel: 'First-effect brine temperature (°C)', ylabel: 'Condensing − boiling ΔT (K)', zlabel: 'Specific electricity', zunit: 'kWh/m³', x: xs, y: ys, z: ys.map((d) => xs.map((T) => tryRun(base, { Tmvc: T, dTmvc: d, fast: true })?.sEl ?? null)), cmap: 'thermal', contours: 8, markers: [{ x: p.Tmvc, y: p.dTmvc, label: 'design' }] };
-    } else {
-      const xs = [4, 6, 9, 12], ys = linspace(58, 74, 4);
-      field = { type: 'field', title: 'Gain-output ratio versus effects and heating-steam temperature', xlabel: 'Number of effects', ylabel: 'Heating-steam temperature (°C)', zlabel: 'GOR', zunit: 'kg/kg', x: xs, y: ys, z: ys.map((T) => xs.map((n) => nz(tryRun(base, { N: n, Ts: T, fast: true, nEnt: p.nEnt > 0 ? Math.max(1, Math.round((p.nEnt * n) / N)) : 0 })?.GOR))), cmap: 'viridis', contours: 8, markers: [{ x: N, y: p.Ts, label: 'design' }] };
-    }
+    // 2-D sensitivity map (grid of fast re-designs) and its use for the cost-optimal design
+    const grid = designGrid(base, N), field = { type: 'field', title: grid.title, xlabel: grid.xlabel, ylabel: grid.ylabel, zlabel: grid.zlabel, zunit: grid.zunit, x: grid.xs, y: grid.ys, z: grid.cells.map((row) => row.map((q) => (q ? nz(grid.metric(q)) : null))), cmap: grid.cmap, contours: 8, markers: [{ x: grid.x0, y: grid.y0, label: 'design' }] };
     // repair isolated gaps of the map so that colour scaling stays finite
     const zf = field.z.flat().filter((x) => x !== null), zMean = zf.length ? sum(zf) / zf.length : 0;
     field.z = field.z.map((row) => row.map((x) => (x === null ? zMean : x)));
     field.note = 'Each cell is a full re-design with equal temperature differences; cells that cannot be designed are filled with the map average.';
+    // ---- thermodynamic–economic and exergy–economic costing, process optimisation on the design grid
+    const wc = waterCost(R, p, costEx), xe = exergoEconomics(R, p, waterCost(R, p)), opt = optimiseGrid(grid, p, tLim, waterCost(R, p).total);
+    const cf_ = opt.cost.flat().filter((x) => x !== null), cMean = cf_.length ? sum(cf_) / cf_.length : wc.total;
+    const costField = { type: 'field', title: 'Unit water cost on the design map (process optimisation)', xlabel: grid.xlabel, ylabel: grid.ylabel, zlabel: 'Water cost', zunit: '$/m³', x: grid.xs, y: grid.ys, z: opt.cost.map((row) => row.map((x) => (x === null ? cMean : x))), cmap: 'thermal', contours: 8, markers: [{ x: grid.x0, y: grid.y0, label: 'design' }, ...(opt.best.base ? [] : [{ x: opt.best.x, y: opt.best.y, label: 'lowest cost' }])],
+      note: `Grid search over ${opt.nCells} re-designs (${opt.nFeas} within the ${tLim} °C scale limit) with the costing inputs of Model setup; lowest cost ${fmt(opt.best.cost, 3)} $/m³ at ${grid.xlabel.toLowerCase()} = ${fmt(opt.best.x, 3)}, ${grid.ylabel.toLowerCase()} = ${fmt(opt.best.y, 3)}${opt.best.base ? ' (the present design)' : ''}.` };
+    if (!opt.best.base && opt.saving > 0.03) W.push({ level: 'info', msg: `Process optimisation: the design map holds a cheaper design (${fmt(opt.best.cost, 3)} instead of ${fmt(waterCost(R, p).total, 3)} $/m³) at ${grid.xlabel.toLowerCase()} ${fmt(opt.best.x, 3)} and ${grid.ylabel.toLowerCase()} ${fmt(opt.best.y, 3)}.` });
 
     let su = null, tSim = p.tEnd;
     if (p.transient) for (let k = 0; k < 4; k++) { su = startUp(R, { ...p, tEnd: tSim }); if (su.t95 !== null) break; if (k < 3) tSim *= 2; }
@@ -630,6 +821,33 @@ const suite = {
     const out = { distillate: R.Qd, GOR: nz(R.GOR), PR: nz(R.PR), secThermal: R.sTh, secElec: R.sEl, steam: R.Ms, area: R.area, recovery: R.rec, coolingWater: (R.Mcw * 3600) / density(p.Tsw, p.Xf), heat: R.Qin / 1000, power: R.Wel / 1000, process: proc, topBrineTemperature: R.Ttop, brineSalinity: R.Xb, secEquivalent: R.sEq, startUpMin: su?.t95 ?? null,
       streams: { distillate: { Q: R.Qd, T: R.Tprod, P: 1, pH: 6.5, tds: tdsD, ions: round(scaleIons(ionsF, tdsD / Math.max(tds(ionsF), 1e-9))) }, brine: { Q: Qb, T: R.Tbrine, P: 1, pH: Math.min(9, 8.1 + 0.3 * Math.log10(cf)), tds: tdsFromSalinity(R.Xb, R.Tbrine), ions: round(scaleIons(ionsF, tdsFromSalinity(R.Xb, R.Tbrine) / Math.max(tds(ionsF), 1e-9))) } } };
 
+    Object.assign(out, extraOut, { waterCost: wc.total, exergyCostProduct: xe.cP, optimumWaterCost: opt.best.cost, heatFlux: R.areaEvap > 0 ? (msf ? sum(m.stages.map((s) => s.Q)) : sum(r.q)) / R.areaEvap / 1000 : 0 });
+    // ---- thermal + RO hybrid
+    let hy = null;
+    if (p.hybrid === 'ro') {
+      try { hy = hybridRO(R, p, tdsD, ionsF); } catch (e) { W.push({ level: 'bad', msg: `The RO block of the hybrid could not be solved at ${p.roRec} % recovery: ${e.message}` }); }
+    }
+    if (hy) {
+      const ro = hy.ro, hn = `${name}–RO`;
+      if (hy.overPressure) W.push({ level: 'bad', msg: `The RO block needs ${fmt(ro.p1.Pf, 3)} bar, above the ${ro.cfg.M.pmax} bar element rating — lower the RO recovery.` });
+      if (hy.Tro > 40) W.push({ level: 'warn', msg: `The RO feed is ${fmt(hy.Tro, 3)} °C; most elements are limited to 40–45 °C — blend in cold seawater.` });
+      if (hy.tdsBlend > p.tdsLimit) W.push({ level: 'warn', msg: `The blended product has ${fmt(hy.tdsBlend, 3)} mg/L, above the ${p.tdsLimit} mg/L limit — lower the RO share or add a second pass.` });
+      else W.push({ level: 'info', msg: `${hn} hybrid: ${fmt(100 * hy.share, 3)} % of the product comes from single-pass RO (${fmt(hy.tdsP, 3)} mg/L) and blends with distillate to ${fmt(hy.tdsBlend, 3)} mg/L.` });
+      extraKpis.push({ label: 'Hybrid product (thermal + RO)', value: hy.Qtot * 24, unit: 'm³/d' }, { label: 'Blended product TDS', value: hy.tdsBlend, unit: 'mg/L', status: hy.tdsBlend > p.tdsLimit ? 'warn' : 'ok' }, { label: 'Hybrid recovery (product ÷ feed treated)', value: 100 * hy.recFeed, unit: '%' },
+        { label: 'Hybrid equivalent-electric energy', value: hy.secEq, unit: 'kWh/m³', help: 'Thermal block (electricity + heat as lost turbine work) and RO electricity over the blended product' }, { label: 'RO feed pressure', value: ro.p1.Pf, unit: 'bar', status: hy.overPressure ? 'bad' : 'ok' }, { label: 'Intake flow saved by sharing', value: 100 * hy.intakeSaving, unit: '%' });
+      extraTables.push({ title: `${hn} hybrid: contribution of each process`, columns: ['Process', 'Feed treated (m³/h)', 'Product (m³/h)', 'Recovery (%)', 'Share of product (%)', 'Product TDS (mg/L)', 'Electricity (kW)', 'Heat (kW)', 'Equivalent electricity (kWh/m³ of its product)', 'Brine (m³/h)'],
+        rows: [[name, hy.QfTh, R.Qd, 100 * R.rec, 100 * (1 - hy.share), tdsD, R.Wel / 1000, R.Qin / 1000, R.sEq, Qb], ['Reverse osmosis', hy.Qf, hy.Qp, 100 * ro.overallRec, 100 * hy.share, hy.tdsP, ro.power, 0, ro.sec, ro.conc.Q], ['Hybrid total', hy.QfTh + hy.Qf, hy.Qtot, 100 * hy.recFeed, 100, hy.tdsBlend, R.Wel / 1000 + ro.power, R.Qin / 1000, hy.secEq, hy.Qbrine]],
+        note: `RO: ${ro.nEl} elements, ${fmt(ro.area, 4)} m², feed at ${fmt(hy.Tro, 3)} °C (${fmt(hy.warm, 4)} m³/h taken from the ${fmt(hy.Qrej, 4)} m³/h warm reject) and ${fmt(ro.p1.Pf, 3)} bar${hy.cold ? `; fed with cold seawater it would need ${fmt(hy.cold.p1.Pf, 3)} bar and ${fmt(hy.cold.sec, 3)} instead of ${fmt(ro.sec, 3)} kWh/m³` : ''}. Shared intake ${fmt(hy.intake, 4)} m³/h (product ÷ intake ${fmt(100 * hy.recIntake, 3)} %); combined brine ${fmt(hy.tdsBrine / 1000, 3)} g/L.` });
+      const sh = linspace(0, 90, 10), at = (x) => { const q = (R.Qd * (x / 100)) / (1 - x / 100); return [(R.Qd * tdsD + q * hy.tdsP) / (R.Qd + q), (R.sEq * R.Qd + ro.sec * q) / (R.Qd + q)]; };
+      extraPlots.push({ type: 'line', title: `${hn} hybrid: blend quality and energy versus RO share`, xlabel: 'RO share of the blended product (%)', ylabel: 'mg/L · kWh/m³', series: [{ name: 'Blended product TDS (mg/L)', x: sh, y: sh.map((x) => at(x)[0]), mode: 'both' }, { name: 'Equivalent electricity × 10 (kWh/m³)', x: sh, y: sh.map((x) => 10 * at(x)[1]), mode: 'both' }], hlines: [{ y: p.tdsLimit, label: 'TDS limit' }], vlines: [{ x: 100 * hy.share, label: 'selected' }], note: 'Thermal capacity fixed; the RO permeate quality and specific energy of the solved array are kept along the curve.' });
+      extraBal.push({ name: 'Hybrid RO water (m³/h)', in: hy.Qf, out: hy.Qp + ro.conc.Q }, { name: 'Blend salt (kg/h)', in: (R.Qd * tdsD + hy.Qp * hy.tdsP) / 1000, out: (hy.Qtot * hy.tdsBlend) / 1000 });
+      Object.assign(out, { hybridProduct: hy.Qtot, hybridTDS: hy.tdsBlend, hybridRecovery: hy.recFeed, hybridSecEquivalent: hy.secEq, hybridSecElec: hy.secEl, hybridSecThermal: hy.secTh, roShare: hy.share });
+      out.streams.blend = { Q: hy.Qtot, T: R.Tprod, P: 1, pH: 6.8, tds: hy.tdsBlend, ions: round(hy.ionsBlend) };
+    }
+    // ---- Raoult's-law comparison of the boiling-point elevation
+    const rl = (msf ? m.stages.map((s) => [s.i, s.T, s.X]) : r.T.map((T, i) => [i + 1, T, r.X[i]])).map(([n, T, X]) => ({ n, T, X, corr: bpe(T, X), act: bpeRaoult(T, X, 'activity'), ideal: bpeRaoult(T, X, 'ideal'), aw: waterActivity(T, X, 'activity'), xw: waterActivity(T, X, 'ideal'), pR: raoultPressure(T, X, 'activity'), pC: psat(T - bpe(T, X)) }));
+    const bpeName = { corr: 'seawater correlation', activity: 'Raoult’s law with water activity', ideal: 'ideal Raoult’s law' }[p.bpeModel] || 'seawater correlation', rlLast = rl[rl.length - 1];
+    if (p.bpeModel === 'ideal') W.push({ level: 'info', msg: `Ideal Raoult’s law (mole fraction, no osmotic coefficient) gives a boiling-point elevation ${fmt(100 * (rlLast.ideal / rlLast.corr - 1), 2)} % away from the seawater correlation in the last ${msf ? 'stage' : 'effect'}.` });
     const xs = Array.from({ length: N }, (_, i) => i + 1), unit = msf ? 'Stage' : 'Effect';
     const plots = [];
     if (msf) plots.push({ type: 'line', title: 'Temperature profile along the stages', xlabel: 'Stage', ylabel: '°C', series: [{ name: 'Flashing brine', x: xs, y: m.stages.map((s) => s.T), mode: 'both' }, { name: 'Condensing vapour', x: xs, y: m.stages.map((s) => s.Tv), mode: 'both' }, { name: 'Tube-side brine leaving stage', x: xs, y: m.stages.map((s) => s.tout), mode: 'both' }], hlines: [{ y: tLim, label: 'scale limit' }], vlines: m.nRej ? [{ x: m.nRec + 0.5, label: 'recovery | rejection' }] : [] },
@@ -645,10 +863,14 @@ const suite = {
     plots.push({ type: 'line', title: 'Effect of seawater temperature', xlabel: 'Seawater temperature (°C)', ylabel: 'see legend', series: [mvc ? { name: 'Specific electricity (kWh/m³)', x: Tsws, y: sweepT.map((q) => q[2]), mode: 'both' } : { name: 'Gain-output ratio', x: Tsws, y: sweepT.map((q) => q[0]), mode: 'both' }, { name: 'Specific area (1000 m² per kg/s)', x: Tsws, y: sweepT.map((q) => q[1]), mode: 'both' }, ...(mvc ? [] : [{ name: 'Cooling water (m³ per m³ distillate)', x: Tsws, y: sweepT.map((q) => q[3]), mode: 'both' }])], note: mvc ? 'Design recalculated at each temperature.' : 'The last effect/stage temperature follows the seawater so that the condenser approach stays constant.' });
     plots.push(msf ? { type: 'line', title: 'Turn-down by top brine temperature (constant stage temperatures spacing)', xlabel: 'Flashing range (% of design)', ylabel: 'see legend', series: [{ name: 'Performance ratio', x: loads, y: part.map((q) => q[1]), mode: 'both' }, { name: 'Condenser area needed (% of installed ÷ 10)', x: loads, y: part.map((q) => (q[2] === null ? null : q[2] / 10)), mode: 'both' }, { name: 'Top brine temperature ÷ 10 (°C)', x: loads, y: part.map((q) => (q[3] === null ? null : q[3] / 10)), mode: 'both' }], note: 'Re-design at reduced flashing range for the same distillate; a ratio above 100 % means the installed area would limit production.' }
       : { type: 'line', title: 'Part-load rating at fixed heat-transfer area', xlabel: 'Load (% of design distillate)', ylabel: 'see legend', series: [{ name: mvc ? 'Specific electricity (kWh/m³)' : 'Gain-output ratio', x: loads, y: part.map((q) => q[1]), mode: 'both' }, { name: 'Heating temperature ÷ 10 (°C)', x: loads, y: part.map((q) => (q[2] === null ? null : q[2] / 10)), mode: 'both' }, { name: 'Top brine temperature ÷ 10 (°C)', x: loads, y: part.map((q) => (q[3] === null ? null : q[3] / 10)), mode: 'both' }], note: 'The installed areas are kept; the temperature differences and the heating-steam temperature adjust to the load.' });
-    plots.push(field);
+    plots.push(field, costField);
+    plots.push({ type: 'line', title: 'Boiling-point elevation: seawater correlation versus Raoult’s law', xlabel: unit, ylabel: 'K', series: [{ name: 'Seawater correlation', x: xs, y: rl.map((q) => q.corr), mode: 'both' }, { name: 'Raoult’s law with water activity a_w = exp(−φ·m/55.51)', x: xs, y: rl.map((q) => q.act), mode: 'both' }, { name: 'Raoult’s law, ideal (water mole fraction)', x: xs, y: rl.map((q) => q.ideal), mode: 'both', dash: true }], note: `BPE = T − t_sat(a_w·p_sat(T)). The balances use the ${bpeName}${p.fBPE !== 1 ? ` × ${p.fBPE}` : ''}.` });
+    plots.push({ type: 'bar', title: 'Unit water cost breakdown (thermodynamic–economic model)', ylabel: '$/m³', categories: Object.keys(wc.parts), series: [{ name: 'Cost', values: Object.values(wc.parts) }], note: `Capital ${fmt(wc.capex / 1e6, 3)} M$ (${fmt(wc.perCapacity, 4)} $ per m³/d), capital-recovery factor ${fmt(wc.crf, 3)} per year, ${fmt(wc.hrs, 4)} h/y.` });
+    plots.push({ type: 'bar', title: 'Exergy–economic cost rates by component', ylabel: '$/h', categories: xe.rows.map((q) => q.name), series: [{ name: 'Cost of exergy destroyed Ċ_D', values: xe.rows.map((q) => q.CD) }, { name: 'Capital and O&M rate Ż', values: xe.rows.map((q) => q.Z) }], stacked: true, note: `Fuel exergy costs ${fmt(xe.cF, 3)} $/kWh; the product (minimum work of separation) leaves at ${fmt(xe.cP, 3)} $/kWh.` });
+    plots.push(...extraPlots);
     if (su) {
       const idx = [...new Set([0, Math.floor((N - 1) / 2), N - 1])];
-      plots.push({ type: 'line', title: 'Start-up from cold and cool-down after a steam trip', xlabel: 'Time (min)', ylabel: '°C · %', series: [...idx.map((i) => ({ name: `${unit} ${i + 1} brine temperature (°C)`, x: su.t, y: su.T.map((y) => y[i]) })), { name: 'Start-up: approach to design (%)', x: su.t, y: su.prod, dash: true }, { name: 'Shutdown after a steam trip: remaining temperature rise (%)', x: sd.t, y: sd.prod, dash: true }], note: `Lumped thermal inertia, linear steam ramp over ${p.ramp} min; after a steam trip feed and cooling water keep flowing; ${su.sub} RK4 sub-step${su.sub > 1 ? 's' : ''} per output step.` });
+      plots.push({ type: 'line', title: 'Start-up from cold and cool-down after a steam trip', xlabel: 'Time (min)', ylabel: '°C · %', series: [...idx.map((i) => ({ name: `${unit} ${i + 1} brine temperature (°C)`, x: su.t, y: su.T.map((y) => y[i]) })), { name: 'Start-up: approach to design (%)', x: su.t, y: su.prod, dash: true }, { name: 'Shutdown after a steam trip: remaining temperature rise (%)', x: sd.t, y: sd.prod, dash: true }, ...(su.vap.mTot > 0 ? [{ name: 'Start-up: vapour inventory (% of design)', x: su.t, y: su.vap.inv, dash: true }] : [])], note: `Lumped thermal inertia, linear steam ramp over ${p.ramp} min; after a steam trip feed and cooling water keep flowing; ${su.sub} RK4 sub-step${su.sub > 1 ? 's' : ''} per output step.` });
     }
     // any failed sweep point is dropped from its series
     for (const pl of plots) if (pl.type === 'line') {
@@ -658,11 +880,11 @@ const suite = {
     const shown = plots.filter((pl) => pl.type !== 'line' || pl.series.length > 0);
 
     const tables = [];
-    if (msf) tables.push({ title: 'Stage-by-stage results', columns: ['Stage', 'Section', 'Brine T (°C)', 'Vapour T (°C)', 'Pressure (kPa)', 'Brine out (kg/s)', 'Salinity (g/kg)', 'Distillate formed (kg/s)', 'BPE (K)', 'NEA (K)', 'Demister+line (K)', 'Tube in (°C)', 'Tube out (°C)', 'TTD (K)', 'U (W/m²·K)', 'Area (m²)', 'Duty (MW)', 'NTU', 'Effectiveness'],
-      rows: m.stages.map((s) => [s.i, s.rec ? 'recovery' : 'rejection', s.T, s.Tv, s.P / 1000, s.B, s.X, s.D, s.be, s.nea, s.dl, s.tin, s.tout, s.ttd, s.U, s.A, s.Q / 1e6, s.ntu, s.eff]) });
-    else tables.push({ title: 'Effect-by-effect results', columns: ['Effect', 'Heating T (°C)', 'Brine T (°C)', 'Vapour T (°C)', 'Pressure (kPa)', 'Feed in (kg/s)', 'Feed T (°C)', 'Brine out (kg/s)', 'Salinity (g/kg)', 'Vapour boiled (kg/s)', 'Flash vapour (kg/s)', 'BPE (K)', 'Demister+line (K)', 'ΔT (K)', 'U (W/m²·K)', 'Area (m²)', 'Duty (MW)', 'CaSO₄ envelope (g/kg)'],
-      rows: xs.map((n, i) => [n, r.Th[i], r.T[i], r.Tv[i], psat(r.Tv[i]) / 1000, r.c.Fi[i], r.c.Fi[i] > 0 ? r.tf[i] : null, r.B[i], r.X[i], r.V[i], r.fl[i], r.be[i], r.dl[i], r.dT[i], r.U[i], r.A[i], r.q[i] / 1e6, caso4Limit(r.T[i])]),
-      note: p.areaMode === 'equalArea' && N > 1 ? 'Temperature differences iterated until all effects have the same area.' : '' });
+    if (msf) tables.push({ title: 'Stage-by-stage results', columns: ['Stage', 'Section', 'Brine T (°C)', 'Vapour T (°C)', 'Pressure (kPa)', 'Brine out (kg/s)', 'Salinity (g/kg)', 'Distillate formed (kg/s)', 'BPE (K)', 'NEA (K)', 'Demister+line (K)', 'Tube in (°C)', 'Tube out (°C)', 'TTD (K)', 'U (W/m²·K)', 'Area (m²)', 'Duty (MW)', 'NTU', 'Effectiveness', 'Heat flux (kW/m²)'],
+      rows: m.stages.map((s) => [s.i, s.rec ? 'recovery' : 'rejection', s.T, s.Tv, s.P / 1000, s.B, s.X, s.D, s.be, s.nea, s.dl, s.tin, s.tout, s.ttd, s.U, s.A, s.Q / 1e6, s.ntu, s.eff, s.A > 0 ? s.Q / s.A / 1000 : 0]) });
+    else tables.push({ title: 'Effect-by-effect results', columns: ['Effect', 'Heating T (°C)', 'Brine T (°C)', 'Vapour T (°C)', 'Pressure (kPa)', 'Feed in (kg/s)', 'Feed T (°C)', 'Brine out (kg/s)', 'Salinity (g/kg)', 'Vapour boiled (kg/s)', 'Flash vapour (kg/s)', 'BPE (K)', 'Demister+line (K)', 'ΔT (K)', 'U (W/m²·K)', 'Area (m²)', 'Duty (MW)', 'CaSO₄ envelope (g/kg)', 'Heat flux (kW/m²)'],
+      rows: xs.map((n, i) => [n, r.Th[i], r.T[i], r.Tv[i], psat(r.Tv[i]) / 1000, r.c.Fi[i], r.c.Fi[i] > 0 ? r.tf[i] : null, r.B[i], r.X[i], r.V[i], r.fl[i], r.be[i], r.dl[i], r.dT[i], r.U[i], r.A[i], r.q[i] / 1e6, caso4Limit(r.T[i]), (r.U[i] * r.dT[i]) / 1000]),
+      note: N > 1 && r.c.areaMode === 'equalArea' ? 'Temperature differences iterated until all effects have the same area.' : N > 1 && r.c.areaMode === 'flux' ? 'Prescribed-flux condition: temperature differences iterated until every effect carries the same heat flux q″ = U·ΔT.' : '' });
     tables.push({ title: 'Heat exchangers (LMTD and effectiveness–NTU)', columns: ['Exchanger', 'Duty (MW)', 'Hot side (°C)', 'Cold in (°C)', 'Cold out (°C)', 'LMTD (K)', 'U (W/m²·K)', 'Area (m²)', 'NTU', 'Effectiveness'], rows: R.hx.map((x) => [x.name, x.duty / 1e6, x.Th, x.tin, x.tout, nz(x.lmtd), x.U, x.area, x.ntu, x.eff]), note: 'For condensing duties ε = 1 − exp(−NTU); the NTU and LMTD routes give the same area.' });
     tables.push({ title: 'Streams and utilities', columns: ['Stream', 'Flow (kg/s)', 'Flow (t/h)', 'Temperature (°C)', 'Salinity (g/kg)'],
       rows: [['Feed (make-up)', R.Mf, R.Mf * kgh, p.Tsw, p.Xf], ['Distillate', R.Md, R.Md * kgh, R.Tprod, tdsD / 1000], ['Brine blow-down', R.Mb, R.Mb * kgh, R.Tbrine, R.Xb], ['Cooling water rejected', R.Mcw, R.Mcw * kgh, R.Tcw, p.Xf],
@@ -671,7 +893,18 @@ const suite = {
     tables.push({ title: 'Energy and exergy accounting', columns: ['Item', 'kW', 'kWh per m³ distillate'],
       rows: [['Heat supplied', R.Qin / 1000, R.sTh], ...Object.entries(R.pumps).map(([k, w]) => [`Electricity · ${k}`, w / 1000, w / 1000 / R.Qd]), ['Electricity · total', R.Wel / 1000, R.sEl], ['Equivalent electricity (heat valued as lost turbine work)', R.sEq * R.Qd, R.sEq], ['Minimum work of separation', R.wMin * R.Qd, R.wMin],
         ['Exergy supplied (heat + electricity)', R.exTot / 1000, R.exTot / 1000 / R.Qd], ...R.ex.map(([k, e]) => [`Exergy destroyed · ${k}`, e / 1000, e / 1000 / R.Qd])] });
-    if (srcRows.length) tables.push({ title: p.source === 'solar' ? 'Solar-thermal integration' : 'Waste-heat integration', columns: ['Quantity', 'Value'], rows: srcRows, note: srcNote });
+    if (srcRows.length) tables.push({ title: srcTitle, columns: ['Quantity', 'Value'], rows: srcRows, note: srcNote });
+    tables.push(...extraTables);
+    tables.push({ title: 'Boiling-point elevation and brine vapour pressure: correlation versus Raoult’s law', columns: [unit, 'Brine T (°C)', 'Salinity (g/kg)', 'BPE correlation (K)', 'BPE Raoult, activity (K)', 'BPE Raoult, ideal (K)', 'Water activity a_w (–)', 'Water mole fraction x_w (–)', 'Vapour pressure a_w·p_sat (kPa)', 'Vapour pressure from correlation (kPa)'],
+      rows: rl.map((q) => [q.n, q.T, q.X, q.corr, q.act, q.ideal, q.aw, q.xw, q.pR / 1000, q.pC / 1000]), note: `Raoult’s law: p = a_w·p_sat(T) with a_w = x_w (ideal) or exp(−φ·m/55.51) (osmotic coefficient φ, ion molality m). Used in the balances: ${bpeName}.` });
+    tables.push({ title: 'Thermodynamic–economic model: unit water cost', columns: ['Item', '$/h', '$/m³'], rows: [['Capital recovery', wc.Zcap, wc.parts['Capital recovery']], ['Heat', wc.Cheat, wc.parts.Heat], ['Electricity', wc.Cel, wc.parts.Electricity], ['Operation and maintenance', wc.Zom, wc.parts['Operation and maintenance']], ['Chemicals', wc.Cchem, wc.parts.Chemicals], ['Total', wc.rate, wc.total],
+      ['Installed capital (M$)', wc.capex / 1e6, null], ['Capital per m³/d of capacity ($)', wc.perCapacity, null], ['Lowest cost on the design map ($/m³)', null, opt.best.cost], [`… at ${grid.xlabel.toLowerCase()}`, opt.best.x, null], [`… at ${grid.ylabel.toLowerCase()}`, opt.best.y, null]],
+      note: 'Cost = annualised capital of the heat-transfer surface (× installation factor) + heat + electricity + O&M + chemicals. The design-map optimum is a grid search over equal-ΔT re-designs within the scale limit' + (p.source === 'mhp' || p.source === 'ahp' ? '; the heat and electricity rows include the heat pump (its driving heat is priced like the heating steam, the heat-pump equipment itself is not costed), the map optimum does not.' : '.') });
+    tables.push({ title: 'Exergy–economic analysis (cost rates per component)', columns: ['Component', 'Exergy destroyed (kW)', 'Share of fuel exergy (%)', 'Cost of destruction Ċ_D ($/h)', 'Capital + O&M rate Ż ($/h)', 'Ċ_D + Ż ($/h)', 'Exergoeconomic factor f (%)'],
+      rows: [...xe.rows.map((q) => [q.name, q.ExD, 100 * q.share, q.CD, q.Z, q.CD + q.Z, 100 * q.f]), ['Product: minimum work of separation', xe.ExP, (100 * xe.ExP) / xe.ExF, xe.cF * xe.ExP, 0, xe.cF * xe.ExP, null], ['Fuel (heat + electricity) / total', xe.ExF, 100, xe.CF, xe.Z, xe.CP, null]],
+      note: `Fuel exergy cost c_F = ${fmt(xe.cF, 3)} $/kWh, product exergy cost c_P = (Ċ_F + Ż)/Ėx_P = ${fmt(xe.cP, 3)} $/kWh, relative cost difference ${fmt(xe.r, 3)}. A low f means the component’s cost is dominated by irreversibility (spend capital there); a high f means capital dominates.` });
+    if (su && su.vap.mTot > 0) tables.push({ title: 'Vapour inventories (initial condition and design state)', columns: [unit, 'Vapour-space volume (m³)', 'Design vapour temperature (°C)', 'Design pressure (kPa)', 'Vapour mass at cold start (kg)', 'Vapour mass at design (kg)'],
+      rows: [...xs.map((n, i) => [n, su.vap.vol[i], su.vap.TvDes[i], psat(su.vap.TvDes[i]) / 1000, su.vap.m0[i], su.vap.mDes[i]]), ['Total', sum(su.vap.vol), null, null, sum(su.vap.m0), su.vap.mTot]], note: `Initial condition: every vapour space is saturated at the ${fmt(p.Tsw, 3)} °C seawater temperature (vacuum already pulled). The vapour space adds its latent and sensible capacity V·(λ·dρ_v/dT + ρ_v·c_p) to each effect/stage of the start-up model.` });
 
     const b = R.balance, sA = R.area / p.Md;
     return {
@@ -689,6 +922,11 @@ const suite = {
         ...(mvc ? [{ label: 'Feed temperature after preheater', value: r.TfM, unit: '°C' }, { label: 'Auxiliary heat', value: R.Qaux / 1000, unit: 'kW', status: R.Qaux > 0 ? 'warn' : 'ok' }] : [{ label: 'Cooling water', value: out.coolingWater, unit: 'm³/h' }, { label: 'Condenser load', value: R.Qcond / 1e6, unit: 'MW' }]),
         ...(R.ej ? [{ label: 'Entrainment ratio', value: R.ej.Ra, unit: 'kg motive/kg', status: R.ej.Ra > 4 ? 'warn' : 'ok' }, { label: 'Ejector compression ratio', value: R.ej.Cr, unit: '–', status: R.ej.Cr < 1.81 ? 'warn' : 'ok' }] : []),
         { label: 'Second-law efficiency', value: 100 * R.eta2, unit: '%' }, { label: 'Distillate TDS', value: tdsD, unit: 'mg/L' },
+        { label: 'Unit water cost', value: wc.total, unit: '$/m³', help: 'Thermodynamic–economic model: capital recovery + heat + electricity + O&M + chemicals' }, { label: 'Exergy cost of the product', value: xe.cP, unit: '$/kWh', help: `Fuel exergy costs ${fmt(xe.cF, 3)} $/kWh` },
+        { label: 'Lowest cost on the design map', value: opt.best.cost, unit: '$/m³', status: !opt.best.base && opt.saving > 0.03 ? 'warn' : 'ok', help: `Grid optimum at ${grid.xlabel.toLowerCase()} ${fmt(opt.best.x, 3)}, ${grid.ylabel.toLowerCase()} ${fmt(opt.best.y, 3)}${opt.best.base ? ' (the present design)' : ''}` },
+        { label: 'Mean heat flux', value: out.heatFlux, unit: 'kW/m²', help: 'Evaporator / stage-condenser duty per m² of surface' }, { label: `Boiling-point elevation, last ${msf ? 'stage' : 'effect'}`, value: msf ? m.stages[N - 1].be : r.be[N - 1], unit: 'K', help: `Basis: ${bpeName}; Raoult (activity) ${fmt(rlLast.act, 3)} K, correlation ${fmt(rlLast.corr, 3)} K` },
+        ...(su && su.vap.mTot > 0 ? [{ label: 'Vapour inventory at design', value: su.vap.mTot, unit: 'kg', help: `${fmt(sum(su.vap.m0), 3)} kg at the cold start` }] : []),
+        ...extraKpis,
         ...(su && su.t95 !== null ? [{ label: 'Start-up to 95 %', value: su.t95, unit: 'min', help: 'Time for the lumped model to reach 95 % of the design temperature rise' }] : []),
         ...(sd && sd.t95 !== null ? [{ label: 'Cool-down to 50 % after steam trip', value: sd.t95, unit: 'min', help: 'Time until half of the design temperature rise is lost when the heating steam stops' }] : []),
       ],
@@ -701,12 +939,14 @@ const suite = {
         mvc && R.sEl > 12 ? 'Reduce the condensing − boiling ΔT or improve compressor efficiency: both lower the electricity demand directly.' : null,
         R.Mcw > 6 * R.Md ? 'Cooling-water demand is high; a warmer last effect/stage or more effects reduces the heat rejected.' : null,
         'Send the brine to suite 2 (Brine chemistry) for a full scaling check and to suite 5 (Sea discharge) — it is warm and saline.',
-        'Use suite 13 (Economics) to weigh the extra area of a higher GOR against the energy saved.',
+        !opt.best.base && opt.saving > 0.03 ? `The cost map points to ${grid.xlabel.toLowerCase()} ${fmt(opt.best.x, 3)} and ${grid.ylabel.toLowerCase()} ${fmt(opt.best.y, 3)} (${fmt(100 * opt.saving, 2)} % cheaper water with the present prices).` : null,
+        'Use suite 13 (Economics) for the full project cash flow; the unit cost here covers only the thermal block.',
       ].filter(Boolean),
       plots: shown, tables,
       balances: [
         { name: 'Water + salt mass (kg/s)', in: b.massIn, out: b.massOut }, { name: 'Salt (kg/s)', in: (b.saltIn) / 1000, out: (b.saltOut) / 1000 }, { name: 'Energy (MW)', in: b.eIn / 1e6, out: b.eOut / 1e6 },
         ...(msf ? [] : [{ name: 'Distillate = Σ vapour boiled − vent (kg/s)', in: sum(r.V) - r.vent, out: r.Md }]),
+        { name: 'Exergy cost rates: Σ(Ċ_D + Ż) + product = Ċ_F + Ż ($/h)', in: sum(xe.rows.map((q) => q.CD + q.Z)) + xe.cF * xe.ExP, out: xe.CP }, ...extraBal,
       ],
       outputs: out,
     };
@@ -771,6 +1011,45 @@ const suite = {
     const ideal = simulateThermal(d, { fBPE: 0, heatLoss: 0, ventPct: 0, rhoP: 80, thick: 50, Vdem: 0.9, linePct: 0, fast: true });
     add('Losses reduce the GOR', 1, ideal.GOR > med.GOR ? 1 : 0, 0, `Without BPE, demister, line and heat losses GOR rises from ${fmt(med.GOR, 4)} to ${fmt(ideal.GOR, 4)}`);
     add('Second-law efficiency is between 0 and 1', 1, [med, tvc, msf, mvc].every((q) => q.eta2 > 0 && q.eta2 < 1) ? 1 : 0, 0, `MED ${fmt(100 * med.eta2, 3)} %, MED-TVC ${fmt(100 * tvc.eta2, 3)} %, MSF ${fmt(100 * msf.eta2, 3)} %, MVC ${fmt(100 * mvc.eta2, 3)} %`);
+    // ---- Raoult's law
+    add('Raoult’s law reproduces the ebullioscopic constant of water', 0.512, bpeRaoult(100, 0.5, 'ideal') / ionMolality(0.5), 0.01, 'Dilute limit at 100 °C: ΔT_b / m → R·T²·M_w/Δh_vap = 0.512 K·kg/mol');
+    add('Raoult’s law with water activity agrees with the seawater BPE correlation', bpe(70, 50), bpeRaoult(70, 50, 'activity'), 0.05, '70 °C, 50 g/kg (K); the ideal mole-fraction form is ' + fmt(bpeRaoult(70, 50, 'ideal'), 3) + ' K');
+    const ra = simulateThermal(d, { bpeModel: 'activity', fast: true }), La = ra.N - 1;
+    add('Selected Raoult basis is the one used in the effect balances', bpeRaoult(ra.r.T[La], ra.r.X[La], 'activity'), ra.r.be[La], 1e-9, 'Last-effect BPE of a run with the Raoult (activity) option (K)');
+    add('Raoult vapour pressure: p = x_w·p_sat for the ideal basis', (55.508 / (55.508 + ionMolality(60))) * psat(60), raoultPressure(60, 60, 'ideal'), 1e-9, 'Hand value at 60 °C, 60 g/kg (Pa)');
+    // ---- prescribed heat flux
+    const fx = simulateThermal(d, { areaMode: 'flux' }), qf = fx.r.q.map((q, i) => q / fx.r.A[i]);
+    add('Equal-heat-flux design: same q″ in every effect', 0, Math.max(...qf) / Math.min(...qf) - 1, 1e-6, `q″ = U·ΔT = ${fmt(qf[0] / 1000, 4)} kW/m² in all ${fx.N} effects`);
+    add('Equal-heat-flux design keeps the energy balance and the last-effect temperature', 0, Math.abs((fx.balance.eIn - fx.balance.eOut) / fx.balance.eIn) + Math.abs(fx.r.T[fx.N - 1] - d.Tn) / 100, 1e-6, 'Relative energy imbalance + temperature mismatch');
+    // ---- vapour inventory
+    const su0 = startUp(med, { ...d, vapVol: 0 }), su1 = startUp(med, { ...d, vapVol: 0.3 });
+    add('Vapour inventory equals the ideal-gas hand value', (psat(med.r.Tv[0]) * 0.01801528 * 0.3 * med.r.A[0]) / (8.314462618 * K(med.r.Tv[0])), su1.vap.mDes[0], 2e-4 * su1.vap.mDes[0], 'm = p_sat·M·V/(R·T) for the first effect (kg)');
+    add('A larger vapour space slows the start-up', 1, su1.t95 > su0.t95 && su1.vap.inv[0] < 50 && Math.abs(su1.vap.inv[su1.vap.inv.length - 1] - 100) < 8 ? 1 : 0, 0, `95 % reached after ${fmt(su0.t95, 4)} min without and ${fmt(su1.t95, 4)} min with 0.3 m³/m² of vapour space; the inventory rises from ${fmt(su1.vap.inv[0], 3)} % to ${fmt(su1.vap.inv[su1.vap.inv.length - 1], 4)} % of design`);
+    // ---- heat pump
+    const hm = heatPump(med, { ...d, source: 'mhp', hpEta: 100 }), ha = heatPump(med, { ...d, source: 'ahp' });
+    add('Mechanical heat pump at 100 % second-law efficiency reaches the Carnot COP', K(hm.Th) / (hm.Th - hm.Tl), hm.cop, 1e-12, 'COP = T_h/(T_h − T_l)');
+    add('Absorption heat pump: reversible three-temperature COP, hand value', (1 - K(ha.Tl) / K(ha.Tg)) / (1 - K(ha.Tl) / K(ha.Th)), ha.copRev, 1e-9, '(1 − T_l/T_g)/(1 − T_l/T_h); the real COP ' + fmt(ha.cop, 3) + ' lies between 1 and this limit');
+    add('Heat-pump energy balance closes', 0, (ha.Qe + ha.drive - ha.Qhp) / ha.Qhp + (ha.Qhp + ha.Qdirect - med.Qin) / med.Qin + (ha.cop > 1 && ha.cop < ha.copRev ? 0 : 1), 1e-12, 'Source heat + driving heat = heat delivered; delivered + direct = plant demand');
+    // ---- cogeneration
+    add('Entropy of saturated steam at 100 °C', 7.355, sVapour(100) / 1000, 0.02, 's_g = ∫c_p dT/T + λ/T (kJ/kg·K), steam tables 7.355');
+    const cgI = cogeneration(1e8, 70, 0, { ...d, etaTurb: 100 }), cgR = cogeneration(med.Qin, med.Tsteam, med.Wel, d);
+    add('Ideal turbine: lost work = Carnot value of the heat + condensate exergy', cgI.carnot + cgI.condensate, cgI.lostPerHeat, 1e-3, 'Second-law identity for wet-steam extraction at 70 °C with a 38 °C condenser');
+    add('Cogeneration: real lost work is below the reversible limit and steam flows balance', 1, cgR.lostPerHeat < cgR.carnot + cgR.condensate && cgR.lostPerHeat > 0 && Math.abs(cgR.mExt * cgR.qExt - med.Qin) < 1e-6 * med.Qin && cgR.euf > cgR.etaPower && cgR.euf < 1 ? 1 : 0, 0, `${fmt(cgR.lostPerHeat, 3)} kWh of power per kWh of heat at ${fmt(cgR.Te, 3)} °C; energy-utilisation factor ${fmt(cgR.euf, 3)} versus ${fmt(cgR.etaPower, 3)} for power only`);
+    // ---- costing
+    add('Capital-recovery factor, 6 % over 25 years', 0.078227, crf(0.06, 25), 1e-6, 'i(1+i)ⁿ/((1+i)ⁿ − 1)');
+    const wcV = waterCost(med, d), xeV = exergoEconomics(med, d, wcV);
+    add('Unit water cost equals the hand sum of its parts', (d.cArea * med.area * d.capFactor * (crf(0.06, 25) + d.omPct / 100)) / (8760 * 0.92) / med.Qd + (d.cHeat * med.sTh) / 1000 + d.cElec * med.sEl + d.cChem, wcV.total, 1e-9, 'Capital + O&M + heat + electricity + chemicals ($/m³)');
+    add('Exergy-cost balance closes', 0, xeV.closure, 1e-12, 'Σ(Ċ_D + Ż) over the components + cost of the product exergy = Ċ_F + Ż');
+    add('Exergy-economic and thermodynamic-economic routes give the same water cost', wcV.total, xeV.perM3 + d.cChem, 1e-9, 'Ċ_P per m³ + chemicals ($/m³); product exergy costs more than fuel exergy: ' + fmt(xeV.cP, 3) + ' vs ' + fmt(xeV.cF, 3) + ' $/kWh');
+    // ---- process optimisation
+    const gr = designGrid(d), og = optimiseGrid(gr, d, d.tbtLimMED, wcV.total), feas = gr.cells.flatMap((row, j) => row.map((q, i) => (q && q.Ttop <= d.tbtLimMED + 1e-9 ? og.cost[j][i] : Infinity)));
+    add('Process optimisation returns the cheapest feasible design', Math.min(wcV.total, ...feas), og.best.cost, 1e-12, `Grid search over ${og.nCells} re-designs, ${og.nFeas} within the scale limit ($/m³)`);
+    // ---- thermal + RO hybrid
+    const hyM = hybridRO(med, d, 5, scaleIons(cloneIons(d.ions), 1)), msfV = simulateThermal({ ...d, ...suite.presets[2].values }), hyS = hybridRO(msfV, { ...d, ...suite.presets[2].values, roFeed: 'intake', roShare: 30 }, 5, scaleIons(cloneIons(d.ions), 1));
+    add('MED–RO hybrid: blended TDS is the flow-weighted mean', (med.Qd * 5 + hyM.Qp * hyM.tdsP) / (med.Qd + hyM.Qp), hyM.tdsBlend, 1e-9, `Distillate 5 mg/L + RO permeate ${fmt(hyM.tdsP, 3)} mg/L (mg/L)`);
+    add('MED–RO hybrid: RO water balance closes and the RO share is met', 0, Math.abs(hyM.Qf - hyM.Qp - hyM.ro.conc.Q) / hyM.Qf + Math.abs(hyM.share - 0.5), 1e-3, 'Feed = permeate + concentrate; RO supplies 50 % of the blend');
+    add('MSF–RO hybrid: combined energy lies between the two processes', 1, hyS.secEq < msfV.sEq && hyS.secEq > hyS.ro.sec && hyS.recFeed > msfV.rec === (hyS.ro.overallRec > msfV.rec) ? 1 : 0, 0, `${fmt(hyS.secEq, 3)} kWh/m³ equivalent for the blend versus ${fmt(msfV.sEq, 3)} (MSF) and ${fmt(hyS.ro.sec, 3)} (RO)`);
+    add('Warm reject feed lowers the RO pressure', 1, hyM.cold && hyM.ro.p1.Pf < hyM.cold.p1.Pf && hyM.Tro > med.T0 ? 1 : 0, 0, `${fmt(hyM.ro.p1.Pf, 3)} bar at ${fmt(hyM.Tro, 3)} °C versus ${fmt(hyM.cold?.p1.Pf ?? 0, 3)} bar on cold seawater`);
     return C;
   },
 };
