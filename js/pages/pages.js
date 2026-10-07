@@ -149,7 +149,7 @@ export function sitePage(root) {
     if (d.bathy) {
       const flat = d.bathy.elev.flat(), zlo = Math.min(...flat), zhi = Math.max(...flat), allLand = zlo >= 0, allSea = zhi <= 0;
       plots.push({ type: 'field', title: allLand ? 'Terrain around the site (elevation above sea level, m)' : allSea ? 'Seabed around the site (m, negative = below sea level)' : 'Seabed and terrain around the site (m; blue = sea, green to brown = land)', xlabel: 'Longitude (°)', ylabel: 'Latitude (°)', zlabel: 'Elevation (m)', zunit: 'm', x: d.bathy.lon, y: d.bathy.lat, z: d.bathy.elev,
-        cmap: allLand ? 'land' : allSea ? 'sea' : 'topo', zmid: allLand || allSea ? undefined : 0, contours: allLand || allSea ? 8 : [0], equal: true, shade: 'geo', exaggeration: zhi - zlo < 60 ? 12 : zhi - zlo < 300 ? 5 : 2, markers: [{ x: site.lon, y: site.lat, label: 'site' }],
+        cmap: allLand ? 'land' : allSea ? 'sea' : 'topo', zmid: allLand || allSea ? undefined : 0, contours: allLand || allSea ? 8 : [0], equal: true, shade: 'geo', exaggeration: zhi - zlo < 60 ? 10 : zhi - zlo < 300 ? 4 : 1.6, markers: [{ x: site.lon, y: site.lat, label: 'site' }],
         onPick: (lo, la) => { latI.value = la.toFixed(4); lonI.value = lo.toFixed(4); map.setView(la, lo); toast(`Site moved to ${la.toFixed(4)}°, ${lo.toFixed(4)}° — fetching live data for the new point…`); doFetch(); },
         note: 'Click anywhere on this panel to move the site to that point. ' + ( allLand ? `This point is inland: the ground is ${fmt(zlo, 3)}–${fmt(zhi, 3)} m above sea level and there is no sea within about 13 km, so the marine figures above come from the nearest sea cell (or are unavailable). For a coastal or outfall study, click a point at the coast or just offshore.` : allSea ? 'Open water: the whole window is below sea level.' : 'The white line is the shoreline (0 m).') });
     }
@@ -191,6 +191,7 @@ export function sitePage(root) {
   };
   q.addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
   paintSources(); paintData();
+  if (s.fetchedAt && s.data?.bathy && s.data.bathy.lat.length < 40 && navigator.onLine) setTimeout(() => doFetch(), 300); // stored by an earlier build with a coarse relief grid: refresh once
   fill(root, 
     h('header', { class: 'page-head' }, h('h1', null, 'Global site data'), h('p', null, 'Choose any location on Earth. Your browser pulls current sea state, tides, currents, seabed relief, salinity and temperature climatology, weather, solar resource and national economic indicators directly from open global data services, and offers them to every suite.')),
     card(

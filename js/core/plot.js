@@ -223,6 +223,13 @@ function drawField(canvas, spec) {
   const octx = off.getContext('2d'), img = octx.createImageData(W, H);
   const cellx = Math.abs(dx) / (nx - 1 || 1), celly = Math.abs(dy) / (ny - 1 || 1), geo = spec.shade === 'geo', kx = geo ? 111320 * Math.cos((((ys[0] + ys[ny - 1]) / 2) * Math.PI) / 180) : 1, ky = geo ? 110540 : 1;
   const zAt = (i, j) => z[Math.max(0, Math.min(ny - 1, j))][Math.max(0, Math.min(nx - 1, i))];
+  // slope at every grid node by central differences; interpolating these (not the per-cell slope) gives smooth, natural shading
+  let GX = null, GY = null;
+  if (smooth && spec.shade) {
+    GX = z.map((row, j) => row.map((_, i) => (zAt(i + 1, j) - zAt(i - 1, j)) / ((i === 0 || i === nx - 1 ? 1 : 2) * cellx * kx)));
+    GY = z.map((row, j) => row.map((_, i) => (zAt(i, j + 1) - zAt(i, j - 1)) / ((j === 0 || j === ny - 1 ? 1 : 2) * celly * ky)));
+  }
+  const cubic = (p0, p1, p2, p3, t) => p1 + 0.5 * t * (p2 - p0 + t * (2 * p0 - 5 * p1 + 4 * p2 - p3 + t * (3 * (p1 - p2) + p3 - p0))); // Catmull–Rom
   for (let r = 0; r < H; r++) {
     const fj = smooth ? ((H - 1 - r) / (H - 1)) * (ny - 1) : ny - 1 - r, j0 = Math.min(ny - 2 < 0 ? 0 : ny - 2, Math.floor(fj)), b = smooth ? fj - j0 : 0;
     for (let cI = 0; cI < W; cI++) {
@@ -232,9 +239,13 @@ function drawField(canvas, spec) {
         const fi = (cI / (W - 1)) * (nx - 1), i0 = Math.min(nx - 2, Math.floor(fi)), a = fi - i0;
         const v00 = z[j0][i0], v10 = z[j0][i0 + 1], v01 = z[j0 + 1][i0], v11 = z[j0 + 1][i0 + 1];
         v = Number.isFinite(v00 + v10 + v01 + v11) ? v00 * (1 - a) * (1 - b) + v10 * a * (1 - b) + v01 * (1 - a) * b + v11 * a * b : z[Math.round(fj)][Math.round(fi)];
-        if (spec.shade && Number.isFinite(v)) { // hill-shading from the local slope, light from the north-west
-          const gx = ((v10 - v00) * (1 - b) + (v11 - v01) * b) / (cellx * kx), gy = ((v01 - v00) * (1 - a) + (v11 - v10) * a) / (celly * ky), ex = spec.exaggeration || 1;
-          shade = Math.max(0.55, Math.min(1.25, 1 + 0.9 * ((-gx + gy) * ex) / Math.sqrt(1 + (gx * ex) ** 2 + (gy * ex) ** 2)));
+        if (spec.shade && Number.isFinite(v)) { // smooth surface (bicubic) lit from the north-west using interpolated node slopes
+          const rowAt = (jj) => cubic(zAt(i0 - 1, jj), zAt(i0, jj), zAt(i0 + 1, jj), zAt(i0 + 2, jj), a);
+          const vc = cubic(rowAt(j0 - 1), rowAt(j0), rowAt(j0 + 1), rowAt(j0 + 2), b);
+          if (Number.isFinite(vc) && (mid === null || (vc - mid) * (v - mid) > 0)) v = vc; // never let smoothing move the shoreline
+          const gx = GX[j0][i0] * (1 - a) * (1 - b) + GX[j0][i0 + 1] * a * (1 - b) + GX[j0 + 1][i0] * (1 - a) * b + GX[j0 + 1][i0 + 1] * a * b;
+          const gy = GY[j0][i0] * (1 - a) * (1 - b) + GY[j0][i0 + 1] * a * (1 - b) + GY[j0 + 1][i0] * (1 - a) * b + GY[j0 + 1][i0 + 1] * a * b, ex = spec.exaggeration || 1;
+          shade = Math.max(0.62, Math.min(1.22, 1 + 0.75 * ((-gx + gy) * ex) / Math.sqrt(1 + (gx * ex) ** 2 + (gy * ex) ** 2)));
         }
       } else {
         if (spec.mask && spec.mask[fj][cI]) { img.data[o] = 100; img.data[o + 1] = 116; img.data[o + 2] = 139; img.data[o + 3] = 255; continue; }

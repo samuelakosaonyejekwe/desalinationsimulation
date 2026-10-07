@@ -65,8 +65,9 @@ async function route() {
   document.body.classList.remove('nav-open');
   document.title = `${page.full || page.label} · ${APP.name}`;
   const prev = PAGES[i - 1], next = PAGES[i + 1];
-  const arrow = (p, dir) => (p ? h('a', { class: 'pager-btn ' + dir, href: '#/' + p.path, rel: dir === 'prev' ? 'prev' : 'next', 'aria-label': (dir === 'prev' ? 'Previous page: ' : 'Next page: ') + p.label }, h('span', { class: 'pg-arrow', 'aria-hidden': 'true' }, dir === 'prev' ? '←' : '→'), h('span', { class: 'pg-text' }, h('small', null, dir === 'prev' ? 'Previous' : 'Next'), h('b', null, `${p.icon} ${p.label}`))) : h('span', { class: 'pager-btn disabled ' + dir }));
-  fill(pager, arrow(prev, 'prev'), h('span', { class: 'pager-pos' }, `${i + 1} / ${PAGES.length}`), arrow(next, 'next'));
+  const arrow = (p, dir) => (p ? h('a', { class: 'pager-btn ' + dir, href: '#/' + p.path, rel: dir === 'prev' ? 'prev' : 'next', 'aria-label': (dir === 'prev' ? 'Previous page: ' : 'Next page: ') + p.label }, h('span', { class: 'pg-arrow', 'aria-hidden': 'true' }), h('span', { class: 'pg-text' }, h('small', null, dir === 'prev' ? 'Previous' : 'Next'), h('b', null, `${p.icon} ${p.label}`))) : h('span', { class: 'pager-btn disabled ' + dir }));
+  const bar = h('i'); bar.style.width = (100 * (i + 1)) / PAGES.length + '%';
+  fill(pager, arrow(prev, 'prev'), h('span', { class: 'pager-pos', title: `Page ${i + 1} of ${PAGES.length}` }, h('span', null, 'Page ', h('b', null, i + 1), ` of ${PAGES.length}`), h('span', { class: 'pager-track' }, bar)), arrow(next, 'next'));
   const set = (id, p) => { const el = document.getElementById(id); el.disabled = !p; el.title = p ? p.label + '  (Alt + ' + (id === 'navPrev' ? '←' : '→') + ')' : ''; el.onclick = () => p && (location.hash = '#/' + p.path); };
   set('navPrev', prev); set('navNext', next);
   document.getElementById('crumb').textContent = page.full || page.label;

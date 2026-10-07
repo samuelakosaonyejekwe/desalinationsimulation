@@ -3,8 +3,11 @@
 // escalation and interest during construction; itemised OPEX; levelised cost of water (annualised and
 // discounted-cash-flow, real and nominal); project finance (debt, depreciation, tax, NPV, IRR, MIRR,
 // payback, DSCR); carbon accounting; tornado, spider, scenario and Monte-Carlo analyses; real-options
-// deferral value. All cost data are indicative defaults and every one of them is editable.
-import { brent, clamp, linspace, logspace, sum, mean, std, quantile, histogram, rng, fmt, interp1 } from '../core/num.js';
+// deferral value; levelised cost of on-site energy; exergy-based (thermoeconomic / exergoeconomic) costing;
+// life-cycle assessment coupled to the cost model; a response-surface surrogate of the cost model; and
+// production and emissions constraints. All cost data are indicative defaults and every one is editable.
+import { brent, clamp, linspace, logspace, sum, mean, std, variance, quantile, histogram, rng, fmt, interp1, lstsq, lhs } from '../core/num.js';
+import { osmoticPressure } from '../core/props.js';
 
 // ---- financial primitives -------------------------------------------------------------------------
 /** Capital-recovery factor for rate i (fraction) over n periods. */
@@ -135,6 +138,12 @@ function touCalc(v, m) {
 export function buildCosts(v, m = {}, K = prepare(v)) {
   const cap = v.capacity, rec = clamp(v.recovery / 100, 0.05, 0.99), feed = cap / rec, brine = feed - cap, tou = touCalc(v, m);
   const cf = Math.min(1, (v.availability / 100) * (m.cf ?? 1)) * tou.prodFactor, prod = cap * 365 * cf;
+  // on-site generation priced at its levelised cost of energy, blended with the grid by the self-supplied share
+  const gen = lcoe({ capex: v.genCapex ?? 900, cf: (v.genCF ?? 24) / 100, om: (v.genOM ?? 1.5) / 100, fuel: v.genFuel ?? 0, life: v.genLife ?? 25, rate: fisherReal(((v.discNominal ?? 8) / 100) * (m.disc ?? 1), (v.inflation ?? 2.5) / 100) });
+  const self = clamp((v.selfShare ?? 0) / 100, 0, 1), elecP = (1 - self) * tou.price + self * gen.lcoe, gridC = (1 - self) * v.gridCarbon + self * (v.genCarbon ?? 0.03);
+  // thermoeconomic heat costing: heat valued at the electricity it could have produced (Carnot factor × expansion efficiency)
+  const heatP = v.heatCosting === 'exergy' ? elecP * carnot(v.T0 ?? 25, v.steamT ?? 70) * 0.85 : v.heatPrice;
+  const minProd = (cap * 365 * (v.minProdPct ?? 0)) / 100, shortfall = Math.max(0, minProd - prod);
   const area = v.membraneArea > 0 ? v.membraneArea : ((cap / 24) * 1000) / v.designFlux, sec = v.sec * (m.sec ?? 1), power = (sec * cap) / 24 + v.zldPower;
   const X = { cap, feed, brine, area, power, outfall: v.outfallLength > 0 ? brine : 0, thermal: v.thermalCapacity, bc: v.bcFeed, solids: v.solids };
   const escal = K.escal, learn = (1 - v.learnRate / 100) ** v.doublings, sat = Math.max(1, cap / Math.max(v.maxScale, 1));
@@ -156,15 +165,15 @@ export function buildCosts(v, m = {}, K = prepare(v)) {
   const elecKWh = sec * prod + v.zldPower * 8760 * cf + bo.energy * brine * 365 * cf, thermKWh = v.secThermal * prod;
   const chemRows = K.chems.map((r) => { const kgd = (r.dose * (r.perProd ? cap : feed)) / 1000; return { name: r.name, basis: r.perProd ? 'product' : 'feed', dose: r.dose, price: r.price, kgd, cost: kgd * 365 * cf * r.price * (m.chem ?? 1) }; });
   const staff = K.staff.map((r) => ({ ...r, cost: r.n * r.salary * (1 + v.burden / 100) * (m.labour ?? 1) }));
-  const memLife = Math.max(0.5, v.memLife * (m.memLife ?? 1)), tCO2 = (elecKWh * v.gridCarbon + thermKWh * v.heatCarbon) / 1000;
+  const memLife = Math.max(0.5, v.memLife * (m.memLife ?? 1)), tCO2 = (elecKWh * gridC + thermKWh * v.heatCarbon) / 1000;
   const o = {
-    elec: elecKWh * tou.price, thermal: thermKWh * v.heatPrice, mem: (area * v.memPrice * learn * v.locFactor) / memLife,
+    elec: elecKWh * elecP, thermal: thermKWh * heatP, mem: (area * v.memPrice * learn * v.locFactor) / memLife,
     cart: (feed / 24 / v.cartFlow) * v.cartPrice * v.cartChanges * cf, cip: area * v.cipCost * v.cleanings, chem: sum(chemRows.map((r) => r.cost)), labour: sum(staff.map((r) => r.cost)),
     maint: (direct * v.maintPct * (m.maint ?? 1)) / 100, ins: (base * v.insPct) / 100, brine: bo.opex * brine * 365 * cf, sludge: (v.sludgeRate / 1000) * feed * 365 * cf * v.sludgeCost / 1000,
-    solids: v.solids * 365 * cf * v.solidsCost, lab: v.labCost, carbon: tCO2 * v.carbonPrice, env: v.envCharge * brine * 365 * cf,
+    solids: v.solids * 365 * cf * v.solidsCost, lab: v.labCost, carbon: tCO2 * v.carbonPrice, env: v.envCharge * brine * 365 * cf, shortfall: shortfall * (v.shortfallPenalty ?? 0),
   };
   o.overhead = ((o.labour + o.maint) * v.overheadPct) / 100;
-  const groups = { energy: { f: 0, v: o.elec + o.thermal }, chem: { f: o.cip, v: o.chem + o.cart }, mem: { f: o.mem, v: 0 }, labour: { f: o.labour + o.overhead, v: 0 }, other: { f: o.maint + o.ins + o.lab, v: o.brine + o.sludge + o.solids + o.carbon + o.env } };
+  const groups = { energy: { f: 0, v: o.elec + o.thermal }, chem: { f: o.cip, v: o.chem + o.cart }, mem: { f: o.mem, v: 0 }, labour: { f: o.labour + o.overhead, v: 0 }, other: { f: o.maint + o.ins + o.lab + o.shortfall, v: o.brine + o.sludge + o.solids + o.carbon + o.env } };
   const opex = sum(Object.values(o));
   const repl = K.repl.map((r) => ({ ...r, cost: r.cost * kAll }));
   // working capital and interest during construction
@@ -172,7 +181,7 @@ export function buildCosts(v, m = {}, K = prepare(v)) {
   const w = v.spendProfile === 'front' ? linspace(1.5, 0.5, nc) : v.spendProfile === 'back' ? linspace(0.5, 1.5, nc) : new Array(nc).fill(1), ws = sum(w);
   const spend = w.map((x) => (base * x) / ws), idc = sum(spend.map((s, k) => debtFrac * s * ((1 + rl) ** (nc - k - 0.5) - 1)));
   const tci = base + wc + idc, grant = (base * v.grantPct) / 100, saltRev = v.saltTpd * 365 * cf * v.saltPrice;
-  return { cap, rec, feed, brine, cf, prod, area, sec, power, tou, escal, learn, sat, items, brineOpts, bo, direct, indirect, indTot, contingency, land, base, wc, idc, tci, grant, spend, o, groups, opex, chemRows, staff, repl, elecKWh, thermKWh, tCO2, saltRev, memLife, debtFrac, rl };
+  return { cap, rec, feed, brine, cf, prod, area, sec, power, tou, escal, learn, sat, items, brineOpts, bo, direct, indirect, indTot, contingency, land, base, wc, idc, tci, grant, spend, o, groups, opex, chemRows, staff, repl, elecKWh, thermKWh, tCO2, saltRev, memLife, debtFrac, rl, gen, self, elecP, gridC, heatP, minProd, shortfall };
 }
 
 /** Rates and horizon. */
@@ -187,6 +196,7 @@ export function lcowAnnual(c, f, v) {
   const replPV = sum(c.repl.map((r) => { let s = 0; for (let t = r.every; t < f.N; t += r.every) s += r.cost / (1 + f.dr) ** t; return s; }));
   const capital = k * (c.tci - salv), replacements = k * replPV, o = c.o, q = c.prod;
   const parts = { Capital: capital, Electricity: o.elec, 'Thermal energy': o.thermal, 'Membrane replacement': o.mem, Chemicals: o.chem + o.cart + o.cip, Labour: o.labour + o.overhead, Maintenance: o.maint + replacements, 'Brine, sludge and solids': o.brine + o.sludge + o.solids, 'Insurance and laboratory': o.ins + o.lab, 'Carbon and environmental charges': o.carbon + o.env };
+  if (o.shortfall > 0) parts['Take-or-pay shortfall penalty'] = o.shortfall;
   const total = sum(Object.values(parts));
   return { lcow: total / q, parts: Object.fromEntries(Object.entries(parts).map(([n, x]) => [n, x / q])), capital, replacements, annualCost: total, crf: k, fcr: (capital + o.ins + o.maint) / c.tci };
 }
@@ -225,6 +235,89 @@ export function evaluate(v, m = {}, withCash = false, K) {
   return { c, f, an, lcow: an.lcow, cash: withCash ? cashFlow(c, f, v) : null };
 }
 
+/** Levelised cost of energy of a generating plant: (CRF·CAPEX + fixed O&M) ÷ annual energy + fuel. capex $/kW, cf and om as fractions. */
+export function lcoe({ capex, cf, om, fuel = 0, life, rate }) {
+  const E = 8760 * Math.max(cf, 1e-6), k = crf(rate, Math.max(1, Math.round(life)));
+  return { capital: (k * capex) / E, om: (om * capex) / E, fuel, lcoe: (k * capex + om * capex) / E + fuel, energy: E, crf: k };
+}
+const carnot = (T0, Ts) => Math.max(0, 1 - (T0 + 273.15) / (Math.max(Ts, T0 + 0.01) + 273.15));
+
+/**
+ * Thermoeconomic / exergoeconomic analysis (specific exergy costing). Per m³ of product: fuel exergy (electricity + Carnot-weighted heat),
+ * product exergy (least work of separation), exergy destruction and cost rates of each subsystem. Components are costed in sequence:
+ * pump → hydraulic exergy; energy recovery returns brine exergy at the membrane-feed unit cost (fuel rule); membrane → product.
+ */
+export function exergoeconomics(c, an, v) {
+  const r = c.rec, T0 = v.T0 ?? 25, wmin = ((osmoticPressure(T0, clamp(v.feedSalinity ?? 35, 0.01, 120)) / 3.6e6) * -Math.log(1 - Math.min(r, 0.985))) / Math.min(r, 0.985);
+  const eEl = c.elecKWh / c.prod, cn = carnot(T0, v.steamT ?? 70), eTh = (c.thermKWh / c.prod) * cn, thShare = c.cap > 0 ? clamp(v.thermalCapacity / c.cap, 0, 1) : 0, memShare = 1 - thShare;
+  const etaP = clamp((v.etaPumpSet ?? 82) / 100, 0.2, 0.98), etaE = clamp((v.etaErd ?? 95) / 100, 0, 0.99), Whp = Math.min(eEl, (clamp((v.hpShare ?? 78) / 100, 0.05, 1) * c.sec) / 1), aux = eEl - Whp;
+  const p = (Whp * etaP * r) / (1 - etaE * (1 - r)), brineEx = (p * (1 - r)) / r, wm = wmin * memShare, cEl = c.elecP, cHeatEx = eTh > 0 ? c.o.thermal / c.prod / eTh : 0;
+  // non-energy cost rates ($ per m³) allocated to the subsystems by installed cost, with their own consumables
+  const key = (b) => (b === 'power' ? 'pump' : b === 'area' ? 'mem' : b === 'brine' ? 'erd' : b === 'thermal' ? 'thermal' : 'aux'), inst = { pump: 0, mem: 0, erd: 0, thermal: 0, aux: c.bo.capex };
+  for (const it of c.items) inst[key(it.basis)] += it.installed;
+  if (!(sum(Object.values(inst)) > 0)) inst.aux = 1; // no equipment list: all shared costs go to the balance of plant
+  const instTot = sum(Object.values(inst)), o = c.o, own = { pump: 0, erd: 0, thermal: 0, mem: o.mem + o.cip, aux: o.chem + o.cart + o.sludge + o.brine + o.solids + o.env };
+  const shared = an.annualCost - o.elec - o.thermal - sum(Object.values(own)), z = Object.fromEntries(Object.keys(inst).map((k) => [k, (own[k] + (shared * inst[k]) / instTot) / c.prod]));
+  if (!(eTh > 0)) { z.aux += z.thermal; z.thermal = 0; }
+  const cPump = (cEl * Whp + z.pump) / Math.max(Whp * etaP, 1e-12), cHyd = (cEl * Whp + z.pump + z.erd) / Math.max(p, 1e-12), cErd = brineEx > 0 && etaE > 0 ? (cHyd * brineEx + z.erd) / (etaE * brineEx) : 0, cMem = (cHyd * p + z.mem) / Math.max(wm, 1e-12);
+  const rows = [
+    { name: 'High-pressure pumps and drives', fuel: Whp, prod: Whp * etaP, cF: cEl, cP: cPump, z: z.pump },
+    { name: 'Energy recovery', fuel: brineEx, prod: etaE * brineEx, cF: cHyd, cP: cErd, z: z.erd },
+    { name: 'Membrane array', fuel: p, prod: wm, cF: cHyd, cP: cMem, z: z.mem },
+    { name: 'Intake, pretreatment, post-treatment and brine handling', fuel: aux, prod: 0, cF: cEl, cP: null, z: z.aux },
+    ...(eTh > 0 ? [{ name: 'Thermal desalination units', fuel: eTh, prod: wmin * thShare, cF: cHeatEx, cP: (cHeatEx * eTh + z.thermal) / Math.max(wmin * thShare, 1e-12), z: z.thermal }] : []),
+  ].map((q) => { const D = q.fuel - q.prod, cD = q.cF * D; return { ...q, D, eff: q.fuel > 0 ? q.prod / q.fuel : 0, cD, f: q.z + cD > 0 ? q.z / (q.z + cD) : 0, rel: q.cP !== null && q.cF > 0 ? (q.cP - q.cF) / q.cF : null }; });
+  const fuel = eEl + eTh, dest = sum(rows.map((q) => q.D)), prodCost = cMem * wm + cEl * aux + z.aux + (eTh > 0 ? cHeatEx * eTh + z.thermal : 0);
+  return { wmin, eEl, eTh, fuel, carnot: cn, eff: wmin / fuel, kStar: fuel / wmin, p, pBar: p * 36, rows, dest, balance: fuel - wmin - dest, prodCost, cProduct: prodCost / wmin, zTot: sum(Object.values(z)), consistent: p >= wm };
+}
+
+/**
+ * Life-cycle assessment coupled to the cost model: cradle-to-grave greenhouse-gas emissions and primary energy per m³ over the operating
+ * life (construction, membranes, chemicals, electricity, heat, end of life) and the cost of internalising them at the carbon price.
+ */
+export function lcaTea(c, f, v, an) {
+  const N = f.N, W = c.prod * N, efC = v.efCapex ?? 0.3, efM = v.efMem ?? 15, efCh = v.efChem ?? 1.1, eol = (v.efEol ?? 5) / 100, chemKg = sum(c.chemRows.map((q) => q.kgd)) * 365 * c.cf;
+  const con = efC * c.direct, st = { Construction: con, 'Membranes (initial + replacements)': efM * c.area * Math.max(1, N / c.memLife), Chemicals: efCh * chemKg * N, Electricity: c.elecKWh * c.gridC * N, Heat: c.thermKWh * v.heatCarbon * N, 'End of life': eol * con };
+  const kg = sum(Object.values(st)), ci = kg / W, opCi = (c.tCO2 * 1000) / c.prod, embodied = ci - opCi;
+  const pe = { Construction: 3.5 * c.direct, 'Membranes (initial + replacements)': 60 * c.area * Math.max(1, N / c.memLife), Chemicals: 6 * chemKg * N, Electricity: 2.5 * c.elecKWh * N, Heat: 1.1 * c.thermKWh * N, 'End of life': 0.05 * 3.5 * c.direct };
+  return { stages: Object.fromEntries(Object.entries(st).map(([k, x]) => [k, x / W])), kgTotal: kg, ci, opCi, embodied, ced: sum(Object.values(pe)) / W, cedStages: Object.fromEntries(Object.entries(pe).map(([k, x]) => [k, x / W])),
+    carbonCostLC: (ci * v.carbonPrice) / 1000, lcowLC: an.lcow + ((ci - opCi) * v.carbonPrice) / 1000, ecoEff: ci > 0 && an.lcow > 0 ? 1 / (an.lcow * ci) : 0 };
+}
+
+/**
+ * Quadratic response surface y ≈ θ·[1, xᵢ, xᵢ², xᵢxⱼ] by least squares. X rows are points in normalised coordinates;
+ * cross = indices of the variables whose pairwise interaction terms are included (default: all variables).
+ */
+export function fitQuadratic(X, y, cross = null) {
+  const d = X[0].length, pairs = [], cr = cross || Array.from({ length: d }, (_, i) => i);
+  for (let a = 0; a < cr.length; a++) for (let b = a + 1; b < cr.length; b++) pairs.push([cr[a], cr[b]]);
+  const feat = (x) => { const q = [1, ...x]; for (let i = 0; i < d; i++) q.push(x[i] * x[i]); for (const [i, j] of pairs) q.push(x[i] * x[j]); return q; };
+  const theta = lstsq(X.map(feat), y), np = pairs.length;
+  return { theta, terms: theta.length, predict: (x) => { let s = theta[0]; for (let i = 0; i < d; i++) s += (theta[1 + i] + theta[1 + d + i] * x[i]) * x[i]; for (let k = 0; k < np; k++) s += theta[1 + 2 * d + k] * x[pairs[k][0]] * x[pairs[k][1]]; return s; } };
+}
+
+/** Response-surface surrogate of the levelised cost over the uncertain drivers, trained on Latin-hypercube runs of the cost model. */
+export function surrogateTEA(v, K, unc, { nTrain = 80, nTest = 20, nMC = 4000, dist = 'tri', corr = null, seed = 1 } = {}) {
+  const d = unc.length, lo = unc.map((q) => Math.min(q.lo, 0) / 100 - 0.02), hi = unc.map((q) => Math.max(q.hi, 0) / 100 + 0.02), mid = lo.map((a, j) => 1 + (a + hi[j]) / 2), half = lo.map((a, j) => Math.max((hi[j] - a) / 2, 1e-6));
+  const toX = (mult) => mult.map((x, j) => (x - mid[j]) / half[j]), run = (mult) => lcowAnnual(buildCosts(v, Object.fromEntries(unc.map((q, j) => [q.k, mult[j]])), K), finance(v, Object.fromEntries(unc.map((q, j) => [q.k, mult[j]]))), v).lcow;
+  const pts = lhs(nTrain + nTest, d, seed).map((u) => u.map((x, j) => mid[j] + (2 * x - 1) * half[j])), ys = pts.map(run), inter = ['capex', 'elec', 'sec', 'cf', 'disc', 'life'].map((k) => unc.findIndex((q) => q.k === k)).filter((i) => i >= 0), fit = fitQuadratic(pts.slice(0, nTrain).map(toX), ys.slice(0, nTrain), inter.length >= 2 ? inter : null);
+  const yt = ys.slice(nTrain), yh = pts.slice(nTrain).map((q) => fit.predict(toX(q))), mu = mean(yt), r2 = 1 - sum(yt.map((a, i) => (a - yh[i]) ** 2)) / Math.max(sum(yt.map((a) => (a - mu) ** 2)), 1e-300), maxErr = 100 * Math.max(...yt.map((a, i) => Math.abs(yh[i] / a - 1)));
+  const draws = sampleMultipliers(nMC, unc, dist, corr, seed + 17), ymc = draws.map((q) => fit.predict(toX(q)));
+  // first-order variance-based sensitivity indices S_i = Var(E[y | x_i]) / Var(y), from the surrogate sample binned in x_i
+  const vy = variance(ymc), my = mean(ymc), nb = 24, S1 = unc.map((_, j) => {
+    let a = Infinity, b = -Infinity;
+    for (let i = 0; i < nMC; i++) { const x = draws[i][j]; if (x < a) a = x; if (x > b) b = x; }
+    if (!(b > a)) return 0;
+    const cnt = new Array(nb).fill(0), acc = new Array(nb).fill(0), w = (b - a) / nb;
+    for (let i = 0; i < nMC; i++) { const k = Math.min(nb - 1, Math.floor((draws[i][j] - a) / w)); cnt[k]++; acc[k] += ymc[i]; }
+    let ve = 0;
+    for (let k = 0; k < nb; k++) if (cnt[k] > 0) ve += (cnt[k] / nMC) * (acc[k] / cnt[k] - my) ** 2;
+    return vy > 0 ? ve / vy : 0;
+  });
+  const srt = Float64Array.from(ymc).sort(), qt = (q) => { const x = (nMC - 1) * q, i = Math.floor(x); return i + 1 < nMC ? srt[i] + (x - i) * (srt[i + 1] - srt[i]) : srt[i]; };
+  return { fit, toX, r2, maxErr, nTrain, nTest, nMC, p10: qt(0.1), p50: qt(0.5), p90: qt(0.9), mean: my, sd: Math.sqrt(vy), S1, ymc, parity: { model: yt, sur: yh } };
+}
+
 /** Scale the extensive technical inputs to another capacity (plant-size sweep, calibration rows). */
 function atCapacity(v, cap, ref = v.capacity) {
   const r = cap / ref;
@@ -248,8 +341,9 @@ const suite = {
   implemented: ['capital-recovery-factor', 'annualized-capital-cost', 'net-present-value', 'internal-rate-of-return', 'discounted-payback', 'simple-payback', 'levelized-cost-of-water', 'fixed-charge-rate', 'depreciation', 'discounted-cash-flow', 'operating-cost', 'maintenance-cost', 'replacement-cost', 'salvage-value', 'working-capital', 'tax/cash-flow', 'learning-curve', 'economies-of-scale', 'cost-capacity scaling', 'inflation/escalation', 'real/nominal discount-rate', 'break-even',
     'techno-economic-process', 'environmental-economic', 'life-cycle-cost', 'water-energy-cost', 'stochastic techno-economic', 'monte-carlo cash-flow', 'probabilistic lcow', 'real-options', 'multi-objective cost-energy-environment',
     'initial capex', 'financing structure', 'debt/equity', 'initial electricity and chemical prices', 'initial production', 'discount rate', 'inflation rate', 'tax assumptions', 'asset value', 'project-lifetime condition', 'terminal/salvage-value condition', 'maximum water-cost constraint', 'debt-service constraint', 'replacement schedule', 'capacity limit', 'resource-price scenario', 'terminal cash-flow',
-    'capital-cost estimation', 'equipment-cost estimation', 'installation and construction cost', 'operating-cost estimation', 'electricity cost', 'chemical cost', 'membrane-replacement cost', 'labour and maintenance cost', 'intake and outfall cost', 'brine-management cost', 'waste-disposal cost', 'product and resource-recovery revenue', 'financing', 'depreciation', 'taxation where applicable', 'discounting', 'cash-flow modelling', 'levelised cost of water', 'net-present-value analysis', 'internal-rate-of-return analysis', 'payback-period analysis', 'lifecycle costing', 'sensitivity analysis', 'scenario analysis', 'uncertainty and monte carlo analysis', 'carbon and environmental cost', 'capacity-factor analysis', 'plant-lifetime analysis', 'multi-objective techno-economic'],
-  equationsNote: 'A screening- to feasibility-level estimate (roughly ±25–30 % on capital). The bundled cost correlations, cost index, chemical prices, salaries and brine-management unit costs are indicative, generic figures in US dollars — not quotations — and should be calibrated to recent regional projects. Capital is placed at the start of operation with interest during construction added; major replacements are expensed in the year they occur; tax losses are carried forward without limit. The real-options value uses a simple binomial tree with a constant volatility and should be read as an indication only.',
+    'capital-cost estimation', 'equipment-cost estimation', 'installation and construction cost', 'operating-cost estimation', 'electricity cost', 'chemical cost', 'membrane-replacement cost', 'labour and maintenance cost', 'intake and outfall cost', 'brine-management cost', 'waste-disposal cost', 'product and resource-recovery revenue', 'financing', 'depreciation', 'taxation where applicable', 'discounting', 'cash-flow modelling', 'levelised cost of water', 'net-present-value analysis', 'internal-rate-of-return analysis', 'payback-period analysis', 'lifecycle costing', 'sensitivity analysis', 'scenario analysis', 'uncertainty and monte carlo analysis', 'carbon and environmental cost', 'capacity-factor analysis', 'plant-lifetime analysis', 'multi-objective techno-economic',
+    'levelized-cost-of-energy', 'thermoeconomic', 'exergoeconomic', 'life-cycle-assessment-techno-economic', 'surrogate', 'economic initial conditions', 'horizon/constraint conditions', 'minimum production constraint', 'emissions constraint'],
+  equationsNote: 'A screening- to feasibility-level estimate (roughly ±25–30 % on capital). The bundled cost correlations, cost index, chemical prices, salaries and brine-management unit costs are indicative, generic figures in US dollars — not quotations — and should be calibrated to recent regional projects. Capital is placed at the start of operation with interest during construction added; major replacements are expensed in the year they occur; tax losses are carried forward without limit. The real-options value uses a simple binomial tree with a constant volatility and should be read as an indication only. The levelised cost of energy is that of a single generator at constant output, bought as under a power-purchase agreement (its capital is not added to the plant CAPEX). The thermoeconomic / exergoeconomic analysis is a lumped specific-exergy-costing model of four subsystems: the membrane feed pressure is inferred from the entered specific energy, pumping share and efficiencies, the brine is costed by the fuel rule, and non-energy costs are allocated by installed cost — use suites 1, 3 and 12 for stream-level exergy. The life-cycle assessment covers greenhouse gases and primary energy with generic emission factors, not a full inventory. The surrogate is a quadratic response surface, valid only inside the uncertainty ranges it was trained on. The two catalogue lines on “economic initial conditions” and “horizon/constraint conditions” describe how the year-0 state, the project horizon and the constraints are treated here; they are reported in the table of initial conditions, horizon and constraints.',
 
   inputs: [
     { group: 'Plant and performance', help: 'Technical basis of the estimate. Pull from the other suites when they have been run.', fields: [
@@ -353,6 +447,28 @@ const suite = {
       { key: 'salvagePct', label: 'Salvage value', unit: '% of CAPEX (real)', value: 5, min: 0, max: 50 },
       { key: 'ramp', label: 'Production in the first year', unit: '% of normal', value: 90, min: 10, max: 100, help: 'Ramp-up after commissioning.' },
     ] },
+    { group: 'Energy supply: on-site generation and heat costing', tab: 'setup', help: 'Levelised cost of energy of a dedicated generator (photovoltaic, wind, gas engine …) and the share of the plant electricity it supplies. With a zero share the grid price is used and the LCOE is reported for comparison.', fields: [
+      { key: 'selfShare', label: 'Electricity supplied by on-site generation', unit: '%', value: 0, min: 0, max: 100, help: 'This share is priced at the levelised cost of energy below and carries its emission factor.' },
+      { key: 'genCapex', label: 'Generator specific capital cost', unit: '$/kW', value: 900, min: 100, max: 10000, help: 'Indicative: utility photovoltaics 700–1100, onshore wind 1200–1700, gas engine 800–1200.' },
+      { key: 'genCF', label: 'Generator capacity factor', unit: '%', value: 24, min: 5, max: 98 },
+      { key: 'genOM', label: 'Generator fixed O&M', unit: '% of capital /y', value: 1.5, min: 0, max: 10 },
+      { key: 'genFuel', label: 'Generator fuel cost', unit: '$/kWh', value: 0, min: 0, max: 1, help: 'Fuel price ÷ efficiency; zero for solar and wind.' },
+      { key: 'genLife', label: 'Generator life', unit: 'years', value: 25, min: 5, max: 50, step: 1 },
+      { key: 'genCarbon', label: 'Generator emission factor', unit: 'kgCO₂/kWh', value: 0.03, min: 0, max: 1.3 },
+      { key: 'heatCosting', label: 'Heat costing', type: 'select', value: 'price', options: [{ value: 'price', label: 'Entered heat price' }, { value: 'exergy', label: 'Thermoeconomic: by exergy (electricity the steam could have produced)' }], help: 'The thermoeconomic option values each kWh of heat at the electricity price × Carnot factor of the heat source × 0.85 expansion efficiency.' },
+    ] },
+    { group: 'Exergy and life-cycle basis', tab: 'setup', help: 'Reference state and subsystem efficiencies for the exergy costing, and emission factors for the life-cycle assessment. Indicative figures — edit freely.', fields: [
+      { key: 'feedSalinity', label: 'Feed salinity', unit: 'g/kg', value: 35, min: 0.5, max: 120, help: 'Sets the least work of separation (product exergy).' },
+      { key: 'T0', label: 'Ambient (dead-state) temperature', unit: '°C', value: 25, min: 0, max: 45 },
+      { key: 'steamT', label: 'Heat-source temperature', unit: '°C', value: 70, min: 40, max: 250, help: 'For the Carnot factor of thermal energy.' },
+      { key: 'hpShare', label: 'Share of electricity used by high-pressure pumping', unit: '%', value: 78, min: 20, max: 100, help: 'The rest drives intake, pretreatment, post-treatment and brine handling.' },
+      { key: 'etaPumpSet', label: 'High-pressure pump × motor × drive efficiency', unit: '%', value: 82, min: 40, max: 95 },
+      { key: 'etaErd', label: 'Energy-recovery efficiency', unit: '%', value: 95, min: 0, max: 99, help: '0 for a plant without energy recovery.' },
+      { key: 'efCapex', label: 'Embodied carbon of construction', unit: 'kgCO₂e per $ direct cost', value: 0.3, min: 0, max: 2 },
+      { key: 'efMem', label: 'Embodied carbon of membrane elements', unit: 'kgCO₂e/m²', value: 15, min: 0, max: 100 },
+      { key: 'efChem', label: 'Embodied carbon of chemicals', unit: 'kgCO₂e/kg', value: 1.1, min: 0, max: 10 },
+      { key: 'efEol', label: 'End-of-life emissions', unit: '% of construction', value: 5, min: 0, max: 50 },
+    ] },
     { group: 'Escalation and cost basis', tab: 'setup', fields: [
       { key: 'escElec', label: 'Energy price escalation above inflation', unit: '%/y', value: 0.5, min: -5, max: 10 },
       { key: 'escLabour', label: 'Labour escalation above inflation', unit: '%/y', value: 1, min: -5, max: 10 },
@@ -376,6 +492,9 @@ const suite = {
       { key: 'mcSeed', label: 'Random seed', unit: '', value: 2024, min: 1, max: 1e9, step: 1 },
       { key: 'targetLcow', label: 'Maximum acceptable water cost', unit: '$/m³', value: 1.0, min: 0.05, max: 20 },
       { key: 'minDscr', label: 'Minimum debt-service cover ratio', unit: '–', value: 1.2, min: 1, max: 3 },
+      { key: 'minProdPct', label: 'Minimum annual production (take-or-pay)', unit: '% of nameplate', value: 85, min: 0, max: 100, help: 'Contractual minimum output. 0 = no constraint. The chance of missing it is taken from the Monte-Carlo sample.' },
+      { key: 'shortfallPenalty', label: 'Penalty for production shortfall', unit: '$/m³ short', value: 0, min: 0, max: 10, showIf: (v) => v.minProdPct > 0, help: 'Charged on every m³ below the minimum and added to the operating cost.' },
+      { key: 'maxCarbon', label: 'Emissions cap', unit: 'kgCO₂/m³', value: 2, min: 0, max: 50, help: 'Limit on the operational carbon intensity. 0 = no cap. When it is exceeded, the renewable share of electricity needed to comply and its water cost are solved.' },
       { key: 'renPrice', label: 'Renewable electricity price', unit: '$/kWh', value: 0.05, min: 0, max: 1, help: 'For the cost–energy–carbon trade-off.' },
       { key: 'renCarbon', label: 'Renewable emission factor', unit: 'kgCO₂/kWh', value: 0.03, min: 0, max: 0.3 },
       { key: 'capexPerSec', label: 'Capital premium per 1 % energy saved', unit: '%', value: 0.6, min: 0, max: 5, help: 'Extra membrane area, better pumps and recovery devices needed for each percent of specific-energy reduction.' },
@@ -394,12 +513,13 @@ const suite = {
     { name: 'Small seawater RO, 10 000 m³/d, higher tariff', values: { capacity: 10000, sec: 3.8, elecPrice: 0.12, tariff: 1.9, land: 0.5, labCost: 120000, outfallLength: 400, constYears: 2,
       staff: [{ role: 'Plant manager', n: 1, salary: 90000 }, { role: 'Operators', n: 8, salary: 42000 }, { role: 'Maintenance technicians', n: 3, salary: 45000 }, { role: 'Laboratory and administration', n: 2, salary: 42000 }],
       replacements: [{ name: 'High-pressure pump overhaul', cost: 0.15, every: 8 }, { name: 'Filter media / UF modules', cost: 0.25, every: 7 }, { name: 'Control system and drives', cost: 0.3, every: 12 }] } },
-    { name: 'Inland brackish RO, 30 000 m³/d, deep-well injection', values: { capacity: 30000, recovery: 80, sec: 0.95, designFlux: 26, memLife: 7, outfallLength: 0, brineOpt: 1, tariff: 0.62, land: 1, labCost: 200000,
+    { name: 'Inland brackish RO, 30 000 m³/d, deep-well injection', values: { capacity: 30000, recovery: 80, sec: 0.95, designFlux: 26, memLife: 7, outfallLength: 0, brineOpt: 1, tariff: 0.62, land: 1, labCost: 200000, feedSalinity: 3.5,
       chemicals: [{ name: 'Sulphuric acid', basis: 'feed', dose: 40, price: 0.12 }, { name: 'Antiscalant', basis: 'feed', dose: 3.5, price: 2.6 }, { name: 'Caustic soda', basis: 'product', dose: 12, price: 0.45 }, { name: 'Sodium hypochlorite (as Cl₂)', basis: 'product', dose: 1.5, price: 0.5 }],
       staff: [{ role: 'Plant manager', n: 1, salary: 100000 }, { role: 'Operators', n: 10, salary: 45000 }, { role: 'Maintenance technicians', n: 4, salary: 48000 }, { role: 'Laboratory and administration', n: 3, salary: 45000 }],
       replacements: [{ name: 'Pump overhauls', cost: 0.25, every: 8 }, { name: 'Control system and drives', cost: 0.6, every: 12 }] } },
-    { name: 'Hybrid RO–MED, 150 000 m³/d', values: { capacity: 150000, thermalCapacity: 50000, sec: 2.9, secThermal: 22, recovery: 42, tariff: 1.25, heatPrice: 0.01, land: 4 } },
-    { name: 'Minimal-liquid-discharge plant with salt recovery', values: { capacity: 12000, recovery: 92, sec: 4.2, bcFeed: 45, solids: 70, zldPower: 1600, saltTpd: 55, saltPrice: 60, outfallLength: 0, brineOpt: 5, tariff: 3.2, elecPrice: 0.07, land: 1, labCost: 180000,
+    { name: 'Solar-supplied seawater RO under an emissions cap', values: { selfShare: 45, genCapex: 850, genCF: 26, maxCarbon: 1.0, minProdPct: 90, shortfallPenalty: 0.4, availability: 88 } },
+    { name: 'Hybrid RO–MED, 150 000 m³/d', values: { capacity: 150000, thermalCapacity: 50000, sec: 2.9, secThermal: 22, recovery: 42, tariff: 1.25, heatPrice: 0.01, land: 4, maxCarbon: 4 } },
+    { name: 'Minimal-liquid-discharge plant with salt recovery', values: { capacity: 12000, recovery: 92, sec: 4.2, bcFeed: 45, solids: 70, zldPower: 1600, saltTpd: 55, saltPrice: 60, outfallLength: 0, brineOpt: 5, tariff: 3.2, elecPrice: 0.07, land: 1, labCost: 180000, maxCarbon: 4,
       staff: [{ role: 'Plant manager', n: 1, salary: 110000 }, { role: 'Operators', n: 12, salary: 48000 }, { role: 'Maintenance technicians', n: 6, salary: 50000 }, { role: 'Laboratory and administration', n: 3, salary: 46000 }],
       replacements: [{ name: 'Pump overhauls', cost: 0.2, every: 8 }, { name: 'Evaporator tube bundles', cost: 1.1, every: 12 }, { name: 'Control system and drives', cost: 0.4, every: 12 }] } },
   ],
@@ -423,6 +543,8 @@ const suite = {
     const salts = o.zld?.salts ? sum(Object.values(o.zld.salts).map((x) => +x || 0)) : 0;
     if (salts > 0) P.push({ key: 'saltTpd', value: salts, from: 'ZLD: recovered salts' });
     if (o.chem?.antiscalantDose > 0 || o.chem?.acidDose > 0) P.push({ key: 'chemicals', value: CHEMS.map((c) => ({ ...c, dose: c.name === 'Antiscalant' && o.chem.antiscalantDose > 0 ? o.chem.antiscalantDose : c.name === 'Sulphuric acid' && o.chem.acidDose > 0 ? o.chem.acidDose : c.dose })), from: 'Brine chemistry: antiscalant and acid dose' });
+    if (o.ro?.streams?.feed?.tds > 0) P.push({ key: 'feedSalinity', value: clamp(o.ro.streams.feed.tds / 1000 / (1 + 0.0007 * (o.ro.streams.feed.tds / 1000)), 0.5, 120), from: 'RO design: feed salinity' });
+    if (o.pump?.erdEfficiency >= 0 && o.pump?.erdEfficiency <= 1) P.push({ key: 'etaErd', value: clamp(100 * o.pump.erdEfficiency, 0, 99), from: 'Pumps and energy recovery: device efficiency' });
     return P;
   },
   site: (site) => {
@@ -460,7 +582,11 @@ const suite = {
     // ---- Monte Carlo
     const nMC = Math.max(200, Math.round(v.nMC)), iE = DRIVERS.findIndex((d) => d.k === 'elec'), iC = DRIVERS.findIndex((d) => d.k === 'chem');
     const draws = sampleMultipliers(nMC, unc, v.mcDist, Math.abs(v.mcCorr) > 1e-6 ? [iE, iC, clamp(v.mcCorr, -0.99, 0.99)] : null, v.mcSeed), mcL = new Array(nMC), mcN = new Array(nMC);
-    for (let k = 0; k < nMC; k++) { const m = Object.fromEntries(DRIVERS.map((d, j) => [d.k, draws[k][j]])), cc = buildCosts(v, m, K), ff = finance(v, m); mcL[k] = lcowAnnual(cc, ff, v).lcow; mcN[k] = cashFlow(cc, ff, v, v.tariff, true).npv; }
+    let nMiss = 0;
+    for (let k = 0; k < nMC; k++) { const m = Object.fromEntries(DRIVERS.map((d, j) => [d.k, draws[k][j]])), cc = buildCosts(v, m, K), ff = finance(v, m); mcL[k] = lcowAnnual(cc, ff, v).lcow; mcN[k] = cashFlow(cc, ff, v, v.tariff, true).npv; if (cc.shortfall > 0) nMiss++; }
+    const pMiss = nMiss / nMC;
+    // ---- response-surface surrogate of the cost model: larger sample and variance-based sensitivity
+    const sg = surrogateTEA(v, K, unc, { dist: v.mcDist, corr: Math.abs(v.mcCorr) > 1e-6 ? [iE, iC, clamp(v.mcCorr, -0.99, 0.99)] : null, seed: v.mcSeed });
     const sorted = [...mcL].sort((a, b) => a - b), p10 = quantile(mcL, 0.1), p50 = quantile(mcL, 0.5), p90 = quantile(mcL, 0.9), pExceed = mcL.filter((x) => x > v.targetLcow).length / nMC, pLoss = mcN.filter((x) => x < 0).length / nMC;
     const hist = histogram(mcL, 30), kq = Math.max(1, Math.floor(nMC / 200)), cdfX = sorted.filter((_, i) => i % kq === 0), cdfY = cdfX.map((_, i) => Math.min(1, (i * kq + 1) / nMC));
     ctx?.progress?.(0.7, 'Monte-Carlo done');
@@ -470,12 +596,21 @@ const suite = {
     const eps = linspace(0.02, 0.2, 13), drs = linspace(2, 14, 11), field = drs.map((d) => eps.map((p) => evaluate({ ...v, tou: false, elecPrice: p, discNominal: d }, {}, false, K).lcow));
     const lives = [15, 20, 25, 30, 40], lifeSweep = lives.map((n) => evaluate({ ...v, life: n }, {}, false, K).lcow);
     // ---- brine-management comparison
-    const brineCmp = c.brineOpts.map((b) => { const capA = an.crf * b.capex * (1 + (v.pEng + v.pProc + v.pComm + v.pOwner) / 100) * (1 + v.pCont / 100), op = b.opex * c.brine * 365 * c.cf, en = b.energy * c.brine * 365 * c.cf * c.tou.price; return { name: b.name, capex: b.capex, add: (capA + op + en) / c.prod, co2: (b.energy * c.brine * 365 * c.cf * v.gridCarbon) / 1000 }; });
+    const brineCmp = c.brineOpts.map((b) => { const capA = an.crf * b.capex * (1 + (v.pEng + v.pProc + v.pComm + v.pOwner) / 100) * (1 + v.pCont / 100), op = b.opex * c.brine * 365 * c.cf, en = b.energy * c.brine * 365 * c.cf * c.elecP; return { name: b.name, capex: b.capex, add: (capA + op + en) / c.prod, co2: (b.energy * c.brine * 365 * c.cf * c.gridC) / 1000 }; });
     // ---- cost–energy–carbon trade-off
     const designs = [['Energy-efficient design (−10 % energy)', 0.9], ['Base design', 1], ['Low-capital design (+10 % energy)', 1.1]], shares = [0, 0.25, 0.5, 0.75, 1], pts = [];
     const trade = designs.map(([name, sf]) => ({ name, mode: 'both', x: [], y: [], sf }));
-    trade.forEach((t) => shares.forEach((sh) => { const e = evaluate({ ...v, tou: false, elecPrice: (1 - sh) * c.tou.price + sh * v.renPrice, gridCarbon: (1 - sh) * v.gridCarbon + sh * v.renCarbon }, { sec: t.sf, capex: 1 + (v.capexPerSec * (1 - t.sf) * 100) / 100 }, false, K); const cI = (e.c.tCO2 * 1000) / e.c.prod; t.x.push(cI); t.y.push(e.lcow); pts.push({ design: t.name, share: sh, lcow: e.lcow, ci: cI, sec: e.c.sec }); }));
+    trade.forEach((t) => shares.forEach((sh) => { const e = evaluate({ ...v, tou: false, selfShare: 0, elecPrice: (1 - sh) * c.elecP + sh * v.renPrice, gridCarbon: (1 - sh) * c.gridC + sh * v.renCarbon }, { sec: t.sf, capex: 1 + (v.capexPerSec * (1 - t.sf) * 100) / 100 }, false, K); const cI = (e.c.tCO2 * 1000) / e.c.prod; t.x.push(cI); t.y.push(e.lcow); pts.push({ design: t.name, share: sh, lcow: e.lcow, ci: cI, sec: e.c.sec }); }));
     pts.forEach((p) => { p.pareto = !pts.some((q) => q !== p && q.lcow <= p.lcow && q.ci <= p.ci && q.sec <= p.sec && (q.lcow < p.lcow || q.ci < p.ci || q.sec < p.sec)); });
+    // ---- levelised cost of energy, exergy costing, life-cycle assessment
+    const gen = c.gen, ex = exergoeconomics(c, an, v), lca = lcaTea(c, f, v, an), genKW = (c.self * c.elecKWh) / gen.energy;
+    // ---- constraints: minimum production and emissions cap (renewable share needed to comply, and its cost)
+    const renAt = (sh) => evaluate({ ...v, tou: false, selfShare: 0, elecPrice: (1 - sh) * c.elecP + sh * v.renPrice, gridCarbon: (1 - sh) * c.gridC + sh * v.renCarbon }, {}, false, K), ciOf = (e) => (e.c.tCO2 * 1000) / e.c.prod;
+    const capC = v.maxCarbon ?? 0, r0 = renAt(0), r1 = renAt(1), ci1 = ciOf(r1), abate = ci - ci1 > 1e-9 ? (1000 * (r1.lcow - r0.lcow)) / (ci - ci1) : null;
+    const emis = { cap: capC, active: capC > 0, ok: !(capC > 0) || ci <= capC, share: 0, lcow: an.lcow, feasible: true, best: null };
+    if (emis.active && !emis.ok) { emis.feasible = ci1 <= capC; emis.share = emis.feasible ? clamp((ci - capC) / (ci - ci1), 0, 1) : 1; emis.lcow = renAt(emis.share).lcow; }
+    if (emis.active) emis.best = pts.filter((q) => q.ci <= capC).reduce((b, q) => (b === null || q.lcow < b.lcow ? q : b), null);
+    const needAvail = c.minProd > 0 ? (100 * c.minProd) / (c.cap * 365 * c.tou.prodFactor) : 0;
     // ---- option to defer
     const Vop = cash.npv + (c.tci - c.grant), strike = c.tci - c.grant, yieldQ = clamp(1 / f.N + 0.02, 0, 0.3);
     const optVal = Vop > 0 ? binomialOption({ V: Vop, K: strike, r: v.riskFree / 100, sigma: v.volatility / 100, T: v.deferYears, steps: v.optSteps, q: yieldQ, american: true }) : 0, flex = optVal - Math.max(cash.npv, 0);
@@ -489,10 +624,16 @@ const suite = {
     if (c.sat > 1) W.push({ level: 'info', msg: `Capacity is ${fmt(c.sat, 3)} × the largest single-plant size: cost is scaled as parallel plants beyond ${fmt(v.maxScale, 4)} m³/d.` });
     if (v.tou) W.push({ level: 'info', msg: `Time-of-use tariff: effective price ${fmt(c.tou.price, 3)} $/kWh (flat running would pay ${fmt(c.tou.flat, 3)}), production factor ${fmt(100 * c.tou.prodFactor, 4)} %.` });
     if (Math.abs(c.escal - 1) > 0.002) W.push({ level: 'info', msg: `Equipment costs escalated by ${fmt(100 * (c.escal - 1), 3)} % from ${v.baseYear} to ${v.analysisYear} with the cost index.` });
+    if (c.shortfall > 0) W.push({ level: 'warn', msg: `Annual production ${fmt(c.prod / M, 4)} Mm³ is below the contractual minimum of ${fmt(c.minProd / M, 4)} Mm³ — a capacity factor of at least ${fmt(needAvail, 3)} % is needed${c.o.shortfall > 0 ? `; the shortfall costs ${fmt(c.o.shortfall / 1000, 3)} k$/y` : ''}.` });
+    else if (pMiss > 0.1) W.push({ level: 'info', msg: `There is a ${fmt(100 * pMiss, 3)} % chance of missing the minimum production of ${fmt(c.minProd / M, 4)} Mm³/y under the capacity-factor uncertainty.` });
+    if (emis.active && !emis.ok) W.push({ level: 'warn', msg: emis.feasible ? `Carbon intensity ${fmt(ci, 3)} kgCO₂/m³ exceeds the cap of ${capC} — a renewable share of ${fmt(100 * emis.share, 3)} % of the electricity would comply, at a water cost of ${fmt(emis.lcow, 3)} $/m³.` : `Carbon intensity ${fmt(ci, 3)} kgCO₂/m³ exceeds the cap of ${capC} and even fully renewable electricity (${fmt(ci1, 3)} kgCO₂/m³) does not comply — reduce the thermal energy or its emission factor.` });
+    if (!ex.consistent) W.push({ level: 'warn', msg: `Exergy analysis: the entered specific energy implies a membrane feed pressure of ${fmt(ex.pBar, 3)} bar, below the least work of separation at this salinity and recovery — check the specific energy, feed salinity and pumping share.` });
+    if (c.self > 0) W.push({ level: 'info', msg: `${fmt(100 * c.self, 3)} % of the electricity is self-supplied at a levelised cost of ${fmt(gen.lcoe, 3)} $/kWh (${fmt(genKW, 4)} kW of generation); effective price ${fmt(c.elecP, 3)} $/kWh.` });
     W.push({ level: 'info', msg: 'Cost data are indicative screening values (about ±25–30 % on capital). Calibrate against recent regional projects before using the result for a decision.' });
     const share = (x) => (100 * x) / an.lcow, top = Object.entries(an.parts).sort((a, b) => b[1] - a[1]);
 
-    const out = { lcow: an.lcow, capex: c.tci, opex: c.opex, npv: cash.npv, carbonIntensity: ci, lcowNominal: cash.lcowNom, lcowDCF: cash.lcowReal, specificCapex: c.tci / c.cap, annualProduction: c.prod, tCO2: c.tCO2, p10, p50, p90, opexPerM3: c.opex / c.prod, lcowLocal: an.lcow * fx, currency: ccy, deferralValue: optVal };
+    const out = { lcow: an.lcow, capex: c.tci, opex: c.opex, npv: cash.npv, carbonIntensity: ci, lcowNominal: cash.lcowNom, lcowDCF: cash.lcowReal, specificCapex: c.tci / c.cap, annualProduction: c.prod, tCO2: c.tCO2, p10, p50, p90, opexPerM3: c.opex / c.prod, lcowLocal: an.lcow * fx, currency: ccy, deferralValue: optVal,
+      lcoe: gen.lcoe, exergyEfficiency: ex.eff, exergyCostOfProduct: ex.cProduct, lifeCycleCarbonIntensity: lca.ci, surrogateR2: sg.r2, surrogateP90: sg.p90, emissionsCapMet: emis.ok, minProductionMet: !(c.shortfall > 0), probMissProduction: pMiss };
     if (Number.isFinite(pIrr)) out.irr = pIrr;
     if (Number.isFinite(pbS)) out.payback = pbS;
     if (breakEven !== null) out.breakEvenTariff = breakEven;
@@ -501,7 +642,7 @@ const suite = {
       ['Direct cost', null, null, null, c.direct / M, (100 * c.direct) / c.tci], ['Engineering and design', null, null, null, c.indirect.engineering / M, (100 * c.indirect.engineering) / c.tci], ['Procurement and construction management', null, null, null, c.indirect.procurement / M, (100 * c.indirect.procurement) / c.tci],
       ['Commissioning and start-up', null, null, null, c.indirect.commissioning / M, (100 * c.indirect.commissioning) / c.tci], ["Owner's costs", null, null, null, c.indirect.owner / M, (100 * c.indirect.owner) / c.tci], ['Contingency', null, null, null, c.contingency / M, (100 * c.contingency) / c.tci],
       ['Land', null, null, null, c.land / M, (100 * c.land) / c.tci], ['Working capital', null, null, null, c.wc / M, (100 * c.wc) / c.tci], ['Interest during construction', null, null, null, c.idc / M, (100 * c.idc) / c.tci], ['Total capital investment', null, null, null, c.tci / M, 100]].filter(Boolean);
-    const o = c.o, opRows = [['Electricity', o.elec], ['Thermal energy', o.thermal], ['Membrane replacement', o.mem], ['Cartridge filters', o.cart], ['Membrane cleaning', o.cip], ['Chemicals', o.chem], ['Labour', o.labour], ['Overheads', o.overhead], ['Maintenance and spares', o.maint], ['Insurance', o.ins], ['Laboratory and monitoring', o.lab], ['Brine management', o.brine], ['Sludge disposal', o.sludge], ['Crystalliser solids disposal', o.solids], ['Carbon cost', o.carbon], ['Environmental charges', o.env]];
+    const o = c.o, opRows = [['Electricity', o.elec], ['Thermal energy', o.thermal], ['Membrane replacement', o.mem], ['Cartridge filters', o.cart], ['Membrane cleaning', o.cip], ['Chemicals', o.chem], ['Labour', o.labour], ['Overheads', o.overhead], ['Maintenance and spares', o.maint], ['Insurance', o.ins], ['Laboratory and monitoring', o.lab], ['Brine management', o.brine], ['Sludge disposal', o.sludge], ['Crystalliser solids disposal', o.solids], ['Carbon cost', o.carbon], ['Environmental charges', o.env], ['Take-or-pay shortfall penalty', o.shortfall]];
     const yrs = cash.rows.map((r) => r.t);
     let cumU = cash.proj[0], cumD = cash.proj[0];
     const cumUnd = [cumU, ...cash.rows.map((r) => (cumU += r.cfProj))], cumDisc = [cumD, ...cash.rows.map((r) => (cumD += r.cfProj / (1 + f.dn) ** r.t))];
@@ -528,10 +669,19 @@ const suite = {
         { label: 'Carbon intensity', value: ci, unit: 'kgCO₂/m³' },
         { label: 'Monte-Carlo P50 / P90', value: `${fmt(p50, 3)} / ${fmt(p90, 3)}`, unit: '$/m³' },
         { label: 'Chance of exceeding the ceiling', value: 100 * pExceed, unit: '%', status: pExceed > 0.25 ? 'warn' : 'ok' },
+        { label: 'LCOE of on-site generation', value: gen.lcoe, unit: '$/kWh', status: 'ok', help: `(CRF·CAPEX + O&M) ÷ annual energy + fuel, real terms; grid price ${fmt(c.tou.price, 3)} $/kWh; ${fmt(100 * c.self, 3)} % self-supplied` },
+        { label: 'Exergy (second-law) efficiency', value: 100 * ex.eff, unit: '%', status: ex.consistent ? 'ok' : 'warn', help: `Least work of separation ${fmt(ex.wmin, 3)} kWh/m³ ÷ fuel exergy ${fmt(ex.fuel, 3)} kWh/m³` },
+        { label: 'Exergy cost of product water', value: ex.cProduct, unit: '$/kWh', help: 'Exergoeconomic unit cost: all fuel and capital cost rates carried by the separation exergy of the product' },
+        { label: 'Life-cycle carbon intensity', value: lca.ci, unit: 'kgCO₂e/m³', status: emis.active && lca.ci > capC ? 'warn' : 'ok', help: `Operation ${fmt(lca.opCi, 3)} + embodied ${fmt(lca.embodied, 3)} kgCO₂e/m³ (construction, membranes, chemicals, end of life)` },
+        { label: 'Surrogate P50 / P90', value: `${fmt(sg.p50, 3)} / ${fmt(sg.p90, 3)}`, unit: '$/m³', status: sg.r2 > 0.99 ? 'ok' : 'warn', help: `Quadratic response surface of the cost model, ${sg.nMC} samples; hold-out R² ${fmt(sg.r2, 5)}` },
+        { label: 'Emissions cap', value: !emis.active ? 'none set' : emis.ok ? 'met' : emis.feasible ? `needs ${fmt(100 * emis.share, 3)} % renewable` : 'cannot be met', unit: '', status: emis.ok ? 'ok' : 'warn' },
+        { label: 'Minimum production', value: !(c.minProd > 0) ? 'none set' : c.shortfall > 0 ? `short by ${fmt(c.shortfall / M, 3)} Mm³/y` : 'met', unit: '', status: c.shortfall > 0 ? 'warn' : 'ok', help: `Chance of missing it under uncertainty: ${fmt(100 * pMiss, 3)} %` },
       ],
       recommendations: [
         `The water cost is most sensitive to ${tornado[0].name.toLowerCase()} and ${tornado[1].name.toLowerCase()}: firm these up first (quotations, tariff agreement, financing terms).`,
-        share(an.parts.Electricity) > 30 ? `Electricity is ${fmt(share(an.parts.Electricity), 2)} % of the water cost — each 0.1 kWh/m³ saved is worth ${fmt((0.1 * c.tou.price * c.prod) / 1000, 3)} k$/y. Check energy recovery and pump efficiency in suite 12.` : null,
+        share(an.parts.Electricity) > 30 ? `Electricity is ${fmt(share(an.parts.Electricity), 2)} % of the water cost — each 0.1 kWh/m³ saved is worth ${fmt((0.1 * c.elecP * c.prod) / 1000, 3)} k$/y. Check energy recovery and pump efficiency in suite 12.` : null,
+        gen.lcoe < 0.9 * c.tou.price && c.self < 0.5 ? `On-site generation at these inputs has a levelised cost of ${fmt(gen.lcoe, 3)} $/kWh against ${fmt(c.tou.price, 3)} $/kWh from the grid — raise the self-supplied share to cut the water cost.` : null,
+        ex.rows.length ? `Exergoeconomics: the largest cost of exergy destruction is in "${[...ex.rows].sort((a, b) => b.cD - a.cD)[0].name.toLowerCase()}" (${fmt([...ex.rows].sort((a, b) => b.cD - a.cD)[0].cD, 3)} $/m³) — that is where efficiency investment pays first.` : null,
         cash.npv < 0 && breakEven ? `Raise the tariff to at least ${fmt(breakEven, 3)} $/m³, or secure a capital grant or cheaper debt, for the project to earn its cost of capital.` : null,
         flex > 0.02 * strike && cash.npv > 0 ? `Waiting has option value (${fmt(flex / M, 3)} M$ above investing now) — consider phasing or deferring if demand or tariffs are uncertain.` : null,
         c.cf < 0.85 ? 'Capacity factor is below 85 %: fixed costs are spread over less water. Storage or demand contracts that raise utilisation cut the unit cost directly.' : null,
@@ -548,8 +698,12 @@ const suite = {
         { type: 'line', title: 'Cumulative probability of LCOW', xlabel: 'LCOW ($/m³)', ylabel: 'Probability of not exceeding', ymin: 0, ymax: 1, series: [{ name: 'Cumulative distribution', x: cdfX, y: cdfY }], vlines: [{ x: v.targetLcow, label: 'ceiling' }], hlines: [{ y: 0.5, label: 'P50' }, { y: 0.9, label: 'P90' }] },
         { type: 'line', title: 'Economies of scale', xlabel: 'Plant capacity (m³/d)', ylabel: 'LCOW ($/m³) · specific capital (k$ per m³/d)', logx: true, series: [{ name: 'LCOW ($/m³)', x: sizes, y: sizeRes.map((r) => r[0]), mode: 'both' }, { name: 'Specific capital (k$ per m³/d)', x: sizes, y: sizeRes.map((r) => r[1] / 1000), mode: 'both' }], vlines: [{ x: v.capacity, label: 'this plant' }], note: 'Staffing is scaled with capacity^0.3 and land with capacity^0.6 for this sweep.' },
         { type: 'line', title: 'Effect of capacity factor and plant life', xlabel: 'Capacity factor (%) · plant life (years × 2)', ylabel: 'LCOW ($/m³)', series: [{ name: 'Capacity factor', x: cfs, y: cfSweep, mode: 'both' }, { name: 'Plant life (x = years × 2)', x: lives.map((n) => 2 * n), y: lifeSweep, mode: 'both' }] },
-        { type: 'field', title: 'LCOW map: electricity price × discount rate', xlabel: 'Electricity price ($/kWh)', ylabel: 'Nominal discount rate (%/y)', zlabel: 'LCOW', zunit: '$/m³', x: eps, y: drs, z: field, cmap: 'viridis', contours: 8, markers: [{ x: clamp(c.tou.price, 0.02, 0.2), y: clamp(v.discNominal, 2, 14), label: 'this case' }] },
+        { type: 'field', title: 'LCOW map: electricity price × discount rate', xlabel: 'Electricity price ($/kWh)', ylabel: 'Nominal discount rate (%/y)', zlabel: 'LCOW', zunit: '$/m³', x: eps, y: drs, z: field, cmap: 'viridis', contours: 8, markers: [{ x: clamp(c.elecP, 0.02, 0.2), y: clamp(v.discNominal, 2, 14), label: 'this case' }] },
         { type: 'line', title: 'Cost – carbon trade-off (renewable share 0 → 100 %)', xlabel: 'Carbon intensity (kgCO₂/m³)', ylabel: 'LCOW ($/m³)', series: trade.map(({ name, mode, x, y }) => ({ name, mode, x, y })), note: 'Each line is one design; points step the renewable share of electricity from 0 to 100 % in quarters.' },
+        { type: 'bar', title: 'Exergy destruction and exergoeconomic cost rates by subsystem', ylabel: 'kWh/m³ · $/m³ × 10', categories: ex.rows.map((q) => q.name), series: [{ name: 'Exergy destruction (kWh/m³)', values: ex.rows.map((q) => q.D) }, { name: 'Cost of exergy destruction ($/m³ × 10)', values: ex.rows.map((q) => 10 * q.cD) }, { name: 'Capital and O&M cost rate ($/m³ × 10)', values: ex.rows.map((q) => 10 * q.z) }] },
+        { type: 'bar', title: 'Life-cycle greenhouse-gas emissions by stage', ylabel: 'kgCO₂e per m³', categories: Object.keys(lca.stages), series: [{ name: 'kgCO₂e/m³', values: Object.values(lca.stages) }] },
+        { type: 'bar', title: 'Variance-based sensitivity of LCOW (first-order indices from the surrogate)', ylabel: 'Share of variance (–)', categories: unc.map((d) => d.name), series: [{ name: 'S₁', values: sg.S1 }] },
+        { type: 'line', title: 'Surrogate parity on hold-out runs of the cost model', xlabel: 'Cost model LCOW ($/m³)', ylabel: 'Surrogate LCOW ($/m³)', series: [{ name: 'Hold-out runs', x: sg.parity.model, y: sg.parity.sur, mode: 'points' }, { name: '1 : 1', x: [Math.min(...sg.parity.model), Math.max(...sg.parity.model)], y: [Math.min(...sg.parity.model), Math.max(...sg.parity.model)], dash: true }] },
         { type: 'bar', title: 'Brine-management options: addition to the water cost', ylabel: '$/m³ of product', categories: brineCmp.slice(0, 5).map((b) => b.name), series: [{ name: '$/m³', values: brineCmp.slice(0, 5).map((b) => b.add) }] },
       ],
       tables: [
@@ -574,8 +728,36 @@ const suite = {
         { title: 'Brine-management options and cost–carbon trade-off', columns: ['Option', 'Capital (M$)', 'Addition to LCOW ($/m³)', 'Carbon (tCO₂/y) / intensity (kg/m³)', 'Specific energy (kWh/m³)', 'Non-dominated'],
           rows: [...brineCmp.slice(0, 5).map((b) => [`Brine: ${b.name}`, b.capex / M, b.add, b.co2, null, null]), ...pts.map((p) => [`${p.design}, ${100 * p.share} % renewable`, null, p.lcow, p.ci, p.sec, p.pareto ? 'yes' : 'no'])],
           note: 'Brine rows: cost added to the product water by each route on the current brine flow (indicative unit costs). Design rows: total LCOW; a point is non-dominated when no other point is at least as good in cost, carbon and energy.' },
+        { title: 'Levelised cost of energy (on-site generation)', columns: ['Item', 'Value', 'Unit'], rows: [
+          ['Capital recovery', gen.capital, '$/kWh'], ['Fixed operation and maintenance', gen.om, '$/kWh'], ['Fuel', gen.fuel, '$/kWh'], ['Levelised cost of energy (real)', gen.lcoe, '$/kWh'], ['Capital-recovery factor of the generator', gen.crf, '1/y'], ['Energy per installed kW', gen.energy, 'kWh/kW·y'],
+          ['Grid electricity price (effective)', c.tou.price, '$/kWh'], ['Self-supplied share', 100 * c.self, '%'], ['Blended electricity price used in the cost model', c.elecP, '$/kWh'], ['Blended emission factor', c.gridC, 'kgCO₂/kWh'], ['Generation needed for the self-supplied share', genKW, 'kW'], ['Its capital (carried in the energy price, not in the plant CAPEX)', (genKW * (v.genCapex ?? 900)) / M, 'M$'],
+          ['Heat price used', c.heatP, '$/kWh'], ['Carnot factor of the heat source', ex.carnot, '–']],
+          note: 'LCOE = (CRF·CAPEX + O&M) ÷ (8760 × capacity factor) + fuel, at the real discount rate. The self-supplied share is bought at this cost, as under a power-purchase agreement.' },
+        { title: 'Exergy and exergoeconomic analysis (per m³ of product)', columns: ['Subsystem', 'Fuel exergy (kWh/m³)', 'Product exergy (kWh/m³)', 'Exergy destruction (kWh/m³)', 'Exergy efficiency (%)', 'Fuel unit cost ($/kWh)', 'Product unit cost ($/kWh)', 'Capital + O&M rate Ż ($/m³)', 'Cost of destruction Ċ_D ($/m³)', 'Exergoeconomic factor f (%)', 'Relative cost difference r'],
+          rows: [...ex.rows.map((q) => [q.name, q.fuel, q.prod, q.D, 100 * q.eff, q.cF, q.cP, q.z, q.cD, 100 * q.f, q.rel]), ['Whole plant', ex.fuel, ex.wmin, ex.dest, 100 * ex.eff, null, ex.cProduct, ex.zTot, sum(ex.rows.map((q) => q.cD)), null, null]],
+          note: `Fuel exergy = electricity + heat × Carnot factor (${fmt(ex.carnot, 3)}); product exergy = least work of separation at ${fmt(v.feedSalinity ?? 35, 3)} g/kg and ${fmt(100 * c.rec, 3)} % recovery (${fmt(ex.wmin, 3)} kWh/m³). Unit exergetic cost k* = ${fmt(ex.kStar, 3)}. Implied membrane feed pressure ${fmt(ex.pBar, 3)} bar. Specific exergy costing: the pump product is hydraulic exergy; the energy-recovery device returns brine exergy at the membrane-feed unit cost; capital, membranes, chemicals and other non-energy costs are allocated by installed cost and added as Ż. The product cost rate equals the LCOW.` },
+        { title: 'Life-cycle assessment and its cost', columns: ['Life-cycle stage', 'Greenhouse gases (kgCO₂e/m³)', 'Share (%)', 'Primary energy (kWh/m³)'],
+          rows: [...Object.keys(lca.stages).map((k) => [k, lca.stages[k], lca.ci > 0 ? (100 * lca.stages[k]) / lca.ci : 0, lca.cedStages[k]]), ['Total, cradle to grave', lca.ci, 100, lca.ced], ['of which operation (electricity and heat)', lca.opCi, lca.ci > 0 ? (100 * lca.opCi) / lca.ci : 0, null], ['of which embodied', lca.embodied, lca.ci > 0 ? (100 * lca.embodied) / lca.ci : 0, null],
+            ['Life-cycle carbon cost at the carbon price ($/m³)', lca.carbonCostLC, null, null], ['LCOW including embodied carbon ($/m³)', lca.lcowLC, null, null], ['Abatement cost of renewable electricity ($/tCO₂)', abate, null, null], ['Eco-efficiency (m³ per $·kgCO₂e)', lca.ecoEff, null, null]],
+          note: `Emission factors: construction ${v.efCapex ?? 0.3} kgCO₂e per $ of direct cost, membranes ${v.efMem ?? 15} kgCO₂e/m², chemicals ${v.efChem ?? 1.1} kgCO₂e/kg, end of life ${v.efEol ?? 5} % of construction; totals over ${f.N} years of operation divided by the water produced. Primary-energy factors are generic (electricity 2.5, heat 1.1 kWh/kWh; 3.5 kWh/$ construction; 60 kWh/m² membrane; 6 kWh/kg chemicals). Indicative values.` },
+        { title: 'Response-surface surrogate of the cost model', columns: ['Quantity', 'Cost model (direct Monte-Carlo)', 'Surrogate'], rows: [
+          ['Samples', nMC, sg.nMC], ['LCOW P10 ($/m³)', p10, sg.p10], ['LCOW P50 ($/m³)', p50, sg.p50], ['LCOW P90 ($/m³)', p90, sg.p90], ['Mean ($/m³)', mean(mcL), sg.mean], ['Standard deviation ($/m³)', std(mcL), sg.sd], ['Hold-out R²', null, sg.r2], ['Largest hold-out error (%)', null, sg.maxErr],
+          ...unc.map((d, j) => [`First-order sensitivity index: ${d.name}`, null, sg.S1[j]]), ['Sum of first-order indices', null, sum(sg.S1)]],
+          note: `Quadratic polynomial in the ${unc.length} drivers (${sg.fit.terms} terms; interaction terms among capital cost, electricity price, specific energy, capacity factor, discount rate and plant life), fitted by least squares to ${sg.nTrain} Latin-hypercube runs of the cost model and checked on ${sg.nTest} further runs. The indices are Var(E[LCOW | driver]) ÷ Var(LCOW) from the surrogate sample; their sum below 1 indicates interactions and correlation.` },
+        { title: 'Initial conditions, horizon and constraints', columns: ['Condition', 'Value', 'Limit', 'Unit', 'Status'], rows: [
+          ['Initial condition: capital investment at start of operation', c.tci / M, null, 'M$', ''], ['Initial condition: debt / equity', `${fmt(cash.D / M, 4)} / ${fmt((c.tci - c.grant - cash.D) / M, 4)}`, null, 'M$', ''], ['Initial condition: electricity price', c.elecP, null, '$/kWh', ''], ['Initial condition: chemical cost', c.o.chem / 1000, null, 'k$/y', ''],
+          ['Initial condition: first-year production', cash.rows[0].Q / M, null, 'Mm³', ''], ['Initial condition: depreciable asset value', Math.max(0, c.base + c.idc - c.land - c.grant) / M, null, 'M$', ''],
+          ['Horizon: construction + operating life', `${Math.round(v.constYears)} + ${f.N}`, null, 'years', ''], ['Horizon: loan fully repaid in year', cash.loan.length, f.N, 'year', cash.loan.length <= f.N ? 'ok' : 'violated'], ['Horizon: terminal value in the final year (nominal)', cash.rows[f.N - 1].terminal / M, null, 'M$', ''],
+          ['Constraint: maximum water cost', an.lcow, v.targetLcow, '$/m³', an.lcow <= v.targetLcow ? 'met' : 'violated'], ['Constraint: minimum debt-service cover', minDscr, v.minDscr, '–', minDscr === null ? 'no debt' : minDscr >= v.minDscr ? 'met' : 'violated'],
+          ['Constraint: minimum annual production', c.prod / M, c.minProd / M, 'Mm³/y', !(c.minProd > 0) ? 'none set' : c.shortfall > 0 ? 'violated' : 'met'], ['  capacity factor needed for it', 100 * c.cf, needAvail, '%', ''], ['  chance of missing it (Monte-Carlo)', 100 * pMiss, null, '%', ''], ['  shortfall penalty', c.o.shortfall / 1000, null, 'k$/y', ''],
+          ['Constraint: emissions cap', ci, emis.active ? capC : null, 'kgCO₂/m³', !emis.active ? 'none set' : emis.ok ? 'met' : 'violated'], ['  renewable share of electricity needed to comply', 100 * emis.share, 100, '%', emis.feasible ? '' : 'not sufficient'], ['  water cost when complying', emis.lcow, v.targetLcow, '$/m³', ''],
+          ['  least-cost compliant design in the trade-off set', emis.best ? `${emis.best.design}, ${100 * emis.best.share} % renewable` : emis.active ? 'none' : 'n/a', null, '', ''], ['Constraint: largest single-plant size', c.cap, v.maxScale, 'm³/d', c.sat > 1 ? 'replicated' : 'met']],
+          note: 'Economic initial conditions are the state at the start of operation (year 0 of the cash flow); the horizon closes the cash flow with the terminal value; constraints are checked on the deterministic case and, for production, on the Monte-Carlo sample.' },
       ],
       balances: [
+        { name: 'Exergy: fuel = product + destruction (kWh/m³)', in: ex.fuel, out: ex.wmin + ex.dest },
+        { name: 'Exergy costing: product cost rate = LCOW ($/m³)', in: an.lcow, out: ex.prodCost },
+        { name: 'Life-cycle stages sum to the total (kgCO₂e/m³)', in: lca.ci, out: sum(Object.values(lca.stages)) },
         { name: 'LCOW components sum to the total ($/m³)', in: an.lcow, out: sum(Object.values(an.parts)) },
         { name: 'Capital items sum to the total investment (M$)', in: c.tci / M, out: (c.direct + c.indTot + c.contingency + c.land + c.wc + c.idc) / M },
         { name: 'Depreciation sums to the depreciable base (M$)', in: Math.max(0, c.base + c.idc - c.land - c.grant) / M, out: sum(cash.depr) / M },
@@ -640,6 +822,45 @@ const suite = {
     add('Monte-Carlo mean of a linear model matches the analytic mean', exact, mean(smp), (4 * std(smp)) / Math.sqrt(n), 'Triangular inputs, E[x] = (min + mode + max)/3; tolerance = 4 standard errors');
     add('Binomial tree converges to Black–Scholes', blackScholesCall(100, 100, 0.04, 0.22, 5), binomialOption({ V: 100, K: 100, r: 0.04, sigma: 0.22, T: 5, steps: 400, american: false }), 0.05, 'European call, no yield');
     add('Carbon intensity = emission factor × specific energy', d.gridCarbon * d.sec + d.gridCarbon * 0.03 * (1 / 0.45 - 1), (e.c.tCO2 * 1000) / e.c.prod, 1e-9, 'Electricity only (membrane plant), including outfall pumping');
+    // ---- levelised cost of energy
+    const g1 = lcoe({ capex: 1000, cf: 0.25, om: 0.02, fuel: 0.01, life: 20, rate: 0.08 });
+    add('LCOE hand calculation', (0.101852209 * 1000 + 20) / 2190 + 0.01, g1.lcoe, 1e-9, '(CRF·CAPEX + O&M) ÷ (8760 × 0.25) + fuel at 8 %, 20 years = 0.0656 $/kWh');
+    add('LCOE at zero discount rate', (1000 / 20 + 20) / 2190, lcoe({ capex: 1000, cf: 0.25, om: 0.02, fuel: 0, life: 20, rate: 0 }).lcoe, 1e-12, '(CAPEX/life + O&M) ÷ annual energy');
+    add('LCOE annuity identity', 1000, npv(0.08, [0, ...new Array(20).fill(g1.capital * g1.energy)]), 1e-6, 'Present value of the capital part of the LCOE revenue over the life equals the investment');
+    const es = evaluate({ ...k, selfShare: 100 }), eg = evaluate({ ...k, selfShare: 0 });
+    add('Self-supplied plant pays the LCOE for its electricity', es.c.gen.lcoe * es.c.elecKWh, es.c.o.elec, 1e-6, 'Electricity cost = LCOE × annual consumption at 100 % self-supply');
+    add('Zero self-supply leaves the grid price unchanged', d.elecPrice, eg.c.elecP, 1e-15, 'Blended price at 0 % share');
+    // ---- thermoeconomic / exergoeconomic costing
+    const xe = exergoeconomics(e.c, e.an, k);
+    add('Exergy balance closes: fuel = product + destruction', 0, xe.balance / xe.fuel, 1e-12, 'Sum over the subsystems, kWh per m³ of product');
+    add('Exergoeconomic cost balance: product cost rate equals the LCOW', e.lcow, xe.prodCost, 1e-10, 'Σ fuel cost + Σ Ż carried to the product by specific exergy costing');
+    add('Least work of separation, closed form', ((osmoticPressure(25, 35) / 3.6e6) * -Math.log(0.55)) / 0.45, xe.wmin, 1e-12, 'w_min = π_f·ln(1/(1 − r))/r for 35 g/kg at 45 % recovery ≈ 0.96 kWh/m³');
+    add('Second-law efficiency is between 0 and 1', 1, xe.eff > 0 && xe.eff < 1 ? 1 : 0, 0, `${fmt(100 * xe.eff, 3)} %`);
+    add('Pump subsystem: product unit cost = (c_F + Ż/W)/η', (e.c.elecP + xe.rows[0].z / xe.rows[0].fuel) / 0.82, xe.rows[0].cP, 1e-12, 'Cost balance of the high-pressure pump, $ per kWh of hydraulic exergy');
+    add('Carnot factor of 70 °C heat at 25 °C ambient', 1 - 298.15 / 343.15, xe.carnot, 1e-12, '1 − T₀/T');
+    const hx = buildCosts({ ...d, secThermal: 20, heatCosting: 'exergy' });
+    add('Thermoeconomic heat price = electricity price × Carnot factor × 0.85', d.elecPrice * (1 - 298.15 / 343.15) * 0.85, hx.heatP, 1e-12, 'Heat valued by its exergy');
+    // ---- life-cycle assessment
+    const lc = lcaTea(e.c, e.f, k, e.an);
+    add('Life-cycle stages sum to the total', lc.ci, sum(Object.values(lc.stages)), 1e-12, 'kgCO₂e per m³');
+    add('Operational stage of the LCA equals the carbon accounting', (e.c.tCO2 * 1000) / e.c.prod, lc.stages.Electricity + lc.stages.Heat, 1e-12, 'Electricity + heat');
+    add('Embodied construction carbon, hand calculation', (0.3 * e.c.direct) / (e.c.prod * e.f.N), lc.stages.Construction, 1e-15, 'Emission factor × direct cost ÷ lifetime production');
+    add('LCOW with embodied carbon = LCOW + embodied intensity × carbon price', e.lcow + (lc.embodied * d.carbonPrice) / 1000, lc.lcowLC, 1e-12, 'Internalised life-cycle externality');
+    // ---- surrogate
+    { const Xq = lhs(60, 3, 5).map((u) => u.map((x) => 2 * x - 1)), fq = (x) => 2 - x[0] + 0.5 * x[1] * x[1] + 0.3 * x[0] * x[2] - 0.2 * x[2], q = fitQuadratic(Xq, Xq.map(fq));
+      add('Quadratic response surface reproduces a quadratic function exactly', fq([0.3, -0.7, 0.5]), q.predict([0.3, -0.7, 0.5]), 1e-8, 'Least-squares fit of 10 terms to 60 Latin-hypercube points'); }
+    const uncD = DRIVERS.map((q) => ({ ...q })), sgt = surrogateTEA(d, prepare(d), uncD, { seed: 3 }), direct = sampleMultipliers(1500, uncD, 'tri', null, 20).map((mm) => evaluate(d, Object.fromEntries(DRIVERS.map((q, j) => [q.k, mm[j]]))).lcow);
+    add('Surrogate reproduces hold-out runs of the cost model', 1, sgt.r2, 0.005, 'R² on Latin-hypercube runs not used in the fit');
+    add('Surrogate median agrees with direct Monte-Carlo', quantile(direct, 0.5), sgt.p50, 0.01, 'P50 of LCOW, independent samples ($/m³)');
+    add('First-order sensitivity indices lie between 0 and 1', 1, sgt.S1.every((x) => x >= 0 && x <= 1) && sum(sgt.S1) > 0.7 && sum(sgt.S1) < 1.3 ? 1 : 0, 0, `Sum = ${fmt(sum(sgt.S1), 3)}`);
+    // ---- initial conditions, horizon and constraints
+    add('Initial condition: year-0 cash flow is the capital investment net of grants', -(e.c.tci - e.c.grant), e.cash.proj[0], 1e-6, 'State of the project at the start of operation');
+    add('Horizon: the cash flow spans the operating life and ends with the terminal value', 1, e.cash.proj.length === e.f.N + 1 && e.cash.rows[e.f.N - 1].terminal > 0 && e.cash.rows[e.f.N - 2].terminal === 0 ? 1 : 0, 0, 'N + 1 entries; salvage and working capital recovered in year N only');
+    const sh = buildCosts({ ...d, availability: 80, minProdPct: 90, shortfallPenalty: 0.5 });
+    add('Minimum-production constraint: shortfall penalty, hand calculation', 0.5 * (0.9 - 0.8) * d.capacity * 365, sh.o.shortfall, 1e-6, 'Penalty × (minimum − actual) with 80 % capacity factor against a 90 % minimum');
+    add('Minimum-production constraint is inactive when production is sufficient', 0, buildCosts({ ...d, minProdPct: 85, shortfallPenalty: 0.5 }).o.shortfall, 0, '92 % capacity factor against an 85 % minimum');
+    const capT = 0.9, ci0 = (e.c.tCO2 * 1000) / e.c.prod, rA = (s2) => evaluate({ ...k, tou: false, selfShare: 0, elecPrice: (1 - s2) * e.c.elecP + s2 * d.renPrice, gridCarbon: (1 - s2) * e.c.gridC + s2 * d.renCarbon }), ciR = (q) => (q.c.tCO2 * 1000) / q.c.prod, sReq = (ci0 - capT) / (ci0 - ciR(rA(1)));
+    add('Emissions constraint: the solved renewable share meets the cap exactly', capT, ciR(rA(sReq)), 1e-9, `Share ${fmt(100 * sReq, 4)} % for a cap of 0.9 kgCO₂/m³`);
     return C;
   },
 };

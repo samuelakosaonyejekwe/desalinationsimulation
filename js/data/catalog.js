@@ -1157,8 +1157,6 @@ export const CATALOG = {
    "Surrogate/AI-assisted techno-economic models"
   ],
   "icbc": [
-   "Better described as economic initial conditions",
-   "Horizon/constraint conditions rather than physical PDE boundary conditions",
    "Initial CAPEX",
    "Financing structure",
    "Debt/equity",
