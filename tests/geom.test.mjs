@@ -70,6 +70,7 @@ await group('surface formats', async () => {
   dv.setUint32(80, 12, true);
   T.forEach((t, i) => t.forEach((vi, k) => V[vi].forEach((c, q) => dv.setFloat32(84 + i * 50 + 12 + k * 12 + q * 4, c, true))));
   isCube(await imp('cube.stl', bin), 'STL binary');
+  isCube(await imp('padded.stl', cat(bin, new Uint8Array(2))), 'STL binary with trailing padding bytes');
   isCube(await imp('cube.obj', `# cube\n${V.map((v) => 'v ' + v.join(' ')).join('\n')}\n${Q.map((q) => 'f ' + q.map((i) => i + 1).join(' ')).join('\n')}\n`), 'OBJ');
   const plyHead = (fmt) => `ply\nformat ${fmt} 1.0\ncomment test\nelement vertex 8\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nelement face 6\nproperty list uchar int vertex_indices\nend_header\n`;
   isCube(await imp('cube.ply', plyHead('ascii') + V.map((v) => v.join(' ') + ' 255').join('\n') + '\n' + Q.map((q) => '4 ' + q.join(' ')).join('\n') + '\n'), 'PLY ascii');
@@ -108,6 +109,7 @@ await group('surface formats', async () => {
   // VTK legacy
   const vtkHead = (kind, mode = 'ASCII') => `# vtk DataFile Version 3.0\ncube\n${mode}\nDATASET ${kind}\n`;
   isCube(await imp('cube.vtk', vtkHead('POLYDATA') + `POINTS 8 float\n${vtxt()}\nPOLYGONS 6 30\n${Q.map((q) => '4 ' + q.join(' ')).join('\n')}\n`), 'VTK legacy ASCII POLYDATA');
+  isCube(await imp('pv.vtk', vtkHead('POLYDATA') + `FIELD FieldData 1\nTIME 1 1 double\n0.5\nPOINTS 8 float\n${vtxt()}\n\nMETADATA\nINFORMATION 2\nNAME L2_NORM_RANGE LOCATION vtkDataArray\nDATA 2 0 1.73205\nNAME L2_NORM_FINITE_RANGE LOCATION vtkDataArray\nDATA 2 0 1.73205\n\nPOLYGONS 6 30\n${Q.map((q) => '4 ' + q.join(' ')).join('\n')}\n\nPOINT_DATA 8\nSCALARS p float\nLOOKUP_TABLE default\n0 1 2 3 4 5 6 7\n`), 'VTK legacy with FIELD and METADATA blocks (ParaView style)');
   isCube(await imp('cube.vtk', cat(vtkHead('POLYDATA', 'BINARY'), 'POINTS 8 float\n', be('f32', V.flat()), '\nPOLYGONS 6 30\n', be('i32', Q.flatMap((q) => [4, ...q])), '\n')), 'VTK legacy BINARY POLYDATA');
   const ug = await imp('hex.vtk', vtkHead('UNSTRUCTURED_GRID') + `POINTS 8 double\n${vtxt()}\nCELLS 1 9\n8 0 1 2 3 4 5 6 7\nCELL_TYPES 1\n12\n`);
   isCube(ug, 'VTK legacy UNSTRUCTURED_GRID hexahedron → boundary');
@@ -187,6 +189,9 @@ await group('computational meshes', async () => {
   const tecO = await imp('cube.plt', `TITLE="ordered"\nVARIABLES="X","Y","Z"\nZONE I=3, J=2, K=2, F=POINT\n${ijk.map((p) => p.join(' ')).join('\n')}\n`);
   isCube(tecO, 'Tecplot ordered I×J×K zone (sniffed from .plt)', { count: 20 });
   ok(tecO.format === 'Tecplot ASCII' && tecO.stats.structured && tecO.stats.cells === 2, 'Tecplot ordered zone stats');
+  await throws('Tecplot with an absurd VARLOCATION range', () => imp('cc.dat', 'VARIABLES = "X", "Y", "Z", "P"\nZONE N=8, E=1, DATAPACKING=BLOCK, ZONETYPE=FEBRICK, VARLOCATION=([1-999999999999]=CELLCENTERED)\n0 1 1 0 0 1 1 0\n0 0 1 1 0 0 1 1\n0 0 0 0 1 1 1 1\n1.5\n1 2 3 4 5 6 7 8\n'), /Cell-centred/);
+  const tecCC = await imp('cc.dat', 'VARIABLES = "X", "Y", "Z", "P"\nZONE N=8, E=1, DATAPACKING=BLOCK, ZONETYPE=FEBRICK, VARLOCATION=([4]=CELLCENTERED)\n0 1 1 0 0 1 1 0\n0 0 1 1 0 0 1 1\n0 0 0 0 1 1 1 1\n1.5\n1 2 3 4 5 6 7 8\n');
+  isCube(tecCC, 'Tecplot block packing with a cell-centred variable');
   const tec2 = await imp('sq.dat', 'VARIABLES = "X", "Y"\nZONE N=4, E=1, F=FEPOINT, ET=QUADRILATERAL\n0 0\n3 0\n3 1\n0 1\n1 2 3 4\n');
   ok(tec2.kind === 'polylines' && tec2.polylines[0].closed && Math.abs(dimensions(tec2).area - 3) < 1e-12, 'Tecplot 2-D quadrilateral → outline');
   await throws('binary Tecplot .plt', () => imp('b.plt', cat('#!TDV112', new Uint8Array(40))), /ASCII/);
@@ -272,22 +277,30 @@ await group('CAD: STEP and IGES', async () => {
   ok(cyl.kind === 'mesh' && cyl.count === 46 * 2 + 96 && cyl.stats.tessellatedFaces === 3, `STEP cylinder: 3 faces → ${cyl.count} triangles`);
   ok(dc.closed && dc.consistentNormals && Math.abs(dc.volume - 2 * A48) < 1e-9 && Math.abs(dc.area - (2 * A48 + 2 * P48)) < 1e-9, `STEP cylinder: closed, volume ${dc.volume} (π·r²·h = ${2 * Math.PI}), area ${dc.area}`);
   ok(Math.abs(dc.volume - 2 * Math.PI) / (2 * Math.PI) < 0.005 && cyl.bbox.min.every((v, k) => Math.abs(v - [-1, -1, 0][k]) < 1e-9) && cyl.bbox.max.every((v, k) => Math.abs(v - [1, 1, 2][k]) < 1e-9), 'STEP cylinder: volume within 0.5 % of exact, bbox [-1,-1,0]–[1,1,2]');
-  // 4 × 4 × 1 plate with a round hole of radius 1: planar faces with a hole + inward-facing cylinder (same_sense .F.)
-  const plate = await imp('plate.stp', stepFile((E) => {
-    sUnits(E);
-    const C = [[0, 0, 0], [4, 0, 0], [4, 4, 0], [0, 4, 0], [0, 0, 1], [4, 0, 1], [4, 4, 1], [0, 4, 1]];
-    sQuadFaces(E, C, Q.slice(2));
-    const w0 = sVX(E, [3, 2, 0]), w1 = sVX(E, [3, 2, 1]), ax0 = sAX(E, [2, 2, 0], [0, 0, 1], [1, 0, 0]), ax1 = sAX(E, [2, 2, 1], [0, 0, 1], [1, 0, 0]);
-    const c0 = E(`EDGE_CURVE('',${w0},${w0},${E(`CIRCLE('',${ax0},1.)`)},.T.)`), c1 = E(`EDGE_CURVE('',${w1},${w1},${E(`CIRCLE('',${ax1},1.)`)},.T.)`), seam = sLine(E, w0, w1, [3, 2, 0], [3, 2, 1]);
-    for (const [zq, q, sense, ce] of [[0, Q[0], '.F.', c0], [1, Q[1], '.T.', c1]]) {
-      const p = q.map((i) => C[i]), vs = p.map((x) => sVX(E, x)), es = p.map((x, k) => [sLine(E, vs[k], vs[(k + 1) % 4], x, p[(k + 1) % 4]), true]);
-      E(`ADVANCED_FACE('',(${E(`FACE_OUTER_BOUND('',${sLoop(E, es)},.T.)`)},${E(`FACE_BOUND('',${sLoop(E, [[ce, zq === 1 ? false : true]])},.T.)`)}),${E(`PLANE('',${sAX(E, [0, 0, zq], [0, 0, 1], [1, 0, 0])})`)},${sense})`);
-    }
-    E(`ADVANCED_FACE('',(${E(`FACE_BOUND('',${sLoop(E, [[c0, true], [seam, true], [c1, false], [seam, false]])},.T.)`)}),${E(`CYLINDRICAL_SURFACE('',${ax0},1.)`)},.F.)`);
-  }));
-  const dp = dimensions(plate);
-  ok(plate.kind === 'mesh' && plate.stats.tessellatedFaces === 7 && dp.closed && dp.consistentNormals, `STEP plate with hole: 7 faces, ${plate.count} triangles, closed with consistent normals (${dp.closed}, ${dp.consistentNormals})`);
-  ok(Math.abs(dp.volume - (16 - A48)) < 1e-9 && Math.abs(dp.area - (2 * (16 - A48) + 16 + P48)) < 1e-9, `STEP plate with hole: volume ${dp.volume} (exact ${16 - Math.PI}), area ${dp.area}`);
+  // plates of thickness 1 with N × N round holes of radius 1 on a pitch of 4: planar faces with holes (several bridged to the
+  // same outline vertex) + inward-facing cylinders (same_sense .F.)
+  for (const N of [1, 3]) {
+    const Wd = 4 * N, plate = await imp(`plate${N}.stp`, stepFile((E) => {
+      sUnits(E);
+      const C = [[0, 0, 0], [Wd, 0, 0], [Wd, Wd, 0], [0, Wd, 0], [0, 0, 1], [Wd, 0, 1], [Wd, Wd, 1], [0, Wd, 1]], rings = [];
+      sQuadFaces(E, C, Q.slice(2));
+      for (let ia = 0; ia < N; ia++) for (let ib = 0; ib < N; ib++) {
+        const cx = 2 + 4 * ia, cy = 2 + 4 * ib, w0 = sVX(E, [cx + 1, cy, 0]), w1 = sVX(E, [cx + 1, cy, 1]), ax0 = sAX(E, [cx, cy, 0], [0, 0, 1], [1, 0, 0]), ax1 = sAX(E, [cx, cy, 1], [0, 0, 1], [1, 0, 0]);
+        const c0 = E(`EDGE_CURVE('',${w0},${w0},${E(`CIRCLE('',${ax0},1.)`)},.T.)`), c1 = E(`EDGE_CURVE('',${w1},${w1},${E(`CIRCLE('',${ax1},1.)`)},.T.)`), seam = sLine(E, w0, w1, [cx + 1, cy, 0], [cx + 1, cy, 1]);
+        rings.push([c0, c1]);
+        E(`ADVANCED_FACE('',(${E(`FACE_BOUND('',${sLoop(E, [[c0, true], [seam, true], [c1, false], [seam, false]])},.T.)`)}),${E(`CYLINDRICAL_SURFACE('',${ax0},1.)`)},.F.)`);
+      }
+      for (const [zq, q, sense] of [[0, Q[0], '.F.'], [1, Q[1], '.T.']]) {
+        const p = q.map((i) => C[i]), vs = p.map((x) => sVX(E, x)), es = p.map((x, k) => [sLine(E, vs[k], vs[(k + 1) % 4], x, p[(k + 1) % 4]), true]);
+        E(`ADVANCED_FACE('',(${[E(`FACE_OUTER_BOUND('',${sLoop(E, es)},.T.)`), ...rings.map((r) => E(`FACE_BOUND('',${sLoop(E, [[r[zq], zq === 0]])},.T.)`))].join(',')}),${E(`PLANE('',${sAX(E, [0, 0, zq], [0, 0, 1], [1, 0, 0])})`)},${sense})`);
+      }
+    }));
+    const dp = dimensions(plate), vol = Wd * Wd - N * N * A48;
+    ok(plate.kind === 'mesh' && plate.stats.tessellatedFaces === 6 + N * N && dp.closed && dp.consistentNormals, `STEP plate with ${N * N} hole(s): ${6 + N * N} faces, ${plate.count} triangles, closed with consistent normals (${dp.closed}, ${dp.consistentNormals})`);
+    ok(Math.abs(dp.volume - vol) < 1e-9 && Math.abs(dp.area - (2 * vol + 4 * Wd + N * N * P48)) < 1e-9, `STEP plate with ${N * N} hole(s): volume ${dp.volume} (exact ${Wd * Wd - N * N * Math.PI}), area ${dp.area}`);
+  }
+  const broken = await imp('broken.stp', stepFile((E) => { sUnits(E); sQuadFaces(E, V, Q); E("PRODUCT('x',(1,2"); }));
+  ok(broken.kind === 'mesh' && broken.count === 12, 'STEP with a malformed, unrelated entity still reads the solid');
   // AP242 tessellated geometry
   const cl = `COORDINATES_LIST('',8,(${V.map((v) => `(${v.map(RN).join(',')})`).join(',')}))`;
   isCube(await imp('tess.stp', stepFile((E) => { sUnits(E); E(`TRIANGULATED_FACE('',${E(cl)},8,((0.,0.,1.)),$,(),(${T.map((t) => `(${t.map((i) => i + 1).join(',')})`).join(',')}))`); }, 'AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF { 1 0 10303 442 1 1 4 }')), 'STEP AP242 TRIANGULATED_FACE');
@@ -319,6 +332,8 @@ await group('2-D drawings', async () => {
   ok(d2.kind === 'mesh' && d2.count === 2 && Math.abs(dimensions(d2).area - 1) < 1e-12 && !dimensions(d2).closed, 'DXF 3DFACE → mesh (open surface, area 1)');
   const d3 = await imp('spl.dxf', dxf('0\nSPLINE\n70\n8\n71\n2\n72\n6\n73\n3\n40\n0\n40\n0\n40\n0\n40\n1\n40\n1\n40\n1\n10\n0\n20\n0\n30\n0\n10\n5\n20\n10\n30\n0\n10\n10\n20\n0\n30\n0\n'));
   ok(d3.polylines.length === 1 && Math.abs(Math.max(...d3.polylines[0].y) - 5) < 1e-9, 'DXF SPLINE evaluated (quadratic peak at y = 5)');
+  const dInf = await imp('odd.dxf', dxf('0\nARC\n10\n0\n20\n0\n40\n1\n50\n0\n51\n-1e308\n0\nARC\n10\n0\n20\n0\n40\n1\n50\n-Infinity\n51\n90\n0\nLINE\n10\n0\n20\n0\n11\n1\n21\n1\n'));
+  ok(dInf.kind === 'polylines' && dInf.polylines.length >= 1 && dInf.polylines.every((p) => p.x.length <= 200), 'DXF arcs with absurd angles neither hang nor explode');
   await throws('DXF without supported entities', () => imp('e.dxf', dxf('0\nTEXT\n1\nhello\n')), /No LINE/);
   const svg = await imp('shapes.svg', `<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><defs><rect x="0" y="0" width="999" height="999"/></defs><rect x="10" y="10" width="10" height="10"/><g transform="translate(100,0) scale(2)"><path d="M0 0 h10 v10 h-10 z"/></g><circle cx="50" cy="50" r="5"/><polygon points="0,90 10,90 10,100"/><path d="M 60 0 A 5 5 0 0 1 70 0 M 80,20 C 80,10 90,10 90,20 q 5,5 10,0 L 100 30"/><line x1="0" y1="0" x2="1" y2="1" transform="matrix(1 0 0 1 150 50)"/></svg>`);
   ok(svg.kind === 'polylines' && svg.polylines.length === 7, `SVG: rect, group path, circle, polygon, 2 sub-paths, line → 7 polylines (${svg.polylines.length})`);
@@ -328,6 +343,8 @@ await group('2-D drawings', async () => {
   ok(Math.max(...r.y) === 85 && Math.min(...r.y) === 75, 'SVG y axis flipped within the bounding box');
   const hp = await imp('sq.hpgl', 'IN;SP1;PU0,0;PD4000,0,4000,4000,0,4000,0,0;PU;PA8000,0;CI400;PU;');
   ok(hp.kind === 'polylines' && hp.polylines.length === 2 && hp.polylines[0].closed && hp.polylines[0].x.length === 4 && Math.abs(dimensions(hp).area - (10000 + 100 * A48)) < 1e-6 && hp.stats.units === 'mm', 'HPGL: 100 mm square + circle of radius 10 mm');
+  const hpA = await imp('arc.hpgl', 'IN;PU10,0;PD;AA0,0,1e15;PU;');
+  ok(hpA.polylines[0].x.length <= 200, 'HPGL arc with an absurd sweep stays bounded');
   const hp2 = await imp('sq.plt', 'IN;PU10,10;PR;PD100,0,0,100,-100,0,0,-100;PU;');
   ok(hp2.format === 'HPGL plot file' && hp2.pathway === 'drawing' && hp2.polylines[0].closed && Math.abs(hp2.bbox.max[0] - 2.75) < 1e-12, 'HPGL sniffed from .plt, relative moves');
   const xy = await imp('profile.xy', '# x y\n0 0\n2 0\n2 1\n0 1\n0 0\n\n5 5\n6 6\n');
@@ -722,7 +739,7 @@ await group('microstructure', async () => {
 });
 
 await group('generate()', async () => {
-  const por = (g) => microstructure(g).porosity, sameData = (a, b) => a.voxels.data.length === b.voxels.data.length && a.voxels.data.every((v, i) => v === b.voxels.data[i]);
+  const por = (g) => microstructure(g, { tortuosity: false }).porosity, sameData = (a, b) => a.voxels.data.length === b.voxels.data.length && a.voxels.data.every((v, i) => v === b.voxels.data[i]);
   const shape = (g, label) => ok(g.kind === 'voxels' && g.voxels.data instanceof Uint8Array && g.voxels.data.length === g.voxels.nx * g.voxels.ny * g.voxels.nz && g.voxels.spacing.length === 3 && g.pathway === 'procedural' && Array.isArray(g.warnings) && Math.abs(g.stats.porosity - por(g)) < 1e-12, `${label}: voxel geometry ${g.voxels.nx} × ${g.voxels.ny} × ${g.voxels.nz}, porosity ${g.stats.porosity.toFixed(4)}`);
   const gy = generate({ type: 'tpms', surface: 'gyroid', porosity: 0.6, n: 32 });
   shape(gy, 'tpms gyroid');
@@ -810,6 +827,8 @@ await group('malformed and truncated input', async () => {
   await throws('PLY with an absurd vertex count', () => importGeometry(F('a.ply', 'ply\nformat binary_little_endian 1.0\nelement vertex 4000000000\nproperty float x\nproperty float y\nproperty float z\nend_header\n')), /impossible|truncated|malformed/);
   await throws('NPY with an absurd shape', () => importGeometry(F('a.npy', npy('<f8', [100000, 100000, 100], new Uint8Array(8)))), /truncated|large|too many/);
   await throws('corrupt gzip', () => importGeometry(F('a.nii.gz', cat(le('u8', [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]), new Uint8Array(40).fill(0xaa)))), /corrupt|truncated|NIfTI/);
+  const bomb = `<model><resources>${Array.from({ length: 9 }, (_, k) => `<object id="${k}"><components>${Array.from({ length: 60 }, () => `<component objectid="${k + 1}"/>`).join('')}</components></object>`).join('')}</resources><build><item objectid="0"/></build></model>`;
+  await throws('3MF component bomb', () => importGeometry(F('bomb.3mf', zip([['3D/3dmodel.model', bomb]]))), /too many|No triangles/);
   await throws('zip without directory', () => importGeometry(F('a.3mf', cat('PK\x03\x04', new Uint8Array(40)))), /zip/);
 });
 

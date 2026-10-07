@@ -457,22 +457,22 @@ function cellMesh(xyz, store, extra = {}) {
   }
   const tri = [], fan = (ids) => { for (let k = 1; k + 1 < ids.length; k++) for (const q of [ids[0], ids[k], ids[k + 1]]) tri.push(xyz[3 * q], xyz[3 * q + 1], xyz[3 * q + 2]); };
   if (has3) {
-    const faces = new Map();
+    const faces = new Map(), wide = nn > 2e5;    // key = the three smallest node ids of a face; a face met twice is interior
     for (let c = 0; c < store.t.length; c++) {
       const cf = CELL_FACES[store.t[c]], v = store.v[c];
       if (!cf) continue;
-      for (const f of cf) {
-        const ids = f.map((k) => v[k]), key = ids.slice().sort((a, b) => a - b).join(',');
-        const e = faces.get(key);
-        if (e) e.n++; else faces.set(key, { ids, c, n: 1 });
+      for (let f = 0; f < cf.length; f++) {
+        let a = Infinity, b = Infinity, d = Infinity;
+        for (const k of cf[f]) { const x = v[k]; if (x < a) { d = b; b = a; a = x; } else if (x < b) { d = b; b = x; } else if (x < d) d = x; }
+        const key = wide ? a + ',' + b + ',' + d : (a * nn + b) * nn + d;
+        if (!faces.delete(key)) faces.set(key, c * 8 + f);
       }
     }
-    for (const e of faces.values()) {
-      if (e.n !== 1) continue;
-      const v = store.v[e.c], cc = [0, 0, 0], fc = [0, 0, 0], nrm = [0, 0, 0], pts = e.ids.map(P);
+    for (const code of faces.values()) {
+      const c = Math.floor(code / 8), v = store.v[c], ids = CELL_FACES[store.t[c]][code % 8].map((k) => v[k]), cc = [0, 0, 0], fc = [0, 0, 0], nrm = [0, 0, 0], pts = ids.map(P);
       for (const i of v) { cc[0] += xyz[3 * i] / v.length; cc[1] += xyz[3 * i + 1] / v.length; cc[2] += xyz[3 * i + 2] / v.length; }
       for (let k = 0; k < pts.length; k++) { const a = pts[k], b = pts[(k + 1) % pts.length]; for (let d = 0; d < 3; d++) fc[d] += a[d] / pts.length; nrm[0] += (a[1] - b[1]) * (a[2] + b[2]); nrm[1] += (a[2] - b[2]) * (a[0] + b[0]); nrm[2] += (a[0] - b[0]) * (a[1] + b[1]); }
-      fan(dot(nrm, sub(fc, cc)) < 0 ? e.ids.slice().reverse() : e.ids);
+      fan(dot(nrm, sub(fc, cc)) < 0 ? ids.reverse() : ids);
       if (tri.length > L.triangles * 9) fail(`The mesh boundary has too many triangles (limit ${L.triangles}).`);
     }
     if (!tri.length) fail('The volume mesh has no boundary faces.');
@@ -562,52 +562,68 @@ function nurbsCurve(deg, knots, cps, w, u0, u1, nSeg) {
 }
 /** Ear clipping of a CCW outer ring with CW holes; points are [u, v, id]; returns id triples. */
 function triangulate(outer, holes) {
-  const c2 = (a, b, c) => (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]), same = (p, q) => p[0] === q[0] && p[1] === q[1];
-  let P = outer.slice();
+  const X = outer.map((p) => p[0]), Y = outer.map((p) => p[1]), ID = outer.map((p) => p[2]);
+  const insert = (arr, at, items) => { for (let k = 0; k < items.length; k += 8192) arr.splice(at + k, 0, ...items.slice(k, k + 8192)); };
   // bridge every hole (rightmost first) to the vertex of the current outline that its rightmost point can see
   const hs = holes.filter((h) => h.length >= 3).map((h) => { let m = 0; for (let k = 1; k < h.length; k++) if (h[k][0] > h[m][0]) m = k; return { h, m }; }).sort((a, b) => b.h[b.m][0] - a.h[a.m][0]);
   for (const { h, m } of hs) {
-    const M = h[m], np = P.length;
+    const mx = h[m][0], my = h[m][1], np = X.length;
     let best = Infinity, bi = -1, pick = 0;
-    for (let i = 0; i < np; i++) {
-      const a = P[i], b = P[(i + 1) % np];
-      if ((a[1] > M[1]) === (b[1] > M[1])) continue;
-      const x = a[0] + ((M[1] - a[1]) * (b[0] - a[0])) / (b[1] - a[1]);
-      if (x >= M[0] && x < best) { best = x; bi = i; }
+    for (let i = 0, j = np - 1; i < np; j = i++) {              // edge j -> i against the ray from M towards +x
+      const ay = Y[j], by = Y[i];
+      if ((ay > my) === (by > my)) continue;
+      const x = X[j] + ((my - ay) * (X[i] - X[j])) / (by - ay);
+      if (x >= mx && x < best) { best = x; bi = j; }
     }
-    if (bi < 0) { let d = Infinity; for (let k = 0; k < np; k++) { const q = (P[k][0] - M[0]) ** 2 + (P[k][1] - M[1]) ** 2; if (q < d) { d = q; pick = k; } } }
+    if (bi < 0) { let d = Infinity; for (let k = 0; k < np; k++) { const q = (X[k] - mx) ** 2 + (Y[k] - my) ** 2; if (q < d) { d = q; pick = k; } } }
     else {
-      pick = P[bi][0] > P[(bi + 1) % np][0] ? bi : (bi + 1) % np;
-      const I = [best, M[1]], C = P[pick];
+      const bj = (bi + 1) % np;
+      pick = X[bi] > X[bj] ? bi : bj;
+      const cx = X[pick], cy = Y[pick], xmax = Math.max(best, cx);
       let tanMin = Infinity;
-      for (let k = 0; k < np; k++) {
-        const q = P[k];
-        if (q[0] < M[0] || same(q, C)) continue;
-        const d1 = c2(M, I, q), d2 = c2(I, C, q), d3 = c2(C, M, q);
+      for (let k = 0; k < np; k++) {                              // a vertex inside triangle (M, hit point, C) hides C: take the one closest to the ray
+        const qx = X[k], qy = Y[k];
+        if (qx < mx || qx > xmax || (qx === cx && qy === cy)) continue;
+        const d1 = (best - mx) * (qy - my), d2 = (cx - best) * (qy - my) - (cy - my) * (qx - best), d3 = (mx - cx) * (qy - cy) - (my - cy) * (qx - cx);
         if (!((d1 >= 0 && d2 >= 0 && d3 >= 0) || (d1 <= 0 && d2 <= 0 && d3 <= 0))) continue;
-        const t = Math.abs(q[1] - M[1]) / (q[0] - M[0] || 1e-300);
+        const t = Math.abs(qy - my) / (qx - mx || 1e-300);
         if (t < tanMin) { tanMin = t; pick = k; }
       }
     }
-    P = [...P.slice(0, pick + 1), ...h.slice(m), ...h.slice(0, m + 1), ...P.slice(pick)];
+    // a vertex already used by earlier bridges exists in several copies: take the copy whose interior wedge faces the hole
+    const px = X[pick], py = Y[pick];
+    for (let k = 0; k < np; k++) {
+      if (X[k] !== px || Y[k] !== py) continue;
+      const a = (k + np - 1) % np, c = (k + 1) % np, l1 = (px - X[a]) * (my - Y[a]) - (py - Y[a]) * (mx - X[a]), l2 = (X[c] - px) * (my - py) - (Y[c] - py) * (mx - px);
+      if ((px - X[a]) * (Y[c] - Y[a]) - (py - Y[a]) * (X[c] - X[a]) > 0 ? l1 > 0 && l2 > 0 : l1 > 0 || l2 > 0) { pick = k; break; }
+    }
+    const ord = [];
+    for (let k = 0; k <= h.length; k++) ord.push(h[(m + k) % h.length]);
+    insert(X, pick + 1, [...ord.map((p) => p[0]), px]); insert(Y, pick + 1, [...ord.map((p) => p[1]), py]); insert(ID, pick + 1, [...ord.map((p) => p[2]), ID[pick]]);
   }
-  const n = P.length, out = [];
+  const n = X.length, out = [];
   if (n < 3) return out;
-  let lo = [Infinity, Infinity], hi = [-Infinity, -Infinity];
-  for (const p of P) { lo = [Math.min(lo[0], p[0]), Math.min(lo[1], p[1])]; hi = [Math.max(hi[0], p[0]), Math.max(hi[1], p[1])]; }
-  const eps = 1e-12 * ((hi[0] - lo[0]) ** 2 + (hi[1] - lo[1]) ** 2 + 1e-300);
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let k = 0; k < n; k++) { if (X[k] < x0) x0 = X[k]; if (X[k] > x1) x1 = X[k]; if (Y[k] < y0) y0 = Y[k]; if (Y[k] > y1) y1 = Y[k]; }
+  const eps = 1e-12 * ((x1 - x0) ** 2 + (y1 - y0) ** 2 + 1e-300), c2 = (a, b, c) => (X[b] - X[a]) * (Y[c] - Y[a]) - (Y[b] - Y[a]) * (X[c] - X[a]);
   // uniform bucket grid so that the "no other vertex inside the ear" test only looks at nearby vertices
-  const G = Math.max(1, Math.min(1024, Math.ceil(Math.sqrt(n / 2)))), gw = (hi[0] - lo[0]) / G || 1, gh = (hi[1] - lo[1]) / G || 1, cells = Array.from({ length: G * G }, () => []);
-  const gx = (x) => Math.max(0, Math.min(G - 1, Math.floor((x - lo[0]) / gw))), gy = (y) => Math.max(0, Math.min(G - 1, Math.floor((y - lo[1]) / gh)));
-  P.forEach((p, k) => cells[gy(p[1]) * G + gx(p[0])].push(k));
-  const alive = new Uint8Array(n).fill(1), prev = P.map((_, k) => (k + n - 1) % n), next = P.map((_, k) => (k + 1) % n);
+  const G = Math.max(1, Math.min(1024, Math.ceil(Math.sqrt(n / 2)))), gw = (x1 - x0) / G || 1, gh = (y1 - y0) / G || 1, cells = Array.from({ length: G * G }, () => []);
+  const gx = (x) => Math.max(0, Math.min(G - 1, Math.floor((x - x0) / gw))), gy = (y) => Math.max(0, Math.min(G - 1, Math.floor((y - y0) / gh)));
+  for (let k = 0; k < n; k++) cells[gy(Y[k]) * G + gx(X[k])].push(k);
+  const alive = new Uint8Array(n).fill(1), prev = new Int32Array(n), next = new Int32Array(n);
+  for (let k = 0; k < n; k++) { prev[k] = (k + n - 1) % n; next[k] = (k + 1) % n; }
   const blocked = (a, i, c) => {
-    const A = P[a], B = P[i], Cc = P[c], x0 = gx(Math.min(A[0], B[0], Cc[0])), x1 = gx(Math.max(A[0], B[0], Cc[0])), y0 = gy(Math.min(A[1], B[1], Cc[1])), y1 = gy(Math.max(A[1], B[1], Cc[1]));
-    for (let yy = y0; yy <= y1; yy++) for (let xx = x0; xx <= x1; xx++) for (const k of cells[yy * G + xx]) {
-      if (!alive[k] || k === a || k === i || k === c) continue;
-      const Q = P[k];
-      if (same(Q, A) || same(Q, B) || same(Q, Cc)) continue;
-      if (c2(A, B, Q) >= -eps && c2(B, Cc, Q) >= -eps && c2(Cc, A, Q) >= -eps) return true;
+    const ax = X[a], ay = Y[a], bx = X[i], by = Y[i], cx = X[c], cy = Y[c];
+    const ca = gx(Math.min(ax, bx, cx)), cb = gx(Math.max(ax, bx, cx)), ra = gy(Math.min(ay, by, cy)), rb = gy(Math.max(ay, by, cy));
+    for (let yy = ra; yy <= rb; yy++) for (let xx = ca; xx <= cb; xx++) {
+      const list = cells[yy * G + xx];
+      for (let q = 0; q < list.length; q++) {
+        const k = list[q];
+        if (!alive[k] || k === a || k === i || k === c) continue;
+        const qx = X[k], qy = Y[k];
+        if ((qx === ax && qy === ay) || (qx === bx && qy === by) || (qx === cx && qy === cy)) continue;
+        if ((bx - ax) * (qy - ay) - (by - ay) * (qx - ax) >= -eps && (cx - bx) * (qy - by) - (cy - by) * (qx - bx) >= -eps && (ax - cx) * (qy - cy) - (ay - cy) * (qx - cx) >= -eps) return true;
+      }
     }
     return false;
   };
@@ -615,16 +631,16 @@ function triangulate(outer, holes) {
   while (left > 3) {
     let found = false, flat = i, flatV = Infinity;
     for (let t = 0; t < left; t++, i = next[i]) {
-      const cr = c2(P[prev[i]], P[i], P[next[i]]);
+      const cr = c2(prev[i], i, next[i]);
       if (Math.abs(cr) < flatV) { flatV = Math.abs(cr); flat = i; }
       if (cr > eps && !blocked(prev[i], i, next[i])) { found = true; break; }
     }
     if (!found) i = flat;                       // degenerate ring: clip the flattest corner so the loop always ends
     const a = prev[i], c = next[i];
-    out.push(P[a][2], P[i][2], P[c][2]);
+    out.push(ID[a], ID[i], ID[c]);
     alive[i] = 0; next[a] = c; prev[c] = a; left--; i = a;
   }
-  out.push(P[prev[i]][2], P[i][2], P[next[i]][2]);
+  out.push(ID[prev[i]], ID[i], ID[next[i]]);
   return out;
 }
 const ringArea = (r) => { let s = 0; for (let k = 0; k < r.length; k++) { const a = r[k], b = r[(k + 1) % r.length]; s += a[0] * b[1] - b[0] * a[1]; } return s / 2; };
@@ -1087,7 +1103,7 @@ async function readPLY(ctx) {
   const RD = { u1: (o) => dv.getUint8(o), i1: (o) => dv.getInt8(o), u2: (o) => dv.getUint16(o, le), i2: (o) => dv.getInt16(o, le), u4: (o) => dv.getUint32(o, le), i4: (o) => dv.getInt32(o, le), f4: (o) => dv.getFloat32(o, le), f8: (o) => dv.getFloat64(o, le), i8: (o) => Number(dv.getBigInt64(o, le)), u8: (o) => Number(dv.getBigUint64(o, le)) };
   const toks = ascii ? latin1.decode(u8.subarray(off)).split(/\s+/).filter(Boolean) : null;
   let tp = 0;
-  const read = ascii ? () => +toks[tp++] : (t) => { const v = RD[t](off); off += DT[t][1]; return v; };
+  const read = ascii ? () => +toks[tp++] : (t) => { if (off + DT[t][1] > u8.length) fail('The PLY data is truncated.'); const v = RD[t](off); off += DT[t][1]; return v; };
   let verts = new Float64Array(0);
   const tri = [];
   let faces = 0, badFaces = 0;
@@ -1145,7 +1161,7 @@ async function read3MF(ctx) {
   const emit = (id, chain, depth) => {
     const ob = objs.get(id);
     if (!ob || depth > 16) return;
-    if (++emits > 2e5) fail('The 3MF model instantiates too many components.');
+    if (++emits > 5e4) fail('The 3MF model instantiates too many components.');
     if (ob.v) {
       if (tri.length + ob.t.length * 3 > L.triangles * 9) fail(`Mesh has too many triangles (limit ${L.triangles}).`);
       for (let k = 0; k < ob.t.length; k++) {
@@ -1244,7 +1260,7 @@ async function readDAE(ctx, doc) {
       };
       const ps = xKids(prim, 'p').map((p) => numsOf(p.text)), vidx = (p) => { const out = []; for (let k = vo; k < p.length; k += step) out.push(p[k]); return out; };
       if (prim.name === 'triangles') for (const p of ps) { const v = vidx(p); for (let k = 0; k + 2 < v.length; k += 3) poly([v[k], v[k + 1], v[k + 2]]); }
-      else if (prim.name === 'polylist') { const vc = numsOf((xKid(prim, 'vcount') || { text: '' }).text), v = vidx(ps[0] || []); let q = 0; for (const n of vc) { if (!(n > 0) || q + n > v.length) break; poly(Array.from(v.subarray ? v.subarray(q, q + n) : v.slice(q, q + n))); q += n; } }
+      else if (prim.name === 'polylist') { const vc = numsOf((xKid(prim, 'vcount') || { text: '' }).text), v = vidx(ps[0] || []); let q = 0; for (const n of vc) { if (!(n > 0) || q + n > v.length) break; poly(v.slice(q, q + n)); q += n; } }
       else if (prim.name === 'tristrips') for (const p of ps) { const v = vidx(p); for (let k = 0; k + 2 < v.length; k++) poly(k % 2 ? [v[k + 1], v[k], v[k + 2]] : [v[k], v[k + 1], v[k + 2]]); }
       else for (const p of ps) poly(vidx(p));
     }
@@ -1724,7 +1740,7 @@ async function readFluent(ctx) {
 async function readSU2(ctx) {
   const ls = splitLines(await ctx.text()), store = cellStore();
   let ndim = 3, xyz = null, skipped = 0;
-  const need = (i, n) => { if (!Number.isInteger(n) || n < 0 || i + n >= ls.length + 1) fail('The SU2 file is truncated or its counts are invalid.'); };
+  const need = (i, n) => { if (!Number.isInteger(n) || n < 0 || i + n > ls.length - 1) fail('The SU2 file is truncated or its counts are invalid.'); };
   for (let i = 0; i < ls.length; i++) {
     const m = /^\s*([A-Za-z_]+)\s*=\s*(-?\d+)/.exec(ls[i].replace(/%.*/, ''));
     if (!m) continue;
@@ -2530,21 +2546,35 @@ async function readBandRaster(ctx) {
 // ---- Column text, point clouds ---------------------------------------------------------------------------
 /** Numeric column text -> { headers, ncol, rows, data (row-major, NaN for non-numeric cells), breaks, textCells }. */
 function readColumns(text, maxRows = 8e6) {
-  const ls = splitLines(text.replace(/^﻿/, '')), breaks = [];
-  let headers = null, ncol = 0, rows = 0, data = new Float64Array(4096), textCells = 0, started = false, comment = null;
-  for (const raw of ls) {
-    const t = raw.trim();
-    if (!t) { if (rows && breaks[breaks.length - 1] !== rows) breaks.push(rows); continue; }
-    if (/^(#|\/\/|%|!)/.test(t)) { if (!started && !comment) comment = t.replace(/^(#|\/\/|%|!)+\s*/, ''); continue; }
-    const parts = t.split(/[,;\t ]+/).filter((s) => s !== '');
-    if (!started) {
-      started = true;
-      if (parts.some((s) => !Number.isFinite(+s.replace(/^"|"$/g, '')))) { headers = parts.map((s) => s.replace(/^"|"$/g, '')); continue; }
+  if (text.indexOf('\n') < 0 && text.indexOf('\r') >= 0) text = text.replace(/\r/g, '\n');
+  const n = text.length, breaks = [], isSep = (c) => c === 32 || c === 9 || c === 44 || c === 59 || c === 13;
+  let headers = null, ncol = 0, rows = 0, data = new Float64Array(4096), textCells = 0, started = false, comment = null, pos = text.charCodeAt(0) === 0xfeff ? 1 : 0;
+  while (pos < n) {
+    let e = text.indexOf('\n', pos), a = pos;
+    if (e < 0) e = n;
+    pos = e + 1;
+    while (a < e && isSep(text.charCodeAt(a))) a++;
+    if (a >= e) { if (rows && breaks[breaks.length - 1] !== rows) breaks.push(rows); continue; }
+    const c0 = text.charCodeAt(a);
+    if (c0 === 35 || c0 === 37 || c0 === 33 || (c0 === 47 && text.charCodeAt(a + 1) === 47)) { if (!started && !comment) comment = text.slice(a, e).replace(/^(#|\/\/|%|!)+\s*/, '').trim(); continue; }
+    if (!started || !ncol) {
+      const parts = text.slice(a, e).trim().split(/[,;\t ]+/).filter((s) => s !== '');
+      if (!started) { started = true; if (parts.some((s) => !Number.isFinite(+s.replace(/^"|"$/g, '')))) { headers = parts.map((s) => s.replace(/^"|"$/g, '')); continue; } }
+      ncol = parts.length;
     }
-    if (!ncol) ncol = parts.length;
     if (rows >= maxRows) fail('The text file holds too many rows.');
     if ((rows + 1) * ncol > data.length) { const g = new Float64Array(Math.max(data.length * 2, (rows + 1) * ncol)); g.set(data); data = g; }
-    for (let k = 0; k < ncol; k++) { const v = k < parts.length ? +parts[k] : NaN; if (v !== v) textCells++; data[rows * ncol + k] = v; }
+    let k = 0;
+    for (let p = a; p < e && k < ncol; k++) {
+      let q = p;
+      while (q < e && !isSep(text.charCodeAt(q))) q++;
+      const v = +text.slice(p, q);
+      if (v !== v) textCells++;
+      data[rows * ncol + k] = v;
+      p = q;
+      while (p < e && isSep(text.charCodeAt(p))) p++;
+    }
+    for (; k < ncol; k++) { data[rows * ncol + k] = NaN; textCells++; }
     rows++;
   }
   if (!headers && comment) { const h = comment.split(/[,;\t ]+/).filter(Boolean); if (h.length === ncol && h.every((s) => !Number.isFinite(+s))) headers = h; }
@@ -3552,49 +3582,63 @@ export function gridOf(g, nx, ny) {
  * axes; tortuosity[a] is the mean shortest pore path (5-7-9 chamfer metric, no corner cutting) from the inlet to the outlet
  * face along axis a divided by the straight distance, or null when the pore space does not percolate along that axis;
  * connectedPorosity counts only pore clusters that span the sample along at least one axis.
+ * opt.tortuosity = false skips the path search; above 8 million voxels it only runs when opt.tortuosity = true.
  */
-export function microstructure(g) {
+export function microstructure(g, opt = {}) {
   const v = asVoxels(g), { nx, ny, nz, data } = v, sp = v.spacing || [1, 1, 1], n = nx * ny * nz, d = [nx, ny, nz], st = [1, nx, nx * ny], axes = nz > 1 ? [0, 1, 2] : [0, 1];
   if (!n || data.length < n) throw new Error('The voxel geometry is empty.');
   let solid = 0, area = 0, poreLen = 0, poreRuns = 0, solidLen = 0, solidRuns = 0;
   for (let i = 0; i < n; i++) solid += data[i] ? 1 : 0;
   const coord = (i, a) => (a === 0 ? i % nx : a === 1 ? Math.floor(i / nx) % ny : Math.floor(i / st[2]));
-  for (const a of axes) {
-    const fa = (sp[0] * sp[1] * sp[2]) / sp[a];
-    for (let i = 0; i < n; i++) {
-      const c = coord(i, a), s = data[i] ? 1 : 0, startRun = c === 0 || (data[i - st[a]] ? 1 : 0) !== s;
-      if (c + 1 < d[a] && (data[i + st[a]] ? 1 : 0) !== s) area += fa;
-      if (s) { solidLen += sp[a]; if (startRun) solidRuns++; } else { poreLen += sp[a]; if (startRun) poreRuns++; }
+  for (const a of axes) {                       // walk every voxel line along axis a: interface faces and chord runs
+    const fa = (sp[0] * sp[1] * sp[2]) / sp[a], [b, c] = [0, 1, 2].filter((k) => k !== a), step = st[a], da = d[a];
+    let faces = 0, solidVox = 0, runsS = 0, runsP = 0;
+    for (let q = 0; q < d[c]; q++) for (let p = 0; p < d[b]; p++) {
+      let prev = -1;
+      for (let t = 0, i = p * st[b] + q * st[c]; t < da; t++, i += step) {
+        const s = data[i] ? 1 : 0;
+        if (s !== prev) { if (prev >= 0) faces++; if (s) runsS++; else runsP++; prev = s; }
+        solidVox += s;
+      }
     }
+    area += faces * fa; solidRuns += runsS; poreRuns += runsP; solidLen += solidVox * sp[a]; poreLen += (n - solidVox) * sp[a];
   }
   // 6-connected pore clusters and the axes they span
-  const label = new Int32Array(n), queue = new Int32Array(n), percolates = axes.map(() => false);
+  const label = new Uint8Array(n), queue = new Int32Array(n - solid), percolates = axes.map(() => false), nxy = st[2];
   let nlab = 0, connected = 0;
   for (let s0 = 0; s0 < n; s0++) {
     if (data[s0] || label[s0]) continue;
     nlab++;
-    let head = 0, tail = 0, size = 0;
-    const lo = [Infinity, Infinity, Infinity], hi = [-1, -1, -1];
-    queue[tail++] = s0; label[s0] = nlab;
+    let head = 0, tail = 0, i0 = nx, i1 = -1, j0 = ny, j1 = -1, k0 = nz, k1 = -1;
+    queue[tail++] = s0; label[s0] = 1;
     while (head < tail) {
-      const i = queue[head++];
-      size++;
-      for (const a of axes) { const c = coord(i, a); if (c < lo[a]) lo[a] = c; if (c > hi[a]) hi[a] = c; if (c > 0 && !data[i - st[a]] && !label[i - st[a]]) { label[i - st[a]] = nlab; queue[tail++] = i - st[a]; } if (c + 1 < d[a] && !data[i + st[a]] && !label[i + st[a]]) { label[i + st[a]] = nlab; queue[tail++] = i + st[a]; } }
+      const i = queue[head++], ck = (i / nxy) | 0, r = i - ck * nxy, cj = (r / nx) | 0, ci = r - cj * nx;
+      if (ci < i0) i0 = ci; if (ci > i1) i1 = ci; if (cj < j0) j0 = cj; if (cj > j1) j1 = cj; if (ck < k0) k0 = ck; if (ck > k1) k1 = ck;
+      if (ci > 0 && !data[i - 1] && !label[i - 1]) { label[i - 1] = 1; queue[tail++] = i - 1; }
+      if (ci + 1 < nx && !data[i + 1] && !label[i + 1]) { label[i + 1] = 1; queue[tail++] = i + 1; }
+      if (cj > 0 && !data[i - nx] && !label[i - nx]) { label[i - nx] = 1; queue[tail++] = i - nx; }
+      if (cj + 1 < ny && !data[i + nx] && !label[i + nx]) { label[i + nx] = 1; queue[tail++] = i + nx; }
+      if (ck > 0 && !data[i - nxy] && !label[i - nxy]) { label[i - nxy] = 1; queue[tail++] = i - nxy; }
+      if (ck + 1 < nz && !data[i + nxy] && !label[i + nxy]) { label[i + nxy] = 1; queue[tail++] = i + nxy; }
     }
+    const span = [i0 === 0 && i1 === nx - 1, j0 === 0 && j1 === ny - 1, k0 === 0 && k1 === nz - 1];
     let spans = false;
-    axes.forEach((a, q) => { if (lo[a] === 0 && hi[a] === d[a] - 1) { percolates[q] = true; spans = true; } });
-    if (spans) connected += size;
+    axes.forEach((a, q) => { if (span[a]) { percolates[q] = true; spans = true; } });
+    if (spans) connected += tail;
   }
   // chamfer geodesic distance from the inlet face (Dial's bucket queue)
-  const smin = Math.min(...axes.map((a) => sp[a])), moves = [];
+  const smin = Math.min(...axes.map((a) => sp[a])), mv = [];
   for (let dz = nz > 1 ? -1 : 0; dz <= (nz > 1 ? 1 : 0); dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
     if (!dx && !dy && !dz) continue;
-    const dd = [dx, dy, dz], nzc = dd.filter(Boolean).length;
-    moves.push({ dd, off: dx + dy * st[1] + dz * st[2], w: Math.max(1, Math.round((5 * Math.hypot(dx * sp[0], dy * sp[1], dz * sp[2])) / smin)), side: nzc > 1 ? dd.map((q, a) => q * st[a]).filter(Boolean) : null });
+    const side = [dx, dy * st[1], dz * st[2]].filter(Boolean);
+    mv.push([dx, dy, dz, dx + dy * st[1] + dz * st[2], Math.max(1, Math.round((5 * Math.hypot(dx * sp[0], dy * sp[1], dz * sp[2])) / smin)), ...(side.length > 1 ? side : []), 0, 0, 0]);
   }
-  const maxW = Math.max(...moves.map((m) => m.w)), nb = maxW + 1, INF = 0x7fffffff;
+  const nm = mv.length, col = (k) => Int32Array.from(mv, (m) => m[k]), mdx = col(0), mdy = col(1), mdz = col(2), moff = col(3), mw = col(4), ms0 = col(5), ms1 = col(6), ms2 = col(7);
+  const nb = Math.max(...mw) + 1, INF = 0x7fffffff;
+  const skipPaths = opt.tortuosity === false || (n > 8e6 && opt.tortuosity !== true);   // large volumes: only on request
   const tortuosity = axes.map((a, q) => {
-    if (!percolates[q] || d[a] < 2) return d[a] < 2 && percolates[q] ? 1 : null;
+    if (!percolates[q] || skipPaths) return null;
+    if (d[a] < 2) return 1;
     const dist = new Int32Array(n).fill(INF), buckets = Array.from({ length: nb }, () => []);
     let pending = 0;
     for (let i = 0; i < n; i++) if (!data[i] && coord(i, a) === 0) { dist[i] = 0; buckets[0].push(i); pending++; }
@@ -3602,27 +3646,29 @@ export function microstructure(g) {
       const cur = buckets[lev % nb];
       if (!cur.length) continue;
       buckets[lev % nb] = [];
-      for (const i of cur) {
-        pending--;
+      pending -= cur.length;
+      for (let c = 0; c < cur.length; c++) {
+        const i = cur[c];
         if (dist[i] !== lev) continue;
-        const ci = i % nx, cj = Math.floor(i / nx) % ny, ck = Math.floor(i / st[2]);
-        for (const m of moves) {
-          const ii = ci + m.dd[0], jj = cj + m.dd[1], kk = ck + m.dd[2];
+        const ck = (i / nxy) | 0, r = i - ck * nxy, cj = (r / nx) | 0, ci = r - cj * nx;
+        for (let m = 0; m < nm; m++) {
+          const ii = ci + mdx[m], jj = cj + mdy[m], kk = ck + mdz[m];
           if (ii < 0 || jj < 0 || kk < 0 || ii >= nx || jj >= ny || kk >= nz) continue;
-          const u = i + m.off, nd = lev + m.w;
+          const u = i + moff[m], nd = lev + mw[m];
           if (data[u] || nd >= dist[u]) continue;
-          if (m.side && m.side.some((o) => data[i + o])) continue;
+          const s0 = ms0[m];
+          if (s0 !== 0 && (data[i + s0] || data[i + ms1[m]] || (ms2[m] !== 0 && data[i + ms2[m]]))) continue;   // no squeezing through solid corners
           dist[u] = nd; buckets[nd % nb].push(u); pending++;
         }
       }
     }
-    let sum = 0, cnt = 0;
+    let sum = 0, cnt = 0, wa = 5;
     for (let i = 0; i < n; i++) if (!data[i] && coord(i, a) === d[a] - 1 && dist[i] < INF) { sum += dist[i]; cnt++; }
-    const wa = moves.find((m) => m.dd[a] === 1 && m.dd.filter(Boolean).length === 1).w;
+    for (let m = 0; m < nm; m++) if ([mdx[m], mdy[m], mdz[m]][a] === 1 && Math.abs(mdx[m]) + Math.abs(mdy[m]) + Math.abs(mdz[m]) === 1) wa = mw[m];
     return cnt ? sum / cnt / (wa * (d[a] - 1)) : null;
   });
   const bulk = n * sp[0] * sp[1] * sp[2];
-  return { porosity: 1 - solid / n, solidFraction: solid / n, specificSurface: area / bulk, meanPoreSize: poreRuns ? poreLen / poreRuns : 0, meanSolidSize: solidRuns ? solidLen / solidRuns : 0, tortuosity, percolates, connectedPorosity: connected / n, poreClusters: nlab };
+  return { porosity: 1 - solid / n, solidFraction: solid / n, specificSurface: area / bulk, meanPoreSize: poreRuns ? poreLen / poreRuns : 0, meanSolidSize: solidRuns ? solidLen / solidRuns : 0, tortuosity, percolates, connectedPorosity: connected / n, poreClusters: nlab, tortuositySkipped: skipPaths };
 }
 
 /** Totals, pipe list and (for acyclic graphs) a topological order of a network geometry. */
@@ -3642,21 +3688,30 @@ export function networkSummary(g) {
   return { nodes: nodes.length, edges: edges.length, totalLength, byType, pipes, maxElevationChange: zhi >= zlo ? zhi - zlo : 0, order: acyclic ? order : [], acyclic, sources: nodes.filter((n) => !edges.some((e) => e.to === n.id)).map((n) => n.id), sinks: nodes.filter((n) => !edges.some((e) => e.from === n.id)).map((n) => n.id) };
 }
 
-/** Overall size, surface area, enclosed volume and closedness of a geometry, with a unit hint when the file gave one. */
+/**
+ * Overall size, surface area, enclosed volume and closedness of a geometry, with a unit hint when the file gave one.
+ * Meshes: area of all triangles, volume by the divergence theorem when every edge is shared by exactly two triangles.
+ * Voxels: solid volume by count and the solid/pore interface area inside the sample (faces on the sample boundary excluded).
+ * Polylines: enclosed area of the closed outlines and total length. Networks: total pipe length.
+ */
 export function dimensions(g) {
   if (!g || !g.bbox) throw new Error('No geometry given.');
   const size = [0, 1, 2].map((k) => (Number.isFinite(g.bbox.max[k]) && Number.isFinite(g.bbox.min[k]) ? g.bbox.max[k] - g.bbox.min[k] : 0));
   const out = { size, area: null, volume: null, closed: false, units: (g.stats && g.stats.units) || (g.geographic || (g.grid && g.grid.geographic) ? 'degrees' : null) };
   if (g.kind === 'mesh') {
-    const t = g.triangles, nt = t.length / 9, diag = Math.hypot(...size) || 1, tol = diag * 1e-7, ids = new Map(), vid = new Int32Array(nt * 3), edges = new Map();
-    let area = 0;
-    for (let i = 0; i < nt * 3; i++) {
-      const key = Math.round((t[3 * i] - g.bbox.min[0]) / tol + 0.3183) + ',' + Math.round((t[3 * i + 1] - g.bbox.min[1]) / tol + 0.3183) + ',' + Math.round((t[3 * i + 2] - g.bbox.min[2]) / tol + 0.3183);
-      let id = ids.get(key);
-      if (id === undefined) { id = ids.size; ids.set(key, id); }
-      vid[i] = id;
+    const t = g.triangles, nt = t.length / 9, nv3 = nt * 3, diag = Math.hypot(...size) || 1, inv = 1e7 / diag, o = g.bbox.min, vid = new Int32Array(nv3), edges = new Map();
+    // weld vertices on a 1e-7·diagonal lattice with an open-addressing hash table
+    let cap = 16, nvert = 0, area = 0;
+    while (cap < nv3 * 2) cap *= 2;
+    const slot = new Int32Array(cap).fill(-1), qa = new Int32Array(nv3), qb = new Int32Array(nv3), qc = new Int32Array(nv3);
+    for (let i = 0; i < nv3; i++) {
+      const a = Math.round((t[3 * i] - o[0]) * inv + 0.3183) | 0, b = Math.round((t[3 * i + 1] - o[1]) * inv + 0.3183) | 0, c = Math.round((t[3 * i + 2] - o[2]) * inv + 0.3183) | 0;
+      for (let h = (Math.imul(a, 73856093) ^ Math.imul(b, 19349663) ^ Math.imul(c, 83492791)) & (cap - 1); ; h = (h + 1) & (cap - 1)) {
+        const s = slot[h];
+        if (s < 0) { slot[h] = nvert; qa[nvert] = a; qb[nvert] = b; qc[nvert] = c; vid[i] = nvert++; break; }
+        if (qa[s] === a && qb[s] === b && qc[s] === c) { vid[i] = s; break; }
+      }
     }
-    const nvert = ids.size;
     for (let f = 0; f < nt; f++) {
       const o = 9 * f, a = [t[o + 3] - t[o], t[o + 4] - t[o + 1], t[o + 5] - t[o + 2]], b = [t[o + 6] - t[o], t[o + 7] - t[o + 1], t[o + 8] - t[o + 2]];
       area += 0.5 * vlen(cross(a, b));
@@ -3667,7 +3722,7 @@ export function dimensions(g) {
     out.area = area; out.closed = closed; out.vertices = nvert;
     if (closed) { out.volume = Math.abs(signedVolume(t)); out.consistentNormals = oriented; }
   } else if (g.kind === 'voxels') {
-    const v = g.voxels, m = microstructure(g), bulk = v.nx * v.ny * v.nz * v.spacing[0] * v.spacing[1] * v.spacing[2];
+    const v = g.voxels, m = microstructure(g, { tortuosity: false }), bulk = v.nx * v.ny * v.nz * v.spacing[0] * v.spacing[1] * v.spacing[2];
     out.volume = m.solidFraction * bulk; out.area = m.specificSurface * bulk; out.closed = true; out.porosity = m.porosity;
   } else if (g.kind === 'polylines') {
     let area = 0, len = 0, allClosed = g.polylines.length > 0;

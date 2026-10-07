@@ -9,6 +9,7 @@ import { download, toCSV } from './io.js';
 import { CATALOG } from '../data/catalog.js';
 import { geometryTab } from './geomview.js';
 import { advicePanel } from './advisorview.js';
+import { wording } from '../data/wording.js';
 
 const lastResult = new Map(); // suite id -> full result of the last run (kept in memory)
 const bigValues = new Map(); // `${suite}.${key}` -> large imported objects (geometry) kept out of localStorage
@@ -108,6 +109,7 @@ function exportReport(suite, res, plotEls) {
 // ---- the page ----------------------------------------------------------------------------------------
 export function renderSuite(suite, root, app) {
   const cat = CATALOG[suite.num] || {};
+  const L = wording(suite.id);
   const isImpl = implementedTest(suite);
   let tabset;
   const status = h('span', { class: 'run-status', role: 'status', 'aria-live': 'polite' });
@@ -129,7 +131,7 @@ export function renderSuite(suite, root, app) {
       toast('Run failed: ' + (e.message || e), 'bad', 9000);
     } finally { runBtn.disabled = false; setTimeout(() => (bar.hidden = true), 500); }
   };
-  const runBtn = btn('▶  Run simulation', doRun, 'primary', 'Solve this suite with the current inputs (shortcut: Ctrl/⌘ + Enter)');
+  const runBtn = btn('▶  ' + L.run, doRun, 'primary', 'Solve this suite with the current inputs (shortcut: Ctrl/⌘ + Enter)');
 
   const presetSel = suite.presets?.length ? h('select', { 'aria-label': 'Load an example case', onchange: (e) => {
     const p = suite.presets[+e.target.value];
@@ -201,7 +203,7 @@ export function renderSuite(suite, root, app) {
       } catch (e) { fill(out, h('p', { class: 'bad' }, 'Study failed: ' + e.message)); }
       go.disabled = false;
     }, 'primary');
-    return h('fieldset', { class: 'group' }, h('legend', null, 'Mesh and step sensitivity', help('Solves the model on three systematically refined levels and quantifies the numerical uncertainty with Richardson extrapolation and the grid-convergence index (GCI), instead of simply declaring the mesh “independent”.')),
+    return h('fieldset', { class: 'group' }, h('legend', null, suite.id === 'econ' || suite.id === 'opt' ? 'Convergence and numerical sensitivity' : 'Mesh and step sensitivity', help('Solves the model on three systematically refined levels and quantifies the numerical uncertainty with Richardson extrapolation and the grid-convergence index (GCI), instead of simply declaring the mesh “independent”.')),
       h('div', { class: 'row-tools' }, studies.length > 1 ? sel : null, h('label', { class: 'inline' }, 'Refinement ratio ', ratio), go),
       h('p', { class: 'note' }, studies.map((st) => st.note).filter(Boolean).join(' ')), out);
   };
@@ -209,7 +211,7 @@ export function renderSuite(suite, root, app) {
   // -- results
   const resultsTab = () => {
     const res = lastResult.get(suite.id);
-    if (!res) return emptyState('No results yet', 'Press “Run simulation” to solve this suite with the current inputs. The defaults describe a realistic industrial case, so you can run straight away.', btn('▶  Run simulation', doRun, 'primary'));
+    if (!res) return emptyState('No results yet', `Press “${L.run}” to solve this suite with the current inputs. The defaults describe a realistic industrial case, so you can run straight away.`, btn('▶  ' + L.run, doRun, 'primary'));
     const plotEls = res.plots.map((p) => plotCard(p, { onDownload: download }));
     const box = h('div', { class: 'results' });
     if (res.warnings.length) box.append(h('div', { class: 'warns' }, res.warnings.map((w) => h('div', { class: 'warn ' + (w.level || 'info') }, h('b', null, w.level === 'bad' ? 'Limit exceeded' : w.level === 'warn' ? 'Check' : 'Note'), ' ', w.msg))));
@@ -316,7 +318,7 @@ export function renderSuite(suite, root, app) {
       h('fieldset', { class: 'group' }, h('legend', null, 'Verification — is the model solved correctly?'), h('div', { class: 'row-tools' }, btn('Run verification checks', run, 'primary')), out),
       res?.balances ? dataTable({ title: 'Conservation closure of the last run', columns: ['Balance', 'In', 'Out', 'Closure error %'], rows: res.balances.map((b) => [b.name, b.in, b.out, b.in ? (100 * (b.in - b.out)) / b.in : 0]) }) : null,
       cat.verification ? h('details', { class: 'ref', open: true }, h('summary', null, 'Verification practice for this suite'), h('p', null, cat.verification)) : null,
-      h('p', { class: 'note' }, 'Validation against measured data and calibration live on the “Calibrate & validate” tab. Mesh and step-size uncertainty live on the “Mesh” tab.'));
+      h('p', { class: 'note' }, `Validation against measured data and calibration live on the “${L.cal}” tab. Numerical uncertainty lives on the “${L.mesh}” tab.`));
   };
 
   const theoryTab = () => {
@@ -334,22 +336,22 @@ export function renderSuite(suite, root, app) {
   const guideTab = () => h('div', { class: 'groups' },
     h('p', { class: 'summary' }, suite.description || suite.tagline),
     h('ol', { class: 'steps' }, (suite.guide || ['Review the inputs — defaults describe a realistic industrial case.', 'Choose the models and boundary conditions on the Model setup tab.', 'Press Run simulation and read the results, warnings and suggested actions.', 'Quantify numerical uncertainty, calibrate against your data and validate on independent data.']).map((s) => h('li', null, s))),
-    h('div', { class: 'row-tools' }, btn('Go to inputs →', () => tabset.show('inputs'), 'primary'), btn('▶  Run with defaults', doRun)),
+    h('div', { class: 'row-tools' }, btn(`Go to ${L.inputs.toLowerCase()} →`, () => tabset.show('inputs'), 'primary'), btn(`▶  ${L.run} with defaults`, doRun)),
     h('details', { class: 'ref' }, h('summary', null, 'Input data this suite accepts'), h('p', null, cat.inputs || '')),
     h('details', { class: 'ref' }, h('summary', null, 'Output data this suite produces'), h('p', null, cat.outputs || '')));
 
   const has = (t) => suite.inputs.some((g) => (g.tab || 'inputs') === t);
   const defs = [
-    { id: 'guide', label: 'Guide', render: guideTab, tip: 'What this suite does and how to use it' },
-    { id: 'inputs', label: 'Inputs', render: groupTab('inputs'), tip: 'Feed, equipment and operating data' },
-    has('setup') && { id: 'setup', label: 'Model setup', render: groupTab('setup'), tip: 'Model choices, initial and boundary conditions, solver settings' },
-    (has('mesh') || suite.mesh) && { id: 'mesh', label: 'Mesh', render: groupTab('mesh'), tip: 'Discretisation and sensitivity study' },
-    { id: 'geometry', label: 'Geometry', render: () => geometryTab(suite, { fields: allFields(suite), values: () => values(suite), setValue: (k, val) => setValue(suite, k, val) }), tip: 'Import CAD, mesh, GIS, point-cloud, image or network geometry, or generate one' },
-    { id: 'results', label: 'Results', render: resultsTab, tip: 'KPIs, plots, tables and exports' },
+    { id: 'guide', label: L.guide, render: guideTab, tip: 'What this suite does and how to use it' },
+    { id: 'inputs', label: L.inputs, render: groupTab('inputs'), tip: 'Feed, equipment and operating data' },
+    has('setup') && { id: 'setup', label: L.setup, render: groupTab('setup'), tip: 'Model choices, initial and boundary conditions, solver settings' },
+    (has('mesh') || suite.mesh) && { id: 'mesh', label: L.mesh, render: groupTab('mesh'), tip: 'Discretisation and sensitivity study' },
+    { id: 'geometry', label: L.geometry, render: () => geometryTab(suite, { fields: allFields(suite), values: () => values(suite), setValue: (k, val) => setValue(suite, k, val) }), tip: 'Import CAD, mesh, GIS, point-cloud, image or network geometry, or generate one' },
+    { id: 'results', label: L.results, render: resultsTab, tip: 'KPIs, plots, tables and exports' },
     ...(suite.views || []).map((v) => ({ id: 'x_' + v.id, label: v.label, tip: v.tip, render: () => { const el = h('div', { class: 'groups' }); try { v.render(el, { values: () => values(suite), set: (k, val) => setValue(suite, k, val), result: () => lastResult.get(suite.id), run: doRun, h, plotCard: (p) => plotCard(p, { onDownload: download }), dataTable, kpiGrid, toast, download, store }); } catch (e) { el.append(h('p', { class: 'bad' }, e.message)); } return el; } })),
-    { id: 'cal', label: 'Calibrate & validate', render: calTab, tip: 'Parameter estimation and independent validation' },
-    { id: 'verify', label: 'Verify', render: verifyTab, tip: 'Conservation, limiting cases and hand-calculation checks' },
-    { id: 'theory', label: 'Theory', render: theoryTab, tip: 'Governing equations, IC/BC and modules' },
+    { id: 'cal', label: L.cal, render: calTab, tip: 'Parameter estimation and independent validation' },
+    { id: 'verify', label: L.verify, render: verifyTab, tip: 'Conservation, limiting cases and hand-calculation checks' },
+    { id: 'theory', label: L.theory, render: theoryTab, tip: 'Governing equations, IC/BC and modules' },
   ].filter(Boolean);
 
   tabset = tabs(defs, store.pref('tab.' + suite.id) || 'guide', (id) => store.pref('tab.' + suite.id, id));
