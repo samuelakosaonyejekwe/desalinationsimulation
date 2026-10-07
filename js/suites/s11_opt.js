@@ -9,6 +9,7 @@ import { clamp, linspace, sum, mean, std, variance, quantile, solveLinear, tridi
   levenbergMarquardt, lstsq, metrics, gci, lhs, rng, histogram, fmt, isNum } from '../core/num.js';
 import { WATERS, cloneIons, tds, scaleIons, osmoticPressureIons } from '../core/water.js';
 import roSuite, { simulateRO, autoSize, MEMBRANES } from './s01_ro.js';
+import { analyzeWater, makeSolution, saturation } from './s02_chem.js';
 
 // ======================================================================================================
 // 1 · Small linear-algebra and statistics helpers
@@ -967,7 +968,18 @@ const CONS = [
   { id: 'P', label: 'Feed pressure', unit: 'bar', val: (m) => m.Pf, lim: (v, m) => Math.min(v.limP, m.pmax) },
   { id: 'cp', label: 'Polarisation factor β', unit: '–', val: (m) => m.maxCP, lim: (v) => v.limCP },
   { id: 'conc', label: 'Concentrate flow per vessel', unit: 'm³/h', val: (m) => m.qcMin, lim: (v) => v.limConc, min: true },
+  { id: 'sec', label: 'Specific energy (cap)', unit: 'kWh/m³', val: (m) => m.sec, lim: (v) => v.limSEC, on: (v) => v.limSEC > 0 },
+  { id: 'si', label: 'Concentrate saturation index', unit: 'SI', val: (m) => m.si, lim: (v) => finite(v.limSI), abs: true, on: (v) => !!SCALE_SETS[v.conScale] },
 ];
+const SCALE_SETS = { gypsum: ['gypsum'], calcite: ['calcite'], barite: ['barite'], celestite: ['celestite'], silica: ['silica'], sulfate: ['gypsum', 'barite', 'celestite'] };
+/** Constraints in force for the current inputs: the six operating limits plus the optional energy cap and scaling limit. */
+const consFor = (v) => CONS.filter((c) => !c.on || c.on(v));
+const concentratePH = (ions, pH, feedTds) => Math.min(9, pH + 0.3 * Math.log10(Math.max(1, tds(ions) / Math.max(feedTds, 1e-9))));
+/** Largest saturation index of the selected scale minerals in the concentrate (Pitzer speciation of suite 2 at the estimated concentrate pH). */
+export function concentrateSI(ions, T, pH, which = 'gypsum') {
+  const ids = SCALE_SETS[which] || SCALE_SETS.gypsum, SI = saturation(makeSolution({ ions, T, pH }).eq, 1, {}, ids);
+  return Math.max(...ids.map((k) => finite(SI[k], -99)));
+}
 /** Simulate one design and return performance, cost and normalised constraint values g ≤ 0. */
 function evalDesign(inp, v) {
   try {
@@ -976,9 +988,10 @@ function evalDesign(inp, v) {
       qcMin: Math.min(...r.p1.stages.map((s) => s.conc.Q / s.nV)), rec: 100 * r.overallRec, nEl: r.nEl, nV: sum(r.vessels), area: r.area, Qp: r.product.Q, Qb: r.conc.Q, power: r.power,
       avgFlux: (r.p1.perm.Q * 1000) / r.area, vessels: r.vessels, pmax: r.cfg.M.pmax, minSEC: r.minSEC };
     if (![m.sec, m.Pf, m.tds, m.maxFlux, m.maxCP].every(Number.isFinite)) throw new Error('non-finite result');
-    const cost = costOfWater(m, v), g = CONS.map((c) => { const L = c.lim(v, m), x = c.val(m); return c.min ? (L - x) / Math.max(L, 1e-9) : (x - L) / Math.max(L, 1e-9); });
+    if (SCALE_SETS[v.conScale]) { m.concPH = concentratePH(r.conc.ions, inp.pH, tds(r.feed.ions)); m.si = concentrateSI(r.conc.ions, inp.T, m.concPH, v.conScale); m.concIons = r.conc.ions; if (!Number.isFinite(m.si)) throw new Error('non-finite saturation index'); }
+    const cost = costOfWater(m, v), g = consFor(v).map((c) => { const L = c.lim(v, m), x = c.val(m); return c.abs ? x - L : c.min ? (L - x) / Math.max(L, 1e-9) : (x - L) / Math.max(L, 1e-9); });
     return { ok: true, m, cost, g, viol: sum(g.map((q) => Math.max(0, q))), inp };
-  } catch (e) { return { ok: false, g: CONS.map(() => 1), viol: CONS.length, err: e.message, inp }; }
+  } catch (e) { const nc = consFor(v).length; return { ok: false, g: new Array(nc).fill(1), viol: nc, err: e.message, inp }; }
 }
 const OBJ = {
   sec: { label: 'Specific energy', unit: 'kWh/m³', f: (e) => e.m.sec },
@@ -1016,6 +1029,19 @@ function makeEvaluator(v, base, vars) {
   const encode = (o) => vars.map((d) => clamp(((d.cat ? d.cat.indexOf(o.membrane) : o[d.key]) - d.lo) / (d.hi - d.lo), 0, 1));
   return { at, decode, encode, get evals() { return evals; } };
 }
+/** Extra KPIs and tables when the energy cap or the scaling constraint is switched on: full speciation of the concentrate by suite 2. */
+function designEvidence(v, eBase, eOpt) {
+  const kpis = [], tables = [];
+  if (v.limSEC > 0) kpis.push({ label: 'Specific-energy cap', value: v.limSEC, unit: 'kWh/m³', status: eOpt.m.sec <= v.limSEC * (1 + FEAS) ? 'ok' : 'bad', help: 'Energy constraint: specific energy of the optimum must not exceed this value.' });
+  if (SCALE_SETS[v.conScale] && Number.isFinite(eOpt.m.si)) {
+    const full = (e) => (e.ok && e.m.concIons ? analyzeWater({ ions: e.m.concIons, T: e.inp.T, pH: e.m.concPH }) : null), a0 = full(eBase), a1 = full(eOpt), ids = ['gypsum', 'barite', 'celestite', 'calcite', 'silica', 'fluorite'];
+    kpis.push({ label: 'Concentrate saturation index', value: eOpt.m.si, unit: 'log₁₀(IAP/K)', status: eOpt.m.si <= finite(v.limSI) + 1e-3 ? 'ok' : 'bad', help: `Largest index of the constrained minerals (${SCALE_SETS[v.conScale].join(', ')}); limit ${fmt(finite(v.limSI))}.` });
+    if (a1) tables.push({ title: 'Scaling of the concentrate (electrolyte model of suite 2)', columns: ['Mineral', 'Saturation index, base case', 'Saturation index, optimum', 'Constrained', 'Limit'],
+      rows: [...ids.map((k) => [k, a0 ? finite(a0.SI[k], -99) : null, finite(a1.SI[k], -99), SCALE_SETS[v.conScale].includes(k) ? 'yes' : 'no', SCALE_SETS[v.conScale].includes(k) ? finite(v.limSI) : null]), ['Concentrate pH (estimated)', eBase.ok ? eBase.m.concPH ?? null : null, eOpt.m.concPH, '', null], ['Concentrate TDS (mg/L)', a0 ? a0.tds : null, a1.tds, '', null]],
+      note: 'The constraint SI ≤ limit is evaluated for every candidate design from a Pitzer speciation of the simulated concentrate; this table repeats the full analysis at the base case and at the optimum. −99 marks a mineral whose constituents are absent.' });
+  }
+  return { kpis, tables };
+}
 const designRow = (vars, o) => vars.map((d) => (d.cat ? memName(o.membrane) : o[d.key]));
 const designOut = (e) => ({ recovery: e.m.rec, targetFlux: e.inp.targetFlux, elements: e.inp.elements, membrane: e.inp.membrane, Pp: e.inp.Pp, boost2: e.inp.boost2, sec: e.m.sec, cost: e.cost.total, productTDS: e.m.tds, feedPressure: e.m.Pf, nElements: e.m.nEl });
 const FEAS = 1e-3; // a design is accepted as feasible when no limit is exceeded by more than 0.1 %
@@ -1023,7 +1049,7 @@ const stepXY = (hist) => ({ x: hist.map((h) => h[0]), y: hist.map((h) => h[1]) }
 
 // ---- Task 1: single-objective constrained optimisation -------------------------------------------------------
 async function taskOpt(v, ctx) {
-  const base = roBase(v), vars = decisionVars(v), n = vars.length, O = OBJ[v.objective] || OBJ.cost;
+  const base = roBase(v), vars = decisionVars(v), n = vars.length, O = OBJ[v.objective] || OBJ.cost, CL = consFor(v);
   if (!n) throw new Error('No decision variable is free: widen at least one pair of bounds.');
   const E = makeEvaluator(v, base, vars), eBase = evalDesign(base, v);
   if (!eBase.ok) throw new Error('The base design cannot be simulated: ' + (eBase.err || 'check the RO plant inputs.'));
@@ -1085,21 +1111,22 @@ async function taskOpt(v, ctx) {
   if (!eOpt.ok) throw new Error('No design inside the bounds could be simulated. Widen the bounds or check the plant inputs.');
   ctx.progress(0.88, 'Optimality check and trade-off sweep'); await ctx.tick();
   // first-order optimality in the continuous variables (integers fixed at the optimum)
-  const kk = cIdx.length ? kktCheck((uc) => fObj(E.at(embed(bestS.u, uc))), (uc) => E.at(embed(bestS.u, uc)).g, cIdx.map((j) => bestS.u[j]), { lo: zc, hi: ones, h: 1e-2, actTol: 4e-3 }) : { lambda: CONS.map(() => 0), residual: 0, relResidual: 0, lamLo: [], lamHi: [], active: [] };
+  const kk = cIdx.length ? kktCheck((uc) => fObj(E.at(embed(bestS.u, uc))), (uc) => E.at(embed(bestS.u, uc)).g, cIdx.map((j) => bestS.u[j]), { lo: zc, hi: ones, h: 1e-2, actTol: 4e-3 }) : { lambda: CL.map(() => 0), residual: 0, relResidual: 0, lamLo: [], lamHi: [], active: [] };
   const feasible = Math.max(...eOpt.g) <= FEAS, fOpt = O.f(eOpt), f0 = O.f(eBase), show = O.show || ((x) => x);
   const gain = (100 * (f0 - fOpt)) / Math.abs(f0 || 1);
   // sweep of the objective along recovery through the optimum
   const jR = vars.findIndex((d) => d.key === 'recovery'), sweep = { x: [], f: [], viol: [] };
   if (jR >= 0) for (const q of linspace(0, 1, 9)) { const w = [...bestS.u]; w[jR] = q; const e = E.at(w); if (e.ok) { sweep.x.push(e.m.rec); sweep.f.push(show(O.f(e))); sweep.viol.push(100 * Math.max(...e.g)); } }
   const W = [], atBound = vars.filter((d, j) => !d.int && (bestS.u[j] < 1e-3 || bestS.u[j] > 1 - 1e-3));
-  if (!feasible) W.push({ level: 'bad', msg: `No fully feasible design was found: the best point still violates ${CONS.filter((c, i) => eOpt.g[i] > FEAS).map((c) => lcFirst(c.label)).join(', ')}. Relax a limit, widen the bounds or allow another element class.` });
+  if (!feasible) W.push({ level: 'bad', msg: `No fully feasible design was found: the best point still violates ${CL.filter((c, i) => eOpt.g[i] > FEAS).map((c) => lcFirst(c.label)).join(', ')}. Relax a limit, widen the bounds or allow another element class.` });
   else W.push({ level: 'info', msg: 'The optimum satisfies every operating constraint.' });
-  if (Math.max(...eBase.g) > FEAS) W.push({ level: 'warn', msg: `The base design itself violates ${CONS.filter((c, i) => eBase.g[i] > FEAS).map((c) => lcFirst(c.label)).join(', ')} — the comparison is against an infeasible reference.` });
+  if (Math.max(...eBase.g) > FEAS) W.push({ level: 'warn', msg: `The base design itself violates ${CL.filter((c, i) => eBase.g[i] > FEAS).map((c) => lcFirst(c.label)).join(', ')} — the comparison is against an infeasible reference.` });
   if (atBound.length) W.push({ level: 'info', msg: `${atBound.map((d) => d.label).join(', ')} ended on a bound: the optimum is limited by the search range, not by the plant.` });
   const feasStarts = starts.filter((s) => s.e.ok), spread = feasStarts.length > 1 ? (Math.max(...feasStarts.map((s) => s.merit)) - Math.min(...feasStarts.map((s) => s.merit))) / Math.max(1e-9, Math.abs(bestS.merit)) : 0;
   if (spread > 0.02) W.push({ level: 'warn', msg: `The ${nStarts} starts disagree by ${fmt(100 * spread, 2)} % in the penalised objective — the problem is multi-modal or not fully converged; use more starts, generations or the global algorithm.` });
   if (cIdx.length && feasible && kk.relResidual > 0.15) W.push({ level: 'warn', msg: `The first-order optimality residual is ${fmt(100 * kk.relResidual, 2)} % of the objective gradient: the point is good but not a tight stationary point (finite-difference noise or an integer-limited optimum).` });
-  const active = CONS.filter((c, i) => eOpt.g[i] > -4e-3), costCats = ['Energy', 'Membranes + vessels', 'Chemicals / pre-treatment', 'Brine disposal'], costOf = (e) => [e.cost.energy, e.cost.membrane, e.cost.chemicals, e.cost.brine];
+  const active = CL.filter((c, i) => eOpt.g[i] > -4e-3), costCats = ['Energy', 'Membranes + vessels', 'Chemicals / pre-treatment', 'Brine disposal'], costOf = (e) => [e.cost.energy, e.cost.membrane, e.cost.chemicals, e.cost.brine];
+  const extra = designEvidence(v, eBase, eOpt);
   const perfRows = [['Recovery (%)', (e) => e.m.rec], ['Average flux (L/m²·h)', (e) => e.m.avgFlux], ['Elements per vessel', (e) => e.inp.elements], ['Element class', (e) => memName(e.inp.membrane)], ['Vessels per stage', (e) => e.m.vessels.join(' : ')],
     ['Elements installed', (e) => e.m.nEl], ['Feed pressure (bar)', (e) => e.m.Pf], ['Specific energy (kWh/m³)', (e) => e.m.sec], ['Cost of water ($/m³)', (e) => e.cost.total], ['Product flow (m³/h)', (e) => e.m.Qp], ['Brine flow (m³/h)', (e) => e.m.Qb],
     ['Product TDS (mg/L)', (e) => e.m.tds], ['Product boron (mg/L)', (e) => e.m.boron], ['Lead-element flux (L/m²·h)', (e) => e.m.maxFlux], ['Polarisation factor β', (e) => e.m.maxCP], ['Permeate back-pressure (bar)', (e) => e.inp.Pp], ['Inter-stage boost (bar)', (e) => e.inp.boost2]];
@@ -1114,6 +1141,7 @@ async function taskOpt(v, ctx) {
       { label: 'Feed pressure', value: eOpt.m.Pf, unit: 'bar' }, { label: 'Product TDS', value: eOpt.m.tds, unit: 'mg/L', status: eOpt.g[0] > FEAS ? 'bad' : 'ok' },
       { label: 'Largest constraint violation', value: 100 * Math.max(0, ...eOpt.g), unit: '% of limit', status: feasible ? 'ok' : 'bad' }, { label: 'Active constraints', value: active.length ? active.map((c) => c.label).join(', ') : 'none' },
       { label: 'KKT stationarity residual', value: kk.relResidual, unit: 'relative', status: kk.relResidual < 0.15 ? 'ok' : 'warn', help: '‖∇f + Σλ∇g‖∞ / ‖∇f‖∞ in the continuous variables with non-negative multipliers on the active set' }, { label: 'Model evaluations', value: E.evals },
+      ...extra.kpis,
     ],
     recommendations: [
       feasible ? `Apply the optimum to suite 1 (RO design): it is offered there as the recommended recovery of ${fmt(eOpt.m.rec, 3)} %.` : 'Relax the most violated limit or add a second pass in suite 1, then re-run the optimisation.',
@@ -1123,7 +1151,7 @@ async function taskOpt(v, ctx) {
     ],
     plots: [
       { type: 'line', title: 'Convergence history (best penalised objective)', xlabel: 'Objective evaluations', ylabel: 'Penalised objective relative to base case', series: starts.map((s, k) => ({ name: `Start ${k + 1} (seed ${s.seed})`, ...stepXY(s.hist), mode: 'step' })), hlines: [{ y: 1, label: 'base case' }] },
-      { type: 'bar', title: 'Constraint utilisation (100 % = at the limit)', ylabel: '% of limit', categories: CONS.map((c) => c.label), series: [{ name: 'Base case', values: eBase.g.map((q) => 100 * (1 + q)) }, { name: 'Optimum', values: eOpt.g.map((q) => 100 * (1 + q)) }], note: 'For the minimum-concentrate-flow limit the bar shows how far the flow has fallen towards the minimum (100 % = at the minimum).' },
+      { type: 'bar', title: 'Constraint utilisation (100 % = at the limit)', ylabel: '% of limit', categories: CL.map((c) => c.label), series: [{ name: 'Base case', values: eBase.g.map((q) => 100 * (1 + q)) }, { name: 'Optimum', values: eOpt.g.map((q) => 100 * (1 + q)) }], note: 'For the minimum-concentrate-flow limit the bar shows how far the flow has fallen towards the minimum (100 % = at the minimum).' },
       { type: 'bar', title: 'Cost of water breakdown', ylabel: '$/m³', stacked: true, categories: ['Base case', 'Optimum'], series: costCats.map((nm, i) => ({ name: nm, values: [costOf(eBase)[i], costOf(eOpt)[i]] })) },
       ...(sweep.x.length > 2 ? [{ type: 'line', title: `${O.label} versus recovery through the optimum`, xlabel: 'Recovery (%)', ylabel: O.unit, series: [{ name: O.label, x: sweep.x, y: sweep.f, mode: 'both' }], vlines: [{ x: eOpt.m.rec, label: 'optimum' }] },
         { type: 'line', title: 'Most critical constraint versus recovery', xlabel: 'Recovery (%)', ylabel: 'Largest normalised constraint (% over limit)', series: [{ name: 'max g(x)', x: sweep.x, y: sweep.viol, mode: 'both' }], hlines: [{ y: 0, label: 'feasible below this line' }], vlines: [{ x: eOpt.m.rec, label: 'optimum' }] }] : []),
@@ -1131,13 +1159,14 @@ async function taskOpt(v, ctx) {
     ],
     tables: [
       { title: 'Optimum compared with the base case', columns: ['Quantity', 'Base case', 'Optimum'], rows: perfRows.map(([nm, f]) => [nm, f(eBase), f(eOpt)]) },
-      { title: 'Constraints at the optimum', columns: ['Constraint', 'Type', 'Value', 'Limit', 'Slack (% of limit)', 'Status', 'Multiplier λ', `Shadow price (${O.unit} per +1 % of limit)`],
-        rows: CONS.map((c, i) => [`${c.label} (${c.unit})`, c.min ? '≥' : '≤', c.val(eOpt.m), c.lim(v, eOpt.m), -100 * eOpt.g[i], eOpt.g[i] > FEAS ? 'violated' : eOpt.g[i] > -4e-3 ? 'active' : 'inactive', kk.lambda[i], kk.lambda[i] * fScale * 0.01]),
+      { title: 'Constraints at the optimum', columns: ['Constraint', 'Type', 'Value', 'Limit', CL.some((c) => c.abs) ? 'Slack (% of limit; index units for the saturation index)' : 'Slack (% of limit)', 'Status', 'Multiplier λ', `Shadow price (${O.unit} per +1 % of limit)`],
+        rows: CL.map((c, i) => [`${c.label} (${c.unit})`, c.min ? '≥' : '≤', c.val(eOpt.m), c.lim(v, eOpt.m), c.abs ? -eOpt.g[i] : -100 * eOpt.g[i], eOpt.g[i] > FEAS ? 'violated' : eOpt.g[i] > -4e-3 ? 'active' : 'inactive', kk.lambda[i], kk.lambda[i] * fScale * 0.01]),
         note: `Constraints are normalised as g = (value − limit)/limit ≤ 0 and enforced with the exact penalty ρ·Σmax(0, g) plus a quadratic term (ρ = ${fmt(rho)}); a limit counts as met when it is exceeded by less than 0.1 %. Multipliers are non-negative least-squares estimates from finite-difference gradients at the optimum with the integer variables held fixed; KKT residual ${fmt(kk.residual, 3)} (relative ${fmt(kk.relResidual, 3)}).` },
       { title: 'Decision variables and bounds', columns: ['Variable', 'Lower bound', 'Upper bound', 'Base', 'Optimum', 'Type', 'Bound multiplier'],
         rows: vars.map((d, j) => { const q = cIdx.indexOf(j); return [d.label + (d.unit ? ` (${d.unit})` : ''), d.cat ? memName(d.cat[0]) : d.lo, d.cat ? memName(d.cat[d.cat.length - 1]) : d.hi, d.cat ? memName(base.membrane) : base[d.key], d.cat ? memName(eOpt.inp.membrane) : eOpt.o[d.key], d.cat ? 'categorical' : d.int ? 'integer' : 'continuous', q >= 0 ? Math.max(kk.lamLo[q], kk.lamHi[q]) : null]; }) },
       { title: 'Multi-start summary', columns: ['Start', 'Seed', ...vars.map((d) => d.label), `${O.label} (${O.unit})`, 'Max violation (%)', 'Objective calls', 'SQP iterations', 'SQP KKT residual'],
         rows: starts.map((s, k) => [k + 1, s.seed, ...designRow(vars, s.e.o), s.e.ok ? show(O.f(s.e)) : null, 100 * Math.max(0, ...s.e.g), s.calls, s.sqp ? s.sqp.iterations : null, s.sqp ? s.sqp.kkt : null]) },
+      ...extra.tables,
     ],
     outputs: { task: 'opt', best: designOut(eOpt), objective: show(fOpt), objectiveName: v.objective, feasible, baseObjective: show(f0), study: { a: show(fOpt), b: eOpt.m.rec } },
   };
@@ -2017,6 +2046,1134 @@ async function taskPE(v, ctx) {
 }
 
 // ======================================================================================================
+// 9b · Further numerical engines: simplex and branch-and-bound, optimal control (Euler–Lagrange, Pontryagin),
+//      neural ODE / neural PDE adjoints, proper orthogonal decomposition, bagging, co-kriging, worker pool
+// ======================================================================================================
+/**
+ * Two-phase primal simplex on a dense tableau (Dantzig pricing, Bland's rule once the iteration count grows).
+ * Minimises cᵀx subject to rows [{ a: [...], op: '<=' | '>=' | '=', b }] and x ≥ 0.
+ * Returns { status: 'optimal' | 'infeasible' | 'unbounded' | 'iteration limit', x, f, dual (∂f/∂bᵢ per row), iterations }.
+ */
+export function lpSolve(c, rows, { maxIter } = {}) {
+  const n = c.length, m = rows.length, eps = 1e-9;
+  const sg = rows.map((r) => (r.b < 0 ? -1 : 1)), op = rows.map((r, i) => (sg[i] > 0 || r.op === '=' ? r.op : r.op === '<=' ? '>=' : '<='));
+  let nc = n;
+  const sCol = op.map((o) => (o === '=' ? -1 : nc++)), nReal = nc, aCol = op.map((o) => (o === '<=' ? -1 : nc++));
+  const T = rows.map((r, i) => {
+    const row = new Float64Array(nc + 1);
+    for (let j = 0; j < n; j++) row[j] = sg[i] * (r.a[j] || 0);
+    if (sCol[i] >= 0) row[sCol[i]] = op[i] === '<=' ? 1 : -1;
+    if (aCol[i] >= 0) row[aCol[i]] = 1;
+    row[nc] = sg[i] * r.b;
+    return row;
+  });
+  const basis = op.map((o, i) => (o === '<=' ? sCol[i] : aCol[i])), z = new Float64Array(nc + 1), limit = maxIter ?? 60 * (m + nc) + 200, blandFrom = 8 * (m + nc) + 50;
+  let iterations = 0;
+  const price = (cost) => { // reduced costs z_j = c_j − c_Bᵀ·B⁻¹·a_j ; z[nc] = −objective
+    z.fill(0);
+    for (let j = 0; j < nc; j++) z[j] = cost[j];
+    for (let i = 0; i < m; i++) { const cb = cost[basis[i]]; if (cb) { const Ti = T[i]; for (let j = 0; j <= nc; j++) z[j] -= cb * Ti[j]; } }
+  };
+  const pivot = (r, s) => {
+    const Tr = T[r], p = Tr[s];
+    for (let j = 0; j <= nc; j++) Tr[j] /= p;
+    Tr[s] = 1;
+    for (let i = 0; i < m; i++) { if (i === r) continue; const Ti = T[i], f = Ti[s]; if (f !== 0) { for (let j = 0; j <= nc; j++) Ti[j] -= f * Tr[j]; Ti[s] = 0; } }
+    const f = z[s];
+    if (f !== 0) { for (let j = 0; j <= nc; j++) z[j] -= f * Tr[j]; z[s] = 0; }
+    basis[r] = s;
+  };
+  const iterate = (nEnter) => {
+    for (;;) {
+      if (iterations++ > limit) return 'iteration limit';
+      const bland = iterations > blandFrom;
+      let s = -1, best = -eps;
+      for (let j = 0; j < nEnter; j++) if (z[j] < best) { s = j; if (bland) break; best = z[j]; }
+      if (s < 0) return 'optimal';
+      let r = -1, ratio = Infinity;
+      for (let i = 0; i < m; i++) { const a = T[i][s]; if (a > eps) { const q = Math.max(0, T[i][nc]) / a; if (q < ratio - 1e-12 || (r >= 0 && q < ratio + 1e-12 && basis[i] < basis[r])) { ratio = q; r = i; } } }
+      if (r < 0) return 'unbounded';
+      pivot(r, s);
+    }
+  };
+  const fail = (status) => ({ status, x: new Array(n).fill(0), f: NaN, dual: new Array(m).fill(0), iterations });
+  if (nc > nReal) { // phase 1: minimise the sum of the artificial variables
+    const c1 = new Float64Array(nc); for (let j = nReal; j < nc; j++) c1[j] = 1;
+    price(c1);
+    const st = iterate(nReal);
+    if (st === 'iteration limit') return fail(st);
+    if (-z[nc] > 1e-7 * (1 + Math.max(...rows.map((r) => Math.abs(r.b))))) return fail('infeasible');
+    for (let i = 0; i < m; i++) if (basis[i] >= nReal) { let s = -1, big = 1e-9; for (let j = 0; j < nReal; j++) if (Math.abs(T[i][j]) > big) { big = Math.abs(T[i][j]); s = j; } if (s >= 0) pivot(i, s); } // drive degenerate artificials out
+  }
+  const c2 = new Float64Array(nc); for (let j = 0; j < n; j++) c2[j] = c[j];
+  price(c2);
+  const st = iterate(nReal);
+  if (st !== 'optimal') return fail(st);
+  const x = new Array(n).fill(0);
+  for (let i = 0; i < m; i++) if (basis[i] < n) x[basis[i]] = Math.max(0, T[i][nc]);
+  const dual = rows.map((_, i) => { const y = -z[aCol[i] >= 0 ? aCol[i] : sCol[i]] * sg[i]; return y === 0 ? 0 : y; });
+  return { status: 'optimal', x, f: dot(c, x), dual, iterations };
+}
+/**
+ * Mixed-integer linear programme by branch and bound on the LP relaxation (depth-first, better child first, bound pruning).
+ * `ints` lists the indices of the integer variables. A rounding heuristic at the root (integers fixed to the rounded-up, then to
+ * the nearest, relaxed values) supplies a first incumbent. The search stops at maxNodes or when the simplex work (pivots × tableau
+ * size) exceeds maxWork. Returns { status, x, f, bound, gap, nodes, lpIterations, relaxation }.
+ */
+export function milpSolve(c, rows, ints, { maxNodes = 2000, maxWork = Infinity, tol = 1e-6 } = {}) {
+  const n = c.length, unit = (j) => { const a = new Array(n).fill(0); a[j] = 1; return a; }, isInt = new Set(ints), size = (rows.length + 1) * (n + 2 * rows.length + 1);
+  const root = lpSolve(c, rows);
+  let nodes = 1, lpIterations = root.iterations, best = null;
+  if (root.status !== 'optimal') return { status: root.status, x: root.x, f: NaN, bound: NaN, gap: NaN, nodes, lpIterations, relaxation: root };
+  const clean = (x) => x.map((q, j) => (isInt.has(j) ? Math.round(q) : q)), worse = (f) => best && f >= best.f - 1e-9 * (1 + Math.abs(best.f));
+  if (ints.some((j) => Math.abs(root.x[j] - Math.round(root.x[j])) > tol)) for (const round of [(q) => Math.ceil(q - tol), Math.round]) { // primal heuristic
+    const lp = lpSolve(c, [...rows, ...ints.map((j) => ({ a: unit(j), op: '=', b: round(root.x[j]) }))]);
+    nodes++; lpIterations += lp.iterations;
+    if (lp.status === 'optimal' && !worse(lp.f)) best = { f: lp.f, x: clean(lp.x) };
+  }
+  const stack = [{ extra: [], lp: root }];
+  while (stack.length && nodes < maxNodes && lpIterations * size < maxWork) {
+    const nd = stack.pop();
+    if (worse(nd.lp.f)) continue;
+    let jb = -1, fr = tol;
+    for (const j of ints) { const d = Math.abs(nd.lp.x[j] - Math.round(nd.lp.x[j])); if (d > fr) { fr = d; jb = j; } }
+    if (jb < 0) { best = { f: nd.lp.f, x: clean(nd.lp.x) }; continue; }
+    const xj = nd.lp.x[jb], kids = [];
+    for (const row of [{ a: unit(jb), op: '<=', b: Math.floor(xj) }, { a: unit(jb), op: '>=', b: Math.ceil(xj) }]) {
+      const extra = [...nd.extra, row], lp = lpSolve(c, [...rows, ...extra]);
+      nodes++; lpIterations += lp.iterations;
+      if (lp.status === 'optimal' && !worse(lp.f)) kids.push({ extra, lp });
+    }
+    kids.sort((a, b) => b.lp.f - a.lp.f);
+    stack.push(...kids);
+  }
+  const open = stack.filter((k) => !worse(k.lp.f)).map((k) => k.lp.f);
+  if (!best) return { status: open.length ? 'node limit' : 'infeasible', x: root.x, f: NaN, bound: root.f, gap: NaN, nodes, lpIterations, relaxation: root };
+  const bound = open.length ? Math.min(best.f, ...open) : best.f;
+  return { status: open.length ? 'node limit' : 'optimal', x: best.x, f: best.f, bound, gap: Math.abs(best.f - bound) / Math.max(1e-12, Math.abs(best.f)), nodes, lpIterations, relaxation: root };
+}
+
+/**
+ * Pontryagin's principle as a two-point boundary-value problem solved by shooting on the initial costate.
+ * prob = { x0, xT (entries null = free end, then λ(T) = 0), T, f(x, u) → ẋ, L(x, u) running cost, dHdx(x, λ, u) → ∂H/∂x with
+ * H = L + λ·f, uStar(x, λ) → the control minimising H inside its bounds }. State, costate and cost are integrated with RK4.
+ * For one state a bracket [λlo, λhi] may be given (Brent); otherwise a damped Newton iteration on λ(0) is used.
+ */
+export function pmpShoot(prob, { N = 100, lam0, bracket } = {}) {
+  const n = prob.x0.length, h = prob.T / N;
+  const rhs = (z) => { const x = z.slice(0, n), lam = z.slice(n, 2 * n), u = prob.uStar(x, lam), dx = prob.f(x, u), dl = prob.dHdx(x, lam, u); return [...dx, ...dl.map((q) => -q), prob.L(x, u)]; };
+  const march = (l0, keep) => {
+    let z = [...prob.x0, ...l0, 0];
+    const path = keep ? [z] : null, ax = (a, b, s) => a.map((q, i) => q + s * b[i]);
+    for (let k = 0; k < N; k++) {
+      const k1 = rhs(z), k2 = rhs(ax(z, k1, h / 2)), k3 = rhs(ax(z, k2, h / 2)), k4 = rhs(ax(z, k3, h));
+      z = z.map((q, i) => q + (h / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]));
+      if (keep) path.push(z);
+    }
+    return keep ? path : z;
+  };
+  const resid = (l0) => { const z = march(l0); return range(n).map((i) => (prob.xT[i] === null || prob.xT[i] === undefined ? z[n + i] : z[i] - prob.xT[i])); };
+  let l0, converged = true, iterations = 0;
+  if (n === 1 && bracket) {
+    const fa = resid([bracket[0]])[0], fb = resid([bracket[1]])[0];
+    if (!(fa * fb <= 0)) throw new Error('Optimal control: the terminal condition cannot be bracketed — the target is not reachable within the control bounds.');
+    l0 = [brentRoot((q) => resid([q])[0], bracket[0], bracket[1], fa, fb)];
+  } else {
+    const r = newtonN(resid, lam0 || new Array(n).fill(0), { tol: 1e-11, maxIter: 60 });
+    l0 = r.x; converged = r.converged; iterations = r.iterations;
+  }
+  const path = march(l0, true), t = range(N + 1).map((k) => k * h), x = path.map((z) => z.slice(0, n)), lam = path.map((z) => z.slice(n, 2 * n)), u = path.map((z, k) => prob.uStar(x[k], lam[k]));
+  const H = path.map((z, k) => prob.L(x[k], u[k]) + dot(lam[k], prob.f(x[k], u[k])));
+  return { t, x, lam, u, H, J: path[N][2 * n], lam0: l0, residual: maxAbs(resid(l0)), converged, iterations };
+}
+/** Root of a bracketed scalar function by bisection with secant acceleration (Illinois regula falsi); used where the function values at the ends are already known. */
+function brentRoot(f, a, b, fa, fb, tol = 1e-13) {
+  if (fa === 0) return a;
+  if (fb === 0) return b;
+  for (let it = 0; it < 200; it++) {
+    let c = b - (fb * (b - a)) / (fb - fa);
+    if (!(c > Math.min(a, b) && c < Math.max(a, b)) || it % 3 === 2) c = 0.5 * (a + b);
+    const fc = f(c);
+    if (fc === 0 || Math.abs(b - a) <= tol * (1 + Math.abs(c))) return c;
+    if (fa * fc < 0) { b = c; fb = fc; } else { a = c; fa = fc; }
+  }
+  return 0.5 * (a + b);
+}
+/**
+ * Euler–Lagrange boundary-value problem d/dt(∂L/∂ẋ) − ∂L/∂x = 0, x(0) = x0, x(T) = xT for one state, discretised with the
+ * midpoint (variational) rule on N intervals and solved by Newton's method on the interior nodes.
+ * Lv(x, v) = ∂L/∂ẋ and Lx(x, v) = ∂L/∂x. Returns { t, x, v (interval velocities), residual, converged }.
+ */
+export function eulerLagrangeBVP(Lv, Lx, x0, xT, T, N = 40) {
+  const dt = T / N, full = (y) => [x0, ...y, xT];
+  const F = (y) => {
+    const X = full(y), lv = new Array(N), lx = new Array(N);
+    for (let k = 0; k < N; k++) { const xm = 0.5 * (X[k] + X[k + 1]), v = (X[k + 1] - X[k]) / dt; lv[k] = Lv(xm, v); lx[k] = Lx(xm, v); }
+    return range(N - 1).map((j) => (lv[j + 1] - lv[j]) / dt - 0.5 * (lx[j] + lx[j + 1]));
+  };
+  const r = newtonN(F, range(N - 1).map((j) => x0 + ((xT - x0) * (j + 1)) / N), { tol: 1e-11, maxIter: 60 }), X = full(r.x);
+  return { t: range(N + 1).map((k) => k * dt), x: X, v: range(N).map((k) => (X[k + 1] - X[k]) / dt), residual: maxAbs(F(r.x)), converged: r.converged };
+}
+
+/** Eigen-decomposition of a symmetric matrix by cyclic Jacobi rotations. Returns { values (descending), vectors (one array per eigenvector) }. */
+export function symEig(A0) {
+  const n = A0.length, A = A0.map((r) => [...r]), V = eye(n);
+  for (let sweep = 0; sweep < 60; sweep++) {
+    let off = 0, diag = 0;
+    for (let i = 0; i < n; i++) { diag += A[i][i] * A[i][i]; for (let j = i + 1; j < n; j++) off += A[i][j] * A[i][j]; }
+    if (off <= 1e-30 * (diag + off) || off === 0) break;
+    for (let p = 0; p < n - 1; p++) for (let q = p + 1; q < n; q++) {
+      const apq = A[p][q];
+      if (Math.abs(apq) < 1e-300) continue;
+      const th = (A[q][q] - A[p][p]) / (2 * apq), t = Math.sign(th || 1) / (Math.abs(th) + Math.sqrt(th * th + 1)), c = 1 / Math.sqrt(t * t + 1), s = t * c;
+      for (let k = 0; k < n; k++) { const akp = A[k][p], akq = A[k][q]; A[k][p] = c * akp - s * akq; A[k][q] = s * akp + c * akq; }
+      for (let k = 0; k < n; k++) { const apk = A[p][k], aqk = A[q][k]; A[p][k] = c * apk - s * aqk; A[q][k] = s * apk + c * aqk; }
+      for (let k = 0; k < n; k++) { const vkp = V[k][p], vkq = V[k][q]; V[k][p] = c * vkp - s * vkq; V[k][q] = s * vkp + c * vkq; }
+    }
+  }
+  const order = range(n).sort((a, b) => A[b][b] - A[a][a]);
+  return { values: order.map((i) => A[i][i]), vectors: order.map((i) => V.map((r) => r[i])) };
+}
+/**
+ * Proper orthogonal decomposition by the method of snapshots: eigen-decomposition of the m × m snapshot covariance.
+ * S = snapshots (m rows of length n). Returns { mean, modes (orthonormal, most energetic first), sigma (singular values), energy (cumulative fraction) }.
+ */
+export function podBasis(S, { center = true, rmax } = {}) {
+  const m = S.length, n = S[0].length, mu = center ? range(n).map((j) => mean(S.map((r) => r[j]))) : zeros(n), F = S.map((r) => r.map((q, j) => q - mu[j]));
+  const C = F.map((a) => F.map((b) => dot(a, b))), eg = symEig(C), tot = sum(eg.values.map((q) => Math.max(0, q))) || 1e-300, modes = [], sigma = [];
+  for (let k = 0; k < Math.min(m, n, rmax ?? m); k++) {
+    const lam = eg.values[k];
+    if (!(lam > 1e-13 * eg.values[0])) break;
+    const s = Math.sqrt(lam), phi = zeros(n);
+    for (let i = 0; i < m; i++) { const w = eg.vectors[k][i] / s; for (let j = 0; j < n; j++) phi[j] += w * F[i][j]; }
+    for (const prev of modes) { const d = dot(phi, prev); for (let j = 0; j < n; j++) phi[j] -= d * prev[j]; } // re-orthogonalise against rounding
+    const nrm = Math.hypot(...phi) || 1;
+    modes.push(phi.map((q) => q / nrm)); sigma.push(s);
+  }
+  let acc = 0;
+  return { mean: mu, modes, sigma, energy: sigma.map((s) => (acc += (s * s) / tot)), total: tot };
+}
+
+/** Semi-discrete finite-volume operator of solveCDR: du/dt = A·u + s (A tri-diagonal: lo, di, hi; s acts on the first and last cell). */
+export function cdrOperator({ L = 1, nx = 40, v = 0, D = 1, left, right, scheme = 'central' }) {
+  const n = nx, dx = L / n, up = scheme === 'upwind', lo = zeros(n), di = zeros(n), hi = zeros(n);
+  const aL = up ? (v >= 0 ? v + D / dx : D / dx) : v / 2 + D / dx, aR = up ? (v >= 0 ? -D / dx : v - D / dx) : v / 2 - D / dx;
+  for (let i = 0; i < n; i++) { if (i < n - 1) { di[i] -= aL / dx; hi[i] -= aR / dx; } if (i > 0) { lo[i] += aL / dx; di[i] += aR / dx; } }
+  if (left.type === 'dirichlet') di[0] -= (2 * D) / dx / dx; else if (left.type === 'neumann') di[0] += v / dx;
+  if (right.type === 'dirichlet') di[n - 1] -= (2 * D) / dx / dx; else if (right.type === 'neumann') di[n - 1] -= v / dx;
+  const s0 = left.type === 'dirichlet' ? ((v + (2 * D) / dx) * left.val) / dx : left.type === 'neumann' ? (-(v * left.val * dx) / 2 - D * left.val) / dx : 0;
+  const s1 = right.type === 'dirichlet' ? (-(v - (2 * D) / dx) * right.val) / dx : right.type === 'neumann' ? -((v * right.val * dx) / 2 - D * right.val) / dx : 0;
+  return { n, dx, lo, di, hi, s0, s1, x: range(n).map((i) => (i + 0.5) * dx), apply: (u) => u.map((q, i) => (i > 0 ? lo[i] * u[i - 1] : 0) + di[i] * q + (i < n - 1 ? hi[i] * u[i + 1] : 0) + (i === 0 ? s0 : 0) + (i === n - 1 ? s1 : 0)) };
+}
+
+// ---- Neural ODE: dy/dt = W2·tanh(W1·y + b1) + b2, RK4, discrete adjoint -----------------------------------------------------
+const nodeLayout = (d, H) => ({ b1: H * d, W2: H * d + H, b2: H * d + H + d * H, n: H * d + H + d * H + d });
+/** Seeded initial parameters of the neural right-hand side (flat array: W1, b1, W2, b2). */
+export function nodeInit(d, H, seed = 1, scale = 0.5) {
+  const g = rng(seed), o = nodeLayout(d, H), p = new Float64Array(o.n);
+  for (let i = 0; i < H * d; i++) p[i] = g.normal(0, 1);
+  for (let i = 0; i < H; i++) p[o.b1 + i] = g.normal(0, 0.5);
+  for (let i = 0; i < d * H; i++) p[o.W2 + i] = g.normal(0, scale / Math.sqrt(H));
+  return p;
+}
+/** Evaluate the network: writes tanh activations into z (length H) and dy/dt into out (length d). */
+export function nodeF(p, d, H, y, z, out) {
+  const o = nodeLayout(d, H);
+  for (let i = 0; i < H; i++) { let s = p[o.b1 + i]; for (let j = 0; j < d; j++) s += p[i * d + j] * y[j]; z[i] = Math.tanh(s); }
+  for (let k = 0; k < d; k++) { let s = p[o.b2 + k]; for (let i = 0; i < H; i++) s += p[o.W2 + k * H + i] * z[i]; out[k] = s; }
+  return out;
+}
+/** Vector–Jacobian product of the network: adds aᵀ·∂f/∂θ to g and returns aᵀ·∂f/∂y (z = activations stored by nodeF at y). */
+export function nodeVJP(p, d, H, y, z, a, g) {
+  const o = nodeLayout(d, H), gy = new Array(d).fill(0);
+  for (let k = 0; k < d; k++) { g[o.b2 + k] += a[k]; for (let i = 0; i < H; i++) g[o.W2 + k * H + i] += a[k] * z[i]; }
+  for (let i = 0; i < H; i++) {
+    let b = 0;
+    for (let k = 0; k < d; k++) b += p[o.W2 + k * H + i] * a[k];
+    b *= 1 - z[i] * z[i];
+    g[o.b1 + i] += b;
+    for (let j = 0; j < d; j++) { g[i * d + j] += b * y[j]; gy[j] += p[i * d + j] * b; }
+  }
+  return gy;
+}
+/** Integrate the neural ODE from y0 through the times ts (RK4 with `sub` steps per interval); returns the state at every time. */
+export function nodeSolve(p, d, H, y0, ts, sub = 2) {
+  const out = [[...y0]], z = new Array(H), k1 = new Array(d), k2 = new Array(d), k3 = new Array(d), k4 = new Array(d), w = new Array(d);
+  let y = [...y0];
+  for (let q = 1; q < ts.length; q++) {
+    const h = (ts[q] - ts[q - 1]) / sub;
+    for (let s = 0; s < sub; s++) {
+      nodeF(p, d, H, y, z, k1);
+      for (let j = 0; j < d; j++) w[j] = y[j] + 0.5 * h * k1[j];
+      nodeF(p, d, H, w, z, k2);
+      for (let j = 0; j < d; j++) w[j] = y[j] + 0.5 * h * k2[j];
+      nodeF(p, d, H, w, z, k3);
+      for (let j = 0; j < d; j++) w[j] = y[j] + h * k3[j];
+      nodeF(p, d, H, w, z, k4);
+      y = y.map((v, j) => v + (h / 6) * (k1[j] + 2 * k2[j] + 2 * k3[j] + k4[j]));
+    }
+    out.push([...y]);
+  }
+  return out;
+}
+/**
+ * Mean squared trajectory error of the neural ODE and its exact gradient by back-propagation through the RK4 integrator
+ * (discrete adjoint). trajs = [{ t: [...], y: [[...], ...] }]; y[0] is the initial condition, the later rows are fitted.
+ */
+export function nodeLossGrad(p, d, H, trajs, sub = 2) {
+  const o = nodeLayout(d, H), g = new Float64Array(p.length);
+  let nObs = 0, maxS = 0, loss = 0;
+  for (const tr of trajs) { nObs += (tr.t.length - 1) * d; maxS = Math.max(maxS, (tr.t.length - 1) * sub); }
+  const Y = new Float64Array(maxS * 4 * d), Z = new Float64Array(maxS * 4 * H), hs = new Float64Array(maxS), E = new Float64Array(maxS * d), has = new Uint8Array(maxS); // tape: stage inputs and activations of every step
+  const k = new Float64Array(4 * d), y = new Float64Array(d), a = new Float64Array(d), abar = new Float64Array(d), gy = new Float64Array(d), acc = new Float64Array(d);
+  const fwd = (yo, zo, ko) => {
+    for (let i = 0; i < H; i++) { let q = p[o.b1 + i]; for (let j = 0; j < d; j++) q += p[i * d + j] * Y[yo + j]; Z[zo + i] = Math.tanh(q); }
+    for (let c = 0; c < d; c++) { let q = p[o.b2 + c]; for (let i = 0; i < H; i++) q += p[o.W2 + c * H + i] * Z[zo + i]; k[ko + c] = q; }
+  };
+  const vjp = (yo, zo) => { // abarᵀ·∂f/∂θ is added to g, abarᵀ·∂f/∂y is written to gy
+    gy.fill(0);
+    for (let c = 0; c < d; c++) { const ac = abar[c]; g[o.b2 + c] += ac; for (let i = 0; i < H; i++) g[o.W2 + c * H + i] += ac * Z[zo + i]; }
+    for (let i = 0; i < H; i++) {
+      let b = 0;
+      for (let c = 0; c < d; c++) b += p[o.W2 + c * H + i] * abar[c];
+      const z = Z[zo + i]; b *= 1 - z * z; g[o.b1 + i] += b;
+      for (let j = 0; j < d; j++) { g[i * d + j] += b * Y[yo + j]; gy[j] += p[i * d + j] * b; }
+    }
+  };
+  for (const tr of trajs) {
+    let s = 0;
+    for (let j = 0; j < d; j++) y[j] = tr.y[0][j];
+    has.fill(0);
+    for (let q = 1; q < tr.t.length; q++) {
+      const h = (tr.t[q] - tr.t[q - 1]) / sub;
+      for (let c = 0; c < sub; c++, s++) {
+        const y0 = s * 4 * d, z0 = s * 4 * H;
+        hs[s] = h;
+        for (let j = 0; j < d; j++) Y[y0 + j] = y[j];
+        fwd(y0, z0, 0);
+        for (let j = 0; j < d; j++) Y[y0 + d + j] = y[j] + 0.5 * h * k[j];
+        fwd(y0 + d, z0 + H, d);
+        for (let j = 0; j < d; j++) Y[y0 + 2 * d + j] = y[j] + 0.5 * h * k[d + j];
+        fwd(y0 + 2 * d, z0 + 2 * H, 2 * d);
+        for (let j = 0; j < d; j++) Y[y0 + 3 * d + j] = y[j] + h * k[2 * d + j];
+        fwd(y0 + 3 * d, z0 + 3 * H, 3 * d);
+        for (let j = 0; j < d; j++) y[j] += (h / 6) * (k[j] + 2 * k[d + j] + 2 * k[2 * d + j] + k[3 * d + j]);
+      }
+      has[s - 1] = 1;
+      for (let j = 0; j < d; j++) { const e = y[j] - tr.y[q][j]; E[(s - 1) * d + j] = e; loss += (e * e) / nObs; }
+    }
+    a.fill(0);
+    for (s -= 1; s >= 0; s--) { // reverse sweep: adjoint of every RK4 stage
+      if (has[s]) for (let j = 0; j < d; j++) a[j] += (2 * E[s * d + j]) / nObs;
+      const h = hs[s], y0 = s * 4 * d, z0 = s * 4 * H;
+      for (let j = 0; j < d; j++) { acc[j] = a[j]; abar[j] = (h / 6) * a[j]; }
+      vjp(y0 + 3 * d, z0 + 3 * H);
+      for (let j = 0; j < d; j++) { acc[j] += gy[j]; abar[j] = (h / 3) * a[j] + h * gy[j]; }
+      vjp(y0 + 2 * d, z0 + 2 * H);
+      for (let j = 0; j < d; j++) { acc[j] += gy[j]; abar[j] = (h / 3) * a[j] + 0.5 * h * gy[j]; }
+      vjp(y0 + d, z0 + H);
+      for (let j = 0; j < d; j++) { acc[j] += gy[j]; abar[j] = (h / 6) * a[j] + 0.5 * h * gy[j]; }
+      vjp(y0, z0);
+      for (let j = 0; j < d; j++) a[j] = acc[j] + gy[j];
+    }
+  }
+  return { loss, grad: g };
+}
+/** Train the neural ODE with Adam on the trajectory loss; the best parameters seen are returned. */
+export function nodeTrain(d, H, trajs, { epochs = 600, lr = 0.02, seed = 1, sub = 2, p0 } = {}) {
+  const p = p0 ? Float64Array.from(p0) : nodeInit(d, H, seed), st = { t: 0, m: new Float64Array(p.length), v: new Float64Array(p.length) }, history = { epoch: [], loss: [] }, every = Math.max(1, Math.floor(epochs / 120));
+  let best = Infinity, bestP = Float64Array.from(p);
+  for (let ep = 0; ep < epochs; ep++) {
+    const { loss, grad } = nodeLossGrad(p, d, H, trajs, sub);
+    if (!Number.isFinite(loss)) break;
+    if (loss < best) { best = loss; bestP.set(p); }
+    if (ep % every === 0) { history.epoch.push(ep); history.loss.push(loss); }
+    adamStep(p, grad, st, lr * 0.05 ** (ep / epochs));
+  }
+  const fin = nodeLossGrad(p, d, H, trajs, sub).loss;
+  if (fin < best) { best = fin; bestP.set(p); }
+  return { p: bestP, loss: best, history, nParams: p.length };
+}
+
+// ---- Neural PDE: convection–diffusion with a neural reaction closure R_θ(u), IMEX θ-scheme, discrete adjoint -----------------
+/**
+ * March ∂u/∂t + v ∂u/∂x = D ∂²u/∂x² + R(u) with the transport part implicit (θ-scheme on the operator of cdrOperator) and the
+ * closure explicit: (I − θΔt·A)·uⁿ⁺¹ = (I + (1 − θ)Δt·A)·uⁿ + Δt·s + Δt·R(uⁿ). clos(u) → R; returns every time level.
+ */
+export function imexMarch(op, u0, nt, dt, clos, theta = 0.5) {
+  const n = op.n, a = op.lo.map((q) => -theta * dt * q), b = op.di.map((q) => 1 - theta * dt * q), c = op.hi.map((q) => -theta * dt * q), U = [[...u0]];
+  let u = [...u0];
+  for (let k = 0; k < nt; k++) {
+    const rhs = new Array(n);
+    for (let i = 0; i < n; i++) rhs[i] = u[i] + (1 - theta) * dt * ((i > 0 ? op.lo[i] * u[i - 1] : 0) + op.di[i] * u[i] + (i < n - 1 ? op.hi[i] * u[i + 1] : 0)) + dt * clos(u[i]);
+    rhs[0] += dt * op.s0; rhs[n - 1] += dt * op.s1;
+    u = tridiag(a, b, c, rhs); U.push(u);
+  }
+  return U;
+}
+/**
+ * Loss (mean squared mismatch to the observed snapshots) of the PDE with the neural closure R_θ(u) = rRef·net(u/uRef) and its gradient
+ * by the discrete adjoint of the IMEX scheme. exps = [{ op, u0, nt, dt, obs: [{ k (time level), u: [...] }] }].
+ */
+export function npdeLossGrad(p, H, exps, { uRef = 1, rRef = 1, theta = 0.5 } = {}) {
+  const g = new Float64Array(p.length), nObs = sum(exps.map((e) => sum(e.obs.map((q) => q.u.length))));
+  let loss = 0;
+  for (const ex of exps) {
+    const { op, nt, dt } = ex, n = op.n, at = new Map(ex.obs.map((q) => [q.k, q.u])), Z = new Float64Array(nt * n * H), U = [[...ex.u0]];
+    const a = op.lo.map((q) => -theta * dt * q), b = op.di.map((q) => 1 - theta * dt * q), c = op.hi.map((q) => -theta * dt * q);
+    for (let k = 0; k < nt; k++) { // forward march (same scheme as imexMarch) keeping the hidden activations for the reverse sweep
+      const u = U[k], rhs = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const sIn = u[i] / uRef, zo = (k * n + i) * H;
+        let f = p[3 * H];
+        for (let j = 0; j < H; j++) { const z = Math.tanh(p[j] * sIn + p[H + j]); Z[zo + j] = z; f += p[2 * H + j] * z; }
+        rhs[i] = u[i] + (1 - theta) * dt * ((i > 0 ? op.lo[i] * u[i - 1] : 0) + op.di[i] * u[i] + (i < n - 1 ? op.hi[i] * u[i + 1] : 0)) + dt * rRef * f;
+      }
+      rhs[0] += dt * op.s0; rhs[n - 1] += dt * op.s1;
+      U.push(tridiag(a, b, c, rhs));
+    }
+    const aT = range(n).map((i) => (i > 0 ? c[i - 1] : 0)), cT = range(n).map((i) => (i < n - 1 ? a[i + 1] : 0)); // transposed tri-diagonal
+    const dLoss = (k) => { const d = at.get(k); if (!d) return null; return U[k].map((q, i) => { const e = q - d[i]; loss += (e * e) / nObs; return (2 * e) / nObs; }); };
+    let ub = dLoss(nt) || zeros(n);
+    for (let k = nt - 1; k >= 0; k--) {
+      const w = tridiag(aT, b, cT, ub), un = U[k], nb = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const sIn = un[i] / uRef, ai = dt * rRef * w[i], zo = (k * n + i) * H;
+        let gy = 0;
+        g[3 * H] += ai;
+        for (let j = 0; j < H; j++) { const z = Z[zo + j], bj = p[2 * H + j] * ai * (1 - z * z); g[2 * H + j] += ai * z; g[H + j] += bj; g[j] += bj * sIn; gy += p[j] * bj; }
+        nb[i] = w[i] + (1 - theta) * dt * ((i > 0 ? op.hi[i - 1] * w[i - 1] : 0) + op.di[i] * w[i] + (i < n - 1 ? op.lo[i + 1] * w[i + 1] : 0)) + gy / uRef;
+      }
+      const dl = k > 0 ? dLoss(k) : null;
+      if (dl) for (let i = 0; i < n; i++) nb[i] += dl[i];
+      ub = nb;
+    }
+  }
+  return { loss, grad: g };
+}
+/** The scalar closure R_θ(u) = rRef·[b₂ + Σ W₂ⱼ·tanh(W₁ⱼ·u/uRef + b₁ⱼ)] for the parameter layout of nodeInit(1, H). */
+export function npdeClosure(p, H, uRef = 1, rRef = 1) {
+  return (u) => { const s = u / uRef; let f = p[3 * H]; for (let j = 0; j < H; j++) f += p[2 * H + j] * Math.tanh(p[j] * s + p[H + j]); return rRef * f; };
+}
+
+// ---- Ensembles and multi-fidelity surrogates ----------------------------------------------------------------------------------
+/**
+ * Bootstrap aggregation (bagging). fit(X, y, memberIndex) → predict(x). Every member is trained on a bootstrap resample; the rows it
+ * did not see give the out-of-bag prediction of each training point. Returns { members, predict(x) → { mean, sd, all }, oob: { pred, rmse, n } }.
+ */
+export function bagEnsemble(X, y, fit, { B = 12, seed = 1 } = {}) {
+  const n = X.length, g = rng(seed), members = [], inBag = [];
+  for (let b = 0; b < B; b++) {
+    const idx = range(n).map(() => g.int(n)), seen = new Uint8Array(n);
+    for (const i of idx) seen[i] = 1;
+    members.push(fit(idx.map((i) => X[i]), idx.map((i) => y[i]), b)); inBag.push(seen);
+  }
+  const predict = (x, upTo = B) => { const all = members.slice(0, upTo).map((f) => f(x)), mu = mean(all); return { mean: mu, sd: all.length > 1 ? std(all) : 0, all }; };
+  const pred = range(n).map((i) => { const out = members.filter((_, b) => !inBag[b][i]).map((f) => f(X[i])); return out.length ? mean(out) : null; }), ok = range(n).filter((i) => pred[i] !== null);
+  return { members, predict, B, oob: { pred, n: ok.length, rmse: ok.length ? Math.sqrt(mean(ok.map((i) => (pred[i] - y[i]) ** 2))) : NaN } };
+}
+/**
+ * Two-level recursive co-kriging (Kennedy–O'Hagan autoregressive model): y_high(x) = ρ·y_low(x) + δ(x). A Gaussian process is fitted
+ * to the low-fidelity data, ρ follows from least squares at the high-fidelity points and a second process models the discrepancy δ.
+ */
+export function coKrige(XL, yL, XH, yH) {
+  const gpL = gpFit(XL, yL), muL = XH.map((x) => gpL.predict(x).mean), n = XH.length, d = XH[0].length, sx = standardizer(XH);
+  const slope = (m, y) => { const a = mean(m), b = mean(y), sxx = sum(m.map((q) => (q - a) ** 2)); return sxx > 1e-300 ? sum(m.map((q, i) => (q - a) * (y[i] - b))) / sxx : 1; };
+  const kinds = { // candidate forms of the discrepancy δ(x); the one with the smallest cross-validation error is kept
+    constant: (m, X, y) => { const rho = slope(m, y), c = mean(y.map((q, i) => q - rho * m[i])); return { rho, delta: () => ({ mean: c, sd: 0 }) }; },
+    'Gaussian process': (m, X, y) => { const rho = slope(m, y), del = y.map((q, i) => q - rho * m[i]); if (std(del) < 1e-12 * (1 + Math.abs(mean(del)))) return kinds.constant(m, X, y); const g = gpFit(X, del, { maxIter: 120 }); return { rho, delta: (x) => g.predict(x) }; },
+    'linear trend': (m, X, y) => { const beta = lstsq(X.map((x, i) => [m[i], 1, ...sx.f(x)]), y); return { rho: beta[0], delta: (x) => ({ mean: beta[1] + dot(sx.f(x), beta.slice(2)), sd: 0 }) }; },
+  };
+  const names = ['constant', 'Gaussian process', ...(n >= d + 4 ? ['linear trend'] : [])], K = Math.min(n, 8), cv = {};
+  for (const nm of names) {
+    let sq = 0;
+    for (let f = 0; f < K; f++) {
+      const tr = range(n).filter((i) => i % K !== f), te = range(n).filter((i) => i % K === f);
+      try { const M = kinds[nm](tr.map((i) => muL[i]), tr.map((i) => XH[i]), tr.map((i) => yH[i])); for (const i of te) sq += (M.rho * muL[i] + M.delta(XH[i]).mean - yH[i]) ** 2; } catch { sq = Infinity; }
+    }
+    cv[nm] = Number.isFinite(sq) ? Math.sqrt(sq / n) : Infinity;
+  }
+  const kind = names.reduce((a, b) => (cv[b] < cv[a] ? b : a)), M = kinds[kind](muL, XH, yH), floor = finite(cv[kind]);
+  const predict = (x) => { const a = gpL.predict(x), b = M.delta(x); return { mean: M.rho * a.mean + b.mean, sd: Math.hypot(M.rho * a.sd, Math.max(b.sd, floor)), low: a.mean, delta: b.mean }; };
+  return { predict, rho: M.rho, kind, cv, gpL };
+}
+/**
+ * Sample-average form of the joint chance constraint P[g(x, ξ) ≤ 0] ≥ 1 − α: the ⌊α·m⌋ worst of the m scenario values are set aside
+ * and the remaining ones must be feasible. α = 0 is the worst-case (robust) constraint. Returns the violation of the kept scenarios.
+ */
+export function chanceViolation(g, alpha = 0) {
+  const kept = [...g].sort((a, b) => b - a).slice(Math.floor(alpha * g.length + 1e-9));
+  return { viol: sum(kept.map((q) => Math.max(0, q))), quad: sum(kept.map((q) => Math.max(0, q) ** 2)), dropped: g.length - kept.length };
+}
+
+// ---- Worker-thread pool for batches of plant simulations ----------------------------------------------------------------------
+const stripEval = (e) => (e.ok ? { ok: true, m: e.m, cost: e.cost, g: e.g, viol: e.viol } : { ok: false, g: e.g, viol: e.viol, err: e.err });
+/** Evaluate one chunk of designs (overrides of the base RO inputs); the pressure warm start is reset so a chunk gives the same numbers on any thread. */
+function evalJobs(jobs, v, base) { warmReset(); return jobs.map((j) => stripEval(evalDesign({ ...base, ...j }, v))); }
+function parHandle(msg) {
+  if (!msg || msg.brinelab !== 'par') return null;
+  if (msg.type === 'ping') return { brinelab: 'par', type: 'pong', id: msg.id };
+  if (msg.type !== 'eval') return null;
+  try { return { brinelab: 'par', type: 'done', id: msg.id, out: evalJobs(msg.jobs, msg.v, roBase(msg.v)) }; } catch (e) { return { brinelab: 'par', type: 'fail', id: msg.id, err: String(e?.message || e) }; }
+}
+const nodeThreads = () => { try { return globalThis.process?.getBuiltinModule?.('node:worker_threads') || null; } catch { return null; } };
+/**
+ * Start `n` worker threads that load this module (Node worker_threads, or module Web Workers when the page is served over http/https).
+ * Resolves to { live, workers, reason, startMs, run(chunks, v) → results per chunk, close() }. When threads cannot be started the pool
+ * reports live = false and the caller evaluates the same chunks on the calling thread.
+ */
+export async function parPool(n, { timeout = 6000 } = {}) {
+  const want = clamp(Math.round(n) || 0, 0, 16), t0 = Date.now(), url = import.meta.url, ws = [], pending = new Map();
+  const dead = (reason) => { for (const w of ws) { try { w.kill(); } catch { /* already gone */ } } return { live: false, workers: 0, reason, startMs: Date.now() - t0, run: null, close() {} }; };
+  if (want < 1) return dead('parallel evaluation switched off');
+  let nextId = 1;
+  const settle = (m) => { const p = pending.get(m?.id); if (!p) return; pending.delete(m.id); clearTimeout(p.timer); if (m.type === 'fail') p.reject(new Error(m.err)); else p.resolve(m); };
+  const failAll = (err) => { for (const [id, p] of pending) { clearTimeout(p.timer); p.reject(err); pending.delete(id); } };
+  const call = (w, msg, ms) => new Promise((resolve, reject) => {
+    const id = nextId++, timer = setTimeout(() => { pending.delete(id); reject(new Error('worker timed out')); }, ms);
+    pending.set(id, { resolve, reject, timer });
+    try { w.post({ ...msg, brinelab: 'par', id }); } catch (e) { clearTimeout(timer); pending.delete(id); reject(e); }
+  });
+  try {
+    const wt = nodeThreads();
+    for (let i = 0; i < want; i++) {
+      if (wt && /^file:/.test(url || '')) {
+        const w = new wt.Worker(new URL(url), { workerData: { brinelabPar: 1 } });
+        w.on('message', settle); w.on('error', failAll);
+        ws.push({ post: (m) => w.postMessage(m), kill: () => w.terminate() });
+      } else if (typeof Worker === 'function' && /^https?:/.test(url || '')) {
+        const w = new Worker(url, { type: 'module' });
+        w.onmessage = (e) => settle(e.data); w.onerror = () => failAll(new Error('worker failed to load'));
+        ws.push({ post: (m) => w.postMessage(m), kill: () => w.terminate() });
+      } else return dead('worker threads are not available in this environment');
+    }
+    await Promise.all(ws.map((w) => call(w, { type: 'ping' }, timeout)));
+  } catch (e) { failAll(new Error('pool closed')); return dead('worker threads could not be started (' + String(e?.message || e).slice(0, 80) + ')'); }
+  return { live: true, workers: ws.length, reason: '', startMs: Date.now() - t0,
+    run: (chunks, v) => Promise.all(chunks.map((jobs, i) => (jobs.length ? call(ws[i % ws.length], { type: 'eval', jobs, v }, 120000).then((m) => m.out) : Promise.resolve([])))),
+    close() { failAll(new Error('pool closed')); for (const w of ws) { try { w.kill(); } catch { /* already gone */ } } } };
+}
+/** Batched evaluator: splits each batch into a fixed number of contiguous chunks and runs them on the pool, or on this thread with cooperative yielding. */
+async function makeBatcher(v, base, nWorkers, ctx) {
+  const chunks = Math.max(1, clamp(Math.round(nWorkers) || 0, 0, 16)), vLite = JSON.parse(JSON.stringify(v)), pool = await parPool(nWorkers);
+  const st = { pool, chunks, jobs: 0, wall: 0, seqRate: null, agree: null, fellBack: false };
+  const split = (jobs) => range(chunks).map((c) => jobs.slice(Math.floor((c * jobs.length) / chunks), Math.floor(((c + 1) * jobs.length) / chunks)));
+  st.run = async (jobs) => {
+    const parts = split(jobs), t0 = Date.now();
+    let out = null;
+    if (pool.live && !st.fellBack) { try { out = await pool.run(parts, vLite); } catch { st.fellBack = true; } }
+    if (!out) { out = []; for (const p of parts) { out.push(evalJobs(p, v, base)); await ctx.tick(); } }
+    st.wall += Date.now() - t0; st.jobs += jobs.length;
+    if (pool.live && !st.fellBack && st.seqRate === null && parts[0].length) { // time the first chunk on this thread: sequential rate and a check that both threads agree
+      const t1 = Date.now(), ref = evalJobs(parts[0], v, base);
+      st.seqRate = (Date.now() - t1) / parts[0].length;
+      st.agree = Math.max(0, ...ref.map((e, i) => (e.ok && out[0][i].ok ? Math.abs(e.m.sec - out[0][i].m.sec) + Math.abs(e.cost.total - out[0][i].cost.total) : e.ok === out[0][i].ok ? 0 : 1)));
+    }
+    return out.flat();
+  };
+  st.speedup = () => (st.seqRate !== null && st.wall > 0 ? (st.seqRate * st.jobs) / st.wall : null);
+  return st;
+}
+
+// ---- Task 11: optimal control of a batch RO cycle (Euler–Lagrange, Hamiltonian system, Pontryagin) -----------------------------
+/** Batch RO cycle: tank volume V (m³) falls at the permeate rate q (m³/h); L = P·q/(36·η) is the pumping power (kW). */
+function batchModel(v) {
+  const V0 = Math.max(1e-6, v.ocV0), Vf = V0 * (1 - clamp(v.ocRec, 1, 95) / 100), T = Math.max(1e-6, v.ocT), Am = Math.max(1e-6, v.ocArea), a = (Am * Math.max(1e-6, v.ocA)) / 1000, qk = (Am * Math.max(0.1, v.ocK) * 3.6) / 1000;
+  const eta = clamp(v.ocEta, 5, 100) / 100, pi0 = Math.max(0, v.ocPi0), dp = Math.max(0, v.ocDp), qmax = (Am * Math.max(0.1, v.ocFluxMax)) / 1000, w = 1 / (36 * eta), Vlow = 0.2 * Vf;
+  const pi = (V) => (pi0 * V0) / Math.max(V, Vlow);
+  const P = (V, q) => q / a + pi(V) * Math.exp(q / qk) + dp;
+  const L = (V, q) => w * P(V, q) * q;
+  const Lq = (V, q) => w * ((2 * q) / a + pi(V) * Math.exp(q / qk) * (1 + q / qk) + dp);
+  const Lqq = (V, q) => w * (2 / a + (pi(V) * Math.exp(q / qk) * (2 + q / qk)) / qk);
+  const LV = (V, q) => (V > Vlow ? -w * ((pi0 * V0) / (V * V)) * q * Math.exp(q / qk) : 0);
+  /** Control minimising the Hamiltonian H = L − λ·q on [0, qcap]: stationarity ∂L/∂q = λ (Newton from above, L is convex in q), then clipping. */
+  const qStar = (V, lam, qcap) => {
+    if (Lq(V, 0) >= lam) return 0;
+    if (Lq(V, qcap) <= lam) return qcap;
+    let q = qcap;
+    for (let it = 0; it < 60; it++) { const dq = (Lq(V, q) - lam) / Lqq(V, q); q -= dq; if (Math.abs(dq) < 1e-14 * (1 + q)) break; }
+    return clamp(q, 0, qcap);
+  };
+  /** Permeate rate at a fixed feed pressure (inverse of P(V, q)). */
+  const qOfP = (V, Pf) => { if (P(V, 0) >= Pf) return 0; let q = Math.min(qmax, (Pf - dp) * a); for (let it = 0; it < 60; it++) { const dq = (P(V, q) - Pf) / (1 / a + (pi(V) * Math.exp(q / qk)) / qk); q -= dq; if (Math.abs(dq) < 1e-14 * (1 + q)) break; } return clamp(q, 0, qmax); };
+  return { V0, Vf, T, Am, a, qk, eta, pi0, dp, qmax, w, pi, P, L, Lq, Lqq, LV, qStar, qOfP, flux: (q) => (1000 * q) / Am };
+}
+/** Pontryagin solution of the batch cycle with the permeate rate limited to qcap. */
+function batchPMP(B, N, qcap) {
+  const prob = { x0: [B.V0], xT: [B.Vf], T: B.T, f: (x, u) => [-u[0]], L: (x, u) => B.L(x[0], u[0]), dHdx: (x, lam, u) => [B.LV(x[0], u[0])], uStar: (x, lam) => [B.qStar(x[0], lam[0], qcap)] };
+  return pmpShoot(prob, { N, bracket: [B.Lq(B.V0, 0), 1.05 * B.Lq(0.9 * B.Vf, qcap) + 1e-9] });
+}
+/** Direct transcription of the same problem: piecewise-constant permeate rates as variables of a nonlinear programme solved by SQP. */
+function batchDirect(B, Nd, qcap, q0) {
+  const dt = B.T / Nd, dV = B.V0 - B.Vf;
+  const cost = (u) => { let V = B.V0, J = 0; for (let k = 0; k < Nd; k++) { const q = u[k] * qcap; J += dt * B.L(V - 0.5 * q * dt, q); V -= q * dt; } return J; };
+  const J0 = cost(q0.map((q) => q / qcap)) || 1, h = (u) => (sum(u) * qcap * dt - dV) / dV;
+  const r = sqpLite((u) => cost(u) / J0, (u) => { const e = h(u); return [e, -e]; }, q0.map((q) => clamp(q / qcap, 0, 1)), { lo: zeros(Nd), hi: new Array(Nd).fill(1), maxIter: 80, tol: 1e-8, h: 1e-6 });
+  return { q: r.x.map((u) => u * qcap), J: cost(r.x), dt, eqErr: Math.abs(h(r.x)), iterations: r.iterations, kkt: r.kkt, lambda: (r.lambda[1] - r.lambda[0]) * J0 / dV, evals: r.evals };
+}
+const lerpAt = (ts, ys, t) => { if (t <= ts[0]) return ys[0]; const n = ts.length; if (t >= ts[n - 1]) return ys[n - 1]; let i = 1; while (ts[i] < t) i++; const f = (t - ts[i - 1]) / (ts[i] - ts[i - 1]); return ys[i - 1] + f * (ys[i] - ys[i - 1]); };
+async function taskOC(v, ctx) {
+  const B = batchModel(v), N = clamp(Math.round(v.ocN), 10, 2000), dV = B.V0 - B.Vf, qAvg = dV / B.T;
+  if (B.qmax * B.T < dV * 1.0005) throw new Error(`The flux limit of ${fmt(v.ocFluxMax)} L/m²·h cannot deliver ${fmt(dV, 4)} m³ of permeate in ${fmt(B.T)} h (average flux needed ${fmt(B.flux(qAvg), 4)} L/m²·h): raise the limit, the area or the cycle time.`);
+  ctx.progress(0.1, 'Pontryagin boundary-value problem (shooting on the costate)'); await ctx.tick();
+  const qFree = Math.max(20 * qAvg, 2 * B.qmax), pm = batchPMP(B, N, B.qmax), free = batchPMP(B, N, qFree);
+  ctx.progress(0.4, 'Euler–Lagrange equation (finite differences, Newton)'); await ctx.tick();
+  const Nel = Math.min(N, 80), el = eulerLagrangeBVP((V, vd) => -B.Lq(V, -vd), (V, vd) => B.LV(V, -vd), B.V0, B.Vf, B.T, Nel);
+  const elGap = Math.max(...el.t.map((t, k) => Math.abs(el.x[k] - lerpAt(free.t, free.x.map((x) => x[0]), t)))) / dV;
+  let elJ = 0; for (let k = 0; k < Nel; k++) elJ += (B.T / Nel) * B.L(0.5 * (el.x[k] + el.x[k + 1]), -el.v[k]);
+  ctx.progress(0.6, 'Direct transcription (nonlinear programme, SQP)'); await ctx.tick();
+  const Nd = Math.min(N, 24), tq = pm.t, qp = pm.u.map((u) => u[0]), cell = (k) => { const a0 = (k * B.T) / Nd, b0 = ((k + 1) * B.T) / Nd, pts = linspace(a0, b0, 9); return mean(pts.map((t) => lerpAt(tq, qp, t))); };
+  const nl = batchDirect(B, Nd, B.qmax, new Array(Nd).fill(qAvg)), pmCell = range(Nd).map(cell), nlGapQ = Math.max(...nl.q.map((q, k) => Math.abs(q - pmCell[k]))) / qAvg;
+  // reference policies: constant flux and constant pressure, integrated with the same RK4 rule
+  const policy = (qOf) => { const r = rk4((t, y) => { const q = qOf(y[0]); return [-q, B.L(y[0], q)]; }, [B.V0, 0], 0, B.T, N); return { t: r.t, V: r.y.map((y) => y[0]), q: r.y.map((y) => qOf(y[0])), J: r.y[N][1] }; };
+  const cf = policy(() => qAvg), endV = (Pf) => policy((V) => B.qOfP(V, Pf)).V[N] - B.Vf;
+  let Plo = B.P(B.V0, 0), Phi = B.P(B.Vf, B.qmax) + 5, cp = null;
+  if (endV(Phi) < 0) { const Pc = brentRoot(endV, Plo, Phi, endV(Plo), endV(Phi), 1e-12); cp = { ...policy((V) => B.qOfP(V, Pc)), P: Pc }; }
+  const Vp = pm.x.map((x) => x[0]), lam = pm.lam.map((l) => l[0]), Pp = Vp.map((V, k) => B.P(V, qp[k])), Hm = mean(pm.H), Hdrift = (Math.max(...pm.H) - Math.min(...pm.H)) / Math.max(1e-12, Math.abs(Hm));
+  const HfreeDrift = (Math.max(...free.H) - Math.min(...free.H)) / Math.max(1e-12, Math.abs(mean(free.H))), onLimit = (100 * qp.filter((q) => q >= B.qmax * (1 - 1e-9)).length) / qp.length;
+  const Emin = (B.pi0 * B.V0 * Math.log(B.V0 / B.Vf)) / 36, sec = (J) => J / dV, save = (J) => (100 * (J - pm.J)) / J, volErr = Math.abs(Vp[N] - B.Vf) / dV;
+  const fluxOf = (qs) => qs.map(B.flux), W = [], qFreeMax = Math.max(...free.u.map((u) => u[0]));
+  if (onLimit > 0.5) W.push({ level: 'info', msg: `The flux limit is active for ${fmt(onLimit, 3)} % of the cycle: the unconstrained Euler–Lagrange extremal would start at ${fmt(B.flux(qFreeMax), 3)} L/m²·h, so Pontryagin's principle clips the control at ${fmt(v.ocFluxMax)} L/m²·h and re-distributes the remaining volume.` });
+  else W.push({ level: 'info', msg: 'The flux limit is never reached: the constrained and unconstrained extremals coincide.' });
+  if (nlGapQ > 0.03) W.push({ level: 'warn', msg: `Direct transcription and the Pontryagin solution differ by up to ${fmt(100 * nlGapQ, 2)} % of the mean permeate rate — the nonlinear programme stopped before full convergence (${nl.iterations} SQP iterations).` });
+  if (Hdrift > 1e-4) W.push({ level: 'warn', msg: `The Hamiltonian varies by ${fmt(100 * Hdrift, 2)} % along the path; it should be constant for this autonomous problem — use more time steps.` });
+  if (!cp) W.push({ level: 'info', msg: 'No constant feed pressure inside the flux limit reaches the target volume; the constant-pressure reference is omitted.' });
+  const rows = [['Pontryagin optimum (flux limit enforced)', pm.J, sec(pm.J), Math.max(...Pp), Math.max(...fluxOf(qp)), 0], ['Direct transcription (NLP, SQP)', nl.J, sec(nl.J), Math.max(...nl.q.map((q, k) => B.P(B.V0 - sum(nl.q.slice(0, k + 1)) * nl.dt, q))), Math.max(...fluxOf(nl.q)), (100 * (nl.J - pm.J)) / pm.J],
+    ['Unconstrained extremal (Euler–Lagrange)', elJ, sec(elJ), Math.max(...free.x.map((x, k) => B.P(x[0], free.u[k][0]))), B.flux(qFreeMax), (100 * (elJ - pm.J)) / pm.J], ['Constant flux', cf.J, sec(cf.J), Math.max(...cf.V.map((V) => B.P(V, qAvg))), B.flux(qAvg), (100 * (cf.J - pm.J)) / pm.J],
+    ...(cp ? [['Constant feed pressure', cp.J, sec(cp.J), cp.P, Math.max(...fluxOf(cp.q)), (100 * (cp.J - pm.J)) / pm.J]] : []), ['Reversible limit (η = 1, no losses)', Emin, sec(Emin), null, null, (100 * (Emin - pm.J)) / pm.J]];
+  const ks = [...new Set(range(21).map((i) => Math.round((i * N) / 20)))];
+  return {
+    summary: `The energy-optimal batch cycle needs ${fmt(pm.J, 4)} kWh (${fmt(sec(pm.J), 4)} kWh/m³) to produce ${fmt(dV, 4)} m³ in ${fmt(B.T)} h — ${cp ? `${fmt(save(cp.J), 3)} % less than constant pressure and ` : ''}${fmt(save(cf.J), 3)} % less than constant flux. The Pontryagin shooting solution, the Euler–Lagrange boundary-value solution and the direct nonlinear programme agree, and the Hamiltonian is constant to ${fmt(100 * Hdrift, 2)} %.`,
+    warnings: W,
+    kpis: [
+      { label: 'Optimal cycle energy', value: pm.J, unit: 'kWh', status: 'ok' }, { label: 'Optimal specific energy', value: sec(pm.J), unit: 'kWh/m³' },
+      { label: 'Saving against constant flux', value: save(cf.J), unit: '%' }, ...(cp ? [{ label: 'Saving against constant pressure', value: save(cp.J), unit: '%' }] : []),
+      { label: 'Initial costate λ(0)', value: pm.lam0[0], unit: 'kWh/m³', help: 'Shadow price of permeate volume: the marginal energy of the next m³ at the start of the cycle.' }, { label: 'Final costate λ(T)', value: lam[N], unit: 'kWh/m³' },
+      { label: 'Hamiltonian drift along the path', value: Hdrift, unit: 'relative', status: Hdrift < 1e-4 ? 'ok' : 'warn', help: 'H = L − λ·q is conserved for a time-invariant problem; the drift is the integration error.' },
+      { label: 'Terminal-volume error', value: volErr, unit: 'of ΔV', status: volErr < 1e-6 ? 'ok' : 'warn', help: 'Residual of the terminal-state constraint V(T) = V_f after shooting.' },
+      { label: 'Euler–Lagrange vs Hamiltonian path', value: elGap, unit: 'of ΔV', status: elGap < 2e-3 ? 'ok' : 'warn', help: 'Largest difference in V(t) between the finite-difference Euler–Lagrange solution and the canonical (state–costate) solution of the unconstrained problem.' },
+      { label: 'NLP vs Pontryagin energy', value: (100 * (nl.J - pm.J)) / pm.J, unit: '%', status: Math.abs(nl.J - pm.J) / pm.J < 2e-3 ? 'ok' : 'warn', help: `Direct transcription with ${Nd} piecewise-constant intervals solved by SQP.` },
+      { label: 'Time on the flux limit', value: onLimit, unit: '%' }, { label: 'Peak feed pressure', value: Math.max(...Pp), unit: 'bar' }, { label: 'Reversible minimum energy', value: Emin, unit: 'kWh' },
+    ],
+    recommendations: [
+      'Program the feed-pump set-point to follow the optimal flux trajectory: nearly constant flux, tapered towards the end of the cycle where concentration polarisation is most expensive.',
+      onLimit > 0.5 ? 'Relaxing the flux limit (cleaner feed, better pre-treatment) would save further energy — the costate shows the marginal value.' : 'The flux limit is slack; a shorter cycle or less membrane area could be afforded.',
+      'Check the peak pressure against the element rating and the concentrate chemistry in suite 2 at the final concentration factor.',
+    ],
+    plots: [
+      { type: 'line', title: 'Control: permeate flux along the cycle', xlabel: 'Time (h)', ylabel: 'Flux (L/m²·h)', series: [{ name: 'Pontryagin optimum', x: pm.t, y: fluxOf(qp) }, { name: `Direct transcription (${Nd} intervals)`, x: range(Nd + 1).map((k) => k * nl.dt), y: fluxOf([...nl.q, nl.q[Nd - 1]]), mode: 'step' },
+        { name: 'Unconstrained extremal (Euler–Lagrange)', x: range(Nel).map((k) => (k + 0.5) * (B.T / Nel)), y: fluxOf(el.v.map((q) => -q)), dash: true }, ...(cp ? [{ name: 'Constant pressure', x: cp.t, y: fluxOf(cp.q), dash: true }] : [])], hlines: [{ y: v.ocFluxMax, label: 'flux limit' }] },
+      { type: 'line', title: 'State: tank volume', xlabel: 'Time (h)', ylabel: 'Volume (m³)', series: [{ name: 'Pontryagin optimum', x: pm.t, y: Vp }, { name: 'Euler–Lagrange (unconstrained)', x: el.t, y: el.x, dash: true }, ...(cp ? [{ name: 'Constant pressure', x: cp.t, y: cp.V, dash: true }] : [])], hlines: [{ y: B.Vf, label: 'terminal volume' }] },
+      { type: 'line', title: 'Costate (shadow price of volume) and marginal pumping energy', xlabel: 'Time (h)', ylabel: 'kWh/m³', series: [{ name: 'Costate λ(t)', x: pm.t, y: lam }, { name: '∂L/∂q at the applied control', x: pm.t, y: Vp.map((V, k) => B.Lq(V, qp[k])), dash: true }], note: 'Where the two curves coincide the control is interior (∂H/∂q = 0); where λ exceeds ∂L/∂q the control sits on its upper bound.' },
+      { type: 'line', title: 'Hamiltonian along the optimal path', xlabel: 'Time (h)', ylabel: 'H = L − λ·q (kW)', series: [{ name: 'Flux limit enforced', x: pm.t, y: pm.H }, { name: 'Unconstrained', x: free.t, y: free.H, dash: true }] },
+      { type: 'line', title: 'Feed pressure', xlabel: 'Time (h)', ylabel: 'Pressure (bar)', series: [{ name: 'Pontryagin optimum', x: pm.t, y: Pp }, { name: 'Constant flux', x: cf.t, y: cf.V.map((V) => B.P(V, qAvg)), dash: true }, { name: 'Osmotic pressure in the tank', x: pm.t, y: Vp.map(B.pi), dash: true }] },
+    ],
+    tables: [
+      { title: 'Operating policies compared', columns: ['Policy', 'Energy (kWh)', 'Specific energy (kWh/m³)', 'Peak pressure (bar)', 'Peak flux (L/m²·h)', 'Energy relative to optimum (%)'], rows,
+        note: 'The unconstrained extremal ignores the flux limit and is therefore a lower bound; the direct nonlinear programme solves the constrained problem on a coarser control grid.' },
+      { title: 'Optimal trajectory', columns: ['Time (h)', 'Volume (m³)', 'Flux (L/m²·h)', 'Feed pressure (bar)', 'Osmotic pressure (bar)', 'Costate λ (kWh/m³)', 'Hamiltonian (kW)'], rows: ks.map((k) => [pm.t[k], Vp[k], B.flux(qp[k]), Pp[k], B.pi(Vp[k]), lam[k], pm.H[k]]) },
+      { title: 'Formulation and solution evidence', columns: ['Item', 'Value'], rows: [['State and control', 'V(t) tank volume; q(t) permeate rate, 0 ≤ q ≤ q_max'], ['Running cost', 'L = P·q/(36·η), P = q/(A·A_m) + π₀·(V₀/V)·exp(J/k) + Δp'], ['Hamiltonian', 'H = L(V, q) − λ·q'],
+        ['Canonical equations', 'dV/dt = −q*, dλ/dt = −∂L/∂V, ∂L/∂q = λ (interior) or q* on a bound'], ['Boundary conditions', `V(0) = ${fmt(B.V0)}, V(T) = ${fmt(B.Vf, 5)} m³ (terminal-state constraint)`], ['Shooting residual', pm.residual], ['Euler–Lagrange residual', el.residual],
+        ['Hamiltonian drift, unconstrained path', HfreeDrift], ['NLP equality residual', nl.eqErr], ['NLP multiplier of the volume constraint (kWh/m³)', nl.lambda], ['SQP iterations / evaluations', `${nl.iterations} / ${nl.evals}`]] },
+    ],
+    balances: [{ name: 'Permeate volume (m³)', in: dV, out: B.V0 - Vp[N] }],
+    outputs: { task: 'oc', best: { energy: pm.J, sec: sec(pm.J), lambda0: pm.lam0[0], peakPressure: Math.max(...Pp), fluxStart: B.flux(qp[0]), fluxEnd: B.flux(qp[N]) }, objective: pm.J, study: { a: pm.J, b: pm.lam0[0] } },
+  };
+}
+
+// ---- Task 12: linear and mixed-integer programming — production scheduling of RO trains against a tariff --------------------------
+const tariffAt = (v, h) => (h >= 17 && h <= 21 ? v.lpPeak : h >= 7 && h <= 22 ? v.lpShoulder : v.lpOff);
+function lpTrainTable() { return [{ cap: 400, sec: 2.9, minLoad: 60, aux: 60 }, { cap: 400, sec: 3.1, minLoad: 60, aux: 60 }, { cap: 300, sec: 3.6, minLoad: 50, aux: 45 }]; }
+/** Build the scheduling model: load fractions x[i][t], unmet demand u[t] and on/off variables y[i][t]; storage rows are scaled by the tank volume. */
+function scheduleModel(v) {
+  const trains = numRows(v.lpTrains, ['cap', 'sec']).filter((r) => r.cap > 0).slice(0, 5).map((r) => ({ cap: r.cap, sec: Math.max(0, r.sec), min: clamp(finite(r.minLoad, 0), 0, 100) / 100, aux: Math.max(0, finite(r.aux, 0)) }));
+  if (!trains.length) throw new Error('The train table needs at least one row with a capacity and a specific energy.');
+  const NP = [4, 6, 8, 12, 24].includes(+v.lpPeriods) ? +v.lpPeriods : 8, h = 24 / NP, nT = trains.length, dm = mean(DEMAND);
+  const d = range(NP).map((t) => (Math.max(0, v.lpDemand) * mean(range(h).map((q) => DEMAND[t * h + q]))) / dm), p = range(NP).map((t) => mean(range(h).map((q) => tariffAt(v, t * h + q))));
+  const Smax = Math.max(1e-6, v.lpTank), S0 = (Smax * clamp(v.lpS0, 0, 100)) / 100, pen = Math.max(0, v.lpPenalty), n = 2 * nT * NP + NP, X = (i, t) => i * NP + t, U = (t) => nT * NP + t, Y = (i, t) => nT * NP + NP + i * NP + t;
+  const cScale = Math.max(1e-9, h * mean(p) * mean(trains.map((r) => r.sec * r.cap))), c = new Array(n).fill(0), rows = [], tag = [];
+  for (let t = 0; t < NP; t++) { c[U(t)] = (h * pen * Math.max(...d, 1)) / cScale; for (let i = 0; i < nT; i++) { c[X(i, t)] = (h * p[t] * trains[i].sec * trains[i].cap) / cScale; c[Y(i, t)] = (h * p[t] * trains[i].aux) / cScale; } }
+  const dMax = Math.max(...d, 1);
+  for (let t = 0; t < NP; t++) { // cumulative storage balance: S_t = S0 + h·Σ(production + unmet − demand)
+    const a = new Array(n).fill(0), cum = h * sum(d.slice(0, t + 1));
+    for (let q = 0; q <= t; q++) { a[U(q)] = (h * dMax) / Smax; for (let i = 0; i < nT; i++) a[X(i, q)] = (h * trains[i].cap) / Smax; }
+    rows.push({ a, op: '>=', b: (cum - S0) / Smax }); tag.push(['lo', t]);
+    rows.push({ a: [...a], op: '<=', b: (cum - S0 + Smax) / Smax }); tag.push(['hi', t]);
+    if (t === NP - 1) { rows.push({ a: [...a], op: '>=', b: cum / Smax }); tag.push(['end', t]); } // terminal condition: finish at least as full as at the start
+  }
+  for (let t = 0; t < NP; t++) for (let i = 0; i < nT; i++) {
+    const a1 = new Array(n).fill(0), a2 = new Array(n).fill(0), a3 = new Array(n).fill(0);
+    a1[X(i, t)] = 1; a1[Y(i, t)] = -1; rows.push({ a: a1, op: '<=', b: 0 }); tag.push(['cap', t, i]);
+    if (trains[i].min > 0) { a2[X(i, t)] = 1; a2[Y(i, t)] = -trains[i].min; rows.push({ a: a2, op: '>=', b: 0 }); tag.push(['min', t, i]); }
+    a3[Y(i, t)] = 1; rows.push({ a: a3, op: '<=', b: 1 }); tag.push(['on', t, i]);
+  }
+  const ints = range(nT * NP).map((q) => nT * NP + NP + q);
+  const read = (x) => {
+    const prod = range(NP).map((t) => trains.map((r, i) => r.cap * x[X(i, t)])), on = range(NP).map((t) => trains.map((_, i) => x[Y(i, t)])), unmet = range(NP).map((t) => dMax * x[U(t)]), level = [S0];
+    for (let t = 0; t < NP; t++) level.push(level[t] + h * (sum(prod[t]) + unmet[t] - d[t]));
+    const energy = sum(range(NP).map((t) => h * sum(trains.map((r, i) => r.sec * prod[t][i] + r.aux * on[t][i])))), cost = sum(range(NP).map((t) => h * p[t] * sum(trains.map((r, i) => r.sec * prod[t][i] + r.aux * on[t][i]))));
+    return { prod, on, unmet, level, energy, cost, penalty: h * pen * sum(unmet), total: cost + h * pen * sum(unmet) };
+  };
+  return { trains, NP, h, nT, d, p, Smax, S0, pen, c, rows, tag, ints, cScale, read, n };
+}
+async function taskLP(v, ctx) {
+  const M = scheduleModel(v), integer = v.lpMode !== 'lp';
+  ctx.progress(0.2, 'Simplex on the linear relaxation'); await ctx.tick();
+  const lp = lpSolve(M.c, M.rows);
+  if (lp.status !== 'optimal') throw new Error(`The linear programme is ${lp.status}: check the tank size, the demand and the train capacities.`);
+  ctx.progress(0.4, integer ? 'Branch and bound on the on/off variables' : 'Reading the solution'); await ctx.tick();
+  const mi = integer ? milpSolve(M.c, M.rows, M.ints, { maxNodes: clamp(Math.round(v.lpNodes), 10, 20000), maxWork: 8e8 }) : null;
+  if (mi && !Number.isFinite(mi.f)) throw new Error(`Branch and bound found no integer schedule within ${mi.nodes} nodes (${mi.status}); raise the node limit or relax the minimum loads.`);
+  const rel = M.read(lp.x), sol = mi ? M.read(mi.x) : rel, fOpt = (mi ? mi.f : lp.f) * M.cScale, fRel = lp.f * M.cScale, gap = mi ? mi.gap : 0, intGap = mi ? (100 * (mi.f - lp.f)) / Math.max(1e-12, Math.abs(mi.f)) : 0;
+  // flat reference: every train on all day at the same load fraction
+  const fr = Math.min(1, sum(M.d) / M.NP / sum(M.trains.map((r) => r.cap))), flatCost = sum(range(M.NP).map((t) => M.h * M.p[t] * sum(M.trains.map((r) => r.sec * r.cap * fr + r.aux))));
+  const water = M.h * sum(sol.prod.map(sum)), peakIdx = range(M.NP).filter((t) => M.p[t] >= Math.max(...M.p) - 1e-12), peakShare = (100 * sum(peakIdx.map((t) => sum(sol.prod[t])))) / Math.max(1e-9, sum(sol.prod.map(sum)));
+  const dualOf = (kind) => M.tag.map((g, r) => (g[0] === kind ? (lp.dual[r] * M.cScale) / M.Smax : null)).filter((q) => q !== null), dHi = dualOf('hi'), dLo = dualOf('lo'), dEnd = dualOf('end')[0];
+  const tankValue = -sum(dHi), W = [], names = M.trains.map((_, i) => `Train ${i + 1}`), per = range(M.NP).map((t) => `${String(t * M.h).padStart(2, '0')}–${String((t + 1) * M.h).padStart(2, '0')} h`);
+  if (sum(sol.unmet) > 1e-6) W.push({ level: 'bad', msg: `Demand cannot be met in full: ${fmt(M.h * sum(sol.unmet), 4)} m³ is left unserved — add capacity or storage.` });
+  if (mi && mi.status === 'node limit') W.push({ level: 'warn', msg: `Branch and bound stopped at its search limit (${mi.nodes} nodes, ${mi.lpIterations} simplex pivots) with an optimality gap of ${fmt(100 * gap, 3)} %; the schedule shown is the best integer solution found.` });
+  else if (mi) W.push({ level: 'info', msg: `Branch and bound proved optimality after ${mi.nodes} nodes and ${mi.lpIterations} simplex pivots; the linear relaxation is ${fmt(intGap, 3)} % cheaper than the best on/off schedule.` });
+  else W.push({ level: 'info', msg: `Linear programme solved in ${lp.iterations} simplex pivots; minimum loads and auxiliary power are relaxed (trains may run at any fraction).` });
+  return {
+    summary: `${integer ? 'Mixed-integer' : 'Linear'} programme with ${M.n} variables and ${M.rows.length} constraints: the cheapest schedule costs ${fmt(fOpt, 5)} $/d (${fmt(fOpt / Math.max(1e-9, water), 4)} $/m³ energy), ${fmt((100 * (flatCost - sol.cost)) / flatCost, 3)} % below running every train at constant load, with ${fmt(peakShare, 3)} % of production in the peak-tariff periods.`,
+    warnings: W,
+    kpis: [
+      { label: 'Optimal daily energy cost', value: fOpt, unit: '$/d', status: sum(sol.unmet) > 1e-6 ? 'bad' : 'ok' }, { label: 'Saving against constant load', value: (100 * (flatCost - sol.cost)) / flatCost, unit: '%' },
+      { label: 'LP relaxation (lower bound)', value: fRel, unit: '$/d' }, { label: 'Integrality gap', value: intGap, unit: '%', help: 'Cost of the on/off and minimum-load restrictions relative to the relaxed linear programme.' },
+      { label: 'Optimality gap', value: 100 * gap, unit: '%', status: gap < 1e-6 ? 'ok' : 'warn', help: 'Distance between the best integer solution and the best remaining bound of the branch-and-bound tree.' },
+      { label: 'Branch-and-bound nodes', value: mi ? mi.nodes : 0 }, { label: 'Simplex pivots', value: mi ? mi.lpIterations : lp.iterations },
+      { label: 'Energy used', value: sol.energy, unit: 'kWh/d' }, { label: 'Water produced', value: water, unit: 'm³/d' }, { label: 'Production in peak periods', value: peakShare, unit: '%' },
+      { label: 'Value of one more m³ of storage', value: tankValue, unit: '$/d per m³', help: 'Sum of the dual values of the tank-full constraints of the linear relaxation.' }, { label: 'Marginal cost of the end-of-day level', value: finite(dEnd), unit: '$ per m³' },
+    ],
+    recommendations: [
+      tankValue > 1e-9 ? `Storage is binding: each additional m³ of tank volume is worth ${fmt(tankValue, 3)} $/d in the relaxed problem.` : 'The tank never limits the schedule; storage is not the bottleneck.',
+      'Feed the per-period production targets to the plant supervisor; the predictive-control task of this suite can track them.',
+      'Re-run with the measured specific energy of each train (suite 12) and the site tariff (Global Site Data).',
+    ],
+    plots: [
+      { type: 'bar', title: 'Optimal production per period', ylabel: 'm³/h', stacked: true, categories: per, series: names.map((nm, i) => ({ name: nm, values: sol.prod.map((r) => r[i]) })) },
+      { type: 'line', title: 'Tank level and tariff', xlabel: 'Hour of day', ylabel: 'Tank level (% of volume)', series: [{ name: integer ? 'Level, on/off schedule' : 'Level, LP schedule', x: range(M.NP + 1).map((t) => t * M.h), y: sol.level.map((s) => (100 * s) / M.Smax), mode: 'both' }, ...(integer ? [{ name: 'Level, LP relaxation', x: range(M.NP + 1).map((t) => t * M.h), y: rel.level.map((s) => (100 * s) / M.Smax), dash: true }] : []),
+        { name: 'Tariff (¢/kWh)', x: range(M.NP + 1).map((t) => t * M.h), y: [...M.p, M.p[M.NP - 1]].map((q) => 100 * q), mode: 'step', dash: true }], hlines: [{ y: 100, label: 'full' }, { y: 0, label: 'empty' }] },
+      { type: 'bar', title: 'Demand and production', ylabel: 'm³/h', categories: per, series: [{ name: 'Demand', values: M.d }, { name: 'Production', values: sol.prod.map(sum) }, ...(integer ? [{ name: 'Production, LP relaxation', values: rel.prod.map(sum) }] : [])] },
+      { type: 'bar', title: 'Shadow prices of the storage constraints (LP relaxation)', ylabel: '$/d per m³', categories: per, series: [{ name: 'Tank full', values: dHi.map((q) => -q) }, { name: 'Tank empty', values: dLo }] },
+    ],
+    tables: [
+      { title: 'Schedule', columns: ['Period', 'Tariff ($/kWh)', 'Demand (m³/h)', ...names.map((nm) => `${nm} (m³/h)`), ...(integer ? names.map((nm) => `${nm} on`) : []), 'Unmet (m³/h)', 'Level at end (%)'],
+        rows: range(M.NP).map((t) => [per[t], M.p[t], M.d[t], ...sol.prod[t], ...(integer ? sol.on[t].map((q) => (q > 0.5 ? 'on' : 'off')) : []), sol.unmet[t], (100 * sol.level[t + 1]) / M.Smax]) },
+      { title: 'Solutions compared', columns: ['Schedule', 'Energy cost ($/d)', 'Energy (kWh/d)', 'Unmet demand (m³/d)'], rows: [['Constant load, all trains on', flatCost, sum(range(M.NP).map((t) => M.h * sum(M.trains.map((r) => r.sec * r.cap * fr + r.aux)))), 0], ['Linear relaxation', rel.cost, rel.energy, M.h * sum(rel.unmet)], ...(integer ? [['On/off schedule (branch and bound)', sol.cost, sol.energy, M.h * sum(sol.unmet)]] : [])] },
+      { title: 'Trains', columns: ['Train', 'Capacity (m³/h)', 'Specific energy (kWh/m³)', 'Minimum load (%)', 'Auxiliary power when on (kW)', 'Hours on', 'Mean load when on (%)'], rows: M.trains.map((r, i) => { const onH = M.h * sum(sol.on.map((q) => q[i])); return [names[i], r.cap, r.sec, 100 * r.min, r.aux, onH, onH > 1e-9 ? (100 * M.h * sum(sol.prod.map((q) => q[i]))) / (onH * r.cap) : 0]; }),
+        note: 'Model: minimise Σ tariff·(specific energy·production + auxiliary power·on) subject to the cumulative storage balance 0 ≤ S ≤ S_max, S(end) ≥ S(start), capacity·on ≥ production ≥ minimum load·on. The linear programme is solved by a two-phase simplex method; integrality by branch and bound on its relaxation.' },
+    ],
+    balances: [{ name: 'Water over the day (m³)', in: M.S0 + water + M.h * sum(sol.unmet), out: sol.level[M.NP] + M.h * sum(M.d) }],
+    outputs: { task: 'lp', best: { cost: fOpt, energy: sol.energy, peakShare, production: sol.prod.map(sum), level: sol.level }, objective: fOpt, relaxation: fRel, gap, study: { a: fOpt, b: fRel } },
+  };
+}
+
+// ---- Task 13: neural ordinary differential equation -----------------------------------------------------------------------------
+/** Built-in record: four runs between cleanings following dK/dt = −0.09·(K − 0.7)^1.6 (unknown to the model) with measurement noise. */
+function nodeSampleTable() {
+  const g = rng(404), rows = [];
+  [1.0, 0.94, 0.88, 0.97].forEach((K0, r) => {
+    const s = rk4((t, y) => [-0.09 * Math.max(0, y[0] - 0.7) ** 1.6], [K0], 0, 120, 120);
+    for (let k = 0; k <= 120; k += 8) rows.push({ run: r + 1, t: k, y: +(s.y[k][0] + (k ? g.normal(0, 0.003) : 0)).toFixed(4) });
+  });
+  return rows;
+}
+async function taskNODE(v, ctx) {
+  const rows = numRows(v.nodeData, ['run', 't', 'y']), ids = [...new Set(rows.map((r) => r.run))].sort((a, b) => a - b);
+  const runs = ids.map((id) => { const q = rows.filter((r) => r.run === id).sort((a, b) => a.t - b.t).filter((r, i, a) => !i || r.t > a[i - 1].t); return { id, t: q.map((r) => r.t - q[0].t), y: q.map((r) => r.y) }; }).filter((r) => r.t.length >= 3);
+  if (!runs.length) throw new Error('The trajectory table needs at least one run with three or more time-ordered rows (run, t, y).');
+  let train, test, mode;
+  if (runs.length >= 2) { const hold = runs.find((r) => r.id === Math.round(v.nodeHold)) || runs[runs.length - 1]; train = runs.filter((r) => r !== hold); test = [{ ...hold }]; mode = `run ${hold.id} held out`; }
+  else { const r = runs[0], k = Math.max(3, Math.round(0.7 * r.t.length)); if (r.t.length - k < 2) throw new Error('A single run needs at least six rows so that its last part can be held out.'); train = [{ id: r.id, t: r.t.slice(0, k), y: r.y.slice(0, k) }]; test = [{ id: r.id, t: r.t.slice(k - 1).map((q) => q - r.t[k - 1]), y: r.y.slice(k - 1), t0: r.t[k - 1] }]; mode = 'last 30 % of the run held out'; }
+  const all = train.flatMap((r) => r.y), ym = mean(all), ys = std(all) || 1, slopes = train.flatMap((r) => range(r.t.length - 1).map((i) => (r.y[i + 1] - r.y[i]) / ys / (r.t[i + 1] - r.t[i]))), tSpan = Math.max(...runs.map((r) => r.t[r.t.length - 1])) || 1, tRef = clamp(1 / (Math.sqrt(mean(slopes.map((q) => q * q))) || 1 / tSpan), tSpan / 50, tSpan), H = clamp(Math.round(v.nodeH), 2, 32), sub = clamp(Math.round(v.nodeSub), 1, 10), seed = Math.round(v.seed);
+  const scale = (r) => ({ t: r.t.map((q) => q / tRef), y: r.y.map((q) => [(q - ym) / ys]) }), trS = train.map(scale);
+  ctx.progress(0.1, 'Training the neural ODE (back-propagation through RK4)'); await ctx.tick();
+  const fit = nodeTrain(1, H, trS, { epochs: clamp(Math.round(v.nodeEpochs), 20, 20000), lr: v.nodeLr, seed, sub });
+  ctx.progress(0.8, 'Held-out trajectory and gradient check'); await ctx.tick();
+  const predict = (r, ts) => nodeSolve(fit.p, 1, H, [(r.y[0] - ym) / ys], ts.map((q) => q / tRef), sub).map((q) => ym + ys * q[0]);
+  const err = (set, f) => Math.sqrt(mean(set.flatMap((r) => { const p = f(r); return r.y.slice(1).map((q, i) => (p[i + 1] - q) ** 2); })));
+  // baseline: first-order law y' = −r·(y − y∞) with the closed-form solution, fitted to the same training runs
+  const lin = levenbergMarquardt((p) => train.flatMap((r) => r.t.slice(1).map((t, i) => p[1] + (r.y[0] - p[1]) * Math.exp(-p[0] * t) - r.y[i + 1])), [1 / tRef, Math.min(...all) - 0.5 * ys], { lo: [0, -1e9], hi: [1e3 / tRef, 1e9] }).p;
+  const linPred = (r) => r.t.map((t) => lin[1] + (r.y[0] - lin[1]) * Math.exp(-lin[0] * t));
+  const eTr = err(train, (r) => predict(r, r.t)), eTe = err(test, (r) => predict(r, r.t)), bTr = err(train, linPred), bTe = err(test, linPred);
+  // adjoint gradient against central differences on a few parameters
+  const lg = nodeLossGrad(fit.p, 1, H, trS, sub), gIdx = [0, H, 2 * H, 3 * H].filter((i) => i < fit.p.length);
+  const p0 = nodeInit(1, H, seed + 5), l0 = nodeLossGrad(p0, 1, H, trS, sub);
+  const gErr = Math.max(...gIdx.map((i) => { const w = Float64Array.from(p0), hh = 1e-6; w[i] += hh; const a = nodeLossGrad(w, 1, H, trS, sub).loss; w[i] -= 2 * hh; const b = nodeLossGrad(w, 1, H, trS, sub).loss; return Math.abs((a - b) / (2 * hh) - l0.grad[i]) / Math.max(1e-12, maxAbs(Array.from(l0.grad))); }));
+  const yLo = Math.min(...runs.flatMap((r) => r.y)), yHi = Math.max(...runs.flatMap((r) => r.y)), yy = linspace(yLo, yHi, 40), z = new Array(H), o = [0];
+  const rhs = yy.map((q) => (ys / tRef) * nodeF(fit.p, 1, H, [(q - ym) / ys], z, o)[0]), fd = train.flatMap((r) => range(r.t.length - 1).map((i) => [0.5 * (r.y[i] + r.y[i + 1]), (r.y[i + 1] - r.y[i]) / (r.t[i + 1] - r.t[i])]));
+  const W = [], better = eTe < bTe;
+  W.push({ level: 'info', msg: `Validation: ${mode}. The network was trained on ${train.length} run${train.length > 1 ? 's' : ''} (${sum(train.map((r) => r.t.length - 1))} fitted points) and never saw the held-out data.` });
+  if (eTe > 3 * eTr && eTe > 0.02 * ys) W.push({ level: 'warn', msg: `The held-out error (${fmt(eTe, 3)}) is ${fmt(eTe / eTr, 3)} times the training error — the learned dynamics do not generalise; add runs covering the held-out range or reduce the network.` });
+  if (!better) W.push({ level: 'warn', msg: 'The first-order baseline predicts the held-out trajectory at least as well as the neural ODE: the data do not support a more flexible law.' });
+  const t0 = (r) => r.t0 || 0, dense = (r) => linspace(0, r.t[r.t.length - 1], 40);
+  return {
+    summary: `A neural ODE dy/dt = f_θ(y) with ${H} hidden neurons (${fit.nParams} parameters), integrated by RK4 and trained by back-propagation through the integrator, reproduces the training runs to an RMS error of ${fmt(eTr, 3)} and the held-out trajectory to ${fmt(eTe, 3)} (first-order baseline: ${fmt(bTe, 3)}).`,
+    warnings: W,
+    kpis: [
+      { label: 'Held-out trajectory RMSE', value: eTe, status: better ? 'ok' : 'warn', help: 'Error on data never used for training, in the units of y.' }, { label: 'Training RMSE', value: eTr },
+      { label: 'Baseline held-out RMSE', value: bTe, help: 'First-order law y′ = −r·(y − y∞) fitted to the same training runs.' }, { label: 'Improvement on baseline', value: (100 * (bTe - eTe)) / Math.max(1e-300, bTe), unit: '%', status: better ? 'ok' : 'warn' },
+      { label: 'Adjoint gradient check', value: gErr, unit: 'relative', status: gErr < 1e-5 ? 'ok' : 'warn', help: 'Largest difference between the back-propagated gradient and central finite differences, relative to the largest gradient entry.' },
+      { label: 'Network parameters', value: fit.nParams }, { label: 'Final training loss (scaled)', value: fit.loss }, { label: 'Gradient norm at the end', value: Math.hypot(...lg.grad) },
+      { label: 'Baseline rate constant', value: lin[0], unit: '1/time' }, { label: 'Baseline plateau y∞', value: lin[1] },
+    ],
+    recommendations: [
+      'Use the learned right-hand side inside the Kalman estimator or a predictive controller only within the range of y covered by the training runs (see the phase plot).',
+      better ? 'The neural law beats the first-order model on unseen data — the decline is not a simple exponential.' : 'Keep the first-order model: it is simpler and predicts the held-out data equally well.',
+      'Hold out a different run and re-train to check that the conclusion does not depend on the split.',
+    ],
+    plots: [
+      { type: 'line', title: 'Trajectories: data and neural ODE', xlabel: 'Time', ylabel: 'y', series: [...train.flatMap((r) => [{ name: `Run ${r.id} data`, x: r.t, y: r.y, mode: 'points' }, { name: `Run ${r.id} neural ODE`, x: dense(r), y: predict(r, dense(r)) }]),
+        ...test.flatMap((r) => [{ name: `Held-out run ${r.id} data`, x: r.t.map((q) => q + t0(r)), y: r.y, mode: 'points' }, { name: 'Held-out prediction', x: dense(r).map((q) => q + t0(r)), y: predict(r, dense(r)), dash: true }, { name: 'First-order baseline', x: r.t.map((q) => q + t0(r)), y: linPred(r), dash: true }])] },
+      { type: 'line', title: 'Learned right-hand side (phase plot)', xlabel: 'y', ylabel: 'dy/dt', series: [{ name: 'Neural ODE f_θ(y)', x: yy, y: rhs }, { name: 'First-order baseline', x: yy, y: yy.map((q) => -lin[0] * (q - lin[1])), dash: true }, { name: 'Finite differences of the training data', x: fd.map((q) => q[0]), y: fd.map((q) => q[1]), mode: 'points' }] },
+      { type: 'line', title: 'Training loss', xlabel: 'Epoch', ylabel: 'Mean squared error (scaled)', logy: true, series: [{ name: 'Loss', x: fit.history.epoch, y: fit.history.loss.map((q) => Math.max(q, 1e-300)) }] },
+    ],
+    tables: [
+      { title: 'Errors by run', columns: ['Run', 'Role', 'Points', 'Neural ODE RMSE', 'Baseline RMSE'], rows: [...train.map((r) => [r.id, 'training', r.t.length, err([r], (q) => predict(q, q.t)), err([r], linPred)]), ...test.map((r) => [r.id, 'held out', r.t.length, err([r], (q) => predict(q, q.t)), err([r], linPred)])] },
+      { title: 'Held-out trajectory', columns: ['Time', 'Measured', 'Neural ODE', 'Baseline'], rows: test.flatMap((r) => { const p = predict(r, r.t), b = linPred(r); return r.t.map((t, i) => [t + t0(r), r.y[i], p[i], b[i]]); }) },
+      { title: 'Model', columns: ['Item', 'Value'], rows: [['Right-hand side', `dy/dt = W₂·tanh(W₁·y + b₁) + b₂, ${H} hidden neurons`], ['Integrator', `Classical RK4, ${sub} step(s) per sampling interval`], ['Gradient', 'Discrete adjoint: reverse sweep through every RK4 stage'], ['Scaling', `y standardised (mean ${fmt(ym)}, s.d. ${fmt(ys)}), time divided by ${fmt(tRef)} so that the scaled slopes are of order one`], ['Optimiser', `Adam, ${Math.round(v.nodeEpochs)} epochs, learning rate decaying from ${fmt(v.nodeLr)}`]] },
+    ],
+    outputs: { task: 'node', best: { heldOutRmse: eTe, trainRmse: eTr, baselineRmse: bTe }, objective: eTe, study: { a: eTe, b: eTr } },
+  };
+}
+
+// ---- Task 14: neural partial differential equation (learned reaction closure inside the transport solver) ------------------------
+async function taskNPDE(v, ctx) {
+  const L = Math.max(1e-9, v.npL), vel = v.npV, D = Math.max(0, v.npD), tEnd = Math.max(1e-9, v.npT), nx = clamp(Math.round(v.npNx), 6, 200), nt = clamp(Math.round(v.npNt), 6, 2000), H = clamp(Math.round(v.npH), 2, 24), seed = Math.round(v.seed);
+  const kmax = Math.max(0, v.npKmax), Km = Math.max(1e-9, v.npKm), hidden = (u) => (-kmax * Math.max(0, u)) / (Km + Math.max(0, u)), cTrain = [v.npC1, v.npC2].map((q) => Math.max(1e-6, q)), cTest = Math.max(1e-6, v.npCtest), g = rng(seed + 31);
+  const uRef = Math.max(...cTrain, cTest), rRef = (uRef * Math.max(Math.abs(vel), D / L, L / tEnd)) / L, dt = tEnd / nt, nObs = 6, kObs = range(nObs).map((q) => Math.round(((q + 1) * nt) / nObs)), theta = 0.5;
+  const bc = (cin) => ({ left: { type: 'dirichlet', val: cin }, right: { type: 'neumann', val: 0 } });
+  /** "Measured" fields: the finite-volume solver on a twice finer grid with the hidden law, averaged onto the model cells. */
+  const truth = (cin) => { const s = solveCDR({ L, nx: 2 * nx, tEnd, nt: 2 * nt, v: vel, D, R: (u) => hidden(u), ic: () => 0, left: { type: 'dirichlet', val: () => cin }, right: { type: 'neumann', val: () => 0 }, theta: 0.5, nSave: 2 * nt }); return kObs.map((k) => range(nx).map((i) => 0.5 * (s.U[2 * k][2 * i] + s.U[2 * k][2 * i + 1]))); };
+  const mkExp = (cin, noisy) => { const T = truth(cin); return { cin, op: cdrOperator({ L, nx, v: vel, D, ...bc(cin) }), u0: zeros(nx), nt, dt, clean: T, obs: T.map((u, q) => ({ k: kObs[q], u: u.map((w) => w + (noisy ? g.normal(0, (v.npNoise / 100) * cin) : 0)) })) }; };
+  ctx.progress(0.05, 'Generating the experiments with the finite-volume solver'); await ctx.tick();
+  const exps = cTrain.map((c) => mkExp(c, true)), exT = mkExp(cTest, false), sc = { uRef, rRef, theta };
+  const p = nodeInit(1, H, seed, 0.2), st = { t: 0, m: new Float64Array(p.length), v: new Float64Array(p.length) }, epochs = clamp(Math.round(v.npEpochs), 10, 5000), hist = { ep: [], loss: [] }, every = Math.max(1, Math.floor(epochs / 100));
+  const g0 = npdeLossGrad(p, H, exps, sc), gi = [0, H, 2 * H, 3 * H], gErr = Math.max(...gi.map((i) => { const w = Float64Array.from(p), hh = 1e-6; w[i] += hh; const a = npdeLossGrad(w, H, exps, sc).loss; w[i] -= 2 * hh; const b = npdeLossGrad(w, H, exps, sc).loss; return Math.abs((a - b) / (2 * hh) - g0.grad[i]) / Math.max(1e-300, maxAbs(Array.from(g0.grad))); }));
+  let best = Infinity, bestP = Float64Array.from(p);
+  for (let ep = 0; ep < epochs; ep++) {
+    const r = npdeLossGrad(p, H, exps, sc);
+    if (!Number.isFinite(r.loss)) break;
+    if (r.loss < best) { best = r.loss; bestP.set(p); }
+    if (ep % every === 0) { hist.ep.push(ep); hist.loss.push(r.loss); }
+    adamStep(p, r.grad, st, v.npLr * 0.05 ** (ep / epochs));
+    if (ep % 40 === 39) { ctx.progress(0.1 + (0.7 * ep) / epochs, `Training the closure: epoch ${ep + 1} of ${epochs}`); await ctx.tick(); }
+  }
+  const net = npdeClosure(bestP, H, uRef, rRef);
+  // baseline closure R = −k·u with k fitted by golden-section search on the same loss
+  const lossOf = (clos, set) => { let s = 0, m = 0; for (const ex of set) { const U = imexMarch(ex.op, ex.u0, nt, dt, clos, theta); for (const ob of ex.obs) for (let i = 0; i < nx; i++) { s += (U[ob.k][i] - ob.u[i]) ** 2; m++; } } return s / m; };
+  let ka = 0, kb = (4 * kmax) / Km + 4 / tEnd; const gr = 0.381966;
+  for (let it = 0; it < 40; it++) { const k1 = ka + gr * (kb - ka), k2 = kb - gr * (kb - ka); if (lossOf((u) => -k1 * u, exps) < lossOf((u) => -k2 * u, exps)) kb = k2; else ka = k1; }
+  const kLin = 0.5 * (ka + kb), rel = (clos) => Math.sqrt(lossOf(clos, [exT])) / cTest, eNN = rel(net), eLin = rel((u) => -kLin * u), eNone = rel(() => 0), eTrain = Math.sqrt(lossOf(net, exps)) / mean(cTrain);
+  // the learned closure inside the Crank–Nicolson/Picard finite-volume solver: consistency of the two discretisations
+  const UT = imexMarch(exT.op, exT.u0, nt, dt, net, theta), fv = solveCDR({ L, nx, tEnd, nt, v: vel, D, R: (u) => net(u), ic: () => 0, left: { type: 'dirichlet', val: () => cTest }, right: { type: 'neumann', val: () => 0 }, theta: 0.5, nSave: nt });
+  const fvGap = Math.max(...fv.u.map((q, i) => Math.abs(q - UT[nt][i]))) / cTest, uu = linspace(0, uRef, 40), closErr = Math.sqrt(mean(uu.map((u) => (net(u) - hidden(u)) ** 2))) / Math.max(1e-300, Math.abs(hidden(uRef)));
+  const x = exT.op.x, last = (ex) => ex.obs[nObs - 1].u, W = [], better = eNN < eLin;
+  W.push({ level: 'info', msg: `The data are a synthetic experiment: the finite-volume solver on ${2 * nx} cells with a hidden saturating law, ${fmt(v.npNoise)} % noise, inlet concentrations ${cTrain.map((c) => fmt(c)).join(' and ')}; the test inlet ${fmt(cTest)} was not used for training.` });
+  if (!better) W.push({ level: 'warn', msg: 'The fitted first-order closure predicts the unseen experiment at least as well as the network — train longer or widen the range of inlet concentrations.' });
+  if (fvGap > 0.02) W.push({ level: 'warn', msg: `The explicit-closure scheme and the Crank–Nicolson/Picard solver differ by ${fmt(100 * fvGap, 2)} % with the learned closure: the time step is too coarse for the reaction rate.` });
+  return {
+    summary: `A network with ${H} hidden neurons learned the reaction term R(u) of the transport equation from concentration snapshots of ${cTrain.length} experiments, by the discrete adjoint of the finite-volume scheme. On an unseen inlet concentration the predicted fields are within ${fmt(100 * eNN, 3)} % RMS (fitted first-order law: ${fmt(100 * eLin, 3)} %, no reaction: ${fmt(100 * eNone, 3)} %).`,
+    warnings: W,
+    kpis: [
+      { label: 'Unseen-experiment field error', value: 100 * eNN, unit: '% of inlet', status: better ? 'ok' : 'warn' }, { label: 'Training field error', value: 100 * eTrain, unit: '% of inlet' },
+      { label: 'First-order closure, unseen error', value: 100 * eLin, unit: '% of inlet' }, { label: 'No-reaction model, unseen error', value: 100 * eNone, unit: '% of inlet' },
+      { label: 'Closure error against the hidden law', value: 100 * closErr, unit: '% of R(u_max)', help: 'RMS difference between the learned and the generating reaction term over the concentration range.' },
+      { label: 'Adjoint gradient check', value: gErr, unit: 'relative', status: gErr < 1e-5 ? 'ok' : 'warn', help: 'Adjoint gradient against central finite differences at the initial parameters.' },
+      { label: 'Closure inside the finite-volume solver', value: 100 * fvGap, unit: '% of inlet', status: fvGap < 0.02 ? 'ok' : 'warn', help: 'Final profile of the Crank–Nicolson/Picard solver with the learned closure against the training scheme.' },
+      { label: 'Fitted first-order rate', value: kLin, unit: '1/s' }, { label: 'Outlet concentration, unseen case', value: UT[nt][nx - 1] }, { label: 'Network parameters', value: p.length },
+    ],
+    recommendations: [
+      'Replace the synthetic experiments by measured profiles only after the closure has been recovered on a case like this one: it shows how much data and which concentration range are needed.',
+      'A closure is only identified inside the range of concentrations seen in training (see the reaction-term plot).',
+      'Use the workbench PDE task for the same equation with a reaction term you type yourself.',
+    ],
+    plots: [
+      { type: 'line', title: 'Reaction term: learned closure and hidden law', xlabel: 'Concentration u', ylabel: 'R(u)', series: [{ name: 'Neural closure', x: uu, y: uu.map(net) }, { name: 'Hidden law (generates the data)', x: uu, y: uu.map(hidden), dash: true }, { name: 'Fitted first-order law', x: uu, y: uu.map((u) => -kLin * u), dash: true }] },
+      { type: 'line', title: 'Final profiles: data and model', xlabel: 'x (m)', ylabel: 'u', series: [...exps.flatMap((ex) => [{ name: `Training data, inlet ${fmt(ex.cin)}`, x, y: last(ex), mode: 'points' }, { name: `Model, inlet ${fmt(ex.cin)}`, x, y: imexMarch(ex.op, ex.u0, nt, dt, net, theta)[nt] }]),
+        { name: `Unseen data, inlet ${fmt(cTest)}`, x, y: last(exT), mode: 'points' }, { name: 'Prediction, unseen inlet', x, y: UT[nt], dash: true }, { name: 'First-order closure, unseen inlet', x, y: imexMarch(exT.op, exT.u0, nt, dt, (u) => -kLin * u, theta)[nt], dash: true }] },
+      { type: 'field', title: 'Predicted field for the unseen inlet concentration', xlabel: 'x (m)', ylabel: 't (s)', zlabel: 'u', x, y: range(nt + 1).map((k) => k * dt), z: UT, cmap: 'salinity', contours: 8 },
+      { type: 'line', title: 'Training loss', xlabel: 'Epoch', ylabel: 'Mean squared field error', logy: true, series: [{ name: 'Loss', x: hist.ep, y: hist.loss.map((q) => Math.max(q, 1e-300)) }] },
+    ],
+    tables: [
+      { title: 'Field errors (RMS, relative to the inlet concentration)', columns: ['Model', 'Training experiments (%)', 'Unseen experiment (%)'], rows: [['Neural closure', 100 * eTrain, 100 * eNN], ['First-order closure R = −k·u', (100 * Math.sqrt(lossOf((u) => -kLin * u, exps))) / mean(cTrain), 100 * eLin], ['No reaction', (100 * Math.sqrt(lossOf(() => 0, exps))) / mean(cTrain), 100 * eNone]] },
+      { title: 'Unseen experiment: outlet history', columns: ['Time (s)', 'Reference', 'Neural closure', 'First-order closure'], rows: (() => { const Ul = imexMarch(exT.op, exT.u0, nt, dt, (u) => -kLin * u, theta); return kObs.map((k, q) => [k * dt, exT.clean[q][nx - 1], UT[k][nx - 1], Ul[k][nx - 1]]); })() },
+      { title: 'Formulation', columns: ['Item', 'Value'], rows: [['Equation', '∂u/∂t + v·∂u/∂x = D·∂²u/∂x² + R_θ(u)'], ['Closure', `R_θ(u) = r_ref·[W₂·tanh(W₁·u/u_ref + b₁) + b₂], ${H} hidden neurons`], ['Boundary conditions', 'inlet: fixed concentration; outlet: zero gradient'], ['Discretisation', `${nx} finite volumes, ${nt} steps, transport implicit (Crank–Nicolson), closure explicit`], ['Gradient', 'Discrete adjoint: transposed tri-diagonal solves backwards in time'], ['Data', `${cTrain.length} experiments × ${nObs} snapshots × ${nx} cells`]] },
+    ],
+    outputs: { task: 'npde', best: { unseenError: eNN, closureError: closErr, firstOrderRate: kLin }, objective: eNN, study: { a: UT[nt][nx - 1], b: eNN } },
+  };
+}
+
+// ---- Task 15: reduced-order model of the transient polarisation layer (POD–Galerkin) ------------------------------------------------
+/** Galerkin projection of du/dt = A·u + s on u = uRef + Σ aₖ·φₖ, integrated with Crank–Nicolson; returns the reduced coordinates at every step. */
+export function galerkinROM(op, modes, uRef, nt, dt) {
+  const r = modes.length, n = op.n, hom = { ...op, s0: 0, s1: 0 }, lin = (u) => u.map((q, i) => (i > 0 ? hom.lo[i] * u[i - 1] : 0) + hom.di[i] * q + (i < n - 1 ? hom.hi[i] * u[i + 1] : 0));
+  const APhi = modes.map(lin), Ar = modes.map((pi) => APhi.map((ap) => dot(pi, ap))), g = modes.map((pi) => dot(pi, op.apply(uRef)));
+  const Ml = range(r).map((i) => range(r).map((j) => (i === j ? 1 : 0) - 0.5 * dt * Ar[i][j])), Mr = range(r).map((i) => range(r).map((j) => (i === j ? 1 : 0) + 0.5 * dt * Ar[i][j])), Minv = invert(Ml), step = matMul(Minv, Mr), drive = matVec(Minv, g.map((q) => dt * q));
+  const out = [zeros(r)];
+  for (let k = 0; k < nt; k++) { const a = matVec(step, out[k]); out.push(a.map((q, i) => q + drive[i])); }
+  return { a: out, Ar, lift: (a) => uRef.map((q, j) => { let s = q; for (let k = 0; k < r; k++) s += a[k] * modes[k][j]; return s; }) };
+}
+async function taskROM(v, ctx) {
+  const delta = Math.max(1e-9, v.romDelta * 1e-6), D = Math.max(1e-15, v.romD * 1e-9), cb = Math.max(1e-9, v.romCb), tEnd = Math.max(1e-9, v.romT), nx = clamp(Math.round(v.romNx), 8, 400), nt = clamp(Math.round(v.romNt), 10, 5000), nSnap = clamp(Math.round(v.romSnap), 4, 60);
+  const J = (lmh) => lmh / 3.6e6, jTrain = [v.romJ1, v.romJ2].map((q) => Math.max(0, q)), jTest = Math.max(0, v.romJt), left = { type: 'dirichlet', val: cb }, right = { type: 'noflux', val: 0 }, uRef = new Array(nx).fill(cb), dt = tEnd / nt;
+  const fom = (lmh, save) => solveCDR({ L: delta, nx, tEnd, nt, v: J(lmh), D, ic: () => cb, left: { type: 'dirichlet', val: () => cb }, right: { type: 'noflux', val: () => 0 }, theta: 0.5, nSave: save });
+  ctx.progress(0.1, 'Full-order snapshots'); await ctx.tick();
+  const runs = jTrain.map((j) => fom(j, nSnap)), S = runs.flatMap((r) => r.U.slice(1).map((u) => u.map((q) => q - cb)));
+  ctx.progress(0.35, 'Proper orthogonal decomposition'); await ctx.tick();
+  const pod = podBasis(S, { center: false, rmax: 12 }), nModes = pod.modes.length;
+  if (!nModes) throw new Error('The snapshots do not vary: set a non-zero flux so that a polarisation layer develops.');
+  const r = v.romR >= 1 ? Math.min(nModes, Math.round(v.romR)) : Math.max(1, Math.min(nModes, pod.energy.findIndex((e) => e >= 0.999999) + 1 || nModes));
+  const ref = fom(jTest, nt), opT = cdrOperator({ L: delta, nx, v: J(jTest), D, left, right }), norm2 = (U) => Math.sqrt(mean(U.flatMap((u) => u.map((q) => (q - cb) ** 2)))) || 1e-300;
+  const romErr = (k) => { const R = galerkinROM(opT, pod.modes.slice(0, k), uRef, nt, dt); let s = 0, m = 0; for (let q = 0; q <= nt; q++) { const u = R.lift(R.a[q]); for (let i = 0; i < nx; i++) { s += (u[i] - ref.U[q][i]) ** 2; m++; } } return { rom: R, err: Math.sqrt(s / m) / norm2(ref.U) }; };
+  const projErr = (k, snaps) => { const Ph = pod.modes.slice(0, k); let s = 0, m = 0; for (const f of snaps) { const a = Ph.map((ph) => dot(ph, f)); for (let i = 0; i < nx; i++) { let q = f[i]; for (let j = 0; j < k; j++) q -= a[j] * Ph[j][i]; s += q * q; m++; } } return Math.sqrt(s / m) / (Math.sqrt(mean(snaps.flatMap((f) => f.map((q) => q * q)))) || 1e-300); };
+  ctx.progress(0.6, 'Galerkin reduced-order model at the unseen flux'); await ctx.tick();
+  const ks = range(nModes).map((k) => k + 1), sweep = ks.map(romErr), pe = ks.map((k) => projErr(k, S)), peT = ks.map((k) => projErr(k, ref.U.map((u) => u.map((q) => q - cb)))), R = sweep[r - 1].rom, uEnd = R.lift(R.a[nt]);
+  // consistency of the operator used for the projection with the finite-volume solver: full-order Crank–Nicolson march in the original space
+  const full = imexMarch(opT, uRef, nt, dt, () => 0, 0.5), opGap = Math.max(...full[nt].map((q, i) => Math.abs(q - ref.u[i]))) / cb;
+  const wall = (u) => 1.5 * u[nx - 1] - 0.5 * u[nx - 2], t = range(nt + 1).map((k) => k * dt), wF = ref.U.map(wall), wR = R.a.map((a) => wall(R.lift(a))), Pe = (J(jTest) * delta) / D, cpExact = Math.exp(Pe), tau = (delta * delta) / D;
+  const W = [], e = sweep[r - 1].err;
+  W.push({ level: 'info', msg: `Snapshots were taken at ${jTrain.map((q) => fmt(q)).join(' and ')} L/m²·h; the reduced model is evaluated at ${fmt(jTest)} L/m²·h, which is ${jTest >= Math.min(...jTrain) && jTest <= Math.max(...jTrain) ? 'inside' : 'OUTSIDE'} the sampled range.` });
+  if (e > 0.02) W.push({ level: 'warn', msg: `The reduced model with ${r} mode${r > 1 ? 's' : ''} misses the full solution by ${fmt(100 * e, 3)} % — retain more modes or add snapshots closer to the target flux.` });
+  if (tEnd < 2 * tau) W.push({ level: 'info', msg: `The simulated time (${fmt(tEnd)} s) is shorter than two diffusion times δ²/D = ${fmt(tau, 3)} s: the layer has not reached its steady state.` });
+  return {
+    summary: `Proper orthogonal decomposition of ${S.length} finite-volume snapshots gives ${nModes} modes; ${r} of them capture ${fmt(100 * pod.energy[r - 1], 8)} % of the fluctuation energy. The Galerkin reduced model (${r} unknowns instead of ${nx}) reproduces the full solution at an unseen flux to ${fmt(100 * e, 3)} % in space and time, and the wall concentration factor to ${fmt(wR[nt] / cb, 5)} against ${fmt(wF[nt] / cb, 5)}.`,
+    warnings: W,
+    kpis: [
+      { label: 'Modes retained', value: r }, { label: 'Energy captured', value: 100 * pod.energy[r - 1], unit: '%' }, { label: 'Reduced-model error at the unseen flux', value: 100 * e, unit: '%', status: e < 0.02 ? 'ok' : 'warn', help: 'RMS difference to the full-order solution over all cells and time levels, relative to the RMS concentration rise.' },
+      { label: 'Projection error of the training snapshots', value: 100 * pe[r - 1], unit: '%' }, { label: 'Projection error of the unseen solution', value: 100 * peT[r - 1], unit: '%', help: 'Best possible error of this basis for the unseen case; the Galerkin error cannot be lower.' },
+      { label: 'Polarisation factor, reduced model', value: wR[nt] / cb, unit: '–' }, { label: 'Polarisation factor, full model', value: wF[nt] / cb, unit: '–' }, { label: 'Steady film-theory value exp(J·δ/D)', value: cpExact, unit: '–' },
+      { label: 'Unknowns per time step', value: `${nx} → ${r}` }, { label: 'Operator consistency with the finite-volume solver', value: opGap, unit: 'relative', status: opGap < 1e-8 ? 'ok' : 'warn', help: 'Full-order march with the projected operator against the solver that produced the snapshots.' },
+    ],
+    recommendations: ['Use the reduced model where the full one is called thousands of times (optimisation, control, uncertainty): it is exact only inside the sampled parameter range.', 'Check the error-versus-modes plot: add modes until the Galerkin error meets the projection error.', 'The full transient solver with user-defined terms is in the workbench PDE task.'],
+    plots: [
+      { type: 'line', title: 'Energy not captured and error versus number of modes', xlabel: 'Number of modes', ylabel: 'Relative value', logy: true, series: [{ name: 'Energy not captured', x: ks, y: pod.energy.map((q) => Math.max(1 - q, 1e-16)), mode: 'both' }, { name: 'Galerkin error, unseen flux', x: ks, y: sweep.map((q) => Math.max(q.err, 1e-16)), mode: 'both' }, { name: 'Projection error, unseen flux', x: ks, y: peT.map((q) => Math.max(q, 1e-16)), mode: 'both', dash: true }], vlines: [{ x: r, label: 'retained' }] },
+      { type: 'line', title: 'POD modes', xlabel: 'Distance from the bulk (µm)', ylabel: 'Mode shape', series: pod.modes.slice(0, Math.min(4, nModes)).map((m, k) => ({ name: `Mode ${k + 1} (σ = ${fmt(pod.sigma[k], 3)})`, x: opT.x.map((q) => q * 1e6), y: m })) },
+      { type: 'line', title: 'Wall concentration at the unseen flux', xlabel: 'Time (s)', ylabel: 'Concentration at the membrane (g/L)', series: [{ name: `Full model (${nx} cells)`, x: t, y: wF }, { name: `Reduced model (${r} modes)`, x: t, y: wR, dash: true }], hlines: [{ y: cb * cpExact, label: 'steady film theory' }] },
+      { type: 'line', title: 'Final profile at the unseen flux', xlabel: 'Distance from the bulk (µm)', ylabel: 'Concentration (g/L)', series: [{ name: 'Full model', x: opT.x.map((q) => q * 1e6), y: ref.u }, { name: 'Reduced model', x: opT.x.map((q) => q * 1e6), y: uEnd, mode: 'points' }] },
+    ],
+    tables: [
+      { title: 'Modes, energy and errors', columns: ['Modes', 'Singular value', 'Cumulative energy (%)', 'Projection error, training (%)', 'Projection error, unseen (%)', 'Galerkin error, unseen (%)'], rows: ks.map((k, i) => [k, pod.sigma[i], 100 * pod.energy[i], 100 * pe[i], 100 * peT[i], 100 * sweep[i].err]) },
+      { title: 'Formulation', columns: ['Item', 'Value'], rows: [['Full model', `∂c/∂t + J·∂c/∂x = D·∂²c/∂x², c = c_b at the bulk edge, zero salt flux at the membrane; ${nx} finite volumes, ${nt} Crank–Nicolson steps`], ['Snapshots', `${S.length} profiles from ${jTrain.length} training fluxes`], ['Decomposition', 'Method of snapshots: Jacobi eigen-decomposition of the snapshot covariance'], ['Reduced model', 'Galerkin projection of the finite-volume operator on the modes, lifted by the bulk concentration'], ['Film Péclet number J·δ/D', Pe], ['Diffusion time δ²/D (s)', tau]] },
+    ],
+    outputs: { task: 'rom', best: { modes: r, error: e, cpFactor: wR[nt] / cb }, objective: e, study: { a: wR[nt] / cb, b: wF[nt] / cb } },
+  };
+}
+
+// ---- Shared data builder for the ensemble and multi-fidelity tasks -----------------------------------------------------------------
+function doeDims(v, base) {
+  return [{ key: 'recovery', label: 'Recovery (%)', lo: v.recLo, hi: v.recHi, nom: base.recovery }, { key: 'targetFlux', label: 'Average flux (L/m²·h)', lo: v.fluxLo, hi: v.fluxHi, nom: base.targetFlux },
+    { key: 'T', label: 'Temperature (°C)', lo: Math.max(5, base.T - 8), hi: Math.min(42, base.T + 8), nom: base.T }, { key: 'salinityFactor', label: 'Salinity multiplier (×)', lo: 0.9, hi: 1.15, nom: 1 }].filter((d) => d.hi > d.lo);
+}
+const cubeTo = (dims, u) => u.map((q, j) => dims[j].lo + q * (dims[j].hi - dims[j].lo));
+/** Zero-dimensional RO model (log-mean osmotic pressure, one average flux): the cheapest fidelity level. */
+function lumpedRO(inp) {
+  const R = clamp(inp.recovery / 100, 0.01, 0.98), piF = osmoticPressureIons(scaleIons(cloneIons(inp.ions), inp.salinityFactor ?? 1), inp.T) / 1e5, tc = 1 + 0.03 * (inp.T - 25), ln = -Math.log(1 - R) / R;
+  const Pf = inp.Pp + 1.1 * piF * ln + inp.targetFlux / Math.max(0.05, inp.A * inp.ff * tc) + 0.7, erd = inp.erd === 'none' ? 0 : inp.erdEff / 100, etaM = (inp.etaMotor ?? 95) / 100;
+  const sec = (Pf / (36 * (inp.etaPump / 100) * etaM)) * (inp.erd === 'px' ? 1 + ((1 - erd) * (1 - R)) / R : (1 - erd * (inp.etaPump / 100) * (1 - R)) / R), Bs = inp.B * tc;
+  return { sec, Pf, tds: (Bs * tds(scaleIons(cloneIons(inp.ions), inp.salinityFactor ?? 1)) * ln * 1.1) / (inp.targetFlux + Bs) };
+}
+const MF_TARGET = { sec: { label: 'Specific energy', unit: 'kWh/m³' }, Pf: { label: 'Feed pressure', unit: 'bar' }, tds: { label: 'Product TDS', unit: 'mg/L' } };
+
+// ---- Task 16: ensemble models (bagging, out-of-bag error, model averaging) ---------------------------------------------------------
+async function taskENS(v, ctx) {
+  const seed = Math.round(v.seed), fromRO = v.mlSource !== 'table';
+  let X = [], y = [], names, yName, yUnit;
+  if (fromRO) {
+    const base = roBase(v), tg = ML_TARGET[v.mlTarget] || ML_TARGET.sec, dims = doeDims(v, base), U = lhs(clamp(Math.round(v.mlN), 20, 400), dims.length, seed);
+    if (dims.length < 2) throw new Error('Widen the recovery and flux bounds: the design-of-experiments needs at least two varying inputs.');
+    for (let i = 0; i < U.length; i++) { const x = cubeTo(dims, U[i]), e = evalDesign({ ...base, ...Object.fromEntries(dims.map((d, j) => [d.key, x[j]])) }, v); if (e.ok && Number.isFinite(tg.f(e))) { X.push(x); y.push(tg.f(e)); } if (i % 12 === 11) { ctx.progress(0.02 + (0.4 * i) / U.length, `Plant simulation ${i + 1} of ${U.length}`); await ctx.tick(); } }
+    names = dims.map((d) => d.label); yName = tg.label; yUnit = tg.unit;
+  } else {
+    const rows = numRows(v.mlData, ['y']), cols = ['x1', 'x2', 'x3', 'x4', 'x5', 'x6'].filter((k) => rows.length && rows.every((r) => isNum(r[k])) && new Set(rows.map((r) => r[k])).size > 1);
+    if (!cols.length) throw new Error('The data table needs at least one fully numeric, non-constant input column (x1…x6) and a y column.');
+    X = rows.map((r) => cols.map((k) => r[k])); y = rows.map((r) => r.y); names = cols; yName = 'y'; yUnit = '';
+  }
+  const n = X.length, d = X[0]?.length || 0;
+  if (n < Math.max(16, d + 10)) throw new Error(`Only ${n} usable data rows: at least ${Math.max(16, d + 10)} are needed for an ensemble with a test set.`);
+  const perm = shuffled(n, rng(seed + 1)), nTe = Math.max(4, Math.round((n * clamp(v.ensTest, 5, 40)) / 100)), iTe = perm.slice(0, nTe), iTr = perm.slice(nTe), take = (idx, A) => idx.map((i) => A[i]);
+  const Xtr = take(iTr, X), ytr = take(iTr, y), Xte = take(iTe, X), yte = take(iTe, y), B = clamp(Math.round(v.ensB), 3, 60), hid = clamp(Math.round(v.ensH), 2, 24), ep = clamp(Math.round(v.ensEpochs), 20, 3000);
+  const learner = (kind) => (Xa, ya, b) => (kind === 'poly' ? polyFit(Xa, ya).predict : nnTrain(Xa, ya, { hidden: [hid], epochs: ep, lr: 0.02, seed: seed + 100 + b }).predict);
+  const fitM = v.ensBase === 'poly' ? learner('poly') : v.ensBase === 'mix' ? (Xa, ya, b) => learner(b % 2 ? 'poly' : 'nn')(Xa, ya, b) : learner('nn');
+  ctx.progress(0.45, `Training ${B} bootstrap members`); await ctx.tick();
+  const bag = bagEnsemble(Xtr, ytr, fitM, { B, seed: seed + 3 });
+  ctx.progress(0.8, 'Reference models and averaging'); await ctx.tick();
+  const single = fitM(Xtr, ytr, 0), P = Xte.map((x) => bag.predict(x)), eEns = rmse(P.map((p) => p.mean), yte), eSingle = rmse(Xte.map(single), yte), eMem = range(B).map((b) => rmse(P.map((p) => p.all[b]), yte));
+  const mseMem = mean(eMem.map((q) => q * q)), ambiguity = mean(P.map((p) => mean(p.all.map((q) => (q - p.mean) ** 2)))), ident = Math.abs(mseMem - eEns * eEns - ambiguity) / Math.max(1e-300, mseMem);
+  const bySize = range(B).map((k) => rmse(Xte.map((x) => bag.predict(x, k + 1).mean), yte)), absErr = P.map((p, i) => Math.abs(p.mean - yte[i])), cover = (100 * P.filter((p, i) => absErr[i] <= 2 * p.sd).length) / nTe, rho = finite(spearman(absErr, P.map((p) => p.sd)));
+  // averaging of the three surrogate families trained once on the same rows
+  const fam = [['Polynomial response surface', polyFit(Xtr, ytr).predict], ['Gaussian process', ((gp) => (x) => gp.predict(x).mean)(gpFit(Xtr, ytr))], ['Neural network', nnTrain(Xtr, ytr, { hidden: [hid], epochs: ep, lr: 0.02, seed }).predict]], eFam = fam.map(([, f]) => rmse(Xte.map(f), yte)), avg = (x) => mean(fam.map(([, f]) => f(x))), eAvg = rmse(Xte.map(avg), yte);
+  const span = Math.max(...y) - Math.min(...y) || 1, bl = rmse(yte.map(() => mean(ytr)), yte), W = [], j0 = 0, xs = linspace(Math.min(...X.map((x) => x[j0])), Math.max(...X.map((x) => x[j0])), 30), mid = range(d).map((j) => mean(X.map((x) => x[j]))), sl = xs.map((q) => bag.predict(mid.map((m, j) => (j === j0 ? q : m))));
+  W.push({ level: 'info', msg: `Each member saw a bootstrap resample; ${bag.oob.n} of ${Xtr.length} training rows have an out-of-bag prediction. The out-of-bag error (${fmt(bag.oob.rmse, 3)}) estimates the test error (${fmt(eEns, 3)}) without a test set.` });
+  if (bag.oob.rmse > 2 * eEns || eEns > 2 * bag.oob.rmse) W.push({ level: 'warn', msg: `The out-of-bag estimate (${fmt(bag.oob.rmse, 3)}) and the test error (${fmt(eEns, 3)}) differ by more than a factor of two: the test set is small or contains points unlike the training rows — do not rely on either figure alone.` });
+  if (cover < 60) W.push({ level: 'warn', msg: `Only ${fmt(cover, 3)} % of the test points fall inside ± 2 member standard deviations: the spread measures disagreement between members, not the full prediction error — do not use it as a confidence interval without calibration.` });
+  if (eEns > eSingle * 1.02) W.push({ level: 'info', msg: 'The bagged ensemble is not more accurate than one model trained on all rows: this learner is already stable on these data (bagging helps high-variance learners).' });
+  return {
+    summary: `A bagged ensemble of ${B} ${v.ensBase === 'poly' ? 'response surfaces' : v.ensBase === 'mix' ? 'networks and response surfaces' : 'neural networks'} predicts ${lcFirst(yName)} with a test RMSE of ${fmt(eEns, 3)} ${yUnit} (single model ${fmt(eSingle, 3)}, mean member ${fmt(Math.sqrt(mseMem), 3)}); the out-of-bag estimate is ${fmt(bag.oob.rmse, 3)} and the mean member spread ${fmt(mean(P.map((p) => p.sd)), 3)} ${yUnit}.`,
+    warnings: W,
+    kpis: [
+      { label: 'Ensemble test RMSE', value: eEns, unit: yUnit, status: eEns <= eSingle * 1.02 ? 'ok' : 'warn' }, { label: 'Single-model test RMSE', value: eSingle, unit: yUnit }, { label: 'Mean member test RMSE', value: Math.sqrt(mseMem), unit: yUnit },
+      { label: 'Out-of-bag RMSE', value: bag.oob.rmse, unit: yUnit, help: 'Each training row predicted only by the members that did not see it.' }, { label: 'Mean member spread', value: mean(P.map((p) => p.sd)), unit: yUnit },
+      { label: 'Test points inside ± 2 spreads', value: cover, unit: '%', status: cover >= 60 ? 'ok' : 'warn' }, { label: 'Rank correlation of spread and error', value: rho, unit: '–' },
+      { label: 'Ambiguity decomposition residual', value: ident, unit: 'relative', status: ident < 1e-9 ? 'ok' : 'warn', help: 'Mean member MSE = ensemble MSE + mean member variance must hold exactly.' },
+      { label: 'Averaged surrogate families, test RMSE', value: eAvg, unit: yUnit, help: 'Equal-weight average of response surface, Gaussian process and network.' }, { label: 'Test RMSE of the mean (no model)', value: bl, unit: yUnit }, { label: 'Ensemble error relative to the data range', value: (100 * eEns) / span, unit: '%' },
+    ],
+    recommendations: ['Use the ensemble mean for prediction and the member spread as a flag for inputs where the models disagree (sparse data, extrapolation).', 'The out-of-bag error is a free validation estimate: compare it with the test error before trusting it on new data.', 'Bagging lowers variance, not bias: if all members share the same systematic error, add data or change the model family.'],
+    plots: [
+      { type: 'line', title: 'Test error versus ensemble size', xlabel: 'Members averaged', ylabel: `Test RMSE (${yUnit || 'units of y'})`, series: [{ name: 'Bagged ensemble', x: range(B).map((k) => k + 1), y: bySize, mode: 'both' }], hlines: [{ y: eSingle, label: 'single model' }, { y: bag.oob.rmse, label: 'out-of-bag estimate' }] },
+      { type: 'line', title: 'Predicted against actual (test set)', xlabel: `Actual ${yName}`, ylabel: `Predicted ${yName}`, series: [{ name: 'Ensemble mean', x: yte, y: P.map((p) => p.mean), mode: 'points' }, { name: 'Single model', x: yte, y: Xte.map(single), mode: 'points' }, { name: 'Perfect', x: [Math.min(...yte), Math.max(...yte)], y: [Math.min(...yte), Math.max(...yte)], dash: true }] },
+      { type: 'line', title: 'Member spread against absolute error (test set)', xlabel: 'Member standard deviation', ylabel: 'Absolute error of the ensemble mean', series: [{ name: 'Test points', x: P.map((p) => p.sd), y: absErr, mode: 'points' }] },
+      { type: 'line', title: `Ensemble along ${names[j0]} (other inputs at their mean)`, xlabel: names[j0], ylabel: `${yName}${yUnit ? ` (${yUnit})` : ''}`, series: [{ name: 'Ensemble mean', x: xs, y: sl.map((p) => p.mean) }, { name: 'Mean + 2 spreads', x: xs, y: sl.map((p) => p.mean + 2 * p.sd), dash: true }, { name: 'Mean − 2 spreads', x: xs, y: sl.map((p) => p.mean - 2 * p.sd), dash: true }, ...range(Math.min(4, B)).map((b) => ({ name: `Member ${b + 1}`, x: xs, y: sl.map((p) => p.all[b]), dash: true }))] },
+      { type: 'bar', title: 'Test RMSE of members and combinations', ylabel: yUnit || 'units of y', categories: ['Best member', 'Mean member', 'Worst member', 'Bagged ensemble', 'Single model', ...fam.map((f) => f[0]), 'Family average'], series: [{ name: 'Test RMSE', values: [Math.min(...eMem), Math.sqrt(mseMem), Math.max(...eMem), eEns, eSingle, ...eFam, eAvg] }] },
+    ],
+    tables: [
+      { title: 'Ensemble evidence', columns: ['Quantity', 'Value'], rows: [['Training rows / test rows', `${Xtr.length} / ${nTe}`], ['Members', B], ['Mean member MSE', mseMem], ['Ensemble MSE', eEns * eEns], ['Mean member variance (ambiguity)', ambiguity], ['Out-of-bag RMSE', bag.oob.rmse], ['Test RMSE of the ensemble', eEns], ['Rows with an out-of-bag prediction', bag.oob.n]], note: 'Ambiguity decomposition (Krogh & Vedelsby): the ensemble error equals the mean member error minus the mean member variance, so an ensemble is never worse than its average member.' },
+      { title: 'Surrogate families and their average', columns: ['Model', 'Test RMSE', 'Relative to data range (%)'], rows: [...fam.map((f, i) => [f[0], eFam[i], (100 * eFam[i]) / span]), ['Equal-weight average', eAvg, (100 * eAvg) / span], ['Bagged ensemble', eEns, (100 * eEns) / span]] },
+      { title: 'Test predictions', columns: [...names, `Actual ${yName}`, 'Ensemble mean', 'Member spread', 'Single model'], rows: Xte.slice(0, 30).map((x, i) => [...x, yte[i], P[i].mean, P[i].sd, single(x)]) },
+    ],
+    outputs: { task: 'ens', best: { rmse: eEns, oobRmse: bag.oob.rmse, singleRmse: eSingle, members: B }, objective: eEns, study: { a: eEns, b: bag.oob.rmse } },
+  };
+}
+
+// ---- Task 17: multi-fidelity surrogate (recursive co-kriging) ------------------------------------------------------------------------
+async function taskMF(v, ctx) {
+  const seed = Math.round(v.seed), base = roBase(v), dims = doeDims(v, base), d = dims.length, key = MF_TARGET[v.mfTarget] ? v.mfTarget : 'sec', tg = MF_TARGET[key], segH = clamp(Math.round(v.mfSegH), 2, 6), lumped = v.mfLow === 'lumped';
+  if (d < 2) throw new Error('Widen the recovery and flux bounds: the design-of-experiments needs at least two varying inputs.');
+  const inpOf = (x) => ({ ...base, ...Object.fromEntries(dims.map((q, j) => [q.key, x[j]])) }), pick = (e) => (key === 'sec' ? e.m.sec : key === 'Pf' ? e.m.Pf : e.m.tds);
+  const high = (x) => { const e = evalDesign({ ...inpOf(x), nSeg: segH }, v); return e.ok ? pick(e) : NaN; }, low = (x) => { if (lumped) return lumpedRO(inpOf(x))[key]; const e = evalDesign({ ...inpOf(x), nSeg: 1 }, v); return e.ok ? pick(e) : NaN; };
+  const nH = clamp(Math.round(v.mfNH), d + 2, 60), nL = Math.max(nH + 2, clamp(Math.round(v.mfNL), 6, 300)), nT = clamp(Math.round(v.mfNT), 5, 100), ratio = lumped ? 0 : 1 / segH, nS = Math.max(nH, Math.round(nH + ratio * nL));
+  const sample = async (U, f, msg, p0, p1) => { const X = [], y = []; for (let i = 0; i < U.length; i++) { const x = cubeTo(dims, U[i]), q = f(x); if (Number.isFinite(q)) { X.push(x); y.push(q); } if (i % 6 === 5) { ctx.progress(p0 + ((p1 - p0) * i) / U.length, `${msg} ${i + 1} of ${U.length}`); await ctx.tick(); } } return { X, y }; };
+  const UH = lhs(nH, d, seed), UL = [...UH, ...lhs(nL - nH, d, seed + 1)]; // nested design: every high-fidelity point is also a low-fidelity point
+  const tL0 = Date.now(), Lo = await sample(UL, low, 'Low-fidelity run', 0.02, 0.2), tL = (Date.now() - tL0) / Math.max(1, UL.length), tH0 = Date.now(), Hi = await sample(UH, high, 'High-fidelity run', 0.2, 0.4), tH = (Date.now() - tH0) / Math.max(1, UH.length);
+  const Te = await sample(lhs(nT, d, seed + 2), high, 'Test run', 0.4, 0.65), Sf = nS > nH ? await sample(lhs(nS, d, seed + 3), high, 'Equal-cost single-fidelity run', 0.65, 0.85) : Hi;
+  if (Hi.X.length < d + 2 || Te.X.length < 4 || Lo.X.length < 6) throw new Error('Too few simulations converged: widen the bounds or check the plant inputs.');
+  ctx.progress(0.88, 'Co-kriging and reference surrogates'); await ctx.tick();
+  const ck = coKrige(Lo.X, Lo.y, Hi.X, Hi.y), gpH = gpFit(Hi.X, Hi.y), gpS = Sf === Hi ? gpH : gpFit(Sf.X, Sf.y);
+  const pMF = Te.X.map((x) => ck.predict(x)), eMF = rmse(pMF.map((p) => p.mean), Te.y), eH = rmse(Te.X.map((x) => gpH.predict(x).mean), Te.y), eS = rmse(Te.X.map((x) => gpS.predict(x).mean), Te.y), loT = Te.X.map(low), eL = rmse(loT, Te.y), eLgp = rmse(pMF.map((p) => p.low), Te.y);
+  const span = Math.max(...Te.y) - Math.min(...Te.y) || 1, cover = (100 * pMF.filter((p, i) => Math.abs(p.mean - Te.y[i]) <= 2 * p.sd + 1e-12).length) / Te.y.length, win = eMF < eS, W = [];
+  const j0 = 0, xs = linspace(dims[j0].lo, dims[j0].hi, 25), at = (q) => dims.map((dm, j) => (j === j0 ? q : clamp(dm.nom, dm.lo, dm.hi))), slMF = xs.map((q) => ck.predict(at(q))), xs7 = linspace(dims[j0].lo, dims[j0].hi, 7), hiSl = xs7.map((q) => high(at(q)));
+  W.push({ level: 'info', msg: `Cost accounting: one low-fidelity run counts as ${lumped ? '0' : fmt(ratio, 3)} high-fidelity run${lumped ? ' (algebraic model)' : ` (1 of ${segH} segments per element)`}, so ${nH} high + ${Lo.X.length} low runs cost as much as ${nS} high-fidelity runs; measured times were ${fmt(tL, 3)} and ${fmt(tH, 3)} ms per run.` });
+  if (!win) W.push({ level: 'warn', msg: `At equal cost the single-fidelity Gaussian process (${nS} runs) is as accurate as the co-kriging model: the low-fidelity model is ${lumped ? 'too different from' : 'too expensive relative to'} the high-fidelity one to pay off here.` });
+  if (Math.abs(ck.rho) < 0.3) W.push({ level: 'warn', msg: `The scaling factor ρ = ${fmt(ck.rho, 3)} is small: the two fidelity levels are poorly correlated.` });
+  return {
+    summary: `Co-kriging of ${Hi.X.length} high-fidelity and ${Lo.X.length} low-fidelity runs predicts ${lcFirst(tg.label)} with a test RMSE of ${fmt(eMF, 3)} ${tg.unit}, against ${fmt(eH, 3)} for a Gaussian process on the same ${Hi.X.length} high-fidelity runs and ${fmt(eS, 3)} for one given the same total cost (${nS} runs); the low-fidelity model alone is off by ${fmt(eL, 3)} ${tg.unit}.`,
+    warnings: W,
+    kpis: [
+      { label: 'Multi-fidelity test RMSE', value: eMF, unit: tg.unit, status: win ? 'ok' : 'warn' }, { label: 'Single fidelity, same high-fidelity runs', value: eH, unit: tg.unit }, { label: 'Single fidelity, equal cost', value: eS, unit: tg.unit },
+      { label: 'Low-fidelity model alone', value: eL, unit: tg.unit, help: 'Systematic error of the cheap model against the high-fidelity test runs.' }, { label: 'Error reduction at equal cost', value: (100 * (eS - eMF)) / Math.max(1e-300, eS), unit: '%', status: win ? 'ok' : 'warn' },
+      { label: 'Scaling factor ρ', value: ck.rho, unit: '–', help: 'y_high ≈ ρ·y_low + δ(x)' }, { label: 'Discrepancy model', value: ck.kind, help: 'Form of δ(x) chosen by cross-validation on the high-fidelity runs: constant, linear trend or Gaussian process.' }, { label: 'Test points inside ± 2 σ', value: cover, unit: '%' }, { label: 'Equivalent high-fidelity cost', value: nS, unit: 'runs' },
+      { label: 'Multi-fidelity error relative to range', value: (100 * eMF) / span, unit: '%' }, { label: 'High / low fidelity runs', value: `${Hi.X.length} / ${Lo.X.length}` },
+    ],
+    recommendations: [win ? 'Spend the simulation budget on many cheap runs plus a few accurate ones: the discrepancy is smoother than the response itself.' : 'For this response the accurate model is cheap enough to sample directly.', 'Place the next high-fidelity run where the co-kriging standard deviation is largest.', 'Use the surrogate in the optimisation and uncertainty tasks only inside the sampled bounds.'],
+    plots: [
+      { type: 'line', title: 'Predicted against high-fidelity test runs', xlabel: `High-fidelity ${tg.label} (${tg.unit})`, ylabel: `Predicted (${tg.unit})`, series: [{ name: 'Co-kriging', x: Te.y, y: pMF.map((p) => p.mean), mode: 'points' }, { name: 'Single fidelity, equal cost', x: Te.y, y: Te.X.map((x) => gpS.predict(x).mean), mode: 'points' }, { name: 'Low-fidelity model', x: Te.y, y: loT, mode: 'points' }, { name: 'Perfect', x: [Math.min(...Te.y), Math.max(...Te.y)], y: [Math.min(...Te.y), Math.max(...Te.y)], dash: true }] },
+      { type: 'line', title: `Fidelity levels along ${dims[j0].label}`, xlabel: dims[j0].label, ylabel: `${tg.label} (${tg.unit})`, series: [{ name: 'Co-kriging mean', x: xs, y: slMF.map((p) => p.mean) }, { name: 'Co-kriging ± 2 σ (upper)', x: xs, y: slMF.map((p) => p.mean + 2 * p.sd), dash: true }, { name: 'Co-kriging ± 2 σ (lower)', x: xs, y: slMF.map((p) => p.mean - 2 * p.sd), dash: true },
+        { name: 'Low-fidelity model', x: xs, y: xs.map((q) => low(at(q))), dash: true }, { name: 'High-fidelity model', x: xs7.filter((_, i) => Number.isFinite(hiSl[i])), y: hiSl.filter(Number.isFinite), mode: 'points' }, { name: 'Single fidelity, equal cost', x: xs, y: xs.map((q) => gpS.predict(at(q)).mean), dash: true }] },
+      { type: 'bar', title: 'Test RMSE by model', ylabel: tg.unit, categories: ['Low fidelity alone', `GP on ${Hi.X.length} high runs`, `GP on ${Sf.X.length} high runs (equal cost)`, 'Co-kriging'], series: [{ name: 'Test RMSE', values: [eL, eH, eS, eMF] }] },
+      { type: 'line', title: 'Discrepancy δ(x) = y_high − ρ·y_low at the test points', xlabel: `High-fidelity ${tg.label} (${tg.unit})`, ylabel: `δ (${tg.unit})`, series: [{ name: 'Actual', x: Te.y, y: Te.y.map((q, i) => q - ck.rho * pMF[i].low), mode: 'points' }, { name: 'Modelled', x: Te.y, y: pMF.map((p) => p.delta), mode: 'points' }] },
+    ],
+    tables: [
+      { title: 'Models compared on the high-fidelity test set', columns: ['Model', 'High runs', 'Low runs', 'Cost (high-fidelity runs)', `Test RMSE (${tg.unit})`, 'Relative to range (%)'], rows: [['Low-fidelity model alone', 0, 0, 0, eL, (100 * eL) / span], ['Gaussian process on the low-fidelity runs', 0, Lo.X.length, ratio * Lo.X.length, eLgp, (100 * eLgp) / span], ['Gaussian process, high fidelity only', Hi.X.length, 0, Hi.X.length, eH, (100 * eH) / span], ['Gaussian process, equal cost', Sf.X.length, 0, Sf.X.length, eS, (100 * eS) / span], ['Co-kriging (ρ·low + δ)', Hi.X.length, Lo.X.length, Hi.X.length + ratio * Lo.X.length, eMF, (100 * eMF) / span]],
+        note: `High fidelity: element model of suite 1 with ${segH} segments per element. Low fidelity: ${lumped ? 'algebraic zero-dimensional model (log-mean osmotic pressure, one average flux)' : 'the same model with one segment per element'}. Recursive co-kriging: a Gaussian process on the low-fidelity runs, ρ by least squares at the nested high-fidelity points and a discrepancy δ(x) whose form (constant, linear trend or Gaussian process) is chosen by cross-validation — here: ${ck.kind}.` },
+      { title: 'Test points', columns: [...dims.map((q) => q.label), 'High fidelity', 'Low fidelity', 'Co-kriging', 'σ', 'Single fidelity, equal cost'], rows: Te.X.slice(0, 30).map((x, i) => [...x, Te.y[i], loT[i], pMF[i].mean, pMF[i].sd, gpS.predict(x).mean]) },
+    ],
+    outputs: { task: 'mf', best: { rmse: eMF, singleRmse: eS, rho: ck.rho, lowRmse: eL }, objective: eMF, study: { a: eMF, b: eS } },
+  };
+}
+
+// ---- Task 18: robust / stochastic design (sample-average approximation, chance constraints, worst case) with batched parallel evaluation --
+async function taskROB(v, ctx) {
+  const base = roBase(v), seed = Math.round(v.seed), O = OBJ[v.objective] || OBJ.cost, CL = consFor(v), worst = v.robMode === 'worst', S = clamp(Math.round(v.robS), 2, 64), nTest = clamp(Math.round(v.robTest), 4, 200), alpha = worst ? 0 : clamp(v.robAlpha, 0, 50) / 100;
+  const vars = [{ key: 'recovery', label: 'Recovery', unit: '%', lo: v.recLo, hi: v.recHi, x0: v.recovery0 }, { key: 'targetFlux', label: 'Average flux', unit: 'L/m²·h', lo: v.fluxLo, hi: v.fluxHi, x0: v.flux0 }].filter((d) => d.hi > d.lo), n = vars.length;
+  if (!n) throw new Error('No decision variable is free: widen the recovery or flux bounds.');
+  const scen = (U) => U.map((u) => ({ salinityFactor: 1 + (v.robSal / 100) * clamp(normInv(u[0]), -2.5, 2.5), T: clamp(base.T + v.robT * clamp(normInv(u[1]), -2.5, 2.5), 1, 45), ff: base.ff * (1 - (v.robDecl / 100) * u[2]) }));
+  const nominal = [{ salinityFactor: 1, T: base.T, ff: base.ff }], scIn = scen(lhs(S, 3, seed + 11)), scOut = scen(lhs(nTest, 3, seed + 97));
+  const design = (u) => Object.fromEntries(vars.map((d, j) => [d.key, d.lo + clamp(u[j], 0, 1) * (d.hi - d.lo)]));
+  const bat = await makeBatcher(v, base, v.parWorkers, ctx), rho = 20;
+  try {
+    const eBase = evalDesign(base, v);
+    if (!eBase.ok) throw new Error('The base design cannot be simulated: ' + (eBase.err || 'check the RO plant inputs.'));
+    const fScale = Math.abs(O.f(eBase)) || 1, allowed = (m) => Math.floor(alpha * m + 1e-9);
+    /** Sample-average statistics of one design over a scenario set. */
+    const stats = (es, robust) => {
+      const f = es.map((e) => (e.ok ? O.f(e) : 1e3 * fScale)), gmax = es.map((e) => Math.max(...e.g)), cv = chanceViolation(gmax, robust ? alpha : 0);
+      const viol = cv.viol, obj = (worst && robust ? Math.max(...f) : mean(f)) / fScale;
+      return { f, gmax, mean: mean(f), worst: Math.max(...f), pViol: gmax.filter((q) => q > FEAS).length / es.length, viol, merit: obj + rho * viol + 10 * rho * cv.quad, gWorst: range(CL.length).map((j) => Math.max(...es.map((e) => e.g[j]))) };
+    };
+    const evalMany = async (us, sc, robust) => { const jobs = us.flatMap((u) => sc.map((s) => ({ ...design(u), ...s }))), out = await bat.run(jobs); return us.map((_, i) => stats(out.slice(i * sc.length, (i + 1) * sc.length), robust)); };
+    /** Generation-synchronous differential evolution: every generation is one batch of (candidates × scenarios) plant simulations. */
+    const search = async (sc, robust, sd, label, p0, p1) => {
+      const g = rng(sd), NP = clamp(Math.round(v.robPop), 4, 40), G = clamp(Math.round(v.robGens), 1, 60), hist = [];
+      let P = lhs(NP, n, sd); P[0] = vars.map((d) => clamp((d.x0 - d.lo) / (d.hi - d.lo), 0, 1));
+      let F = await evalMany(P, sc, robust);
+      hist.push(Math.min(...F.map((q) => q.merit)));
+      for (let gen = 0; gen < G; gen++) {
+        const trial = P.map((x, i) => { const pick = () => { let k; do k = g.int(NP); while (k === i); return k; }, a = P[pick()], b = P[pick()], c = P[pick()], jr = g.int(n); return x.map((q, j) => (g.uniform() < 0.9 || j === jr ? clamp(a[j] + 0.6 * (b[j] - c[j]), 0, 1) : q)); });
+        const Ft = await evalMany(trial, sc, robust);
+        for (let i = 0; i < NP; i++) if (Ft[i].merit <= F[i].merit) { P[i] = trial[i]; F[i] = Ft[i]; }
+        hist.push(Math.min(...F.map((q) => q.merit)));
+        ctx.progress(p0 + ((p1 - p0) * (gen + 1)) / G, `${label}: generation ${gen + 1} of ${G}`); await ctx.tick();
+      }
+      const ib = range(NP).reduce((a, b) => (F[b].merit < F[a].merit ? b : a)), nPol = clamp(Math.round(v.robPolish), 0, 20);
+      let ub = P[ib], Fb = F[ib], step = 0.1;
+      for (let it = 0; it < nPol; it++) { // pattern search around the best point: one batch of 2·n neighbours per refinement
+        const cand = range(n).flatMap((j) => [-1, 1].map((sg) => ub.map((q, k) => (k === j ? clamp(q + sg * step, 0, 1) : q)))), Fc = await evalMany(cand, sc, robust), kb = range(cand.length).reduce((a, b) => (Fc[b].merit < Fc[a].merit ? b : a));
+        if (Fc[kb].merit < Fb.merit - 1e-12) { ub = cand[kb]; Fb = Fc[kb]; } else step *= 0.5;
+        hist.push(Fb.merit);
+        ctx.progress(p1, `${label}: refinement ${it + 1} of ${nPol}`); await ctx.tick();
+      }
+      return { u: ub, st: Fb, hist };
+    };
+    ctx.progress(0.05, 'Nominal (deterministic) optimum'); await ctx.tick();
+    const nom = await search(nominal, false, seed, 'Nominal design', 0.05, 0.25), rob = await search(scIn, true, seed + 1, 'Robust design', 0.25, 0.85);
+    ctx.progress(0.88, 'Out-of-sample validation'); await ctx.tick();
+    const [nomIn, robNom] = [(await evalMany([nom.u], scIn, false))[0], (await evalMany([rob.u], nominal, false))[0]], [nomOut, robOut] = await evalMany([nom.u, rob.u], scOut, false);
+    const dN = design(nom.u), dR = design(rob.u), eN = evalDesign({ ...base, ...dN }, v), eR = evalDesign({ ...base, ...dR }, v), show = O.show || ((x) => x);
+    if (!eN.ok || !eR.ok) throw new Error('The optimal designs could not be re-simulated: widen the bounds or check the plant inputs.');
+    const price = (100 * (robNom.mean - nom.st.mean)) / Math.abs(nom.st.mean || 1), feasR = rob.st.pViol <= alpha + 1e-9, sp = bat.speedup(), W = [];
+    if (!feasR) W.push({ level: 'bad', msg: `No design inside the bounds keeps the violation probability below ${fmt(100 * alpha, 3)} % over the ${S} scenarios (best found: ${fmt(100 * rob.st.pViol, 3)} %). Relax a limit, widen the bounds or reduce the uncertainty.` });
+    else W.push({ level: 'info', msg: `The robust design violates a limit in ${fmt(100 * rob.st.pViol, 3)} % of the ${S} design scenarios (allowed ${fmt(100 * alpha, 3)} %) and in ${fmt(100 * robOut.pViol, 3)} % of ${nTest} fresh scenarios; the nominal optimum fails in ${fmt(100 * nomOut.pViol, 3)} % of them.` });
+    if (robOut.pViol > alpha + 2 * Math.sqrt((alpha * (1 - alpha) + 0.01) / nTest)) W.push({ level: 'warn', msg: 'The out-of-sample violation probability is clearly above the target: the sample-average approximation used too few scenarios — increase the scenario count.' });
+    W.push(bat.pool.live && !bat.fellBack ? { level: 'info', msg: `Plant simulations ran on ${bat.pool.workers} worker threads (${bat.jobs} runs in ${bat.wall} ms after ${bat.pool.startMs} ms start-up); the same chunk on the calling thread gave identical numbers (largest difference ${fmt(bat.agree ?? 0, 2)}).` }
+      : { level: 'info', msg: v.parWorkers >= 1 ? `Parallel evaluation was requested but ${bat.pool.reason || 'the pool stopped responding'}: the ${bat.jobs} runs were evaluated on the calling thread in ${bat.chunks} chunks.` : `${bat.jobs} plant simulations evaluated on the calling thread in batches (set “Worker threads” above 0 to evaluate them in parallel).` });
+    const cRow = (e) => CL.map((c) => c.val(e.m)), scRow = (s, i, a, b) => [i + 1, s.salinityFactor, s.T, s.ff, 100 * a.gmax[i], 100 * b.gmax[i], show(a.f[i]), show(b.f[i])];
+    return {
+      summary: `${worst ? 'Worst-case' : 'Chance-constrained'} design over ${S} sampled scenarios: recovery ${fmt(dR.recovery ?? base.recovery, 4)} % and flux ${fmt(dR.targetFlux ?? base.targetFlux, 4)} L/m²·h instead of the nominal optimum ${fmt(dN.recovery ?? base.recovery, 4)} % and ${fmt(dN.targetFlux ?? base.targetFlux, 4)} L/m²·h. The price of robustness is ${fmt(price, 3)} % in ${lcFirst(O.label)} at nominal conditions; the out-of-sample violation probability falls from ${fmt(100 * nomOut.pViol, 3)} % to ${fmt(100 * robOut.pViol, 3)} %.`,
+      warnings: W,
+      kpis: [
+        { label: `Robust design: ${lcFirst(O.label)} at nominal conditions`, value: show(robNom.mean), unit: O.unit, status: feasR ? 'ok' : 'bad' }, { label: `Nominal optimum: ${lcFirst(O.label)}`, value: show(nom.st.mean), unit: O.unit },
+        { label: 'Price of robustness', value: price, unit: '%', help: 'Loss of the objective at nominal conditions accepted to stay feasible under uncertainty.' }, { label: `Robust design: expected ${lcFirst(O.label)}`, value: show(rob.st.mean), unit: O.unit },
+        { label: 'Robust recovery', value: dR.recovery ?? base.recovery, unit: '%' }, { label: 'Robust average flux', value: dR.targetFlux ?? base.targetFlux, unit: 'L/m²·h' }, { label: 'Nominal recovery', value: dN.recovery ?? base.recovery, unit: '%' }, { label: 'Nominal average flux', value: dN.targetFlux ?? base.targetFlux, unit: 'L/m²·h' },
+        { label: 'Violation probability, robust (out of sample)', value: 100 * robOut.pViol, unit: '%', status: robOut.pViol <= alpha + 0.1 ? 'ok' : 'warn' }, { label: 'Violation probability, nominal (out of sample)', value: 100 * nomOut.pViol, unit: '%', status: nomOut.pViol <= alpha + 1e-9 ? 'ok' : 'warn' },
+        { label: 'Plant simulations', value: bat.jobs }, { label: 'Worker threads used', value: bat.pool.live && !bat.fellBack ? bat.pool.workers : 0 },
+        ...(sp !== null ? [{ label: 'Measured parallel speed-up', value: sp, unit: '×', status: sp > 1 ? 'ok' : 'warn', help: 'Time the calling thread needs per simulation (measured on the first chunk) × number of simulations ÷ wall time of the pool. Wall-clock measurement: it varies from run to run and with the load of the machine.' }] : []),
+      ],
+      recommendations: [
+        feasR ? `Design for ${fmt(dR.recovery ?? base.recovery, 3)} % recovery: it keeps every limit in at least ${fmt(100 * (1 - alpha), 3)} % of the sampled feed conditions at a cost of ${fmt(price, 3)} % at nominal conditions.` : 'Reduce the uncertainty (tighter pre-treatment, temperature control) or relax the limiting constraint.',
+        'Check the limiting constraint in the scenario table: it shows which limit the uncertainty pushes against.', 'Increase the number of scenarios until the in-sample and out-of-sample violation probabilities agree.',
+      ],
+      plots: [
+        { type: 'bar', title: 'Probability of violating a limit', ylabel: '%', categories: [`Design scenarios (${S})`, `Fresh scenarios (${nTest})`], series: [{ name: 'Nominal optimum', values: [100 * nomIn.pViol, 100 * nomOut.pViol] }, { name: 'Robust design', values: [100 * rob.st.pViol, 100 * robOut.pViol] }] },
+        { type: 'line', title: 'Most critical constraint in every design scenario', xlabel: 'Scenario', ylabel: 'Largest normalised constraint (% over limit)', series: [{ name: 'Nominal optimum', x: range(S).map((i) => i + 1), y: nomIn.gmax.map((q) => 100 * q), mode: 'points' }, { name: 'Robust design', x: range(S).map((i) => i + 1), y: rob.st.gmax.map((q) => 100 * q), mode: 'points' }], hlines: [{ y: 0, label: 'feasible below this line' }] },
+        { type: 'bar', title: 'Worst constraint utilisation over the design scenarios (100 % = at the limit)', ylabel: '% of limit', categories: CL.map((c) => c.label), series: [{ name: 'Nominal optimum', values: nomIn.gWorst.map((q) => 100 * (1 + q)) }, { name: 'Robust design', values: rob.st.gWorst.map((q) => 100 * (1 + q)) }] },
+        { type: 'line', title: 'Convergence of the two searches', xlabel: 'Batch (generations, then pattern-search refinements)', ylabel: 'Best penalised objective (relative to base case)', series: [{ name: 'Nominal problem', x: range(nom.hist.length), y: nom.hist, mode: 'step' }, { name: worst ? 'Worst-case problem' : 'Sample-average problem', x: range(rob.hist.length), y: rob.hist, mode: 'step' }] },
+        { type: 'line', title: `${O.label} over the fresh scenarios`, xlabel: 'Scenario (sorted)', ylabel: O.unit, series: [{ name: 'Nominal optimum', x: range(nTest).map((i) => i + 1), y: [...nomOut.f].map(show).sort((a, b) => a - b) }, { name: 'Robust design', x: range(nTest).map((i) => i + 1), y: [...robOut.f].map(show).sort((a, b) => a - b) }] },
+      ],
+      tables: [
+        { title: 'Nominal optimum and robust design', columns: ['Quantity', 'Nominal optimum', 'Robust design'], rows: [...vars.map((d) => [`${d.label} (${d.unit})`, dN[d.key], dR[d.key]]), [`${O.label} at nominal conditions (${O.unit})`, show(nom.st.mean), show(robNom.mean)], [`Expected ${lcFirst(O.label)} over the design scenarios (${O.unit})`, show(nomIn.mean), show(rob.st.mean)], [`Worst ${lcFirst(O.label)} over the design scenarios (${O.unit})`, show(O.show ? Math.min(...nomIn.f) : nomIn.worst), show(O.show ? Math.min(...rob.st.f) : rob.st.worst)],
+          ['Violation probability, design scenarios (%)', 100 * nomIn.pViol, 100 * rob.st.pViol], ['Violation probability, fresh scenarios (%)', 100 * nomOut.pViol, 100 * robOut.pViol], ['Feed pressure at nominal conditions (bar)', eN.m.Pf, eR.m.Pf], ['Specific energy at nominal conditions (kWh/m³)', eN.m.sec, eR.m.sec], ['Elements installed', eN.m.nEl, eR.m.nEl]] },
+        { title: 'Constraints at nominal conditions and in the worst design scenario', columns: ['Constraint', 'Limit', 'Nominal optimum, nominal', 'Robust design, nominal', 'Nominal optimum, worst scenario (% over limit)', 'Robust design, worst scenario (% over limit)'], rows: CL.map((c, j) => [`${c.label} (${c.unit})`, c.lim(v, eR.m), cRow(eN)[j], cRow(eR)[j], 100 * nomIn.gWorst[j], 100 * rob.st.gWorst[j]]),
+          note: `Sample-average approximation: the ${worst ? 'worst objective over' : 'mean objective over'} ${S} Latin-hypercube scenarios of feed salinity (σ ${fmt(v.robSal)} %), temperature (σ ${fmt(v.robT)} °C) and permeability loss (0–${fmt(v.robDecl)} %) is minimised; ${worst ? 'every scenario must satisfy every limit' : `at most ${allowed(S)} of ${S} scenarios may violate a limit (joint chance constraint, ${fmt(100 * alpha, 3)} %)`}. The array is sized by the design and the feed pressure adapts to each scenario. For the saturation index the last two columns give 100 × (index − limit).` },
+        { title: 'Design scenarios', columns: ['Scenario', 'Salinity factor', 'Temperature (°C)', 'Flow factor', 'Nominal optimum: worst constraint (% over limit)', 'Robust design: worst constraint (% over limit)', `Nominal optimum: ${O.label} (${O.unit})`, `Robust design: ${O.label} (${O.unit})`], rows: scIn.map((s, i) => scRow(s, i, nomIn, rob.st)) },
+        { title: 'Batched evaluation', columns: ['Item', 'Value'], rows: [['Plant simulations', bat.jobs], ['Chunks per batch', bat.chunks], ['Worker threads', bat.pool.live && !bat.fellBack ? bat.pool.workers : 0], ['Execution', bat.pool.live && !bat.fellBack ? 'parallel worker threads' : 'calling thread, cooperative batches'], ['Thread agreement (largest difference)', bat.agree ?? 0]], note: 'Wall-clock times and the measured speed-up are reported in the warnings and KPIs only, because they change from run to run.' },
+      ],
+      outputs: { task: 'rob', best: { recovery: dR.recovery ?? base.recovery, targetFlux: dR.targetFlux ?? base.targetFlux, sec: eR.m.sec, cost: eR.cost.total, feedPressure: eR.m.Pf, productTDS: eR.m.tds, nElements: eR.m.nEl }, objective: show(robNom.mean), objectiveName: v.objective, feasible: feasR, nominal: { recovery: dN.recovery ?? base.recovery, targetFlux: dN.targetFlux ?? base.targetFlux, objective: show(nom.st.mean) }, priceOfRobustness: price, violationProbability: robOut.pViol, study: { a: show(robNom.mean), b: price } },
+    };
+  } finally { bat.pool.close(); }
+}
+
+// ======================================================================================================
 // 10 · Suite declaration
 // ======================================================================================================
 const TASKS = {
@@ -2025,10 +3182,14 @@ const TASKS = {
   ml: { label: 'Surrogate modelling and machine learning', run: taskML }, pinn: { label: 'Physics-informed neural network (verified demo)', run: taskPINN },
   ts: { label: 'Forecasting, anomaly detection and state estimation', run: taskTS }, ctl: { label: 'Predictive control and reinforcement learning', run: taskCTL },
   wb: { label: 'Custom numerical modelling workbench', run: taskWB }, pe: { label: 'Parameter estimation and identifiability', run: taskPE },
+  oc: { label: 'Optimal control of a batch RO cycle (Euler–Lagrange, Pontryagin)', run: taskOC }, lp: { label: 'Linear and mixed-integer programming (train scheduling)', run: taskLP },
+  node: { label: 'Neural ordinary differential equation', run: taskNODE }, npde: { label: 'Neural partial differential equation (learned closure)', run: taskNPDE },
+  rom: { label: 'Reduced-order model (proper orthogonal decomposition)', run: taskROM }, ens: { label: 'Ensemble models (bagging, out-of-bag error)', run: taskENS },
+  mf: { label: 'Multi-fidelity surrogate (co-kriging)', run: taskMF }, rob: { label: 'Robust and stochastic design under uncertainty', run: taskROB },
 };
 const is = (...t) => (v) => t.includes(v.task);
-const usesRO = (v) => ['opt', 'mo', 'sa', 'uq'].includes(v.task) || (v.task === 'ml' && v.mlSource === 'ro');
-const usesDesign = (v) => ['opt', 'mo'].includes(v.task) || (v.task === 'ml' && v.mlSource === 'ro');
+const usesRO = (v) => ['opt', 'mo', 'sa', 'uq', 'mf', 'rob'].includes(v.task) || (['ml', 'ens'].includes(v.task) && v.mlSource === 'ro');
+const usesDesign = (v) => ['opt', 'mo', 'mf', 'rob'].includes(v.task) || (['ml', 'ens'].includes(v.task) && v.mlSource === 'ro');
 const wb = (mode) => (v) => v.task === 'wb' && v.wbMode === mode;
 const lazy = (obj, make) => Object.defineProperty(obj, 'value', { enumerable: true, configurable: true, get() { const val = make(); Object.defineProperty(obj, 'value', { value: val, enumerable: true, writable: true }); return val; } });
 const studyGet = (task, key, mode) => (r) => {
@@ -2042,8 +3203,8 @@ const texts = (prefix, n, label, vals, showFn, help) => range(n).map((i) => ({ k
 
 const suite = {
   id: 'opt', num: 11, title: 'Optimization, AI & Custom Numerical Modelling', short: 'Optimise & AI', icon: '🧠',
-  tagline: 'Optimise, rank, quantify, learn, forecast, control and build your own models — ten verified studies in one workspace.',
-  description: 'Wraps the element-by-element RO model of suite 1 in constrained single- and multi-objective optimisers, global sensitivity analysis and Monte-Carlo uncertainty propagation, and trains response-surface, Gaussian-process and neural-network surrogates on it or on imported data. Further tasks cover a physics-informed network checked against an analytical solution, forecasting with anomaly detection and a Kalman state estimator, predictive control with reinforcement learning, a custom equation workbench (ODE, algebraic, optimisation, PDE) driven by a safe expression evaluator, and nonlinear parameter estimation with identifiability and Bayesian inference.',
+  tagline: 'Optimise, rank, quantify, learn, forecast, control and build your own models — eighteen verified studies in one workspace.',
+  description: 'Wraps the element-by-element RO model of suite 1 in constrained single- and multi-objective optimisers, global sensitivity analysis and Monte-Carlo uncertainty propagation, and trains response-surface, Gaussian-process and neural-network surrogates on it or on imported data. Further tasks cover a physics-informed network checked against an analytical solution, forecasting with anomaly detection and a Kalman state estimator, predictive control with reinforcement learning, a custom equation workbench (ODE, algebraic, optimisation, PDE) driven by a safe expression evaluator, and nonlinear parameter estimation with identifiability and Bayesian inference. Eight more studies add optimal control by Pontryagin\'s principle, linear and mixed-integer programming, a neural ODE, a neural PDE closure, a POD reduced-order model, bagged ensembles, multi-fidelity co-kriging and robust design under uncertainty with optional parallel evaluation.',
   guide: [
     'Pick a study in “Task”. Only the inputs of that study are shown; every study runs with its defaults.',
     'For the plant studies, pull the feed water and the base design from the Case page and suite 1, then set bounds and limits on the Model setup tab.',
@@ -2052,15 +3213,15 @@ const suite = {
     'The optimum recovery is offered back to suite 1; fouling rate and time-to-cleaning feed suite 10.',
   ],
   implemented: ['objective-function', 'equality constraint', 'karush-kuhn-tucker', 'lagrange multiplier', 'nonlinear-programming', 'mixed-integer programming', 'dynamic-programming', 'model-predictive-control', 'least-square', 'maximum-likelihood', 'bayesian equation', 'gaussian-process', 'artificial-neural-network', 'state-space',
-    'physics-informed neural-network', 'grey-box', 'mechanistic-machine-learning', 'surrogate-assisted optimization', 'bayesian-mechanistic', 'digital-twin state-estimation', 'reinforcement-learning', 'genetic-algorithm-mechanistic',
+    'physics-informed neural-network', 'grey-box', 'mechanistic-machine-learning', 'surrogate-assisted optimization', 'bayesian-mechanistic', 'digital-twin state-estimation', 'reinforcement-learning', 'genetic-algorithm-mechanistic', 'euler-lagrange', 'hamiltonian equation', 'pontryagin maximum-principle', 'linear-programming equation', 'neural ordinary differential', 'neural partial differential', 'reduced-order/cfd', 'ensemble model', 'multi-fidelity', 'robust/stochastic optimization', 'energy constraint', 'scaling constraint', 'parallel computing',
     'initial decision variable', 'state vector', 'model parameter', 'neural-network parameter', 'prior distribution', 'covariance matri', 'controller state', 'physical conservation constraint', 'parameter bound', 'operating envelope', 'water-quality constraint', 'pressure constraint', 'recovery constraint', 'terminal-state constraint', 'pde boundary constraint', 'feasibility constraint',
     'numerical equation solving', 'ordinary- and partial-differential-equation solving', 'nonlinear-system solving', 'parameter estimation', 'model calibration', 'model validation', 'sensitivity analysis', 'uncertainty quantification', 'monte carlo simulation', 'deterministic optimisation', 'nonlinear optimisation', 'mixed-integer optimisation', 'global optimisation', 'multi-objective optimisation',
     'surrogate modelling', 'machine learning', 'deep learning', 'physics-informed machine learning', 'time-series forecasting', 'anomaly detection', 'predictive maintenance', 'reinforcement learning', 'model-predictive control', 'digital-twin modelling', 'automated data processing', 'scenario analysis', 'custom-model development'],
-  equationsNote: 'Everything runs in the browser, so problem sizes are deliberately small: networks have one or two hidden layers and a few hundred weights, Gaussian processes a few hundred points, NSGA-II a few hundred plant simulations, the reinforcement-learning agent is tabular and the predictive controller linear. Surrogates trained on the RO model reproduce that model, not plant reality, and must not be extrapolated. Optimal-control formulations (Euler–Lagrange, Hamiltonian, Pontryagin), linear programming, neural ODE/PDE operators, multi-fidelity and reduced-order CFD models, ensemble learning, robust/stochastic programming, deep reinforcement learning and parallel computing are listed for reference only. User expressions are parsed by a built-in arithmetic evaluator; no user text is ever executed as code.',
+  equationsNote: 'Everything runs in the browser, so problem sizes are deliberately small: networks have one or two hidden layers and a few hundred weights, Gaussian processes a few hundred points, NSGA-II a few hundred plant simulations, the reinforcement-learning agent is tabular and the predictive controller linear. Surrogates trained on the RO model reproduce that model, not plant reality, and must not be extrapolated. The newer studies are genuine but small-scale forms of their methods: optimal control (Euler–Lagrange boundary-value problem, Hamiltonian state–costate system and Pontryagin\'s principle with a bounded control) is solved for one state — a batch RO cycle with a lumped polarisation law; linear programmes use a dense two-phase simplex and integer variables a depth-first branch and bound, suitable for a few hundred variables; the neural ODE has one state and is trained by back-propagation through RK4; the neural PDE is a learned scalar reaction closure R(u) inside the 1-D finite-volume transport solver, trained on synthetic experiments by the discrete adjoint (it is not a neural operator for an arbitrary PDE); the reduced-order model is a POD–Galerkin projection of that 1-D convection–diffusion solver, not of a Navier–Stokes field; ensembles are bagged response surfaces or small networks; the multi-fidelity model is two-level recursive co-kriging; robust design uses a sample-average approximation with a few dozen scenarios, so its violation probabilities carry sampling error (compare the out-of-sample figure); the scaling constraint uses the Pitzer speciation of suite 2 on the simulated concentrate with an estimated concentrate pH and no antiscalant kinetics. Parallel computing means worker threads that evaluate chunks of plant simulations: it needs the multi-file edition served over http(s) or Node; where threads cannot start the same chunks run sequentially and the result says so. Deep reinforcement learning is not included. User expressions are parsed by a built-in arithmetic evaluator; no user text is ever executed as code.',
 
   inputs: [
     { group: 'Study', help: 'Choose what to compute. Each task has its own inputs, shown below and on the Model setup and Mesh tabs.', fields: [
-      { key: 'task', label: 'Task', type: 'select', value: 'opt', options: Object.entries(TASKS).map(([k, t]) => ({ value: k, label: t.label })), help: 'Ten independent studies. The presets (“Load example…”) jump straight to each one.' },
+      { key: 'task', label: 'Task', type: 'select', value: 'opt', options: Object.entries(TASKS).map(([k, t]) => ({ value: k, label: t.label })), help: 'Eighteen independent studies. The presets (“Load example…”) jump straight to each one.' },
       { key: 'seed', label: 'Random seed', unit: '', value: 7, min: 0, max: 1e6, step: 1, help: 'All sampling, initialisation and stochastic searches are seeded: the same seed reproduces the same result.' },
     ] },
     { group: 'RO plant (base case)', help: 'The plant model of suite 1 evaluated by the optimisation, sensitivity, uncertainty and surrogate tasks. Other RO settings keep the defaults of suite 1 (single pass, pressure exchanger).', showIf: usesRO, fields: [
@@ -2078,7 +3239,7 @@ const suite = {
       { key: 'etaPump', label: 'High-pressure pump efficiency', unit: '%', value: 86, min: 30, max: 93 },
     ] },
     { group: 'Objective and cost model', help: 'What “best” means. The cost of water is deliberately simple; suite 13 holds the full economics.', showIf: usesRO, fields: [
-      { key: 'objective', label: 'Objective', type: 'select', value: 'cost', options: [{ value: 'cost', label: 'Minimise cost of water' }, { value: 'sec', label: 'Minimise specific energy' }, { value: 'maxrec', label: 'Maximise recovery' }, { value: 'brine', label: 'Minimise brine volume per m³ product' }], showIf: is('opt') },
+      { key: 'objective', label: 'Objective', type: 'select', value: 'cost', options: [{ value: 'cost', label: 'Minimise cost of water' }, { value: 'sec', label: 'Minimise specific energy' }, { value: 'maxrec', label: 'Maximise recovery' }, { value: 'brine', label: 'Minimise brine volume per m³ product' }], showIf: is('opt', 'rob') },
       { key: 'elecPrice', label: 'Electricity price', unit: '$/kWh', value: 0.08, min: 0, max: 2, typical: [0.03, 0.25] },
       { key: 'elemPrice', label: 'Membrane element price', unit: '$/element', value: 650, min: 0, max: 5000 },
       { key: 'memLife', label: 'Membrane life', unit: 'years', value: 5, min: 0.5, max: 15 },
@@ -2094,7 +3255,7 @@ const suite = {
       { key: 'tsSeason', label: 'Season length', unit: 'samples', value: 7, min: 0, max: 400, step: 1, help: 'Number of samples in one repeating cycle (7 for daily data with a weekly pattern). 0 or 1 disables seasonality.' },
       { key: 'tsHorizon', label: 'Forecast horizon', unit: 'samples', value: 14, min: 1, max: 200, step: 1 },
     ] },
-    { group: 'Data for surrogate models', showIf: is('ml'), fields: [
+    { group: 'Data for surrogate models', showIf: is('ml', 'ens'), fields: [
       { key: 'mlSource', label: 'Training data', type: 'select', value: 'ro', options: [{ value: 'ro', label: 'Design of experiments on the RO model (Latin hypercube)' }, { value: 'table', label: 'Imported data table' }] },
       { key: 'mlTarget', label: 'Quantity to learn', type: 'select', value: 'sec', options: Object.entries(ML_TARGET).map(([k, t]) => ({ value: k, label: `${t.label} (${t.unit})` })), showIf: (v) => v.mlSource === 'ro', help: 'Inputs are recovery, average flux, temperature and feed salinity.' },
       { key: 'mlN', label: 'Number of plant simulations', unit: '', value: 70, min: 20, max: 400, step: 1, showIf: (v) => v.mlSource === 'ro' },
@@ -2169,6 +3330,62 @@ const suite = {
       lazy({ key: 'peData', label: 'Measurements', type: 'table', columns: [{ key: 'x', label: 'x' }, { key: 'y', label: 'y' }] }, peSampleTable),
     ] },
 
+    { group: 'Batch RO cycle', help: 'A closed batch: the tank volume V falls as permeate is withdrawn at the rate q(t) and the retained salt concentrates. Minimise the pumping energy ∫P·q/(36·η)dt for a fixed permeate volume in a fixed time, with P = q/(A·area) + π₀·(V₀/V)·exp(J/k) + Δp.', showIf: is('oc'), fields: [
+      { key: 'ocV0', label: 'Initial batch volume', unit: 'm³', value: 10, min: 0.01, max: 1e5, help: 'Feed charged to the tank at the start of the cycle.' },
+      { key: 'ocRec', label: 'Batch recovery', unit: '%', value: 60, min: 1, max: 95, help: 'Fixes the terminal volume V(T) = V₀·(1 − recovery): the terminal-state constraint.' },
+      { key: 'ocT', label: 'Cycle time', unit: 'h', value: 3, min: 0.01, max: 1000, help: 'Fixed duration in which the permeate volume must be produced.' },
+      { key: 'ocArea', label: 'Membrane area', unit: 'm²', value: 80, min: 0.1, max: 1e6, help: 'Active membrane area of the batch unit.' },
+      { key: 'ocA', label: 'Water permeability A', unit: 'L/m²·h·bar', value: 3, min: 0.05, max: 50, help: 'Pure-water permeability at operating temperature.' },
+      { key: 'ocPi0', label: 'Initial osmotic pressure', unit: 'bar', value: 8, min: 0, max: 80, help: 'Osmotic pressure of the feed; it rises as V₀/V (complete rejection).' },
+      { key: 'ocK', label: 'Mass-transfer coefficient', unit: 'µm/s', value: 8, min: 1, max: 1000, help: 'Concentration polarisation exp(J/k) makes high flux expensive late in the cycle.' },
+      { key: 'ocDp', label: 'Hydraulic losses', unit: 'bar', value: 1, min: 0, max: 20, help: 'Constant feed-side pressure loss added to the pump pressure.' },
+      { key: 'ocFluxMax', label: 'Flux limit', unit: 'L/m²·h', value: 26, min: 1, max: 200, help: 'Upper bound on the control (fouling limit). When it is active the optimum follows from Pontryagin\'s principle rather than from the Euler–Lagrange equation alone.' },
+      { key: 'ocEta', label: 'Pump efficiency', unit: '%', value: 80, min: 5, max: 100, help: 'Hydraulic-to-electric efficiency of the feed pump.' },
+    ] },
+    { group: 'Train scheduling problem', help: 'Choose the production of each RO train in every period of the day so that demand is met from a product tank at the lowest energy cost. Demand follows the built-in daily profile with morning and evening peaks.', showIf: is('lp'), fields: [
+      { key: 'lpMode', label: 'Problem class', type: 'select', value: 'milp', options: [{ value: 'milp', label: 'Mixed-integer: trains on/off with minimum load (branch and bound)' }, { value: 'lp', label: 'Linear programme: any load fraction (simplex)' }], help: 'The linear programme is the relaxation of the on/off problem and always gives a lower bound.' },
+      lazy({ key: 'lpTrains', label: 'RO trains', type: 'table', columns: [{ key: 'cap', label: 'Capacity', unit: 'm³/h' }, { key: 'sec', label: 'Specific energy', unit: 'kWh/m³' }, { key: 'minLoad', label: 'Minimum load', unit: '%' }, { key: 'aux', label: 'Auxiliary power when on', unit: 'kW' }], help: 'Up to five trains. Minimum load and auxiliary power only matter for the on/off problem.' }, lpTrainTable),
+      { key: 'lpDemand', label: 'Mean demand', unit: 'm³/h', value: 650, min: 0, max: 1e6, help: 'Daily average; the hourly profile is scaled to it.' },
+      { key: 'lpPeriods', label: 'Periods per day', type: 'select', value: 8, options: [4, 6, 8, 12, 24].map((q) => ({ value: q, label: `${q} (${24 / q} h each)` })), help: 'More periods give a finer schedule and a much larger branch-and-bound tree: with 12 or 24 periods the on/off search usually stops at its limit with a proven gap.' },
+      { key: 'lpTank', label: 'Product-tank volume', unit: 'm³', value: 4000, min: 1, max: 1e7, help: 'Storage that decouples production from demand.' },
+      { key: 'lpS0', label: 'Tank level at midnight', unit: '%', value: 50, min: 0, max: 100, help: 'The day must end at least as full (terminal condition).' },
+      { key: 'lpOff', label: 'Off-peak tariff (23–07 h)', unit: '$/kWh', value: 0.06, min: 0, max: 2, help: 'Night tariff.' },
+      { key: 'lpShoulder', label: 'Shoulder tariff (07–17 h, 22 h)', unit: '$/kWh', value: 0.11, min: 0, max: 2, help: 'Day tariff outside the peak.' },
+      { key: 'lpPeak', label: 'Peak tariff (17–22 h)', unit: '$/kWh', value: 0.18, min: 0, max: 2, help: 'Evening peak tariff.' },
+      { key: 'lpPenalty', label: 'Penalty for unmet demand', unit: '$/m³', value: 5, min: 0, max: 1e4, help: 'Keeps the problem feasible: unserved water is allowed at this price.' },
+    ] },
+    { group: 'Trajectories to learn', help: 'One state y(t) observed in several runs (for example normalised permeability between cleanings). The network learns dy/dt = f(y); the first row of each run is its initial condition.', showIf: is('node'), fields: [
+      lazy({ key: 'nodeData', label: 'Runs', type: 'table', columns: [{ key: 'run', label: 'Run' }, { key: 't', label: 'Time' }, { key: 'y', label: 'y' }], help: 'The built-in record holds four fouling runs that follow a non-exponential decline law with measurement noise.' }, nodeSampleTable),
+      { key: 'nodeHold', label: 'Run held out for validation', unit: '', value: 4, min: 1, max: 1000, step: 1, help: 'Never used for training. With a single run its last 30 % is held out instead.' },
+    ] },
+    { group: 'Transport problem with an unknown reaction', help: 'A reacting species (for example residual chlorine or a nutrient) is carried along a channel: ∂u/∂t + v·∂u/∂x = D·∂²u/∂x² + R(u). Experiments at two inlet concentrations are generated with a hidden saturating law R = −k_max·u/(K_m + u); a network learns R(u) from the concentration fields and is tested on a third inlet concentration.', showIf: is('npde'), fields: [
+      { key: 'npL', label: 'Channel length', unit: 'm', value: 1, min: 1e-6, max: 1e5, help: 'Length of the 1-D domain.' }, { key: 'npV', label: 'Velocity', unit: 'm/s', value: 0.1, min: 0, max: 100, help: 'Mean axial velocity (inlet at x = 0).' }, { key: 'npD', label: 'Dispersion coefficient', unit: 'm²/s', value: 0.004, min: 1e-12, max: 100, help: 'Axial dispersion or diffusion coefficient.' },
+      { key: 'npT', label: 'Duration of each experiment', unit: 's', value: 12, min: 1e-6, max: 1e7, help: 'Each experiment starts from a clean channel and runs this long.' },
+      { key: 'npKmax', label: 'Hidden law: maximum rate', unit: 'conc./s', value: 0.5, min: 0, max: 1e6, help: 'Used only to generate the data; the model never sees it.' }, { key: 'npKm', label: 'Hidden law: half-saturation', unit: 'conc.', value: 1.5, min: 1e-6, max: 1e6, help: 'Concentration at which the hidden rate is half its maximum.' },
+      { key: 'npC1', label: 'Inlet concentration, experiment 1', unit: 'conc.', value: 2, min: 1e-6, max: 1e6, help: 'First training experiment.' }, { key: 'npC2', label: 'Inlet concentration, experiment 2', unit: 'conc.', value: 6, min: 1e-6, max: 1e6, help: 'Second training experiment; together they set the concentration range the closure is identified on.' },
+      { key: 'npCtest', label: 'Inlet concentration, unseen test', unit: 'conc.', value: 4, min: 1e-6, max: 1e6, help: 'Used only to test the learned closure.' }, { key: 'npNoise', label: 'Measurement noise', unit: '% of inlet', value: 1, min: 0, max: 20, help: 'Standard deviation of the noise added to the training fields.' },
+    ] },
+    { group: 'Polarisation layer', help: 'Transient build-up of the concentration boundary layer at a membrane: ∂c/∂t + J·∂c/∂x = D·∂²c/∂x² across a film of thickness δ, bulk concentration at one side and a salt-rejecting wall at the other. Snapshots at two fluxes train the reduced model; it is tested at a third flux.', showIf: is('rom'), fields: [
+      { key: 'romJ1', label: 'Training flux 1', unit: 'L/m²·h', value: 15, min: 0, max: 300, help: 'First flux at which snapshots are taken.' }, { key: 'romJ2', label: 'Training flux 2', unit: 'L/m²·h', value: 45, min: 0, max: 300, help: 'Second flux at which snapshots are taken.' }, { key: 'romJt', label: 'Unseen test flux', unit: 'L/m²·h', value: 30, min: 0, max: 300, help: 'Flux at which the reduced model is compared with the full one.' },
+      { key: 'romDelta', label: 'Film thickness δ', unit: 'µm', value: 60, min: 1, max: 5000, help: 'Thickness of the concentration boundary layer, δ = D/k.' }, { key: 'romD', label: 'Solute diffusivity', unit: '10⁻⁹ m²/s', value: 1.5, min: 0.01, max: 100, help: 'Diffusivity of the solute in water.' },
+      { key: 'romCb', label: 'Bulk concentration', unit: 'g/L', value: 35, min: 0.001, max: 400, help: 'Concentration at the bulk edge of the film.' }, { key: 'romT', label: 'Simulated time', unit: 's', value: 10, min: 1e-3, max: 1e5, help: 'A few diffusion times δ²/D reach the steady layer.' },
+    ] },
+    { group: 'Fidelity levels', help: 'High fidelity: the element model of suite 1 with several segments per element. Low fidelity: the same model with one segment, or an algebraic zero-dimensional model. Inputs are recovery, average flux, temperature and feed salinity.', showIf: is('mf'), fields: [
+      { key: 'mfTarget', label: 'Quantity to learn', type: 'select', value: 'sec', options: Object.entries(MF_TARGET).map(([k, t]) => ({ value: k, label: `${t.label} (${t.unit})` })), help: 'Output of the RO model that the surrogate predicts.' },
+      { key: 'mfLow', label: 'Low-fidelity model', type: 'select', value: 'lumped', options: [{ value: 'lumped', label: 'Algebraic zero-dimensional model (negligible cost)' }, { value: 'coarse', label: 'Element model with one segment per element' }], help: 'A low-fidelity run is charged as 0 (algebraic) or 1/segments (coarse) of a high-fidelity run.' },
+      { key: 'mfSegH', label: 'High fidelity: segments per element', unit: '', value: 2, min: 2, max: 6, step: 1, help: 'Resolution of the accurate model; each run costs about this many coarse runs.' },
+      { key: 'mfNH', label: 'High-fidelity runs', unit: '', value: 8, min: 4, max: 60, step: 1, help: 'Expensive runs used for training.' }, { key: 'mfNL', label: 'Low-fidelity runs', unit: '', value: 40, min: 6, max: 300, step: 1, help: 'The high-fidelity points are a subset of the low-fidelity design (nested).' },
+      { key: 'mfNT', label: 'High-fidelity test runs', unit: '', value: 12, min: 5, max: 100, step: 1, help: 'Used only to measure the error.' },
+    ] },
+    { group: 'Uncertainty and risk', help: 'Uncertain feed conditions and membrane state. The design (recovery and flux, hence the array) is fixed before the uncertainty is revealed; the feed pressure adapts to each scenario.', showIf: is('rob'), fields: [
+      { key: 'robMode', label: 'Formulation', type: 'select', value: 'chance', options: [{ value: 'chance', label: 'Stochastic: expected objective, chance constraint' }, { value: 'worst', label: 'Robust: worst-case objective, every scenario feasible' }], help: 'Chance constraint: a share of scenarios may violate a limit. Worst case: none may.' },
+      { key: 'robS', label: 'Design scenarios', unit: '', value: 6, min: 2, max: 64, step: 1, help: 'Latin-hypercube sample used inside the optimisation (sample-average approximation).' },
+      { key: 'robAlpha', label: 'Allowed violation probability', unit: '%', value: 20, min: 0, max: 50, showIf: (v) => v.robMode !== 'worst', help: 'Joint chance constraint: share of scenarios in which any limit may be exceeded.' },
+      { key: 'robSal', label: 'Feed salinity, standard deviation', unit: '%', value: 3, min: 0, max: 20, help: 'Normal, truncated at ± 2.5 standard deviations.' }, { key: 'robT', label: 'Feed temperature, standard deviation', unit: '°C', value: 2, min: 0, max: 12, help: 'Normal, truncated at ± 2.5 standard deviations.' },
+      { key: 'robDecl', label: 'Permeability loss, worst case', unit: '%', value: 10, min: 0, max: 60, help: 'Uniform between 0 and this loss.' },
+      { key: 'robTest', label: 'Fresh scenarios for validation', unit: '', value: 16, min: 4, max: 200, step: 1, help: 'Independent sample: the out-of-sample violation probability is the honest one.' },
+    ] },
+
     // ---- Model setup tab ---------------------------------------------------------------------------------
     { group: 'Decision variables and bounds', tab: 'setup', help: 'The search space. A variable whose bounds coincide is held fixed.', showIf: usesDesign, fields: [
       { key: 'recLo', label: 'Recovery, lower bound', unit: '%', value: 35, min: 5, max: 95 }, { key: 'recHi', label: 'Recovery, upper bound', unit: '%', value: 55, min: 5, max: 95 },
@@ -2184,6 +3401,9 @@ const suite = {
       { key: 'limTDS', label: 'Product TDS limit', unit: 'mg/L', value: 500, min: 1, max: 5000 }, { key: 'limBoron', label: 'Product boron limit', unit: 'mg/L', value: 2.4, min: 0.05, max: 10 },
       { key: 'limFlux', label: 'Maximum lead-element flux', unit: 'L/m²·h', value: 34, min: 5, max: 60 }, { key: 'limP', label: 'Maximum feed pressure', unit: 'bar', value: 70, min: 2, max: 120, help: 'The element rating also applies.' },
       { key: 'limCP', label: 'Maximum polarisation factor β', unit: '–', value: 1.2, min: 1.02, max: 2 }, { key: 'limConc', label: 'Minimum concentrate flow per vessel', unit: 'm³/h', value: 3, min: 0.1, max: 10 },
+      { key: 'limSEC', label: 'Specific-energy cap', unit: 'kWh/m³', value: 0, min: 0, max: 20, showIf: is('opt', 'mo', 'rob'), help: 'Energy constraint: specific energy of the membrane system must stay below this value. 0 switches the constraint off.' },
+      { key: 'conScale', label: 'Scaling constraint on the concentrate', type: 'select', value: 'off', showIf: is('opt', 'mo', 'rob'), options: [{ value: 'off', label: 'Off' }, { value: 'gypsum', label: 'Gypsum (CaSO₄·2H₂O)' }, { value: 'sulfate', label: 'Sulphate scales: gypsum, barite, celestite' }, { value: 'barite', label: 'Barite (BaSO₄)' }, { value: 'celestite', label: 'Celestite (SrSO₄)' }, { value: 'calcite', label: 'Calcite (CaCO₃)' }, { value: 'silica', label: 'Amorphous silica' }], help: 'Saturation index of the concentrate from the electrolyte model of suite 2 (Pitzer), evaluated for every candidate design.' },
+      { key: 'limSI', label: 'Maximum saturation index', unit: 'log₁₀(IAP/K)', value: 0, min: -3, max: 3, showIf: (v) => is('opt', 'mo', 'rob')(v) && v.conScale !== 'off', help: '0 = saturation; a positive value is the supersaturation an antiscalant can hold.' },
     ] },
     { group: 'Optimisation algorithm', tab: 'setup', showIf: is('opt'), fields: [
       { key: 'algo', label: 'Algorithm', type: 'select', value: 'de', options: [{ value: 'de', label: 'Differential evolution (global, integers relaxed)' }, { value: 'nm', label: 'Nelder–Mead simplex + integer neighbourhood search' }, { value: 'sqp', label: 'SQP with finite-difference gradients + integer neighbourhood search' }], help: 'The global method is the most robust; SQP is the fastest near a smooth optimum and reports its own KKT residual.' },
@@ -2241,6 +3461,28 @@ const suite = {
       { key: 'pdeTheta', label: 'Time integration', type: 'select', value: 'cn', options: [{ value: 'cn', label: 'Crank–Nicolson (second order)' }, { value: 'be', label: 'Backward Euler (first order, damped)' }], showIf: wb('pde') },
       { key: 'pdeScheme', label: 'Convection scheme', type: 'select', value: 'central', options: [{ value: 'central', label: 'Central (second order)' }, { value: 'upwind', label: 'Upwind (first order, bounded)' }], showIf: wb('pde') },
     ] },
+    { group: 'Neural ODE training', tab: 'setup', showIf: is('node'), fields: [
+      { key: 'nodeH', label: 'Hidden neurons (tanh)', unit: '', value: 8, min: 2, max: 32, step: 1, help: 'Width of the single hidden layer of the right-hand side.' }, { key: 'nodeEpochs', label: 'Adam epochs', unit: '', value: 800, min: 20, max: 20000, step: 10, help: 'Full-batch gradient steps.' },
+      { key: 'nodeLr', label: 'Initial learning rate', unit: '', value: 0.05, min: 1e-4, max: 0.3, help: 'Adam step size; it decays to 5 % of this value.' }, { key: 'nodeSub', label: 'RK4 steps per sampling interval', unit: '', value: 1, min: 1, max: 10, step: 1, help: 'The gradient is propagated backwards through every stage of every step.' },
+    ] },
+    { group: 'Closure network and training', tab: 'setup', showIf: is('npde'), fields: [
+      { key: 'npH', label: 'Hidden neurons (tanh)', unit: '', value: 6, min: 2, max: 24, step: 1, help: 'Width of the single hidden layer of the closure.' }, { key: 'npEpochs', label: 'Adam epochs', unit: '', value: 200, min: 10, max: 5000, step: 10, help: 'Full-batch gradient steps; each needs one forward and one adjoint solve per experiment.' }, { key: 'npLr', label: 'Initial learning rate', unit: '', value: 0.05, min: 1e-4, max: 0.5, help: 'Adam step size; it decays to 5 % of this value.' },
+    ] },
+    { group: 'Reduced basis', tab: 'setup', showIf: is('rom'), fields: [
+      { key: 'romR', label: 'Modes retained', unit: '', value: 0, min: 0, max: 12, step: 1, help: '0 = as many as needed to capture 99.9999 % of the snapshot energy.' }, { key: 'romSnap', label: 'Snapshots per training run', unit: '', value: 25, min: 4, max: 60, step: 1, help: 'Saved profiles of each full-order run.' },
+    ] },
+    { group: 'Ensemble settings', tab: 'setup', showIf: is('ens'), fields: [
+      { key: 'ensBase', label: 'Base learner', type: 'select', value: 'nn', options: [{ value: 'nn', label: 'Neural network (high variance: bagging helps)' }, { value: 'poly', label: 'Polynomial response surface' }, { value: 'mix', label: 'Alternating network and response surface' }], help: 'Model type trained on every bootstrap resample.' },
+      { key: 'ensB', label: 'Bootstrap members', unit: '', value: 12, min: 3, max: 60, step: 1, help: 'Number of bootstrap resamples and models.' }, { key: 'ensH', label: 'Hidden neurons per network', unit: '', value: 6, min: 2, max: 24, step: 1, help: 'Width of the hidden layer of each member.' }, { key: 'ensEpochs', label: 'Epochs per network', unit: '', value: 250, min: 20, max: 3000, step: 10, help: 'Training length of each member (no early stopping).' },
+      { key: 'ensTest', label: 'Test share', unit: '%', value: 25, min: 5, max: 40, help: 'Held out completely; the out-of-bag error is computed without it.' },
+    ] },
+    { group: 'Search and parallel evaluation', tab: 'setup', showIf: is('rob'), fields: [
+      { key: 'robPop', label: 'Population size', unit: '', value: 6, min: 4, max: 40, step: 1, help: 'Every generation is one batch of population × scenarios plant simulations.' }, { key: 'robGens', label: 'Generations', unit: '', value: 2, min: 1, max: 60, step: 1, help: 'Differential-evolution generations before the local refinement.' }, { key: 'robPolish', label: 'Pattern-search refinements', unit: '', value: 3, min: 0, max: 20, step: 1, help: 'Local refinement of the best design; each one is a batch of four neighbouring designs.' },
+      { key: 'parWorkers', label: 'Worker threads', unit: '', value: 0, min: 0, max: 16, step: 1, help: 'Parallel computing: batches are split into this many chunks and simulated on worker threads; the speed-up is measured. 0 evaluates on the calling thread. If threads cannot be started (for example in the single-file edition) the same chunks run on the calling thread and the result says so.' },
+    ] },
+    { group: 'Branch and bound', tab: 'setup', showIf: is('lp'), fields: [
+      { key: 'lpNodes', label: 'Node limit', unit: '', value: 1500, min: 10, max: 20000, step: 10, help: 'The search stops here, or earlier when its simplex work budget is used up, and reports the remaining optimality gap.' },
+    ] },
     { group: 'Bayesian inference', tab: 'setup', showIf: is('pe'), fields: [
       { key: 'peBayes', label: 'Sample the posterior (Metropolis–Hastings)', type: 'bool', value: true }, { key: 'peMcmcN', label: 'Total MCMC iterations (two chains)', unit: '', value: 6000, min: 400, max: 200000, step: 100, showIf: (v) => v.peBayes },
     ] },
@@ -2251,6 +3493,9 @@ const suite = {
       { key: 'uqN', label: 'Monte-Carlo samples', unit: '', value: 160, min: 10, max: 5000, step: 10, showIf: is('uq') },
       { key: 'odeDt', label: 'ODE time step (fixed-step RK4)', unit: 'time', value: 0.05, min: 1e-9, max: 1e9, showIf: wb('ode') },
       { key: 'pdeNx', label: 'PDE cells', unit: '', value: 40, min: 4, max: 2000, step: 1, showIf: wb('pde') }, { key: 'pdeNt', label: 'PDE time steps', unit: '', value: 120, min: 2, max: 20000, step: 1, showIf: wb('pde') },
+      { key: 'ocN', label: 'Optimal control: time steps', unit: '', value: 100, min: 10, max: 2000, step: 1, showIf: is('oc'), help: 'RK4 steps of the state–costate integration.' },
+      { key: 'npNx', label: 'Neural PDE: cells', unit: '', value: 20, min: 6, max: 200, step: 1, showIf: is('npde'), help: 'Finite volumes of the model the closure is trained in.' }, { key: 'npNt', label: 'Neural PDE: time steps', unit: '', value: 40, min: 6, max: 2000, step: 1, showIf: is('npde'), help: 'Time steps of each experiment.' },
+      { key: 'romNx', label: 'Reduced-order model: cells of the full model', unit: '', value: 60, min: 8, max: 400, step: 1, showIf: is('rom'), help: 'Finite volumes of the full-order model.' }, { key: 'romNt', label: 'Reduced-order model: time steps', unit: '', value: 100, min: 10, max: 5000, step: 1, showIf: is('rom'), help: 'Crank–Nicolson steps of the full and the reduced model.' },
     ] },
   ],
 
@@ -2271,6 +3516,17 @@ const suite = {
     { name: '9 · Workbench PDE: transient polarisation layer', values: { task: 'wb', wbMode: 'pde' } },
     { name: '9 · Workbench PDE: decaying tracer pulse in a channel (upwind)', values: { task: 'wb', wbMode: 'pde', pdeL: 1, pdeT: 1.5, pdeV: 0.4, pdeD: 0.002, pdeR: '-kd*u', pdeIC: 'exp(-((x - 0.2)/0.05)^2)', pdeBCL: 'dirichlet', pdeBCLv: '0', pdeBCR: 'neumann', pdeBCRv: '0', pdeScheme: 'upwind', pdeNx: 100, pdeNt: 150 } },
     { name: '10 · Fit a fouling-decline model with identifiability and MCMC', values: { task: 'pe' } },
+    { name: '1 · Optimise cost with an energy cap and a gypsum-scaling limit', values: { task: 'opt', limSEC: 1.8, conScale: 'gypsum', limSI: -0.33 } },
+    { name: '11 · Optimal control: energy-optimal batch RO cycle (Pontryagin)', values: { task: 'oc' } },
+    { name: '12 · Train scheduling against a tariff (simplex + branch and bound)', values: { task: 'lp' } },
+    { name: '12 · Train scheduling as a pure linear programme (12 periods)', values: { task: 'lp', lpMode: 'lp', lpPeriods: 12 } },
+    { name: '13 · Neural ODE for fouling decline with a held-out run', values: { task: 'node' } },
+    { name: '14 · Neural PDE: learn a reaction closure from concentration fields', values: { task: 'npde' } },
+    { name: '15 · Reduced-order model of the polarisation layer (POD–Galerkin)', values: { task: 'rom' } },
+    { name: '16 · Bagged ensemble of surrogates with out-of-bag error', values: { task: 'ens' } },
+    { name: '17 · Multi-fidelity co-kriging of the RO model', values: { task: 'mf' } },
+    { name: '18 · Chance-constrained RO design with energy and scaling limits', values: { task: 'rob', limSEC: 2.08, conScale: 'gypsum', limSI: -0.25 } },
+    { name: '18 · Worst-case design evaluated on 4 worker threads', values: { task: 'rob', robMode: 'worst', parWorkers: 4 } },
   ],
 
   pull: ({ feed, outputs } = {}) => [
@@ -2304,6 +3560,8 @@ const suite = {
       metrics: [{ label: 'Mean specific energy', unit: 'kWh/m³', get: studyGet('uq', 'a') }, { label: 'Feed pressure P95', unit: 'bar', get: studyGet('uq', 'b') }, { label: 'Mean product TDS', unit: 'mg/L', get: studyGet('uq', 'c') }] },
     { name: 'ODE time step (workbench, fixed-step RK4)', keys: ['odeDt'], refine: 'divide', metrics: [{ label: 'y1 at end time', unit: '', get: studyGet('wb', 'a', 'ode') }, { label: 'y2 (or y1) at end time', unit: '', get: studyGet('wb', 'b', 'ode') }] },
     { name: 'PDE grid and time step (workbench)', keys: ['pdeNx', 'pdeNt'], min: 8, metrics: [{ label: 'Domain mean at end time', unit: '', get: studyGet('wb', 'a', 'pde') }, { label: 'Value at right boundary', unit: '', get: studyGet('wb', 'b', 'pde') }] },
+    { name: 'Optimal control: time steps of the state–costate integration', keys: ['ocN'], min: 10, metrics: [{ label: 'Optimal cycle energy', unit: 'kWh', get: studyGet('oc', 'a') }, { label: 'Initial costate', unit: 'kWh/m³', get: studyGet('oc', 'b') }] },
+    { name: 'Reduced-order model: grid and time step of the full model', keys: ['romNx', 'romNt'], min: 8, metrics: [{ label: 'Polarisation factor, reduced model', unit: '–', get: studyGet('rom', 'a') }, { label: 'Polarisation factor, full model', unit: '–', get: studyGet('rom', 'b') }] },
   ],
 
   calibration: {
@@ -2316,7 +3574,7 @@ const suite = {
     get validationSample() { return (this._v ||= foulingSynth(53, [5, 25, 50, 80, 120, 160, 200])); },
   },
 
-  verify() {
+  async verify() {
     const C = [], add = (name, expected, got, tol, note) => C.push({ name, expected, got, tol, pass: Number.isFinite(got) && Math.abs(got - expected) <= tol, note });
     const rosen = (x) => (1 - x[0]) ** 2 + 100 * (x[1] - x[0] ** 2) ** 2, himmel = (x) => (x[0] ** 2 + x[1] - 11) ** 2 + (x[0] + x[1] ** 2 - 7) ** 2;
     // optimisers on benchmark functions
@@ -2405,6 +3663,83 @@ const suite = {
     const L = cholesky([[4, 2, 0.6], [2, 5, 1], [0.6, 1, 3]]), xs = cholSolve(L, [1, 2, 3]);
     add('Cholesky solve satisfies the linear system', 0, Math.abs(4 * xs[0] + 2 * xs[1] + 0.6 * xs[2] - 1) + Math.abs(2 * xs[0] + 5 * xs[1] + xs[2] - 2) + Math.abs(0.6 * xs[0] + xs[1] + 3 * xs[2] - 3), 1e-12, 'Residual of A·x = b');
     add('Inverse normal CDF is consistent with the error function', 0.975, normCdf(normInv(0.975)), 1e-6, 'Φ(Φ⁻¹(0.975))');
+    { // ---- checks of the newer studies (own scope)
+    // linear and mixed-integer programming
+    const l1 = lpSolve([-3, -5], [{ a: [1, 0], op: '<=', b: 4 }, { a: [0, 2], op: '<=', b: 12 }, { a: [3, 2], op: '<=', b: 18 }]);
+    add('Simplex solves the textbook linear programme', 36, -l1.f, 1e-9, `max 3x + 5y s.t. x ≤ 4, 2y ≤ 12, 3x + 2y ≤ 18 → (${fmt(l1.x[0])}, ${fmt(l1.x[1])}), z = 36`);
+    add('Simplex dual values equal the known shadow prices', 0, Math.abs(l1.dual[0]) + Math.abs(l1.dual[1] + 1.5) + Math.abs(l1.dual[2] + 1), 1e-9, '∂z/∂b = (0, 3/2, 1) for the maximisation');
+    const l2 = lpSolve([1, 2, 3], [{ a: [1, 1, 1], op: '=', b: 10 }, { a: [1, 0, 0], op: '<=', b: 4 }, { a: [0, 1, 0], op: '<=', b: 5 }, { a: [1, 1, 0], op: '>=', b: 2 }]);
+    add('Two-phase simplex with equality and ≥ rows', 17, l2.f, 1e-9, 'min x + 2y + 3z s.t. x + y + z = 10, x ≤ 4, y ≤ 5 → (4, 5, 1)');
+    add('Simplex detects infeasible and unbounded programmes', 2, (lpSolve([1], [{ a: [1], op: '<=', b: 1 }, { a: [1], op: '>=', b: 2 }]).status === 'infeasible' ? 1 : 0) + (lpSolve([-1], [{ a: [-1], op: '<=', b: 0 }]).status === 'unbounded' ? 1 : 0), 0, 'x ≤ 1 with x ≥ 2; min −x without an upper limit');
+    const kv = [24, 13, 23, 15, 16, 11, 9, 21], kw = [12, 7, 11, 8, 9, 6, 5, 10], unitRow = (j) => range(8).map((q) => (q === j ? 1 : 0));
+    let brute = 0; for (let b = 0; b < 256; b++) { let w = 0, val = 0; for (let j = 0; j < 8; j++) if (b >> j & 1) { w += kw[j]; val += kv[j]; } if (w <= 26 && val > brute) brute = val; }
+    const mk = milpSolve(kv.map((q) => -q), [{ a: kw, op: '<=', b: 26 }, ...range(8).map((j) => ({ a: unitRow(j), op: '<=', b: 1 }))], range(8));
+    add('Branch and bound finds the knapsack optimum', brute, -mk.f, 1e-9, `${mk.nodes} nodes against enumeration of all 256 subsets; LP bound ${fmt(-mk.relaxation.f, 5)}`);
+    const asg = [[9, 2, 7], [6, 4, 3], [5, 8, 1]], am = milpSolve(asg.flat(), [...range(3).map((i) => ({ a: range(9).map((q) => (Math.floor(q / 3) === i ? 1 : 0)), op: '=', b: 1 })), ...range(3).map((j) => ({ a: range(9).map((q) => (q % 3 === j ? 1 : 0)), op: '=', b: 1 }))], range(9));
+    add('Mixed-integer assignment problem: known minimum cost', 9, am.f, 1e-9, '3 × 3 cost matrix, optimum 2 + 6 + 1');
+    // optimal control
+    const di2 = pmpShoot({ x0: [0, 0], xT: [1, 0], T: 1, f: (x, u) => [x[1], u[0]], L: (x, u) => 0.5 * u[0] ** 2, dHdx: (x, l) => [0, l[0]], uStar: (x, l) => [-l[1]] }, { N: 20 });
+    add('Pontryagin shooting: minimum-energy double integrator, cost', 6, di2.J, 1e-9, 'x(0) = v(0) = 0 → x(1) = 1, v(1) = 0; J = ½∫u² = 6');
+    add('Pontryagin shooting: optimal control u*(t) = 6 − 12t', 0, Math.max(...di2.t.map((t, k) => Math.abs(di2.u[k][0] - (6 - 12 * t)))), 1e-8, 'Largest deviation along the path');
+    const lq = pmpShoot({ x0: [1], xT: [null], T: 2, f: (x, u) => [u[0]], L: (x, u) => 0.5 * (x[0] ** 2 + u[0] ** 2), dHdx: (x) => [x[0]], uStar: (x, l) => [-l[0]] }, { N: 200 });
+    add('Linear-quadratic regulator: optimal cost ½·tanh(T)', 0.5 * Math.tanh(2), lq.J, 1e-8, 'min ½∫(x² + u²)dt, ẋ = u, x(0) = 1, free end; costate λ(0) = Riccati gain tanh(T)');
+    add('Linear-quadratic regulator: initial costate equals the Riccati solution', Math.tanh(2), lq.lam0[0], 1e-8, 'P(0) = tanh(T) from −dP/dt = 1 − P², P(T) = 0');
+    add('Hamiltonian is constant along the optimal path', 0, (Math.max(...lq.H) - Math.min(...lq.H)) / Math.abs(lq.H[0]), 1e-8, 'Autonomous problem: H = ½x² − ½λ²');
+    const elv = eulerLagrangeBVP((x, vd) => vd, (x) => x, 0, 1, 1, 80);
+    add('Euler–Lagrange boundary-value solver: x″ = x', 0, Math.max(...elv.t.map((t, k) => Math.abs(elv.x[k] - Math.sinh(t) / Math.sinh(1)))), 5e-5, 'L = ½(ẋ² + x²), x(0) = 0, x(1) = 1 → sinh t / sinh 1');
+    const bv = { ocV0: 10, ocRec: 50, ocT: 2, ocArea: 100, ocA: 3, ocPi0: 5, ocK: 1e9, ocDp: 1, ocFluxMax: 1e4, ocEta: 80 }, Bm = batchModel(bv), bp = batchPMP(Bm, 100, 1e3), qc = 5 / 2;
+    add('Batch RO without polarisation: the optimal flux is constant', 0, Math.max(...bp.u.map((u) => Math.abs(u[0] - qc))) / qc, 1e-7, 'Analytical result of the Euler–Lagrange equation when the osmotic term is an exact differential');
+    add('Batch RO: optimal energy equals the closed form', Bm.w * ((qc * qc * 2) / Bm.a + 5 * 10 * Math.log(2) + 5), bp.J, 1e-7, 'w·(q²T/a + π₀V₀·ln(V₀/V_f) + Δp·ΔV)');
+    const bc2 = batchModel({ ...bv, ocK: 8, ocFluxMax: 27, ocRec: 60, ocT: 3, ocArea: 80, ocPi0: 8 }), bq = batchPMP(bc2, 60, bc2.qmax), bd = batchDirect(bc2, 16, bc2.qmax, new Array(16).fill(2));
+    add('Bounded control: Pontryagin and direct transcription agree on the energy', 0, (bd.J - bq.J) / bq.J, 1e-3, `Flux limit active; NLP with 16 intervals, ${bd.iterations} SQP iterations`);
+    add('Bounded control: the control never exceeds its limit', 1, Math.max(...bq.u.map((u) => u[0])) / bc2.qmax, 1e-12, 'Clipping of the Hamiltonian minimiser');
+    // neural ODE and neural PDE
+    const gq = rng(3), trj = [0.4, -0.7].map((y0) => ({ t: [0, 0.3, 0.7, 1.2], y: [[y0, 0.2], ...range(3).map(() => [gq.normal(), gq.normal()])] })), pn0 = nodeInit(2, 4, 11), lg0 = nodeLossGrad(pn0, 2, 4, trj, 2);
+    let nErr = 0;
+    for (const i of [0, 5, 9, 13, 20, pn0.length - 1]) { const w = Float64Array.from(pn0), hh = 1e-6; w[i] += hh; const a = nodeLossGrad(w, 2, 4, trj, 2).loss; w[i] -= 2 * hh; const b = nodeLossGrad(w, 2, 4, trj, 2).loss; nErr = Math.max(nErr, Math.abs((a - b) / (2 * hh) - lg0.grad[i])); }
+    add('Neural ODE: adjoint gradient through RK4 matches the numerical gradient', 0, nErr, 1e-7, 'Two states, four hidden neurons, six parameters checked');
+    const tt = linspace(0, 2, 11), dec = [1, 0.5, -0.6].map((y0) => ({ t: tt, y: tt.map((t) => [y0 * Math.exp(-t)]) })), nf = nodeTrain(1, 5, dec, { epochs: 400, lr: 0.05, seed: 2, sub: 1 });
+    add('Neural ODE learns exponential decay and predicts an unseen start', 0.75 * Math.exp(-2), nodeSolve(nf.p, 1, 5, [0.75], tt, 1)[10][0], 0.01, 'Trained on y(0) = 1, 0.5 and −0.6; tested from y(0) = 0.75 at t = 2');
+    const opv = cdrOperator({ L: 1, nx: 12, v: 0.3, D: 0.02, left: { type: 'dirichlet', val: 2 }, right: { type: 'neumann', val: 0 } }), pv = nodeInit(1, 3, 7), exv = [{ op: opv, u0: zeros(12), nt: 10, dt: 0.2, obs: [{ k: 4, u: range(12).map((i) => 1 + 0.1 * i) }, { k: 10, u: range(12).map((i) => 2 - 0.05 * i) }] }], gv = npdeLossGrad(pv, 3, exv, { uRef: 2, rRef: 0.5 });
+    let vErr = 0;
+    for (const i of [0, 2, 4, 7, 9]) { const w = Float64Array.from(pv), hh = 1e-6; w[i] += hh; const a = npdeLossGrad(w, 3, exv, { uRef: 2, rRef: 0.5 }).loss; w[i] -= 2 * hh; const b = npdeLossGrad(w, 3, exv, { uRef: 2, rRef: 0.5 }).loss; vErr = Math.max(vErr, Math.abs((a - b) / (2 * hh) - gv.grad[i])); }
+    add('Neural PDE: discrete-adjoint gradient matches the numerical gradient', 0, vErr, 1e-7, 'Transposed tri-diagonal solves backwards in time, five parameters checked');
+    const fvv = solveCDR({ L: 1, nx: 12, tEnd: 2, nt: 10, v: 0.3, D: 0.02, ic: () => 0, left: { type: 'dirichlet', val: () => 2 }, right: { type: 'neumann', val: () => 0 }, theta: 0.5 }), imv = imexMarch(opv, zeros(12), 10, 0.2, () => 0, 0.5)[10];
+    add('Neural-PDE time stepping reproduces the finite-volume solver without a closure', 0, Math.max(...imv.map((q, i) => Math.abs(q - fvv.u[i]))), 1e-12, 'Same operator and Crank–Nicolson scheme');
+    // proper orthogonal decomposition
+    const eg = symEig([[2, 1, 0], [1, 2, 0], [0, 0, 5]]);
+    add('Jacobi eigen-solver: known eigenvalues', 0, Math.abs(eg.values[0] - 5) + Math.abs(eg.values[1] - 3) + Math.abs(eg.values[2] - 1), 1e-12, 'Eigenvalues 5, 3, 1');
+    const m1 = range(9).map((j) => Math.sin(j / 3)), m2 = range(9).map((j) => Math.cos(j / 2)), snaps = range(7).map((k) => m1.map((q, j) => (k - 3) * q + 0.5 * k * k * m2[j])), pd = podBasis(snaps, { center: false });
+    add('POD of rank-two snapshots finds exactly two modes', 2, pd.modes.length, 0, `Singular values ${pd.sigma.map((q) => fmt(q, 4)).join(', ')}`);
+    add('POD modes are orthonormal and reconstruct the snapshots', 0, Math.abs(dot(pd.modes[0], pd.modes[1])) + Math.abs(dot(pd.modes[0], pd.modes[0]) - 1) + Math.max(...snaps.map((f) => { const a = pd.modes.map((ph) => dot(ph, f)); return maxAbs(f.map((q, j) => q - a[0] * pd.modes[0][j] - a[1] * pd.modes[1][j])); })), 1e-10, 'Projection residual of all seven snapshots');
+    const opr = cdrOperator({ L: 1, nx: 10, v: 0.5, D: 0.1, left: { type: 'dirichlet', val: 1 }, right: { type: 'noflux', val: 0 } }), fomr = imexMarch(opr, new Array(10).fill(1), 40, 0.05, () => 0, 0.5), pr = podBasis(fomr.slice(1).map((u) => u.map((q) => q - 1)), { center: false }), gr2 = galerkinROM(opr, pr.modes, new Array(10).fill(1), 40, 0.05);
+    add('Galerkin reduced model with a complete basis reproduces the full model', 0, Math.max(...gr2.lift(gr2.a[40]).map((q, i) => Math.abs(q - fomr[40][i]))), 5e-6, `${pr.modes.length} modes of a 10-cell problem (modes below 10⁻¹³ of the leading eigenvalue are dropped)`);
+    // ensembles, multi-fidelity, chance constraints
+    const ge = rng(17), Xe = range(80).map(() => [ge.uniform(-1, 1), ge.uniform(-1, 1)]), ye = Xe.map((x) => 2 * x[0] - x[1] + ge.normal(0, 0.1)), bg = bagEnsemble(Xe, ye, (Xa, ya) => polyFit(Xa, ya, 1).predict, { B: 20, seed: 4 }), Xq = range(40).map(() => [ge.uniform(-1, 1), ge.uniform(-1, 1)]), yq = Xq.map((x) => 2 * x[0] - x[1]);
+    const Pq = Xq.map((x) => bg.predict(x)), mseE = mean(Pq.map((p, i) => (p.mean - yq[i]) ** 2)), mseM = mean(range(20).map((b) => mean(Pq.map((p, i) => (p.all[b] - yq[i]) ** 2)))), amb = mean(Pq.map((p) => mean(p.all.map((q) => (q - p.mean) ** 2))));
+    add('Ensemble: ambiguity decomposition holds exactly', 0, Math.abs(mseM - mseE - amb) / mseM, 1e-10, 'mean member MSE = ensemble MSE + mean member variance');
+    add('Ensemble: out-of-bag error recovers the noise level', 0.1, bg.oob.rmse, 0.025, 'Bagged linear fits of y = 2x₁ − x₂ + N(0, 0.1²), 80 rows');
+    const fH = (x) => (6 * x - 2) ** 2 * Math.sin(12 * x - 4), fL = (x) => 0.5 * fH(x) + 10 * (x - 0.5) - 5, xL = linspace(0, 1, 11).map((x) => [x]), xH = [0, 0.4, 0.6, 0.8, 1].map((x) => [x]), ckf = coKrige(xL, xL.map((x) => fL(x[0])), xH, xH.map((x) => fH(x[0]))), gHf = gpFit(xH, xH.map((x) => fH(x[0]))), xtf = linspace(0.03, 0.97, 25);
+    const eMFf = rmse(xtf.map((x) => ckf.predict([x]).mean), xtf.map(fH)), eSFf = rmse(xtf.map((x) => gHf.predict([x]).mean), xtf.map(fH));
+    add('Co-kriging beats the single-fidelity process on the Forrester benchmark', 0, eMFf / eSFf, 0.2, `RMSE ${fmt(eMFf, 3)} against ${fmt(eSFf, 3)} with 5 high- and 11 low-fidelity points; ρ = ${fmt(ckf.rho, 4)} (exact 2), discrepancy: ${ckf.kind}`);
+    const xi = lhs(400, 1, 3).map((u) => normInv(u[0])), cc = (al) => nelderMead((x) => x[0] + 50 * chanceViolation(xi.map((q) => q - x[0]), al).viol, [3], { lo: [-5], hi: [5], maxIter: 400, tol: 1e-12, scale: 0.5 }).x[0];
+    add('Chance constraint by sample-average approximation: 90 % quantile of a normal variable', 1.2816, cc(0.1), 0.03, 'min x s.t. P[ξ ≤ x] ≥ 0.9, ξ ~ N(0, 1), 400 Latin-hypercube scenarios');
+    add('Worst-case constraint equals the largest scenario', Math.max(...xi), cc(0), 1e-4, 'α = 0: every scenario must be feasible');
+    // energy and scaling constraints of the RO optimisation, and the worker pool
+    const dv = Object.fromEntries(suite.inputs.flatMap((gq2) => gq2.fields).map((f) => [f.key, f.value])), vb = roBase(dv), e0 = evalDesign(vb, dv), vc = { ...dv, limSEC: 0.9 * e0.m.sec, conScale: 'gypsum', limSI: -0.1 };
+    warmReset();
+    const e1 = evalDesign(vb, vc), aw = analyzeWater({ ions: e1.m.concIons, T: vb.T, pH: e1.m.concPH });
+    add('Energy constraint: normalised value of a 10 % tighter cap', 1 / 0.9 - 1, e1.g[6], 1e-6, 'g = (SEC − cap)/cap with cap = 0.9 × SEC');
+    add('Scaling constraint: saturation index equals the full speciation of suite 2', aw.SI.gypsum, e1.m.si, 1e-9, `Gypsum in the concentrate at ${fmt(e0.m.rec, 3)} % recovery; g = SI − limit = ${fmt(e1.g[7], 4)}`);
+    const e2 = evalDesign({ ...vb, recovery: vb.recovery + 8 }, vc);
+    add('Scaling constraint tightens with recovery', 1, e2.m.si > e1.m.si ? 1 : 0, 0, `Gypsum SI ${fmt(e1.m.si, 4)} → ${fmt(e2.m.si, 4)} for +8 points of recovery`);
+    const jobs = [40, 44, 48, 52].map((q) => ({ recovery: q })), bt = await makeBatcher(dv, vb, 2, { tick: async () => {} });
+    try {
+      const got = await bt.run(jobs), want = [evalJobs(jobs.slice(0, 2), dv, vb), evalJobs(jobs.slice(2), dv, vb)].flat(), live = bt.pool.live && !bt.fellBack;
+      add(live ? 'Parallel evaluation on worker threads reproduces the calling thread' : 'Chunked evaluation reproduces the direct evaluation (worker threads unavailable here)', 0, Math.max(...got.map((e, i) => Math.abs(e.m.sec - want[i].m.sec) + Math.abs(e.cost.total - want[i].cost.total))), 1e-12, live ? `Four plant simulations on ${bt.pool.workers} threads, started in ${bt.pool.startMs} ms` : `Sequential fallback: ${bt.pool.reason}`);
+    } finally { bt.pool.close(); }
+    warmReset();
+    }
     return C;
   },
 };
@@ -2413,6 +3748,13 @@ const suite = {
 function foulingSynth(seed, days) {
   const g = rng(seed);
   return days.map((t) => ({ t, Kn: +(0.74 + 0.26 * Math.exp(-0.0052 * t) + g.normal(0, 0.004)).toFixed(4) }));
+}
+
+// Worker-thread entry: when this module is loaded inside a worker started by parPool it answers batch-evaluation requests.
+{
+  const wt = nodeThreads();
+  if (wt && !wt.isMainThread && wt.workerData?.brinelabPar) wt.parentPort.on('message', (m) => { const r = parHandle(m); if (r) wt.parentPort.postMessage(r); });
+  else if (typeof DedicatedWorkerGlobalScope !== 'undefined' && globalThis instanceof DedicatedWorkerGlobalScope) globalThis.addEventListener('message', (e) => { const r = parHandle(e.data); if (r) globalThis.postMessage(r); });
 }
 
 export default suite;
