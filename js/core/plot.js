@@ -324,6 +324,7 @@ function drawField(canvas, spec) {
   for (const v of barTicks) if (v >= lo && v <= hi) ctx.fillText(tickLabel(v), bx + bwid + 4, m.t + ph - norm(v) * ph);
   void inv;
   if (spec.zlabel) { ctx.save(); ctx.translate(w - 5, m.t + ph / 2); ctx.rotate(-Math.PI / 2); ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'; ctx.fillStyle = C.fg; ctx.fillText(spec.zlabel, 0, 0); ctx.restore(); }
+  canvas._pick = (px, py) => (px < m.l || px > m.l + pw || py < m.t || py > m.t + ph ? null : { x: xs[0] + ((px - m.l) / pw) * dx, y: ys[0] + ((m.t + ph - py) / ph) * dy });
   canvas._hover = (px, py) => {
     if (px < m.l || px > m.l + pw || py < m.t || py > m.t + ph) return null;
     const vx = xs[0] + ((px - m.l) / pw) * dx, vy = ys[0] + ((m.t + ph - py) / ph) * dy;
@@ -390,6 +391,10 @@ export function plotCard(spec, { onDownload } = {}) {
     tip.style.left = Math.min(r.width - 150, Math.max(0, hv.x + 10)) + 'px'; tip.style.top = Math.max(0, hv.y - 30) + 'px';
   });
   canvas.addEventListener('pointerleave', () => (tip.hidden = true));
+  if (typeof spec.onPick === 'function') { // clickable field plots (e.g. choose a point on a map)
+    canvas.style.cursor = 'crosshair';
+    canvas.addEventListener('click', (e) => { const r = canvas.getBoundingClientRect(), p = canvas._pick && canvas._pick(e.clientX - r.left, e.clientY - r.top); if (p) spec.onPick(p.x, p.y); });
+  }
   card._redraw = render;
   return card;
 }
