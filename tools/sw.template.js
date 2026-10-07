@@ -2,7 +2,7 @@
 // Makes the whole application available offline, keeps the last live-data responses for offline
 // use, and lets a newer build replace the stored one.
 const VERSION = '__VERSION__';
-const SHELL = 'brinelab-shell-' + VERSION, DATA = 'brinelab-data-v1', TILES = 'brinelab-tiles-v1';
+const SHELL = 'brinelab-shell-' + VERSION, DATA = 'brinelab-data-v1', TILES = 'brinelab-tiles-v2';
 const FILES = __FILES__;
 const DATA_HOSTS = ['api.open-meteo.com', 'marine-api.open-meteo.com', 'geocoding-api.open-meteo.com', 'api.bigdatacloud.net', 'pae-paha.pacioos.hawaii.edu', 'gis.ngdc.noaa.gov', 'erddap.emodnet-physics.eu', 'api.worldbank.org', 'open.er-api.com', 'ourworldindata.org', 'power.larc.nasa.gov', 'api.openalex.org', 'api.crossref.org'];
 
@@ -19,7 +19,7 @@ self.addEventListener('install', (e) => {
 
 self.addEventListener('activate', (e) => {
   e.waitUntil((async () => {
-    for (const k of await caches.keys()) if (k.startsWith('brinelab-shell-') && k !== SHELL) await caches.delete(k);
+    for (const k of await caches.keys()) if ((k.startsWith('brinelab-shell-') && k !== SHELL) || (k.startsWith('brinelab-tiles-') && k !== TILES)) await caches.delete(k);
     await self.clients.claim();
     await tell({ type: 'offline-ready' }); await tell({ type: 'version', version: VERSION });
   })());
@@ -58,11 +58,11 @@ self.addEventListener('fetch', (e) => {
     })());
     return;
   }
-  if (url.hostname === 'tile.openstreetmap.org') { // map tiles: stored copy first
+  if (url.hostname === 'tile.openstreetmap.org' || url.hostname === 'basemaps.cartocdn.com') { // map tiles: stored copy first
     e.respondWith((async () => {
       const cache = await caches.open(TILES), hit = await cache.match(req);
       if (hit) return hit;
-      const r = await fetch(req); if (r.ok || r.type === 'opaque') { cache.put(req, r.clone()); trim(TILES, 400); } return r;
+      const r = await fetch(req); if (r.ok) { cache.put(req, r.clone()); trim(TILES, 400); } return r; // refused tiles are never stored
     })());
   }
 });

@@ -8,7 +8,7 @@ export function checkFile(file) {
   if (file.size > LIMITS.fileBytes) throw new Error(`File is larger than ${LIMITS.fileBytes / 1e6} MB.`);
   return file;
 }
-export const extOf = (name) => (String(name).toLowerCase().match(/\.([a-z0-9]+)$/) || [, ''])[1];
+export const extOf = (name) => (String(name).toLowerCase().match(/\.([a-z0-9_]+)$/) || [, ''])[1];
 
 /** RFC-4180 style parser with automatic delimiter detection. Returns array of string rows. */
 export function parseDelimited(text, delim) {

@@ -5,7 +5,7 @@ import { h, clear, btn, kpiGrid, dataTable, toast, importBtn, help } from './ui.
 import { plotCard } from './plot.js';
 import { fmt } from './num.js';
 import { download, LIMITS } from './io.js';
-import { FORMATS, PATHWAYS, SUITE_GEOMETRY, formatOf, importGeometry, sectionOf, gridOf, microstructure, networkSummary, dimensions, generate } from './geom.preview.js';
+import { FORMATS, PATHWAYS, SUITE_GEOMETRY, formatOf, importGeometry, sectionOf, gridOf, microstructure, networkSummary, dimensions, generate } from './geom.js';
 import { geometryLinks } from './geomlinks.js';
 
 const attached = new Map(); // suite id -> Geometry (kept in memory for the session; files are never uploaded)
@@ -73,9 +73,9 @@ function facts(g) {
   const d = derive(g), k = [{ label: 'Format', value: g.format || '—' }, { label: 'Pathway', value: PATHWAYS[g.pathway]?.title || g.pathway || '—' }, { label: 'Read as', value: { mesh: 'Triangulated surface', polylines: '2-D outlines', points: 'Point cloud', grid: 'Elevation grid', voxels: 'Voxel microstructure', network: 'Equipment / piping network', table: 'Data table' }[g.kind] || g.kind }];
   if (g.count) k.push({ label: g.kind === 'points' ? 'Points' : 'Triangles', value: g.count });
   if (g.polylines) k.push({ label: 'Outlines', value: g.polylines.length });
-  for (const [key, val] of Object.entries(g.stats || {})) if (typeof val === 'number' || typeof val === 'string') k.push({ label: key.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase()), value: val });
+  for (const [key, val] of Object.entries(g.stats || {})) if ((typeof val === 'number' || typeof val === 'string') && !/^(nx|ny|nz|zmin|zmax|min|max)$/i.test(key)) k.push({ label: key.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase()), value: val });
   if (d.dims?.size) k.push({ label: 'Extent', value: d.dims.size.filter((s) => Number.isFinite(s)).map((s) => fmt(s, 4)).join(' × ') });
-  if (d.dims?.area) k.push({ label: 'Surface area', value: d.dims.area }); if (d.dims?.volume) k.push({ label: 'Volume', value: d.dims.volume, help: d.dims.closed === false ? 'The surface is not closed, so the volume is approximate.' : '' });
+  if (d.dims?.area && g.kind === 'mesh') k.push({ label: 'Surface area', value: d.dims.area }); if (d.dims?.volume) k.push({ label: 'Volume', value: d.dims.volume, help: d.dims.closed === false ? 'The surface is not closed, so the volume is approximate.' : '' });
   if (d.micro) k.push({ label: 'Porosity', value: d.micro.porosity }, { label: 'Tortuosity', value: (d.micro.tortuosity || []).filter(Number.isFinite).map((t) => fmt(t, 3)).join(' / ') || '—' }, { label: 'Mean pore size', value: d.micro.meanPoreSize }, { label: 'Specific surface', value: d.micro.specificSurface, unit: '1/length' }, { label: 'Percolates', value: (d.micro.percolates || []).map((p) => (p ? 'yes' : 'no')).join(' / ') });
   if (d.net) k.push({ label: 'Nodes', value: d.net.nodes }, { label: 'Connections', value: d.net.edges }, { label: 'Total pipe length', value: d.net.totalLength, unit: 'm' });
   if (d.grid) k.push({ label: 'Lowest point', value: d.grid.min, unit: 'm' }, { label: 'Highest point', value: d.grid.max, unit: 'm' }, { label: 'Grid', value: `${d.grid.nx} × ${d.grid.ny}` });

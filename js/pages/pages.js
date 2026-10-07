@@ -5,7 +5,7 @@ import { SUITES, CHAIN, byId, loadSuite, downstream } from '../suites/index.js';
 import { runSuite, applyLinks, linkItems, allFields, setInputValue } from '../core/suiteview.js';
 import { readFiles, geometryCard, generatorPanel, formatCatalogue, attachGeometry, derive, ACCEPT } from '../core/geomview.js';
 import { geometryLinks } from '../core/geomlinks.js';
-import { SUITE_GEOMETRY, formatOf } from '../core/geom.preview.js';
+import { SUITE_GEOMETRY, formatOf } from '../core/geom.js';
 import { fetchSite, searchPlace, SOURCES } from '../core/live.js';
 import { plotCard } from '../core/plot.js';
 import { fmt } from '../core/num.js';
@@ -71,11 +71,35 @@ export function casePage(root) {
 }
 
 // ---------------------------------------------------------------------------------- global site data
+// Map tiles are fetched (not hot-linked) so the HTTP status can be checked: a refused tile is never
+// shown, the next provider is tried instead, and good tiles are kept in memory for the session.
+const TILE_SOURCES = [(z, x, y) => `https://tile.openstreetmap.org/${z}/${x}/${y}.png`, (z, x, y) => `https://basemaps.cartocdn.com/rastertiles/voyager/${z}/${x}/${y}.png`];
+const tileCache = new Map();
+let tileSource = 0;
+function loadTile(z, x, y) {
+  const key = `${z}/${x}/${y}`;
+  if (tileCache.has(key)) return tileCache.get(key);
+  const p = (async () => {
+    for (let k = tileSource; k < TILE_SOURCES.length; k++) {
+      try {
+        const r = await fetch(TILE_SOURCES[k](z, x, y), { mode: 'cors', credentials: 'omit', referrerPolicy: 'strict-origin-when-cross-origin' });
+        if (r.ok && (r.headers.get('content-type') || '').startsWith('image/')) return URL.createObjectURL(await r.blob());
+        if (r.status === 403 || r.status === 429) tileSource = Math.max(tileSource, k + 1); // provider refuses this app: stop asking it
+      } catch { /* offline or blocked: try the next provider */ }
+    }
+    tileCache.delete(key);
+    return null;
+  })();
+  if (tileCache.size > 600) { const first = tileCache.keys().next().value; tileCache.get(first).then((u) => u && URL.revokeObjectURL(u)); tileCache.delete(first); }
+  tileCache.set(key, p);
+  return p;
+}
+
 function slippyMap(lat, lon, onPick) {
   let zoom = lat === null || lat === undefined ? 2 : 8, cLat = lat ?? 22, cLon = lon ?? 30, mLat = lat, mLon = lon;
   const box = h('div', { class: 'map', tabindex: '0', role: 'application', 'aria-label': 'World map. Click or tap to choose the site.' }), layer = h('div', { class: 'map-layer' }), pin = h('div', { class: 'map-pin', hidden: true }, '📍');
   box.append(layer, pin, h('div', { class: 'map-zoom' }, h('button', { type: 'button', 'aria-label': 'Zoom in', onclick: (e) => { e.stopPropagation(); zoom = Math.min(15, zoom + 1); draw(); } }, '+'), h('button', { type: 'button', 'aria-label': 'Zoom out', onclick: (e) => { e.stopPropagation(); zoom = Math.max(2, zoom - 1); draw(); } }, '−')),
-    h('div', { class: 'map-attr' }, '© OpenStreetMap contributors'));
+    h('div', { class: 'map-attr' }, '© OpenStreetMap contributors · © CARTO'));
   const X = (lo, z) => ((lo + 180) / 360) * 2 ** z * 256, Y = (la, z) => { const r = (la * Math.PI) / 180; return ((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * 2 ** z * 256; };
   const invX = (x, z) => (x / (2 ** z * 256)) * 360 - 180, invY = (y, z) => (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / (2 ** z * 256)))) * 180) / Math.PI;
   function draw() {
@@ -83,10 +107,10 @@ function slippyMap(lat, lon, onPick) {
     clear(layer);
     for (let tx = Math.floor((cx - w / 2) / 256); tx <= Math.floor((cx + w / 2) / 256); tx++) for (let ty = Math.floor((cy - hgt / 2) / 256); ty <= Math.floor((cy + hgt / 2) / 256); ty++) {
       if (ty < 0 || ty >= n) continue;
-      const img = h('img', { alt: '', draggable: 'false', loading: 'lazy', referrerpolicy: 'no-referrer', src: `https://tile.openstreetmap.org/${zoom}/${((tx % n) + n) % n}/${ty}.png` });
+      const img = h('img', { alt: '', draggable: 'false' });
       img.style.left = Math.round(tx * 256 - cx + w / 2) + 'px'; img.style.top = Math.round(ty * 256 - cy + hgt / 2) + 'px';
-      img.addEventListener('error', () => img.remove());
       layer.append(img);
+      loadTile(zoom, ((tx % n) + n) % n, ty).then((url) => { if (url && img.isConnected) img.src = url; else img.remove(); });
     }
     if (mLat !== null && mLat !== undefined) { pin.hidden = false; pin.style.left = X(mLon, zoom) - cx + w / 2 + 'px'; pin.style.top = Y(mLat, zoom) - cy + hgt / 2 + 'px'; } else pin.hidden = true;
   }
@@ -283,7 +307,7 @@ export function appPage(root, app) {
       const url = el.dataset.url;
       try { const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 9000); const r = await fetch(url + 'version.json?t=' + Date.now(), { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'cors' }); clearTimeout(tm); const j = await r.json(); el.className = 'source ok'; el.lastChild.textContent = `online · build ${String(j.version).slice(0, 12)}`; }
       catch { el.className = 'source fail'; el.lastChild.textContent = navigator.onLine ? 'not reachable from this network' : 'offline'; }
-      el.append(h('a', { class: 'btn mini', href: url, rel: 'noopener' }, 'Open'));
+      el.append(h('a', { class: 'btn mini', href: url + 'index.html', rel: 'noopener' }, 'Open'));
     }
   };
   const paintStorage = async () => {
@@ -305,7 +329,7 @@ export function appPage(root, app) {
         h('li', null, h('b', null, 'macOS Safari: '), 'File → “Add to Dock”.'), h('li', null, h('b', null, 'Firefox desktop: '), 'no install prompt, but the app still works offline in a normal tab once loaded; or use the single-file edition.'))),
     card(h('h2', null, 'Works in aeroplane mode'), h('p', null, 'All 13 calculation engines, the plotting, file import and your cases run entirely on the device. Only two things need a connection: pulling live site data and checking for a newer build. Site data already fetched remain stored with the case.'),
       h('p', { class: 'note' }, 'While you are online the app checks for a newer build in the background and refreshes stored site data that are more than six hours old; installed copies on supporting browsers also refresh periodically in the background.')),
-    card(h('h2', null, 'Availability and mirrors'), h('p', null, 'The same build is published at more than one independent address. If one host is down, open another — or simply keep using the installed copy, which needs no host at all.'), mirrorBox, h('div', { class: 'row-tools' }, btn('Check mirrors now', check))),
+    card(h('h2', null, 'Availability and mirrors'), h('p', null, MIRRORS.length > 1 ? 'The same build is published at more than one independent address. If one host is down, open another — or simply keep using the installed copy, which needs no host at all.' : 'Once installed (or saved as the single-file edition) the application needs no host at all: it keeps running if the web address is unreachable. The build is host-independent, so it can also be published to a second, independent host; none has been set up yet.'), mirrorBox, h('div', { class: 'row-tools' }, btn('Check mirrors now', check))),
     card(h('h2', null, 'Security and privacy'), h('ul', { class: 'steps' },
       h('li', null, 'No account, no tracking, no analytics, no cookies. Cases, inputs and results never leave this device unless you export them.'),
       h('li', null, 'A strict content-security policy blocks inline and third-party scripts; the app loads no external code libraries.'),

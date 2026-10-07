@@ -52,11 +52,11 @@ project is involved, so the data are as fresh as the sources whenever and wherev
 
 ## Availability
 
-The static build is host-independent (relative paths only). It is published on GitHub Pages and is
-also reachable through independent CDNs that serve the same repository (listed in `js/data/app.js`
-and checked live on the app's *Install & offline* page). To add a fully independent host, run
-`tools/deploy-mirrors.sh` with a Cloudflare Pages, Netlify or GitLab account. Installed copies and
-the single-file edition keep working with no host at all.
+The static build is host-independent (relative paths only). It is published on GitHub Pages. Installed
+copies and the single-file edition (`standalone.html`) keep working with no host at all, so an outage of
+the web address does not stop existing users. To add a second, fully independent web address, run
+`tools/deploy-mirrors.sh` with a Cloudflare Pages, Netlify, GitLab or Codeberg account, then list the new
+address in `js/data/app.js` so the app's *Install & offline* page checks it.
 
 ## Security
 

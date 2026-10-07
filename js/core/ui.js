@@ -3,7 +3,7 @@
 import { fmt } from './num.js';
 import { IONS, ION_IDS, WATERS, cloneIons, summarize } from './water.js';
 import { readTable, toCSV, download, checkFile } from './io.js';
-import { importGeometry, FORMATS } from './geom.preview.js';
+import { importGeometry, FORMATS } from './geom.js';
 import { asOutline, asBathy } from './geomlinks.js';
 
 export function h(tag, attrs, ...kids) {
@@ -41,7 +41,7 @@ export const badge = (text, kind = '') => h('span', { class: 'badge ' + kind }, 
 export function kpiGrid(items) {
   return h('div', { class: 'kpis' }, items.map((k) => h('div', { class: 'kpi ' + (k.status || ''), title: k.help || null },
     h('div', { class: 'kpi-l' }, k.label),
-    h('div', { class: 'kpi-v' }, typeof k.value === 'number' ? fmt(k.value, k.sig || 4) : String(k.value ?? '–'), k.unit ? h('small', null, ' ' + k.unit) : null))));
+    h('div', { class: 'kpi-v' + (typeof k.value === 'string' && k.value.length > 9 ? ' txt' : '') }, typeof k.value === 'number' ? fmt(k.value, k.sig || 4) : String(k.value ?? '–'), k.unit ? h('small', null, ' ' + k.unit) : null))));
 }
 
 /** Result table with CSV export. spec: { title, columns:[string], rows:[[...]], note } */

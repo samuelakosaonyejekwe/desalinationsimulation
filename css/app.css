@@ -281,3 +281,4 @@ label.inline { display: inline-flex; align-items: center; gap: 6px; font-size: 1
 @keyframes nudge { 0%, 100% { transform: translateY(-1px); } 50% { transform: translateY(2px); } }
 @media (max-width: 720px) { .install-btn { padding: 0 5px; gap: 0; } .install-btn span { display: none; } }
 @media (min-width: 721px) { .tabs { flex-wrap: wrap; overflow-x: visible; row-gap: 0; } }
+.kpi-v.txt { font-size: .98rem; line-height: 1.3; }
