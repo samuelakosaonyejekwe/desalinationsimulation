@@ -99,15 +99,16 @@ const connectors = {
     return { data };
   },
   async bathy(lat, lon) {
-    const half = 0.12, n = 21;
+    const half = 0.12, n = 57; // 57 × 57 samples ≈ the 15-arc-second native resolution of the mosaic over this window
     const lats = Array.from({ length: n }, (_, i) => clamp(lat - half + (2 * half * i) / (n - 1), -89.9, 89.9)), lons = Array.from({ length: n }, (_, i) => clamp(lon - half + (2 * half * i) / (n - 1), -179.9, 179.9));
     let elev;
     try { // primary: one multipoint sample request against the NOAA global DEM mosaic
       const points = lats.flatMap((la) => lons.map((lo) => [+lo.toFixed(5), +la.toFixed(5)]));
-      const j = await getJSON('https://gis.ngdc.noaa.gov/arcgis/rest/services/DEM_mosaics/DEM_global_mosaic/ImageServer/getSamples', 25000,
-        { geometry: JSON.stringify({ points, spatialReference: { wkid: 4326 } }), geometryType: 'esriGeometryMultipoint', returnFirstValueOnly: 'true', f: 'json' });
-      const flat = new Array(n * n).fill(null);
-      for (const sm of j.samples || []) { const v = parseFloat(sm.value); if (Number.isInteger(sm.locationId) && sm.locationId >= 0 && sm.locationId < n * n && Number.isFinite(v) && Math.abs(v) < 12000) flat[sm.locationId] = v; }
+      const flat = new Array(n * n).fill(null), CH = 1000, jobs = []; // the service returns at most 1000 samples per request
+      for (let o = 0; o < points.length; o += CH) jobs.push(getJSON('https://gis.ngdc.noaa.gov/arcgis/rest/services/DEM_mosaics/DEM_global_mosaic/ImageServer/getSamples', 25000,
+        { geometry: JSON.stringify({ points: points.slice(o, o + CH), spatialReference: { wkid: 4326 } }), geometryType: 'esriGeometryMultipoint', returnFirstValueOnly: 'true', f: 'json' })
+        .then((j) => { for (const sm of j.samples || []) { const v = parseFloat(sm.value), id = o + sm.locationId; if (Number.isInteger(sm.locationId) && id >= 0 && id < n * n && Number.isFinite(v) && Math.abs(v) < 12000) flat[id] = v; } }));
+      await Promise.all(jobs);
       if (flat.filter((v) => v !== null).length < 0.6 * n * n) throw new Error('Incomplete relief grid');
       elev = lats.map((_, a) => lons.map((_, b) => flat[a * n + b] ?? 0));
     } catch { // fallback: SRTM30+ 1 km relief resampled onto the same grid

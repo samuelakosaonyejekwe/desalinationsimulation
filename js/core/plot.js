@@ -215,17 +215,38 @@ function drawField(canvas, spec) {
   const mid = spec.zmid !== undefined && spec.zmid > lo && spec.zmid < hi ? spec.zmid : null;
   const norm = (v) => (mid === null ? (v - lo) / (hi - lo) : v < mid ? (0.5 * (v - lo)) / (mid - lo) : 0.5 + (0.5 * (v - mid)) / (hi - mid));
   const inv = (t) => (mid === null ? lo + t * (hi - lo) : t < 0.5 ? lo + (t / 0.5) * (mid - lo) : mid + ((t - 0.5) / 0.5) * (hi - mid));
-  const off = document.createElement('canvas'); off.width = nx; off.height = ny;
-  const octx = off.getContext('2d'), img = octx.createImageData(nx, ny);
-  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
-    const v = z[j][i], o = ((ny - 1 - j) * nx + i) * 4;
-    if (spec.mask && spec.mask[j][i]) { img.data[o] = 100; img.data[o + 1] = 116; img.data[o + 2] = 139; img.data[o + 3] = 255; continue; }
-    if (!Number.isFinite(v)) { img.data[o + 3] = 0; continue; }
-    const t = Math.max(0, Math.min(255, Math.round(norm(v) * 255)));
-    img.data[o] = L[t * 3]; img.data[o + 1] = L[t * 3 + 1]; img.data[o + 2] = L[t * 3 + 2]; img.data[o + 3] = 255;
+  // Smooth fields are resampled to screen resolution by bilinear interpolation of the VALUES (then coloured),
+  // which keeps colour boundaries such as a shoreline sharp; masked fields stay cell-exact.
+  const smooth = !spec.mask && nx > 2 && ny > 2 && spec.interpolate !== false;
+  const dprF = Math.min(window.devicePixelRatio || 1, 2), W = smooth ? Math.max(nx, Math.min(900, Math.round(pw * dprF))) : nx, H = smooth ? Math.max(ny, Math.min(900, Math.round(ph * dprF))) : ny;
+  const off = document.createElement('canvas'); off.width = W; off.height = H;
+  const octx = off.getContext('2d'), img = octx.createImageData(W, H);
+  const cellx = Math.abs(dx) / (nx - 1 || 1), celly = Math.abs(dy) / (ny - 1 || 1), geo = spec.shade === 'geo', kx = geo ? 111320 * Math.cos((((ys[0] + ys[ny - 1]) / 2) * Math.PI) / 180) : 1, ky = geo ? 110540 : 1;
+  const zAt = (i, j) => z[Math.max(0, Math.min(ny - 1, j))][Math.max(0, Math.min(nx - 1, i))];
+  for (let r = 0; r < H; r++) {
+    const fj = smooth ? ((H - 1 - r) / (H - 1)) * (ny - 1) : ny - 1 - r, j0 = Math.min(ny - 2 < 0 ? 0 : ny - 2, Math.floor(fj)), b = smooth ? fj - j0 : 0;
+    for (let cI = 0; cI < W; cI++) {
+      const o = (r * W + cI) * 4;
+      let v, shade = 1;
+      if (smooth) {
+        const fi = (cI / (W - 1)) * (nx - 1), i0 = Math.min(nx - 2, Math.floor(fi)), a = fi - i0;
+        const v00 = z[j0][i0], v10 = z[j0][i0 + 1], v01 = z[j0 + 1][i0], v11 = z[j0 + 1][i0 + 1];
+        v = Number.isFinite(v00 + v10 + v01 + v11) ? v00 * (1 - a) * (1 - b) + v10 * a * (1 - b) + v01 * (1 - a) * b + v11 * a * b : z[Math.round(fj)][Math.round(fi)];
+        if (spec.shade && Number.isFinite(v)) { // hill-shading from the local slope, light from the north-west
+          const gx = ((v10 - v00) * (1 - b) + (v11 - v01) * b) / (cellx * kx), gy = ((v01 - v00) * (1 - a) + (v11 - v10) * a) / (celly * ky), ex = spec.exaggeration || 1;
+          shade = Math.max(0.55, Math.min(1.25, 1 + 0.9 * ((-gx + gy) * ex) / Math.sqrt(1 + (gx * ex) ** 2 + (gy * ex) ** 2)));
+        }
+      } else {
+        if (spec.mask && spec.mask[fj][cI]) { img.data[o] = 100; img.data[o + 1] = 116; img.data[o + 2] = 139; img.data[o + 3] = 255; continue; }
+        v = zAt(cI, fj);
+      }
+      if (!Number.isFinite(v)) { img.data[o + 3] = 0; continue; }
+      const t = Math.max(0, Math.min(255, Math.round(norm(v) * 255)));
+      img.data[o] = Math.min(255, L[t * 3] * shade); img.data[o + 1] = Math.min(255, L[t * 3 + 1] * shade); img.data[o + 2] = Math.min(255, L[t * 3 + 2] * shade); img.data[o + 3] = 255;
+    }
   }
   octx.putImageData(img, 0, 0);
-  ctx.imageSmoothingEnabled = !spec.mask && nx * ny > 400;
+  ctx.imageSmoothingEnabled = smooth;
   ctx.drawImage(off, m.l, m.t, pw, ph);
   const X = (v) => m.l + ((v - xs[0]) / dx) * pw, Y = (v) => m.t + ph - ((v - ys[0]) / dy) * ph;
   const gi = (v) => ((v - xs[0]) / dx) * (nx - 1), gj = (v) => ((v - ys[0]) / dy) * (ny - 1);
