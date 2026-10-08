@@ -345,3 +345,14 @@ main:focus, main:focus-visible { outline: none; }
 /* theory lists: an even grid of equal-width entries instead of a ragged run of pills */
 .chips { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 250px), 1fr)); gap: 7px 8px; }
 .chips > .chip { display: flex; align-items: center; gap: 6px; border-radius: 10px; padding: 7px 11px; line-height: 1.3; white-space: normal; min-height: 36px; }
+
+/* integrated-run table: every header sits over its own column */
+.tbl.chain { table-layout: auto; }
+.tbl.chain th, .tbl.chain td { text-align: left; vertical-align: middle; padding: 9px 12px; }
+.tbl.chain th:nth-child(1), .tbl.chain td:nth-child(1) { width: 52px; text-align: center; }
+.tbl.chain th:nth-child(2), .tbl.chain td:nth-child(2) { width: 56px; text-align: center; color: var(--muted); }
+.tbl.chain th:nth-child(3), .tbl.chain td:nth-child(3) { min-width: 250px; }
+.tbl.chain th:nth-child(4), .tbl.chain td:nth-child(4) { width: 120px; white-space: nowrap; color: var(--muted); }
+.tbl.chain th:nth-child(5), .tbl.chain td:nth-child(5) { width: 170px; white-space: nowrap; }
+.tbl.chain td:nth-child(3) a { text-decoration: none; font-weight: 600; } .tbl.chain td:nth-child(3) a:hover { text-decoration: underline; }
+.tbl.chain td input[type=checkbox] { width: 20px; height: 20px; min-height: 0; accent-color: var(--brand-2); cursor: pointer; }

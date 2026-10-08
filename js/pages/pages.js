@@ -322,7 +322,7 @@ export function chainPage(root) {
   fill(root, 
     h('header', { class: 'page-head' }, h('h1', null, 'Integrated run'), h('p', null, 'Solves the suites one after another in data-flow order. Before each suite runs, it receives the case feed water, the site data and the results of the suites before it — so one industrial case is analysed across all disciplines in a single pass.')),
     card(h('div', { class: 'row-tools' }, go, btn('Select all', () => CHAIN.forEach((id) => { sel[id].checked = true; store.pref('chain.' + id, true); }), 'ghost'), btn('Select none', () => CHAIN.forEach((id) => { sel[id].checked = false; store.pref('chain.' + id, false); }), 'ghost')), bar,
-      h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl chain' }, h('thead', null, h('tr', null, ['', '#', 'Suite', 'Links', 'Status', 'Key results'].map((x) => h('th', null, x)))), rows))),
+      h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl chain' }, h('thead', null, h('tr', null, ['Run', 'Step', 'Suite', 'Linked inputs', 'Status', 'Key results'].map((x) => h('th', { scope: 'col' }, x)))), rows))),
     summary);
 }
 
