@@ -24,9 +24,11 @@ if (esbuildPath && existsSync(esbuildPath)) {
   const esbuild = await import(pathToFileURL(esbuildPath).href);
   const out = await esbuild.build({ entryPoints: [join(root, 'js/app.js')], bundle: true, format: 'iife', minify: true, write: false, target: ['es2020'], legalComments: 'none', charset: 'utf8' });
   // The bundle is stored gzip-compressed (base64) in an inert data block and unpacked in the browser by a tiny loader,
-  // which keeps the single-file edition small. The loader is the only inline script and is pinned by its hash.
+  // which keeps the single-file edition small. The security policy lists exactly two script fingerprints: the loader and
+  // the unpacked application code. The browser checks the unpacked code against its fingerprint before running it, so the
+  // policy is as strict as an uncompressed build: no other script, from any source, can run.
   const bundle = out.outputFiles[0].text, packed = gzipSync(Buffer.from(bundle, 'utf8'), { level: 9 }).toString('base64');
-  const loader = "(async()=>{try{const t=document.getElementById('app-gz').textContent,b=Uint8Array.from(atob(t),c=>c.charCodeAt(0)),r=new Response(new Blob([b]).stream().pipeThrough(new DecompressionStream('gzip'))),u=URL.createObjectURL(new Blob([await r.arrayBuffer()],{type:'text/javascript'})),e=document.createElement('script');e.src=u;document.body.append(e)}catch(x){document.getElementById('main').textContent='This browser is too old to unpack the single-file edition (it needs DecompressionStream). Use a current Chrome, Edge, Firefox or Safari, or the web address.'}})();";
+  const loader = "(async()=>{try{const t=document.getElementById('app-gz').textContent,b=Uint8Array.from(atob(t),c=>c.charCodeAt(0)),r=new Response(new Blob([b]).stream().pipeThrough(new DecompressionStream('gzip'))),e=document.createElement('script');e.textContent=await r.text();document.body.append(e)}catch(x){document.getElementById('main').textContent='This browser is too old to unpack the single-file edition (it needs DecompressionStream). Use a current Chrome, Edge, Firefox or Safari, or the web address.'}})();";
   const js = loader;
   const css = readFileSync(join(root, 'css/app.css'), 'utf8');
   const icon = 'data:image/svg+xml;base64,' + readFileSync(join(root, 'assets/icon.svg')).toString('base64');
@@ -38,7 +40,7 @@ if (esbuildPath && existsSync(esbuildPath)) {
     .replace(/src="assets\/icon\.svg"/g, `src="${icon}"`)
     .replace('<link rel="stylesheet" href="css/app.css">', () => `<style>${css}</style>`)
     .replace('<script type="module" src="js/app.js"></script>', () => `<script type="application/octet-stream" id="app-gz">${packed}</script>\n<script>${js}</script>`)
-    .replace("script-src 'self'", () => `script-src ${sha(js)} blob:`).replace("style-src 'self'", () => `style-src ${sha(css)}`);
+    .replace("script-src 'self'", () => `script-src ${sha(js)} ${sha(bundle)}`).replace("style-src 'self'", () => `style-src ${sha(css)}`);
   writeFileSync(join(root, 'standalone.html'), html);
   standalone = `${(bundle.length / 1e6).toFixed(2)} MB of code packed to ${(html.length / 1e6).toFixed(2)} MB`;
 }
