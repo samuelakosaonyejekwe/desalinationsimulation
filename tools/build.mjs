@@ -5,6 +5,7 @@
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, relative, dirname } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -22,7 +23,11 @@ const esbuildPath = process.env.ESBUILD || ['node_modules/esbuild/lib/main.js'].
 if (esbuildPath && existsSync(esbuildPath)) {
   const esbuild = await import(pathToFileURL(esbuildPath).href);
   const out = await esbuild.build({ entryPoints: [join(root, 'js/app.js')], bundle: true, format: 'iife', minify: true, write: false, target: ['es2020'], legalComments: 'none', charset: 'utf8' });
-  const js = out.outputFiles[0].text.replace(/<\/script/gi, '<\\/script');
+  // The bundle is stored gzip-compressed (base64) in an inert data block and unpacked in the browser by a tiny loader,
+  // which keeps the single-file edition small. The loader is the only inline script and is pinned by its hash.
+  const bundle = out.outputFiles[0].text, packed = gzipSync(Buffer.from(bundle, 'utf8'), { level: 9 }).toString('base64');
+  const loader = "(async()=>{try{const t=document.getElementById('app-gz').textContent,b=Uint8Array.from(atob(t),c=>c.charCodeAt(0)),r=new Response(new Blob([b]).stream().pipeThrough(new DecompressionStream('gzip'))),u=URL.createObjectURL(new Blob([await r.arrayBuffer()],{type:'text/javascript'})),e=document.createElement('script');e.src=u;document.body.append(e)}catch(x){document.getElementById('main').textContent='This browser is too old to unpack the single-file edition (it needs DecompressionStream). Use a current Chrome, Edge, Firefox or Safari, or the web address.'}})();";
+  const js = loader;
   const css = readFileSync(join(root, 'css/app.css'), 'utf8');
   const icon = 'data:image/svg+xml;base64,' + readFileSync(join(root, 'assets/icon.svg')).toString('base64');
   const sha = (s) => "'sha256-" + createHash('sha256').update(s, 'utf8').digest('base64') + "'";
@@ -32,13 +37,13 @@ if (esbuildPath && existsSync(esbuildPath)) {
     .replace(/<link rel="icon"[^>]*>/, `<link rel="icon" href="${icon}">`)
     .replace(/src="assets\/icon\.svg"/g, `src="${icon}"`)
     .replace('<link rel="stylesheet" href="css/app.css">', () => `<style>${css}</style>`)
-    .replace('<script type="module" src="js/app.js"></script>', () => `<script>${js}</script>`)
-    .replace("script-src 'self'", () => `script-src ${sha(js)}`).replace("style-src 'self'", () => `style-src ${sha(css)}`);
+    .replace('<script type="module" src="js/app.js"></script>', () => `<script type="application/octet-stream" id="app-gz">${packed}</script>\n<script>${js}</script>`)
+    .replace("script-src 'self'", () => `script-src ${sha(js)} blob:`).replace("style-src 'self'", () => `style-src ${sha(css)}`);
   writeFileSync(join(root, 'standalone.html'), html);
-  standalone = true;
+  standalone = `${(bundle.length / 1e6).toFixed(2)} MB of code packed to ${(html.length / 1e6).toFixed(2)} MB`;
 }
 
 const precache = ['./', ...files, 'version.json', ...(existsSync(join(root, 'standalone.html')) ? [] : [])];
 writeFileSync(join(root, 'version.json'), JSON.stringify({ version, built: new Date().toISOString(), files: files.length }) + '\n');
 writeFileSync(join(root, 'sw.js'), readFileSync(join(root, 'tools/sw.template.js'), 'utf8').replace('__VERSION__', version).replace('__FILES__', JSON.stringify(precache)));
-console.log(`build ${version}: ${files.length} files pre-cached${standalone ? ', standalone.html written' : ' (standalone.html not rebuilt: esbuild not found)'}`);
+console.log(`build ${version}: ${files.length} files pre-cached${standalone ? `, standalone.html written (${standalone})` : ' (standalone.html not rebuilt: esbuild not found)'}`);
