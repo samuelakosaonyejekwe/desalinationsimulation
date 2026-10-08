@@ -366,4 +366,3 @@ main:focus, main:focus-visible { outline: none; }
 
 .tbl.params td.lead { white-space: normal; min-width: 150px; } .tbl.params td input { min-width: 64px; width: 100%; }
 @media (max-width: 720px) { fieldset.group { min-width: 0; } .tbl.params th, .tbl.params td { padding: 5px 6px; } }
-html { overflow-x: clip; }
