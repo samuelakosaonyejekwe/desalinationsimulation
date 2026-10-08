@@ -4,9 +4,11 @@
 // electrode kinetics, Faraday's law with co-ion leakage, back-diffusion, shunt currents and water transport.
 // Reduced-order models of bipolar-membrane ED (acid/base) and membrane capacitive deionisation are included,
 // together with a 1-D Nernst–Planck–Donnan profile solver across film | membrane | film.
-import { brent, clamp, linspace, logspace, sum, rng, fmt, rk4, solveLinear, tridiag, newtonN, lhs } from '../core/num.js';
+import { brent, clamp, linspace, logspace, sum, rng, fmt, rk4, solveLinear, tridiag, newtonN, lhs, gci, nelderMead } from '../core/num.js';
 import { R, F, KELVIN, density, viscosity, cp as cpWater } from '../core/props.js';
 import { IONS, ION_IDS, WATERS, cloneIons, tds, scaleIons, chargeBalance, balanceCharge } from '../core/water.js';
+import { solveChannel, buildMask, yGrid } from './s04_cfd.js';
+import { nnTrain, gpFit } from './s11_opt.js';
 
 const CH = ION_IDS.filter((k) => IONS[k].z !== 0), NI = CH.length; // charged species tracked through the membranes
 const Z = CH.map((k) => IONS[k].z), AZ = Z.map(Math.abs), LAM = CH.map((k) => IONS[k].lambda), DI = CH.map((k) => IONS[k].D), MW = CH.map((k) => IONS[k].mw);
@@ -37,21 +39,25 @@ export function electrolyte(c, T) {
 /** Spacer-channel hydraulics and mass transfer: Sh = a·Re^b·Sc^(1/3). */
 export function channel(u, h, eps, T, Ds, par) {
   const rho = density(T, 0), mu = viscosity(T, 0);
-  if (par.ns) { // open channel: Sherwood number and friction of the Navier–Stokes / Nernst–Planck solution, rescaled with (Re·Sc)^⅓ (Lévêque) and with the velocity
-    const dh = 2 * h, Re = (rho * u * dh) / mu, Sc = mu / (rho * Ds), Sh = Math.max(par.ns.Sh * ((Re * Sc) / (par.ns.Re * par.ns.Sc)) ** (1 / 3), 8.235), k = (Sh * Ds) / dh;
-    return { dh, Re, Sc, Sh, k, delta: Ds / k, dpPerM: par.ns.dpPerM * (u / par.ns.U) * (mu / par.ns.mu) };
+  if (par.ns) { // Sherwood number and friction of the Navier–Stokes / Nernst–Planck solution at its reference state, rescaled to the local state:
+    // open channel Sh ∝ (Re·Sc)^⅓ (Lévêque), Δp ∝ μu; spacer-filled channel (2-D solution) Sh ∝ Re^b·Sc^⅓, Δp ∝ ρu²·Re^−0.3
+    const ns = par.ns, nRe = ns.nRe ?? 1 / 3, nDp = ns.nDp ?? 1, dh = 2 * h, Re = (rho * u * dh) / mu, Sc = mu / (rho * Ds), Sh = Math.max(ns.Sh * (Re / ns.Re) ** nRe * (Sc / ns.Sc) ** (1 / 3), ns.ShMin ?? 8.235), k = (Sh * Ds) / dh;
+    return { dh, Re, Sc, Sh, k, delta: Ds / k, dpPerM: ns.dpPerM * (u / ns.U) ** nDp * (mu / ns.mu) ** (2 - nDp) };
   }
   const dh = (4 * eps) / (2 / h + ((1 - eps) * 8) / h), Re = (rho * u * dh) / mu, Sc = mu / (rho * Ds);
   const Sh = Math.max(par.shA * Math.max(Re, 1e-6) ** par.shB * Sc ** (1 / 3), 3), k = (Sh * Ds) / dh;
   return { dh, Re, Sc, Sh, k, delta: Ds / k, dpPerM: (par.kdp * 6.23 * Math.max(Re, 1) ** -0.3 * rho * u * u) / (2 * dh) };
 }
 
+const ghkWarm = { C: 0, A: 0 }; // last GHK roots (RT/F) of the cation and anion membrane: starting values of the next Newton solve
 /**
  * Local cell-pair electrochemistry for given diluate/concentrate compositions.
  * Returns the limiting currents and a function U(i) with its components (V per cell pair).
  */
 export function cellPair(cd, cc, u, G, par, T) {
-  const d = electrolyte(cd, T), c = electrolyte(cc, T), hd = channel(u, G.h, G.eps, T, d.Ds, par), hc = channel(u, G.h, G.eps, T, c.Ds, par), V = vt(T);
+  // a completely desalted stream keeps a trace of salt (10⁻⁹ eq/m³) so that the limiting current and the film potentials stay defined
+  const el = (x) => { const e = electrolyte(x, T); return e.ceq > 1e-9 ? e : electrolyte(x.map((q, j) => Math.max(q, 1e-9 / (NI * AZ[j]))), T); };
+  const d = el(cd), c = el(cc), hd = channel(u, G.h, G.eps, T, d.Ds, par), hc = channel(u, G.h, G.eps, T, c.Ds, par), V = vt(T);
   const tC = 0.5 * (1 + par.alphaC), tA = 0.5 * (1 + par.alphaA); // counter-ion transport numbers in the membranes
   // film coefficients of the analytical Nernst–Planck solution: K1 sets the slope of c, K2/K1 the potential drop
   const K = (tm, Dct, Dco) => ({ k1: tm / Dct - (1 - tm) / Dco, k2: tm / Dct + (1 - tm) / Dco });
@@ -63,8 +69,10 @@ export function cellPair(cd, cc, u, G, par, T) {
   // bulk compositions, with its local slope dE/d ln(ratio) carrying the concentration-polarisation correction
   let ghk = null;
   if (par.membModel === 'ghk') {
-    const pm = membranePermeabilities(cd, par), up = cc.map((x) => x * 1.02), ln = Math.log(1.02), EC = ghkPotential(pm.PC, Z, cd, cc, T), EA = -ghkPotential(pm.PA, Z, cd, cc, T);
-    ghk = { E: EC + EA, aC: (ghkPotential(pm.PC, Z, cd, up, T) - EC) / (V * ln), aA: (-ghkPotential(pm.PA, Z, cd, up, T) - EA) / (V * ln) };
+    // Newton warm starts: the root of the neighbouring state (previous call) for the bulk potentials, and the bulk root for the perturbed composition
+    const pm = membranePermeabilities(cd, par), up = cc.map((x) => x * 1.02), ln = Math.log(1.02), EC = ghkPotential(pm.PC, Z, cd, cc, T, ghkWarm.C), EA = -ghkPotential(pm.PA, Z, cd, cc, T, ghkWarm.A);
+    ghkWarm.C = EC / V; ghkWarm.A = -EA / V;
+    ghk = { E: EC + EA, aC: (ghkPotential(pm.PC, Z, cd, up, T, ghkWarm.C) - EC) / (V * ln), aA: (-ghkPotential(pm.PA, Z, cd, up, T, ghkWarm.A) - EA) / (V * ln) };
   }
   const parts = (i) => {
     const wdC = d.ceq * (1 - i / ilimC), wdA = d.ceq * (1 - i / ilimA), wcC = c.ceq + (i * hc.delta * kCc.k1) / (2 * F), wcA = c.ceq + (i * hc.delta * kAc.k1) / (2 * F);
@@ -560,12 +568,17 @@ export function pnpRamp(spec, from = {}, steps = 4) {
 /** GHK flux of one ion (mol/m²·s for P in m/s, c in mol/m³): J = P·z·u·(c₁ − c₂e^(−zu)) / (1 − e^(−zu)), u = F(φ₁ − φ₂)/RT. */
 export const ghkFlux = (P, z, c1, c2, u) => P * (bern(-z * u) * c1 - bern(z * u) * c2);
 /** GHK zero-current membrane potential φ₁ − φ₂ (V) for any mixture of valences: Σ zᵢJᵢ(u) = 0 solved for u. */
-export function ghkPotential(P, z, c1, c2, T = 25) {
+export function ghkPotential(P, z, c1, c2, T = 25, u0 = 0) {
   const cur = (u) => { let s = 0; for (let j = 0; j < z.length; j++) if (P[j] > 0 && (c1[j] > 0 || c2[j] > 0)) s += z[j] * ghkFlux(P[j], z[j], c1[j], c2[j], u); return s; };
-  let u = 0, ok = false; // Newton on the monotone current–voltage relation, bracketing fallback
+  let u = Number.isFinite(u0) ? u0 : 0, ok = false; // Newton on the monotone current–voltage relation (optionally warm-started, u0 in RT/F), bracketing fallback
   for (let k = 0; k < 40; k++) {
     let f = 0, df = 0;
-    for (let j = 0; j < z.length; j++) if (P[j] > 0 && (c1[j] > 0 || c2[j] > 0)) { const x = z[j] * u; f += z[j] * P[j] * (bern(-x) * c1[j] - bern(x) * c2[j]); df -= z[j] * z[j] * P[j] * (dbern(-x) * c1[j] + dbern(x) * c2[j]); }
+    for (let j = 0; j < z.length; j++) if (P[j] > 0 && (c1[j] > 0 || c2[j] > 0)) {
+      // one exponential per ion: B(−x) = B(x) + x and B′(−x) = −1 − B′(x)
+      const x = z[j] * u, ax = Math.abs(x); let B, dB;
+      if (ax < 1e-5) { B = 1 - x / 2 + (x * x) / 12; dB = -0.5 + x / 6; } else if (x > 600) { B = 0; dB = 0; } else if (x < -600) { B = -x; dB = -1; } else { const e = Math.expm1(x); B = x / e; dB = ax < 1e-4 ? -0.5 + x / 6 : (e - x * (e + 1)) / (e * e); }
+      f += z[j] * P[j] * ((B + x) * c1[j] - B * c2[j]); df -= z[j] * z[j] * P[j] * ((-1 - dB) * c1[j] + dB * c2[j]);
+    }
     if (df === 0 && f === 0) return 0; // no permeating ion on either side
     if (!(df > 0)) break;
     const d = clamp(f / df, -3, 3); u -= d;
@@ -661,71 +674,144 @@ export function stokesMode(k) {
   const sh = Math.sinh(k), ch = Math.cosh(k), [a, b, d] = solveLinear([[k, 0, 1], [sh, sh, ch], [k * ch, sh + k * ch, ch + k * sh]], [1, 0, 0]);
   return { W: (y) => (a + b * y) * Math.sinh(k * y) + d * y * Math.cosh(k * y), dW: (y) => b * Math.sinh(k * y) + (a + b * y) * k * Math.cosh(k * y) + d * Math.cosh(k * y) + d * y * k * Math.sinh(k * y) };
 }
-/** Marginal voltage (in RT/F) of the quiescent limiting state for wavenumber k: Pe·V²/8 = −1/(k²·g′(0)), g″ − k²g = W. */
-export function ecMarginal(k, Pe) {
+/**
+ * Marginal voltage (in RT/F) of the quiescent limiting state for wavenumber k: Pe·V²/8 = −1/(k²·g′(0)), g″ − k²g = W.
+ * ell > 0 applies the short-wave cut-off of the slip, exp(−(k·ℓ)²) (finite thickness of the extended space charge), which gives the
+ * marginal curve a minimum — the critical wavenumber.
+ */
+export function ecMarginal(k, Pe, ell = 0) {
   const m = stokesMode(k), n = 400; let s = 0;
   for (let q = 0; q <= n; q++) { const y = q / n, w = q === 0 || q === n ? 1 : q % 2 ? 4 : 2; s += w * m.W(y) * (Math.sinh(k * (1 - y)) / Math.sinh(k)); }
-  return Math.sqrt(8 / (Pe * k * k * (s / (3 * n))));
+  return Math.sqrt(8 / (Pe * k * k * (s / (3 * n)))) * Math.exp(0.5 * (k * ell) ** 2);
+}
+/** Critical (lowest-threshold) wavenumber and voltage of the marginal curve with the cut-off length ell (> 0): bracketing scan + golden-section refinement. */
+export function ecCritical(Pe, ell) {
+  const f = (k) => ecMarginal(k, Pe, ell); let kb = 0.8, vb = Infinity;
+  for (let k = 0.8; k <= Math.min(14, 2.5 / ell + 1); k += 0.4) { const v = f(k); if (v < vb) { vb = v; kb = k; } }
+  let a = Math.max(0.4, kb - 0.4), b = kb + 0.4; const g = 0.6180339887498949; let x1 = b - g * (b - a), x2 = a + g * (b - a), f1 = f(x1), f2 = f(x2);
+  for (let it = 0; it < 22; it++) { if (f1 < f2) { b = x2; x2 = x1; f2 = f1; x1 = b - g * (b - a); f1 = f(x1); } else { a = x1; x1 = x2; f1 = f2; x2 = a + g * (b - a); f2 = f(x2); } }
+  const kc = 0.5 * (a + b);
+  return { kc, Vc: f(kc) };
 }
 /**
  * Non-linear electroconvection in the depleted diffusion layer (lengths in δ, time in δ²/D, c in bulk units, V in RT/F):
- *   c_t + u·∇c = ∇²c,  c(x,0) = 0,  c(x,1) = 1,  Stokes flow driven by the slip u_s = −(Pe·V²/8)·∂ₓ ln(∂c/∂y) at the membrane.
- * Periodic cell of one wavelength 2π/k; the Stokes problem is solved exactly per Fourier mode, the salt balance by explicit finite
- * differences. Returns the time-averaged Sherwood number ⟨∂c/∂y⟩ = i / i_lim.
+ *   c_t + u·∇c = ∇²c,  c(x,0) = 0,  c(x,1) = 1,  Stokes flow driven by the slip u_s = −(Pe·V²/8)·G_ℓ * ∂ₓ ln(∂c/∂y) at the membrane,
+ * where G_ℓ is the Gaussian short-wave cut-off exp(−(kℓ)²) of the slip (ℓ = 0 switches it off). Periodic cell of one wavelength 2π/k.
+ * Discretisation: second-order central differences on a grid clustered towards the depleted interface (y_j = (e^{βj/n} − 1)/(e^β − 1)),
+ * second-order one-sided wall gradient, slip differentiated spectrally, Stokes problem solved exactly per Fourier mode (all modes the
+ * cut-off passes), Peaceman–Rachford ADI in time (tridiagonal across the layer, cyclic tridiagonal along it) — the steady state is free
+ * of time-step and splitting error. `init` restarts from a coarser solution (nested iteration).
+ * Returns the (time-averaged, if unsteady) Sherwood number ⟨∂c/∂y⟩ = i / i_lim.
  */
-export function ecSolve({ V, Pe, k, nx = 16, ny = 20, tEnd = 4, modes = 3, keep = false }) {
-  const Lx = (2 * Math.PI) / k, dxx = Lx / nx, dy = 1 / ny, M = Math.min(modes, Math.floor(nx / 2) - 1), amp = (Pe * V * V) / 8;
-  const kn = [], Wn = [], dWn = [], sn = [], cn = [];
-  for (let q = 1; q <= M; q++) { const kk = q * k, m = stokesMode(kk); kn.push(kk); Wn.push(Float64Array.from({ length: ny + 1 }, (_, j) => m.W(j * dy))); dWn.push(Float64Array.from({ length: ny + 1 }, (_, j) => m.dW(j * dy))); sn.push(Float64Array.from({ length: nx }, (_, i) => Math.sin(kk * i * dxx))); cn.push(Float64Array.from({ length: nx }, (_, i) => Math.cos(kk * i * dxx))); }
-  const st = nx, c = new Float64Array((ny + 1) * nx), cnw = new Float64Array((ny + 1) * nx), u = new Float64Array((ny + 1) * nx), w = new Float64Array((ny + 1) * nx), jw = new Float64Array(nx), lj = new Float64Array(nx), us = new Float64Array(nx);
-  for (let j = 0; j <= ny; j++) for (let i = 0; i < nx; i++) c[j * st + i] = j * dy + 0.02 * Math.sin(Math.PI * j * dy) * Math.cos(k * i * dxx);
-  const flow = () => {
-    let nu = 0;
-    for (let i = 0; i < nx; i++) { jw[i] = Math.max((4 * c[st + i] - c[2 * st + i]) / (2 * dy), 1e-6); lj[i] = Math.log(jw[i]); nu += jw[i]; }
-    for (let i = 0; i < nx; i++) us[i] = (-amp * (lj[(i + 1) % nx] - lj[(i + nx - 1) % nx])) / (2 * dxx);
-    u.fill(0); w.fill(0);
-    let umax = 0;
-    for (let q = 0; q < M; q++) {
-      let A = 0, B = 0; for (let i = 0; i < nx; i++) { A += us[i] * sn[q][i]; B += us[i] * cn[q][i]; }
-      A *= 2 / nx; B *= 2 / nx;
-      if (Math.abs(A) + Math.abs(B) < 1e-14) continue;
-      for (let j = 0; j <= ny; j++) { const dWj = dWn[q][j], Wj = kn[q] * Wn[q][j], o = j * st; for (let i = 0; i < nx; i++) { u[o + i] += (A * sn[q][i] + B * cn[q][i]) * dWj; w[o + i] += (-A * cn[q][i] + B * sn[q][i]) * Wj; } }
+export function ecSolve({ V, Pe, k, nx = 0, ny = 20, tEnd = 4, modes = 0, keep = false, ell = 0, beta = 2.5, init = null, cfl = 2, dtMax = 0.01, raw = false }) {
+  const Lx = (2 * Math.PI) / k, amp = (Pe * V * V) / 8, Mw = modes > 0 ? Math.round(modes) : ell > 0 ? Math.ceil(3 / (k * ell)) : 3;
+  nx = nx > 0 ? Math.max(6, 2 * Math.round(nx / 2)) : Math.max(16, 2 * Mw + 2);
+  const M = Math.max(1, Math.min(Mw, nx / 2 - 1)), dx = Lx / nx, n1 = ny + 1, N = n1 * nx;
+  const y = Float64Array.from({ length: n1 }, (_, j) => (beta > 1e-9 ? Math.expm1((beta * j) / ny) / Math.expm1(beta) : j / ny)); y[ny] = 1;
+  const d2m = new Float64Array(n1), d2p = new Float64Array(n1), d1m = new Float64Array(n1), d1p = new Float64Array(n1), d10 = new Float64Array(n1);
+  for (let j = 1; j < ny; j++) { const hm = y[j] - y[j - 1], hp = y[j + 1] - y[j]; d2m[j] = 2 / (hm * (hm + hp)); d2p[j] = 2 / (hp * (hm + hp)); d1m[j] = -hp / (hm * (hm + hp)); d1p[j] = hm / (hp * (hm + hp)); d10[j] = (hp - hm) / (hm * hp); }
+  const kn = new Float64Array(M), fl = new Float64Array(M), Wn = [], dWn = [], sn = [], cn = [];
+  for (let q = 0; q < M; q++) { const kk = (q + 1) * k, m = stokesMode(kk); kn[q] = kk; fl[q] = Math.exp(-((kk * ell) ** 2)); Wn.push(Float64Array.from(y, (yy) => kk * m.W(yy))); dWn.push(Float64Array.from(y, (yy) => m.dW(yy))); sn.push(Float64Array.from({ length: nx }, (_, i) => Math.sin(kk * i * dx))); cn.push(Float64Array.from({ length: nx }, (_, i) => Math.cos(kk * i * dx))); }
+  const c = new Float64Array(N), cs = new Float64Array(N), u = new Float64Array(N), w = new Float64Array(N), jw = new Float64Array(nx), lj = new Float64Array(nx), ev = new Float64Array(nx), gv = new Float64Array(nx);
+  if (init && init._c && init._y && init._nx) { // bilinear transfer of a coarser solution (periodic along the membrane)
+    const ya = init._y, n0 = init._nx, c0 = init._c, m0 = ya.length - 1; let jj = 0;
+    for (let j = 0; j <= ny; j++) {
+      while (jj < m0 - 1 && ya[jj + 1] < y[j]) jj++;
+      const fy = clamp((y[j] - ya[jj]) / (ya[jj + 1] - ya[jj]), 0, 1);
+      for (let i = 0; i < nx; i++) { const xs = (i * n0) / nx, i0 = Math.floor(xs) % n0, fx = xs - Math.floor(xs), i1 = (i0 + 1) % n0; c[j * nx + i] = (1 - fy) * ((1 - fx) * c0[jj * n0 + i0] + fx * c0[jj * n0 + i1]) + fy * ((1 - fx) * c0[(jj + 1) * n0 + i0] + fx * c0[(jj + 1) * n0 + i1]); }
     }
-    for (let q = 0; q < u.length; q++) umax = Math.max(umax, Math.abs(u[q]), Math.abs(w[q]));
+  } else for (let j = 0; j <= ny; j++) for (let i = 0; i < nx; i++) c[j * nx + i] = y[j] + Math.sin(Math.PI * y[j]) * (0.02 * Math.cos(k * i * dx) + 0.004 * Math.cos(2 * k * i * dx + 1));
+  for (let i = 0; i < nx; i++) { c[i] = 0; c[ny * nx + i] = 1; }
+  const h1 = y[1], h2 = y[2], g1 = h2 / (h1 * (h2 - h1)), g2 = -h1 / (h2 * (h2 - h1)); // second-order wall gradient with c(0) = 0
+  const flow = () => {
+    let nu = 0, umax = 0;
+    for (let i = 0; i < nx; i++) { const g = g1 * c[nx + i] + g2 * c[2 * nx + i]; nu += g; jw[i] = g > 1e-6 ? g : 1e-6; lj[i] = Math.log(jw[i]); }
+    u.fill(0); w.fill(0);
+    for (let q = 0; q < M; q++) {
+      let A = 0, B = 0; const s = sn[q], co = cn[q];
+      for (let i = 0; i < nx; i++) { A += lj[i] * s[i]; B += lj[i] * co[i]; }
+      const f = (2 / nx) * amp * fl[q] * kn[q], a = f * B, b = -f * A; // slip u_s = −amp·∂ₓ ln j, differentiated in Fourier space
+      if (Math.abs(a) + Math.abs(b) < 1e-14) continue;
+      const dW = dWn[q], Wq = Wn[q];
+      for (let i = 0; i < nx; i++) { ev[i] = a * s[i] + b * co[i]; gv[i] = -a * co[i] + b * s[i]; }
+      for (let j = 0, o = 0; j <= ny; j++) { const dj = dW[j], wj = Wq[j]; for (let i = 0; i < nx; i++, o++) { u[o] += ev[i] * dj; w[o] += gv[i] * wj; } }
+    }
+    for (let q = 0; q < N; q++) { const a = Math.abs(u[q]); if (a > umax) umax = a; }
     return { nu: nu / nx, umax };
   };
-  let t = 0, nuAvg = 0, tAvg = 0, steps = 0, nuLast = 1, steady = false, f = flow();
+  const al = new Float64Array(nx), bd = new Float64Array(nx), cu = new Float64Array(nx), rr = new Float64Array(nx), zz = new Float64Array(nx), cq = new Float64Array(nx), ta = new Float64Array(n1), tb = new Float64Array(n1), tc = new Float64Array(n1), td = new Float64Array(n1);
+  const idx2 = 1 / (dx * dx), i2dx = 1 / (2 * dx);
+  const cyclic = (o) => { // cyclic tridiagonal system (Sherman–Morrison), solution written to cs[o … o + nx)
+    const gam = -bd[0], bn = bd[nx - 1] - (al[0] * cu[nx - 1]) / gam;
+    let bet = bd[0] - gam; cq[0] = cu[0] / bet; rr[0] /= bet; zz[0] = gam / bet;
+    for (let i = 1; i < nx; i++) { bet = (i === nx - 1 ? bn : bd[i]) - al[i] * cq[i - 1]; cq[i] = cu[i] / bet; rr[i] = (rr[i] - al[i] * rr[i - 1]) / bet; zz[i] = ((i === nx - 1 ? cu[nx - 1] : 0) - al[i] * zz[i - 1]) / bet; }
+    for (let i = nx - 2; i >= 0; i--) { rr[i] -= cq[i] * rr[i + 1]; zz[i] -= cq[i] * zz[i + 1]; }
+    const fact = (rr[0] + (al[0] * rr[nx - 1]) / gam) / (1 + zz[0] + (al[0] * zz[nx - 1]) / gam);
+    for (let i = 0; i < nx; i++) cs[o + i] = rr[i] - fact * zz[i];
+  };
+  let t = 0, steps = 0, f = flow(), nuAvg = 0, tAvg = 0, nuLast = f.nu, tLast = 0, steady = false;
   const hist = [];
-  while (t < tEnd && steps < 60000) {
-    const hmin = Math.min(dxx, dy), dt = Math.min(0.2 * hmin * hmin, (0.4 * hmin) / (f.umax + 1e-9), tEnd - t), up = f.umax * hmin > 1.8;
-    for (let j = 1; j < ny; j++) for (let i = 0; i < nx; i++) {
-      const o = j * st + i, ip = j * st + ((i + 1) % nx), im = j * st + ((i + nx - 1) % nx), jp = o + st, jm = o - st, uu = u[o], ww = w[o];
-      const cx = up ? (uu > 0 ? (c[o] - c[im]) / dxx : (c[ip] - c[o]) / dxx) : (c[ip] - c[im]) / (2 * dxx), cy = up ? (ww > 0 ? (c[o] - c[jm]) / dy : (c[jp] - c[o]) / dy) : (c[jp] - c[jm]) / (2 * dy);
-      cnw[o] = c[o] + dt * ((c[ip] - 2 * c[o] + c[im]) / (dxx * dxx) + (c[jp] - 2 * c[o] + c[jm]) / (dy * dy) - uu * cx - ww * cy);
+  while (t < tEnd && steps < 20000) {
+    const dt = Math.min(dtMax, (cfl * dx) / (f.umax + 1e-9), tEnd - t), hd = 0.5 * dt;
+    for (let j = 1; j < ny; j++) { // implicit along the membrane
+      const o = j * nx, am = d2m[j], ap = d2p[j], bm = d1m[j], b0 = d10[j], bp = d1p[j];
+      for (let i = 0; i < nx; i++) { const q = o + i, uu = u[q], ww = w[q]; al[i] = -hd * (idx2 + uu * i2dx); cu[i] = -hd * (idx2 - uu * i2dx); bd[i] = 1 + dt * idx2; rr[i] = c[q] + hd * (am * c[q - nx] + ap * c[q + nx] - (am + ap) * c[q] - ww * (bm * c[q - nx] + b0 * c[q] + bp * c[q + nx])); }
+      cyclic(o);
     }
-    for (let i = 0; i < nx; i++) { cnw[i] = 0; cnw[ny * st + i] = 1; }
-    c.set(cnw); t += dt; steps++;
-    f = flow();
-    if (!Number.isFinite(f.nu) || dt < 1e-8) return { nu: NaN, steps, ok: false };
+    for (let i = 0; i < nx; i++) { cs[i] = 0; cs[ny * nx + i] = 1; }
+    for (let i = 0; i < nx; i++) { // implicit across the layer
+      const ip = (i + 1) % nx, im = (i + nx - 1) % nx;
+      tb[0] = 1; tc[0] = 0; td[0] = 0;
+      for (let j = 1; j < ny; j++) { const o = j * nx, q = o + i, ww = w[q]; ta[j] = -hd * (d2m[j] - ww * d1m[j]); tc[j] = -hd * (d2p[j] - ww * d1p[j]); tb[j] = 1 + hd * (d2m[j] + d2p[j] + ww * d10[j]); td[j] = cs[q] + hd * (idx2 * (cs[o + ip] - 2 * cs[q] + cs[o + im]) - u[q] * i2dx * (cs[o + ip] - cs[o + im])); }
+      for (let j = 1; j < ny; j++) { const m = ta[j] / tb[j - 1]; tb[j] -= m * tc[j - 1]; td[j] -= m * td[j - 1]; }
+      let prev = 1;
+      for (let j = ny - 1; j >= 1; j--) { prev = (td[j] - tc[j] * prev) / tb[j]; c[j * nx + i] = prev; }
+    }
+    t += dt; steps++; f = flow();
+    if (!Number.isFinite(f.nu)) return { nu: NaN, steps, ok: false };
     if (t > 0.6 * tEnd) { nuAvg += f.nu * dt; tAvg += dt; }
-    if (steps % 200 === 0) { hist.push([t, f.nu]); if (t > 1.5 && Math.abs(f.nu - nuLast) < 2e-7 * (1 + f.nu)) { steady = true; break; } nuLast = f.nu; }
+    if (t - tLast >= 0.05) { hist.push([t, f.nu]); if (t > 0.3 && Math.abs(f.nu - nuLast) < 3e-7 * (1 + f.nu)) { steady = true; break; } nuLast = f.nu; tLast = t; }
   }
-  const nu = steady || tAvg <= 0 ? f.nu : nuAvg / tAvg, out = { nu, steps, t, steady, umax: f.umax, Lx, ok: true, hist };
-  if (keep) { const row = (a) => Array.from({ length: ny + 1 }, (_, j) => Array.from({ length: nx + 1 }, (_, i) => a[j * st + (i % nx)])); out.x = Array.from({ length: nx + 1 }, (_, i) => i * dxx); out.y = Array.from({ length: ny + 1 }, (_, j) => j * dy); out.c = row(c); out.u = row(u); out.w = row(w); out.jw = Array.from(jw); }
+  const out = { nu: steady || tAvg <= 0 ? f.nu : nuAvg / tAvg, steps, t, steady, umax: f.umax, Lx, ok: true, hist, modes: M, nx, ny, h: 1 / Math.sqrt(nx * ny), _c: c, _y: y, _nx: nx };
+  if (keep) { // fields on a uniform grid across the layer for plotting (linear interpolation from the clustered grid)
+    const yu = Array.from({ length: n1 }, (_, j) => j / ny), row = (a) => { let jj = 0; return yu.map((yy) => { while (jj < ny - 1 && y[jj + 1] < yy) jj++; const fy = clamp((yy - y[jj]) / (y[jj + 1] - y[jj]), 0, 1); return Array.from({ length: nx + 1 }, (_, i) => (1 - fy) * a[jj * nx + (i % nx)] + fy * a[(jj + 1) * nx + (i % nx)]); }); };
+    out.x = Array.from({ length: nx + 1 }, (_, i) => i * dx); out.y = yu; out.c = row(c); out.u = row(u); out.w = row(w); out.jw = Array.from(jw); out.yGrid = Array.from(y);
+  }
   return out;
 }
 const ecCache = new Map();
-/** Electroconvection characteristics for the stack model: threshold voltage, vortex wavelength and over-limiting slope dSh/dV from two non-linear solutions. */
+/**
+ * Electroconvection characteristics for the stack model, grid-converged by construction. In the scaled problem the Sherwood number depends only
+ * on V/V_c, the cut-off length and the cell wavelength (Pe enters through V_c ∝ Pe^-½). Steps: (1) critical wavenumber k_c from the minimum of
+ * the marginal curve; (2) scan of cell wavelengths around 2π/k_c on the coarse grid, keeping the one that transports most; (3) solution on
+ * three systematically refined grids (ratio 1.5, nested iteration) at 1.3 and 1.7 × threshold, Richardson extrapolation and grid-convergence
+ * index. The extrapolated Sherwood number at 1.7 × threshold sets the over-limiting slope used by the stack model.
+ */
 export function electroconvection(Pe, opt = {}) {
-  const ny = opt.ny || 20, key = `${Pe.toPrecision(4)}|${ny}`;
-  if (ecCache.has(key)) return ecCache.get(key);
-  // vortex pair of wavelength 2δ: the limiting slip formula has no short-wave cut-off (marginal voltage → √(32/Pe) as k → ∞), so the
-  // wavelength is set to the layer scale observed in experiments and direct simulations and the flow is truncated to three harmonics
-  const kc = Math.PI, th = { kc, Vc: ecMarginal(kc, Pe), VcShort: Math.sqrt(32 / Pe) }, pts = [1.3, 1.7].map((f) => { const s = ecSolve({ V: f * th.Vc, Pe, k: kc, ny }); return { V: f * th.Vc, nu: Number.isFinite(s.nu) ? Math.max(1, s.nu) : 1, steady: !!s.steady }; });
-  const slope = Math.max(0, (pts[1].nu - 1) / (pts[1].V - th.Vc)), out = { Pe, ...th, pts, slope };
-  if (ecCache.size > 40) ecCache.clear();
-  ecCache.set(key, out);
-  return out;
+  const ny = clamp(Math.round(opt.ny || 20), 12, 48), ell = clamp(opt.ell ?? 0.2, 0.1, 0.4), key = `${ny}|${ell.toPrecision(4)}`;
+  let u = ecCache.get(key);
+  if (!u) {
+    const cr = ecCritical(1, ell), ns = [Math.max(8, Math.round(ny / 1.5)), ny, Math.round(1.5 * ny)];
+    const grid = (k, m) => { const Lx = (2 * Math.PI) / k, M = Math.ceil(3 / (k * ell)), a = Math.max(0.5 * Lx, (2 * M + 2) / ns[0]); return { nx: 2 * Math.ceil((a * m) / 2), ny: m, modes: M }; };
+    // the scan grid does not depend on the resolution input, so the selected wavelength does not either
+    const scan = [0.63, 0.8, 1, 1.25, 1.6].map((kf) => { const k = kf * cr.kc, M = Math.ceil(3 / (k * ell)), s = ecSolve({ V: 1.7 * cr.Vc, Pe: 1, k, ell, nx: 2 * Math.ceil(Math.max(7 * ((2 * Math.PI) / k), 2 * M + 2) / 2), ny: 14, modes: M, tEnd: 3 }); return { kf, k, nu: Number.isFinite(s.nu) ? s.nu : 1, steady: !!s.steady, sol: s }; });
+    const pool = scan.some((q) => q.steady) ? scan.filter((q) => q.steady) : scan, sel = pool.reduce((m, q) => (q.nu > m.nu ? q : m), pool[0]);
+    const triplet = (fV, first) => {
+      const sols = []; let prev = first;
+      for (let l = 0; l < 3; l++) { const s = ecSolve({ V: fV * cr.Vc, Pe: 1, k: sel.k, ell, ...grid(sel.k, ns[l]), init: prev, tEnd: prev ? 3 : 4, keep: l === 2 }); sols.push(s); prev = s; }
+      const nu = sols.map((s) => (Number.isFinite(s.nu) ? Math.max(1, s.nu) : 1)), g = gci([sols[2].h, sols[1].h, sols[0].h], [nu[2], nu[1], nu[0]]);
+      const ex = Number.isFinite(g.fExact) && g.type === 'monotonic' ? Math.max(1, g.fExact) : nu[2];
+      return { f: fV, nu, nuExtrap: ex, gciPct: 100 * g.gciFine, order: Number.isFinite(g.p) ? g.p : 2, monotone: g.type !== 'oscillatory', steady: sols.every((s) => s.steady), grids: sols.map((s) => ({ nx: s.nx, ny: s.ny, h: s.h, steps: s.steps, steady: !!s.steady })), modes: sols[2].modes, fine: sols[2] };
+    };
+    const hi = triplet(1.7, sel.sol), lo = triplet(1.3, null), fine = hi.fine; delete hi.fine; delete lo.fine;
+    u = { ell, kcU: cr.kc, VcU: cr.Vc, kSel: sel.k, scan: scan.map((q) => ({ kf: q.kf, k: q.k, wavelength: (2 * Math.PI) / q.k, nu: q.nu, steady: q.steady })), hi, lo, slopeU: Math.max(0, (hi.nuExtrap - 1) / (0.7 * cr.Vc)),
+      field: fine.c ? { x: fine.x, y: fine.y, c: fine.c, u: fine.u, w: fine.w, nu: fine.nu, umax: fine.umax } : null };
+    if (ecCache.size > 12) ecCache.clear();
+    ecCache.set(key, u);
+  }
+  const sq = Math.sqrt(Pe), Vc = u.VcU / sq; // V_c ∝ Pe^-½; Sherwood numbers are functions of V/V_c only
+  return { Pe, kc: u.kcU, kSel: u.kSel, ell: u.ell, Vc, VcShort: Math.sqrt(32 / Pe), pts: [u.lo, u.hi].map((q) => ({ V: q.f * Vc, nu: q.nuExtrap, steady: q.steady, gciPct: q.gciPct, order: q.order, grids: q.nu })), slope: u.slopeU * sq, scan: u.scan,
+    richardson: { ...u.hi, lo: u.lo }, nuExtrap: u.hi.nuExtrap, gciPct: u.hi.gciPct, order: u.hi.order, monotone: u.hi.monotone, steady: u.hi.steady, field: u.field };
 }
 /** Material electro-osmotic Péclet number Pe = ε(RT/F)² / (ηD). */
 export const ecPeclet = (T, D) => (78.4 * (1 - 0.0046 * (T - 25)) * EPS0 * vt(T) ** 2) / (viscosity(T, 0) * D);
@@ -771,6 +857,62 @@ export function channelNS({ U, h, L, T = 25, D, c0 = 1, jw = [0, 0], ny = 48, gr
     ShMean: shInt / (out.x[out.x.length - 1] - out.x[0]), ShEnd: out.Sh[out.Sh.length - 1], cwMin: Math.min(...out.cw0, ...out.cw1), saltIn: U * h * c0, saltOut: U * h * out.cb[out.cb.length - 1] + (jw[0] + jw[1]) * L };
 }
 
+// ---- full 2-D Navier–Stokes + salt transport in the (spacer-filled) channel: finite-volume solver of suite 4 --------------
+/**
+ * Two-dimensional steady incompressible Navier–Stokes equations (SIMPLE-type pressure–velocity coupling on a staggered finite-volume grid, suite 4)
+ * with the convection–diffusion equation of the salt in one ED channel of height h. Geometry: open channel over the whole flow path (arr = 'none'), or
+ * nFil pitches of transverse spacer filaments (zigzag, cavity or submerged; diameter df·h, pitch lm·h) as immersed solids. Both membranes take the
+ * salt flux jw (mol/m²·s) out of the solution — the wall condition equivalent to the current density, jw = (t̄ − t)·i/F. The salt equation is linear,
+ * so the solved field scales with jw: the Sherwood number does not depend on it. U is the superficial velocity (flow ÷ full cross-section).
+ * Returns local and mean Sherwood numbers (2h basis), the pressure gradient over whole pitches, friction factor and the fields.
+ */
+export async function channelCFD({ U, h, L, T = 25, D, c0 = 1, jw = 0, arr = 'none', df = 0.5, lm = 4, nFil = 8, nx = 0, ny = 24, stretch = 4, maxIter = 500, tol = 2e-5, scalIter = 300 }, ctx) {
+  const rho = density(T, 0), mu = viscosity(T, 0), spacer = arr !== 'none', Lc = spacer ? nFil * lm * h : L, nxx = nx > 0 ? Math.round(nx) : spacer ? nFil * Math.max(12, Math.round((20 * ny) / 24)) : Math.max(60, 5 * ny), g = yGrid(h, ny, stretch);
+  const mk = buildMask({ type: 'spacer', arr, L: Lc, H: h, df: df * h, lm: lm * h, nFil }, nxx, ny, g.yc), jr = jw !== 0 ? jw : (1e-3 * D * c0) / h;
+  const r = await solveChannel({ L: Lc, H: h, nx: nxx, ny, stretch, solid: mk.solid, rho, mu, Uin: U, inlet: 'parabolic', scheme: 'hybrid', steady: true, maxIter, tol, alphaU: 0.7, scalIter, species: { c0, D, A: 0, B: 0, dP: 0, pi: () => 0, cw: -jr, bot: 'flux', top: 'flux' } }, ctx);
+  const { dx, dy, u, v, p, nu1, solid } = r, phi = r.spc.phi, xc = new Array(nxx), cb = new Array(nxx), pm = new Array(nxx), cwB = Array.from(r.spc.wB), cwT = Array.from(r.spc.wT), ShLoc = new Array(nxx);
+  for (let i = 0; i < nxx; i++) {
+    let q = 0, qc = 0, ps = 0, m = 0;
+    for (let j = 0; j < ny; j++) { const P = j * nxx + i; if (solid[P]) continue; const uc = 0.5 * (u[j * nu1 + i] + u[j * nu1 + i + 1]); q += uc * dy[j]; qc += uc * phi[P] * dy[j]; ps += p[P] * dy[j]; m += dy[j]; }
+    xc[i] = (i + 0.5) * dx; cb[i] = Math.abs(q) > 1e-9 * U * h ? qc / q : c0; pm[i] = m ? ps / m : 0;
+  }
+  // averaging planes: whole pitches away from the inlet and outlet (spacer) or the whole path (open channel, stage-mean Sherwood number)
+  let i1 = 1, i2 = nxx - 2, ip1 = Math.round(0.5 * nxx), ip2 = nxx - 2;
+  if (spacer && nFil >= 4) { i1 = ip1 = Math.round((2 * lm * h) / dx); i2 = ip2 = Math.round((Lc - lm * h) / dx) - 1; }
+  let fl = 0, dr = 0, cwMin = Infinity;
+  for (let i = 0; i < nxx; i++) {
+    let sm = 0, m = 0;
+    for (const top of [0, 1]) { const P = (top ? ny - 1 : 0) * nxx + i; if (solid[P]) continue; const cw = (top ? cwT : cwB)[i], d = cb[i] - cw; cwMin = Math.min(cwMin, cw); if (i >= i1 && i <= i2) { fl += jr; dr += d; } if (d > 0) { sm += jr / d; m++; } }
+    ShLoc[i] = m ? ((sm / m) * 2 * h) / D : null;
+  }
+  const dpdx = (pm[ip1] - pm[ip2 + (spacer && nFil >= 4 ? 1 : 0)]) / ((ip2 + (spacer && nFil >= 4 ? 1 : 0) - ip1) * dx), dh = 2 * h, Re = (rho * U * dh) / mu, f = (dpdx * dh) / (0.5 * rho * U * U);
+  let saltOut = 0, wallOut = 0; for (let j = 0; j < ny; j++) saltOut += u[j * nu1 + nxx] * phi[j * nxx + nxx - 1] * dy[j];
+  for (let i = 0; i < nxx; i++) for (const top of [0, 1]) if (!solid[(top ? ny - 1 : 0) * nxx + i]) wallOut += jr * dx;
+  // cell-centred fields as rows for plotting
+  const rows = (fn) => Array.from({ length: ny }, (_, j) => Array.from({ length: nxx }, (_, i) => fn(j, i))), ucell = (j, i) => 0.5 * (u[j * nu1 + i] + u[j * nu1 + i + 1]), vcell = (j, i) => 0.5 * (v[j * nxx + i] + v[(j + 1) * nxx + i]);
+  return { arr, spacer, U, h, Lc, D, c0, jw: jr, rho, mu, Re, Sc: mu / (rho * D), dh, Sh: dr > 0 ? ((fl / dr) * dh) / D : 8.235, ShLoc, dpdx, dpTot: pm[0] - pm[nxx - 1], f, fRe: f * Re, xc, yc: Array.from(g.yc), cb, cwB, cwT, pm, cwMin,
+    saltIn: U * h * c0, saltOut: saltOut + wallOut, converged: !!r.converged, iters: r.iters, scalRes: r.scalRes, nx: nxx, ny, solidFraction: mk.solidFraction, shapes: mk.shapes,
+    fields: { uu: rows(ucell), vv: rows(vcell), speed: rows((j, i) => (solid[j * nxx + i] ? 0 : Math.hypot(ucell(j, i), vcell(j, i)))), c: rows((j, i) => phi[j * nxx + i]), mask: rows((j, i) => !!solid[j * nxx + i]) } };
+}
+const cfdCache = new Map();
+const cfdGeomKey = (p, G) => `${p.spArr || 'zigzag'}|${(+(p.spDf ?? 0.5)).toPrecision(4)}|${(+(p.spLm ?? 4)).toPrecision(4)}|${G.h.toPrecision(5)}|${G.eps.toPrecision(4)}|${G.L.toPrecision(5)}|${Math.round(p.cfdNy || 24)}`;
+/** Solve (or fetch) the 2-D channel solution for the run conditions; the stack model picks it up through attachModels. u0 = mean velocity in the open cross-section of the stack model. */
+export async function prepareChannelCFD(p, ctx) {
+  const G = geometry(p), T = p.T, cf = toMolar(balanceCharge(scaleIons(cloneIons(p.ions), p.salinityFactor ?? 1))), Ds = electrolyte(cf, T).Ds;
+  const u0 = Math.max(p.mode === 'design' || p.mode === 'batch' ? p.uLin / 100 : p.Qp / 3600 / Math.max(1, Math.round(p.Ncp)) / (G.W * G.h * G.eps), 1e-4), gk = cfdGeomKey(p, G), key = `${gk}|${u0.toPrecision(5)}|${T}|${Ds.toPrecision(5)}`;
+  let hit = cfdCache.get(key);
+  if (!hit) {
+    const arr = p.spArr || 'zigzag', ny = clamp(Math.round(p.cfdNy || 24), 12, 48);
+    const sol = await channelCFD({ U: u0 * G.eps, h: G.h, L: G.L, T, D: Ds, arr, df: clamp(p.spDf ?? 0.5, 0.2, 0.8), lm: clamp(p.spLm ?? 4, 2, 12), ny }, ctx);
+    const rho = density(T, 0);
+    hit = { cfd: true, gk, Sh: sol.Sh, Re: (rho * u0 * 2 * G.h) / sol.mu, Sc: sol.Sc, dpPerM: sol.dpdx, U: u0, mu: sol.mu, nRe: sol.spacer ? clamp(p.shB ?? 0.5, 0.3, 0.9) : 1 / 3, nDp: sol.spacer ? 1.7 : 1, ShMin: sol.spacer ? 3 : 8.235, sol };
+    if (cfdCache.size > 24) cfdCache.clear();
+    cfdCache.set(key, hit);
+  }
+  cfdCache.set(`last|${gk}`, hit);
+  return hit;
+}
+
 // ---- fouling and scaling of the stack (reduced-order kinetics) ----------------------------------------------------
 /**
  * Membrane fouling and scaling at constant current: organic deposit m_f (g/m², anion membrane) and mineral scale m_s (g/m², concentrate side)
@@ -790,16 +932,29 @@ export function foulingED({ i, u, cFoul, kDep, kDet, rFoul, Sg, Sc, kScale, rSca
 // ---- kernel (Gaussian-process type) surrogate of the mechanistic model ------------------------------------------------
 /** Kernel ridge regression with a squared-exponential kernel on inputs scaled to the unit cube; length scale by leave-one-out error. */
 export function kernelFit(X, y, lam = 1e-6) {
-  const n = X.length, d2 = (a, b) => { let s = 0; for (let q = 0; q < a.length; q++) s += (a[q] - b[q]) ** 2; return s; }, mean = sum(y) / n, yc = y.map((v) => v - mean);
+  const n = X.length, mean = sum(y) / n, yc = Float64Array.from(y, (v) => v - mean), D2 = new Float64Array(n * n);
+  for (let r = 0; r < n; r++) for (let c = 0; c < r; c++) { let q = 0; const a = X[r], b = X[c]; for (let k = 0; k < a.length; k++) q += (a[k] - b[k]) ** 2; D2[r * n + c] = D2[c * n + r] = q; }
+  const L = new Float64Array(n * n), Li = new Float64Array(n * n), z = new Float64Array(n);
   let best = null;
   for (const ell of [0.25, 0.4, 0.6, 0.9, 1.4]) {
-    const K = X.map((a, r) => X.map((b, s) => Math.exp(-d2(a, b) / (2 * ell * ell)) + (r === s ? lam : 0)));
-    let alpha, loo = 0;
-    try { alpha = solveLinear(K, yc); for (let q = 0; q < n; q++) { const e = new Array(n).fill(0); e[q] = 1; const col = solveLinear(K, e); loo += (alpha[q] / col[q]) ** 2; } } catch { continue; }
-    if (!best || loo < best.loo) best = { ell, alpha, loo };
+    // Cholesky factor K = L·Lᵀ, then L⁻¹: α = K⁻¹y and diag(K⁻¹) = column norms of L⁻¹ give the leave-one-out residuals α_q / (K⁻¹)_qq in O(n³)
+    const g = -1 / (2 * ell * ell); let ok = true;
+    for (let r = 0; r < n && ok; r++) for (let c = 0; c <= r; c++) {
+      let q = Math.exp(g * D2[r * n + c]) + (r === c ? lam : 0);
+      for (let k = 0; k < c; k++) q -= L[r * n + k] * L[c * n + k];
+      if (r === c) { if (!(q > 1e-14)) { ok = false; break; } L[r * n + r] = Math.sqrt(q); } else L[r * n + c] = q / L[c * n + c];
+    }
+    if (!ok) continue;
+    Li.fill(0);
+    for (let c = 0; c < n; c++) { Li[c * n + c] = 1 / L[c * n + c]; for (let r = c + 1; r < n; r++) { let q = 0; for (let k = c; k < r; k++) q -= L[r * n + k] * Li[k * n + c]; Li[r * n + c] = q / L[r * n + r]; } }
+    for (let r = 0; r < n; r++) { let q = 0; for (let k = 0; k <= r; k++) q += Li[r * n + k] * yc[k]; z[r] = q; } // z = L⁻¹y
+    const alpha = new Array(n); let loo = 0;
+    for (let c = 0; c < n; c++) { let a = 0, dg = 0; for (let r = c; r < n; r++) { const v = Li[r * n + c]; a += v * z[r]; dg += v * v; } alpha[c] = a; loo += (a / dg) ** 2; }
+    if (Number.isFinite(loo) && (!best || loo < best.loo)) best = { ell, alpha, loo };
   }
   if (!best) throw new Error('The surrogate could not be trained (singular kernel matrix).');
-  return { ...best, rmseLoo: Math.sqrt(best.loo / n), predict: (x) => mean + sum(X.map((a, q) => best.alpha[q] * Math.exp(-d2(a, x) / (2 * best.ell * best.ell)))) };
+  const gb = -1 / (2 * best.ell * best.ell);
+  return { ...best, rmseLoo: Math.sqrt(best.loo / n), predict: (x) => { let q = mean; for (let r = 0; r < n; r++) { let d = 0; const a = X[r]; for (let k = 0; k < a.length; k++) d += (a[k] - x[k]) ** 2; q += best.alpha[r] * Math.exp(gb * d); } return q; } };
 }
 
 /** GHK permeabilities (m²/s, relative) of the cation and anion membranes for the tracked ions: counter-ions by diffusivity × selectivity; co-ions scaled so that the small-ratio slope for a single salt equals the permselectivity. */
@@ -814,15 +969,25 @@ function membranePermeabilities(c, par) {
 
 // ---- coupling of the membrane-scale models to the stack ----------------------------------------------------------
 /** Reference Navier–Stokes / Nernst–Planck solution of the open channel at velocity U (unit wall flux: the Sherwood number does not depend on it). */
+const nsCache = new Map();
 function nsReference(U, G, T, Ds, pOut = 0) {
+  const key = `${U}|${G.h}|${G.L}|${T}|${Ds}|${pOut}`; let hit = nsCache.get(key); // the same reference state recurs in every re-design and sweep of a run
+  if (hit) return hit;
   const s = channelNS({ U, h: G.h, L: G.L, T, D: Ds, c0: 1, jw: [(1e-3 * Ds) / G.h, (1e-3 * Ds) / G.h], pOut });
-  return { Sh: s.ShMean, Re: s.Re, Sc: s.Sc, dpPerM: s.dp / G.L, U, mu: s.mu, sol: s };
+  hit = { Sh: s.ShMean, Re: s.Re, Sc: s.Sc, dpPerM: s.dp / G.L, U, mu: s.mu, sol: s };
+  if (nsCache.size > 60) nsCache.clear();
+  nsCache.set(key, hit);
+  return hit;
 }
 /** Attach the optional sub-models (channel Navier–Stokes, electroconvection) to the parameter set of a run. */
 function attachModels(p, par, G, T, cf, u0) {
   const Ds = electrolyte(cf, T).Ds;
   if (p.flowModel === 'ns') par.ns = nsReference(Math.max(u0, 1e-4), G, T, Ds, (p.pOut || 0) * 1e5);
-  if (p.olModel === 'rz') par.ol = electroconvection(ecPeclet(T, Ds), { ny: clamp(Math.round(p.ecN || 20), 12, 48) });
+  else if (p.flowModel === 'cfd2d') { // 2-D solution prepared by the (asynchronous) run; synchronous callers reuse the latest solution of the same geometry, rescaled in channel()
+    par.ns = cfdCache.get(`last|${cfdGeomKey(p, G)}`) || null;
+    if (!par.ns) { par.cfdMissing = true; if ((p.spArr || 'zigzag') === 'none') par.ns = nsReference(Math.max(u0, 1e-4), G, T, Ds, (p.pOut || 0) * 1e5); }
+  }
+  if (p.olModel === 'rz') par.ol = electroconvection(ecPeclet(T, Ds), { ny: p.ecN, ell: p.ecEll });
   return par;
 }
 /** Electrochemical–thermal coupling: stack energy balance (Joule and polarisation heat, pumping dissipation, heat loss) iterated with the temperature-dependent conductivity, diffusivity and thermal voltage. */
@@ -848,26 +1013,69 @@ export function rateStack(cf, cc, U, uCm, nSt, G, par, T, nSeg = 4) {
   const t0 = tdsOf(cf), t1 = tdsOf(s.cd);
   return { removal: 1 - t1 / t0, sec: E / (s.qd * 3.6e6), iAvg: I / (nSt * G.W * G.L), cd: s.cd, areaSpec: (2 * nSt * G.W * G.L) / (s.qd * 3600) };
 }
-/** Train and test the kernel surrogate of the stack rating: inputs feed-salinity multiplier, voltage per cell pair and velocity; outputs ln(SEC) and salt removal. */
-export function stackSurrogate(r, nTrain = 48, nTest = 16) {
+/** Names of the surrogate learners compared by stackSurrogate. */
+export const SURROGATES = { kernel: 'Kernel ridge regression', gp: 'Gaussian process', nn: 'Neural network' };
+/**
+ * Train, compare and test three surrogates of the stack rating on the same design points: kernel ridge regression (squared-exponential kernel,
+ * leave-one-out length scale), a Gaussian process (anisotropic kernel, hyper-parameters by maximum marginal likelihood) and a feed-forward neural
+ * network (two tanh layers, Adam, early stopping). Inputs: feed-salinity multiplier, voltage per cell pair and velocity; outputs ln(SEC) and salt removal.
+ * Selection: every learner is first trained on three quarters of the design and scored on the remaining quarter (validation); the learner with the
+ * lowest validation error is selected per output and retrained on the whole design. A separate Latin-hypercube set, never seen during training or
+ * selection, gives the held-out errors of all three. Deterministic for a given seed.
+ */
+export function stackSurrogate(r, nTrain = 48, nTest = 16, seed = 11) {
   const rg = { s: [0.4, 2.5], U: [0.25, 1.2], u: [3, 16] }, cc0 = r.tr.ccIn, T = r.T;
   const at = (x) => { const sf = rg.s[0] * (rg.s[1] / rg.s[0]) ** x[0], U = rg.U[0] + (rg.U[1] - rg.U[0]) * x[1], u = rg.u[0] * (rg.u[1] / rg.u[0]) ** x[2], q = rateStack(r.cf.map((c) => c * sf), cc0.map((c) => c * sf), U, u, r.nSt, r.G, r.par, T); return { x, sf, U, u, sec: Math.max(q.sec, 1e-9), removal: q.removal }; };
   const toX = (sf, U, u) => [Math.log(sf / rg.s[0]) / Math.log(rg.s[1] / rg.s[0]), (U - rg.U[0]) / (rg.U[1] - rg.U[0]), Math.log(u / rg.u[0]) / Math.log(rg.u[1] / rg.u[0])];
-  const tr = lhs(nTrain, 3, 11).map(at), te = lhs(nTest, 3, 29).map(at), X = tr.map((q) => q.x);
-  const mS = kernelFit(X, tr.map((q) => Math.log(q.sec))), mR = kernelFit(X, tr.map((q) => q.removal));
-  const pred = (sf, U, u) => { const x = toX(sf, U, u); return { sec: Math.exp(mS.predict(x)), removal: mR.predict(x) }; };
+  const tr = lhs(nTrain, 3, seed).map(at), te = lhs(nTest, 3, seed + 18).map(at), X = tr.map((q) => q.x), Xt = te.map((q) => q.x);
   const stat = (a, b) => { const m = sum(a) / a.length, ss = sum(a.map((v) => (v - m) ** 2)), se = sum(a.map((v, k) => (v - b[k]) ** 2)); return { r2: ss > 0 ? 1 - se / ss : 1, rmse: Math.sqrt(se / a.length) }; };
-  const pt = te.map((q) => ({ ...q, p: pred(q.sf, q.U, q.u) })), ptr = tr.map((q) => pred(q.sf, q.U, q.u));
-  return { rg, train: tr, test: pt, pred, mS, mR, sec: stat(pt.map((q) => q.sec), pt.map((q) => q.p.sec)), removal: stat(pt.map((q) => q.removal), pt.map((q) => q.p.removal)), fitSec: stat(tr.map((q) => q.sec), ptr.map((q) => q.sec)), at: (sf, U, u) => at(toX(sf, U, u)) };
+  const isVal = (k) => k % 4 === 3, Xf = X.filter((_, k) => !isVal(k)), Xv = X.filter((_, k) => isVal(k)), targets = { sec: tr.map((q) => Math.log(q.sec)), removal: tr.map((q) => q.removal) }, back = { sec: Math.exp, removal: (y) => y };
+  const fitters = {
+    kernel: (A, y) => { const m = kernelFit(A, y); return { predict: m.predict, info: m }; },
+    gp: (A, y, o = {}) => { const m = gpFit(A, y, { maxIter: o.theta0 ? 60 : 160, theta0: o.theta0 }); return { predict: (x) => m.predict(x).mean, info: m }; },
+    nn: (A, y, o = {}) => { const m = nnTrain(A, y, { hidden: [10, 8], epochs: o.epochs || 700, lr: 0.02, seed, Xval: o.Xval, yval: o.yval, patience: 120, l2: 1e-5, batch: 8 }); return { predict: m.predict, info: m }; },
+  };
+  const models = {}, best = {}, fin = {};
+  for (const key of ['sec', 'removal']) {
+    const y = targets[key], yf = y.filter((_, k) => !isVal(k)), yv = y.filter((_, k) => isVal(k)), ytrue = te.map((q) => q[key]);
+    for (const name of Object.keys(fitters)) {
+      let val = Infinity, test = { r2: 0, rmse: Infinity }, final = null, predT = ytrue.map(() => NaN), ok = false;
+      try {
+        const m1 = fitters[name](Xf, yf, { Xval: Xv, yval: yv }); val = stat(yv, Xv.map(m1.predict)).rmse; // selection stage: fit on 75 %, score on 25 %
+        final = name === 'nn' ? fitters.nn(X, y, { epochs: Math.max(60, Math.round(1.15 * (m1.info.bestEpoch + 1))) }) : name === 'gp' ? fitters.gp(X, y, { theta0: m1.info.theta }) : fitters.kernel(X, y); // final stage: all design points
+        predT = Xt.map((x) => back[key](final.predict(x))); test = stat(ytrue, predT); ok = predT.every(Number.isFinite) && Number.isFinite(val);
+      } catch { ok = false; }
+      (models[name] ||= { name: SURROGATES[name] })[key] = { val: ok ? val : Infinity, ...test, ok, pred: predT, final };
+    }
+    best[key] = Object.keys(fitters).filter((n) => models[n][key].ok).reduce((m, n) => (m === null || models[n][key].val < models[m][key].val ? n : m), null);
+    if (!best[key]) throw new Error('none of the surrogate learners could be trained');
+    fin[key] = models[best[key]][key].final;
+  }
+  const mS = models.kernel.sec.final?.info || kernelFit(X, targets.sec), mR = models.kernel.removal.final?.info || kernelFit(X, targets.removal);
+  const pred = (sf, U, u) => { const x = toX(sf, U, u); return { sec: Math.exp(fin.sec.predict(x)), removal: fin.removal.predict(x) }; };
+  const pt = te.map((q, k) => ({ ...q, p: { sec: models[best.sec].sec.pred[k], removal: models[best.removal].removal.pred[k] } })), ptrK = tr.map((q) => Math.exp(mS.predict(q.x)));
+  for (const n of Object.keys(models)) for (const key of ['sec', 'removal']) delete models[n][key].final;
+  return { rg, train: tr, test: pt, pred, mS, mR, models, best, nFit: Xf.length, nVal: Xv.length, seed, sec: stat(pt.map((q) => q.sec), pt.map((q) => q.p.sec)), removal: stat(pt.map((q) => q.removal), pt.map((q) => q.p.removal)), fitSec: stat(tr.map((q) => q.sec), ptrK), at: (sf, U, u) => at(toX(sf, U, u)) };
 }
 /** Unit cost used by the operating-condition optimiser: electricity plus straight-line membrane replacement, $/m³ of product. */
 export const edCost = (r, p) => p.cElecED * r.sec + (p.cMem * r.area) / (Math.max(p.memLife, 0.1) * 8760 * 0.9 * r.Qprod * 3600);
-/** Grid search over the operating fraction of the limiting current and the linear velocity for the lowest unit cost (design mode). */
-export function optimiseED(v, phis = [40, 55, 70, 85, 95], us = [4, 7, 10, 14]) {
+/**
+ * Operating fraction of the limiting current and linear velocity for the lowest unit cost (design mode). A coarse grid of complete re-designs gives the
+ * cost map (backdrop) and the starting point; a bounded Nelder–Mead simplex then searches the continuous variables. The cost steps where the number of
+ * stages changes, so the best design met anywhere (grid or simplex) is returned.
+ */
+export function optimiseED(v, phis = [40, 55, 70, 85, 95], us = [4, 7, 10, 14], refine = true) {
   const cells = [], z = us.map(() => phis.map(() => null));
-  us.forEach((u, a) => phis.forEach((ph, b) => { try { const q = simulateED({ ...v, mode: 'design' }, { safety: ph, uLin: u, nSeg: Math.min(Math.max(2, Math.round(v.nSeg)), 4), tol: 1e-4 }); if (q.reached) { const c = edCost(q, v); cells.push({ phi: ph, u, cost: c, sec: q.sec, area: q.area, nSt: q.nSt, Ncp: q.Ncp }); z[a][b] = c; } } catch { /* infeasible cell */ } }));
-  const best = cells.reduce((m, c) => (!m || c.cost < m.cost ? c : m), null);
-  return { cells, best, phis, us, z };
+  const design = (ph, u) => { try { const q = simulateED({ ...v, mode: 'design' }, { safety: ph, uLin: u, nSeg: Math.min(Math.max(2, Math.round(v.nSeg)), 4), tol: 1e-4 }); if (q.reached) return { phi: ph, u, cost: edCost(q, v), sec: q.sec, area: q.area, nSt: q.nSt, Ncp: q.Ncp }; } catch { /* infeasible design */ } return null; };
+  us.forEach((u, a) => phis.forEach((ph, b) => { const c = design(ph, u); if (c) { cells.push(c); z[a][b] = c.cost; } }));
+  const gridBest = cells.reduce((m, c) => (!m || c.cost < m.cost ? c : m), null), path = [];
+  let best = gridBest, evals = us.length * phis.length, iterations = 0;
+  if (refine && gridBest) {
+    const lo = [Math.min(...phis), Math.min(...us)], hi = [Math.max(...phis), Math.max(...us)], worst = Math.max(...cells.map((c) => c.cost));
+    const f = (x) => { const c = design(x[0], x[1]); evals++; if (!c) return 10 * worst; path.push(c); if (c.cost < best.cost) best = c; return c.cost; };
+    iterations = nelderMead(f, [gridBest.phi, gridBest.u], { lo, hi, tol: 2e-4, maxIter: 18, scale: 0.07 }).iterations;
+  }
+  return { cells, best, gridBest, phis, us, z, evals, iterations, path, refined: !!(refine && gridBest) };
 }
 
 /** Results of the optional membrane-scale, thermal, fouling, surrogate and optimisation models for a continuous ED run. */
@@ -884,16 +1092,38 @@ function advancedED(r, p, W) {
   if (r.par.membModel === 'ghk') kpis.push({ label: 'GHK membrane potential (inlet, both membranes)', value: 1000 * (gC + gA), unit: 'mV', help: 'Zero-current potential of the cation plus the anion membrane from the Goldman–Hodgkin–Katz equation' });
   // ---- electroconvection
   if (r.par.ol) {
-    const ol = r.par.ol, Vs = linspace(0, 2.2 * ol.Vc, 23);
-    kpis.push({ label: 'Electroconvection threshold', value: ol.Vc * V, unit: 'V per depleted layer', help: `${fmt(ol.Vc, 3)} thermal voltages; electro-osmotic Péclet number ${fmt(ol.Pe, 3)}` }, { label: 'Over-limiting slope d(i/i_lim)/dV', value: ol.slope / V, unit: '1/V' });
-    let fld = null; try { fld = ecSolve({ V: 1.7 * ol.Vc, Pe: ol.Pe, k: ol.kc, ny: clamp(Math.round(p.ecN || 20), 12, 48), keep: true }); } catch { fld = null; }
-    plots.push({ type: 'line', title: 'Over-limiting current from electroconvection (Rubinstein–Zaltzman slip model)', xlabel: 'Voltage across one depleted diffusion layer (V)', ylabel: 'i / i_lim', series: [{ name: 'Stack model: 1 + slope·(V − V_c)', x: Vs.map((x) => x * V), y: Vs.map((x) => 1 + ol.slope * Math.max(0, x - ol.Vc)) }, { name: 'Non-linear vortex solutions', x: [ol.Vc, ...ol.pts.map((q) => q.V)].map((x) => x * V), y: [1, ...ol.pts.map((q) => q.nu)], mode: 'points' }], vlines: [{ x: ol.Vc * V, label: 'instability threshold' }], note: `Vortex pair of wavelength 2δ (k = π); the short-wave limit of the marginal curve is √(32/Pe) = ${fmt(Math.sqrt(32 / ol.Pe), 3)} thermal voltages.` });
-    if (fld && fld.ok && fld.c) plots.push({ type: 'field', title: 'Electroconvective vortices in the depleted layer at 1.7 × threshold', xlabel: 'Along the membrane (x/δ)', ylabel: 'Distance from the membrane (y/δ)', zlabel: 'Concentration', zunit: 'c / c_bulk', x: fld.x, y: fld.y, z: fld.c, u: fld.u, v: fld.w, stream: true, cmap: 'salinity', contours: 8, note: `Sherwood number ${fmt(fld.nu, 3)} (i / i_lim); slip velocity up to ${fmt(fld.umax, 3)} D/δ.` });
-    tables.push({ title: 'Electroconvection model', columns: ['Quantity', 'Value', 'Unit'], rows: [['Electro-osmotic Péclet number ε(RT/F)²/(ηD)', ol.Pe, '–'], ['Vortex wavenumber k·δ', ol.kc, '–'], ['Threshold voltage (linear stability)', ol.Vc, 'RT/F'], ['Threshold voltage', ol.Vc * V, 'V'], ['Plateau length per cell pair (two depleted layers)', 2 * ol.Vc * V, 'V'], ...ol.pts.map((q) => [`Sherwood number at ${fmt(q.V / ol.Vc, 3)} × threshold`, q.nu, '–']), ['Over-limiting slope d(i/i_lim)/dV', ol.slope, 'per RT/F']], note: 'These values replace the empirical plateau length and over-limiting conductance in the polarisation curve and in the stack solution.' });
-    out.electroconvectionThresholdV = ol.Vc * V;
+    const ol = r.par.ol, Vs = linspace(0, 2.2 * ol.Vc, 23), rh = ol.richardson, fld = ol.field, lam = (2 * Math.PI) / ol.kSel, gst = ol.gciPct < 5 && ol.monotone ? 'ok' : 'warn';
+    kpis.push({ label: 'Electroconvection threshold', value: ol.Vc * V, unit: 'V per depleted layer', help: `${fmt(ol.Vc, 3)} thermal voltages; electro-osmotic Péclet number ${fmt(ol.Pe, 3)}` }, { label: 'Over-limiting slope d(i/i_lim)/dV', value: ol.slope / V, unit: '1/V', help: 'From the Richardson-extrapolated Sherwood number at 1.7 × threshold' },
+      { label: 'Over-limiting current at 1.7 × threshold (grid-extrapolated)', value: ol.nuExtrap, unit: '× i_lim', help: `Richardson extrapolation of three grids: ${rh.nu.map((q) => fmt(q, 5)).join(' → ')}` },
+      { label: 'Numerical uncertainty of the over-limiting current (GCI)', value: ol.gciPct, unit: '%', status: gst, help: `Grid-convergence index of the fine grid (safety factor 1.25); observed order ${fmt(ol.order, 3)}` },
+      { label: 'Observed order of grid convergence', value: ol.order, unit: '–', help: 'Formal order of the scheme: 2' }, { label: 'Vortex-pair wavelength', value: lam, unit: '× δ', help: `Most-transporting cell of the wavelength scan; critical wavelength ${fmt((2 * Math.PI) / ol.kc, 3)} δ` });
+    if (!ol.monotone || ol.gciPct > 5) W.push({ level: 'warn', msg: `Electroconvection: the three-grid sequence is ${ol.monotone ? 'monotone' : 'not monotone'} with a grid-convergence index of ${fmt(ol.gciPct, 3)} % — raise the number of grid cells across the layer.` });
+    if (!ol.steady) W.push({ level: 'info', msg: 'Electroconvection: the vortex solution is unsteady on at least one grid; its Sherwood number is a time average.' });
+    plots.push({ type: 'line', title: 'Over-limiting current from electroconvection (Rubinstein–Zaltzman slip model)', xlabel: 'Voltage across one depleted diffusion layer (V)', ylabel: 'i / i_lim', series: [{ name: 'Stack model: 1 + slope·(V − V_c)', x: Vs.map((x) => x * V), y: Vs.map((x) => 1 + ol.slope * Math.max(0, x - ol.Vc)) }, { name: 'Non-linear vortex solutions (grid-extrapolated)', x: [ol.Vc, ...ol.pts.map((q) => q.V)].map((x) => x * V), y: [1, ...ol.pts.map((q) => q.nu)], mode: 'points' }], vlines: [{ x: ol.Vc * V, label: 'instability threshold' }], note: `Vortex pair of wavelength ${fmt(lam, 3)} δ; slip cut-off length ${fmt(ol.ell, 3)} δ. Without the cut-off the marginal curve has no minimum (short-wave limit √(32/Pe) = ${fmt(Math.sqrt(32 / ol.Pe), 3)} thermal voltages).` });
+    plots.push({ type: 'line', title: 'Electroconvection: grid convergence and wavelength scan', xlabel: 'Representative cell size h = 1/√(n_x·n_y)  ·  or wavelength ÷ 10 δ', ylabel: 'i / i_lim at 1.7 × threshold', series: [{ name: 'Three grids', x: rh.grids.map((g) => g.h), y: rh.nu, mode: 'both' }, { name: 'Richardson extrapolation (h → 0)', x: [0], y: [ol.nuExtrap], mode: 'points' }, { name: 'Wavelength scan on the scan grid (x = wavelength ÷ 10 δ)', x: ol.scan.map((q) => q.wavelength / 10), y: ol.scan.map((q) => q.nu), mode: 'points' }], note: `Observed order ${fmt(ol.order, 3)}, grid-convergence index ${fmt(ol.gciPct, 3)} %. The stack model uses the extrapolated value.` });
+    if (fld) plots.push({ type: 'field', title: 'Electroconvective vortices in the depleted layer at 1.7 × threshold', xlabel: 'Along the membrane (x/δ)', ylabel: 'Distance from the membrane (y/δ)', zlabel: 'Concentration', zunit: 'c / c_bulk', x: fld.x, y: fld.y, z: fld.c, u: fld.u, v: fld.w, stream: true, cmap: 'salinity', contours: 8, note: `Finest grid: Sherwood number ${fmt(fld.nu, 4)} (i / i_lim); slip velocity up to ${fmt(fld.umax, 3)} D/δ.` });
+    tables.push({ title: 'Electroconvection model', columns: ['Quantity', 'Value', 'Unit'], rows: [['Electro-osmotic Péclet number ε(RT/F)²/(ηD)', ol.Pe, '–'], ['Slip cut-off length ℓ', ol.ell, 'δ'], ['Critical wavenumber k_c·δ (minimum of the marginal curve)', ol.kc, '–'], ['Vortex wavenumber k·δ (most-transporting cell)', ol.kSel, '–'], ['Threshold voltage (linear stability)', ol.Vc, 'RT/F'], ['Threshold voltage', ol.Vc * V, 'V'], ['Plateau length per cell pair (two depleted layers)', 2 * ol.Vc * V, 'V'], ...ol.pts.map((q) => [`Sherwood number at ${fmt(q.V / ol.Vc, 3)} × threshold (extrapolated)`, q.nu, '–']), ['Over-limiting slope d(i/i_lim)/dV', ol.slope, 'per RT/F']], note: 'These values replace the empirical plateau length and over-limiting conductance in the polarisation curve and in the stack solution.' });
+    tables.push({ title: 'Electroconvection: grid-convergence study (Richardson extrapolation)', columns: ['Grid', 'Cells along × across', 'Cell size h', 'i/i_lim at 1.7 × threshold', 'i/i_lim at 1.3 × threshold', 'Steady'], rows: [...rh.grids.map((g, q) => [['coarse', 'medium', 'fine'][q], `${g.nx} × ${g.ny}`, g.h, rh.nu[q], rh.lo.nu[q], g.steady ? 'yes' : 'time-averaged']), ['extrapolated (h → 0)', '–', 0, rh.nuExtrap, rh.lo.nuExtrap, '–'], ['observed order p', '–', null, rh.order, rh.lo.order, '–'], ['grid-convergence index (%)', '–', null, rh.gciPct, rh.lo.gciPct, '–']],
+      note: `Refinement ratio 1.5 in both directions, ${rh.modes} Fourier modes of the Stokes flow (all that the cut-off passes), grid clustered towards the depleted interface. Wavelength scan (÷ critical): ${ol.scan.map((q) => `${fmt(1 / q.kf, 3)} → ${fmt(q.nu, 4)}${q.steady ? '' : ' (unsteady)'}`).join(', ')}.` });
+    out.electroconvectionThresholdV = ol.Vc * V; out.overLimitingRatio = ol.nuExtrap; out.overLimitingGciPct = ol.gciPct;
   }
   // ---- Navier–Stokes / Nernst–Planck channel
-  if (r.par.ns) {
+  if (r.par.ns && r.par.ns.cfd) {
+    const ns = r.par.ns, s = ns.sol, tm = 0.5 * (1 + r.par.alphaC), ts = e0.Dc / (e0.Dc + e0.Da), jw = ((tm - ts) * r.iAvg) / F, sc = jw / s.jw, cOf = (c) => e0.ceq - sc * (s.c0 - c), ilimC = (F * s.Sh * e0.Ds * e0.ceq) / (2 * r.G.h) / (tm - ts);
+    const hd0 = channel(ns.U, r.G.h, r.G.eps, T, e0.Ds, { ...r.par, ns: null }), xm = s.xc.map((x) => x * 1000), ym = s.yc.map((y) => y * 1000), pOut = (p.pOut || 0) * 1e5, dpStage = s.dpdx * r.G.L, cwMin = cOf(s.cwMin);
+    const base = { type: 'field', xlabel: 'x (mm)', ylabel: 'y (mm)', x: xm, y: ym, mask: s.fields.mask, equal: s.Lc / s.h <= 8, shapes: s.shapes.map((q) => ({ ...q, x: q.x.map((x) => x * 1000), y: q.y.map((y) => y * 1000) })) };
+    kpis.push({ label: 'Sherwood number (2-D Navier–Stokes)', value: s.Sh, unit: '–', help: `Flux-weighted over ${s.spacer ? 'whole spacer pitches' : 'the whole flow path'}; the spacer correlation gives ${fmt((hd0.Sh * 2 * r.G.h) / hd0.dh, 3)} on the same 2h basis` }, { label: 'Boundary-layer thickness (2-D Navier–Stokes)', value: ((2 * r.G.h) / s.Sh) * 1e6, unit: 'µm', help: 'δ = D/k = 2h/Sh' },
+      { label: 'Channel pressure drop per stage (2-D Navier–Stokes)', value: dpStage / 1e5, unit: 'bar', help: `Pressure gradient ${fmt(s.dpdx, 4)} Pa/m over whole pitches; friction factor × Reynolds number ${fmt(s.fRe, 4)}` }, { label: 'Channel inlet pressure (2-D Navier–Stokes)', value: (pOut + dpStage) / 1e5, unit: 'bar' });
+    if (!s.converged) W.push({ level: 'warn', msg: `The 2-D Navier–Stokes solution stopped after ${s.iters} iterations without meeting its tolerance — refine the grid across the channel or lower the velocity.` });
+    if (cwMin <= 0) W.push({ level: 'warn', msg: 'The 2-D channel solution reaches zero salt concentration at a membrane wall at the mean current density: locally the current exceeds the limiting value (typically behind a filament).' });
+    plots.push({ ...base, title: 'Velocity in the ED channel (2-D Navier–Stokes, finite volumes)', z: s.fields.speed, u: s.fields.uu, v: s.fields.vv, stream: true, zlabel: 'Speed', zunit: 'm/s', cmap: 'viridis', note: `${s.spacer ? `Spacer filaments (${s.arr}), ` : 'Open channel, '}superficial velocity ${fmt(s.U * 100, 3)} cm/s, Re = ${fmt(s.Re, 3)} (2h basis); ${s.nx} × ${s.ny} cells, ${s.iters} iterations.` },
+      { ...base, title: 'Salt concentration in the diluate channel at the mean current density', z: s.fields.c.map((row) => row.map(cOf)), zlabel: 'Concentration', zunit: 'eq/m³', cmap: 'salinity', contours: 8, note: `Both membranes remove (t̄ − t)·i/F = ${fmt(jw * 1000, 3)} mmol/m²·s; lowest wall concentration ${fmt(Math.max(cwMin, 0), 3)} eq/m³ of ${fmt(e0.ceq, 3)} in the bulk at the inlet.` },
+      { type: 'line', title: 'Local Sherwood number and pressure along the channel (2-D Navier–Stokes)', xlabel: 'x (mm)', ylabel: 'see legend', series: [{ name: 'Local Sherwood number (both walls)', x: xm.filter((_, k) => s.ShLoc[k] !== null), y: s.ShLoc.filter((q) => q !== null) }, { name: 'Section-mean pressure above the outlet (Pa)', x: xm, y: s.pm.map((q) => q - s.pm[s.nx - 1]) }], hlines: [{ y: s.Sh, label: 'mean used by the stack model' }] });
+    tables.push({ title: 'Channel hydrodynamics and mass transfer (2-D Navier–Stokes + salt transport)', columns: ['Quantity', 'Value', 'Unit'], rows: [['Spacer arrangement', s.spacer ? s.arr : 'open channel', ''], ['Solved length', s.Lc * 1000, 'mm'], ['Grid (along × across)', `${s.nx} × ${s.ny}`, 'cells'], ['Solid fraction of the section', s.solidFraction, '–'], ['Reynolds number (2h, superficial velocity)', s.Re, '–'], ['Schmidt number', s.Sc, '–'], ['Friction factor (Darcy, 2h)', s.f, '–'], ['Friction factor × Reynolds number', s.fRe, '–'], ['Pressure gradient', s.dpdx, 'Pa/m'], ['Pressure drop of one stage', dpStage / 1e5, 'bar'], ['Mean Sherwood number (2h)', s.Sh, '–'], ['Mass-transfer coefficient', (s.Sh * s.D) / (2 * s.h), 'm/s'], ['Boundary-layer thickness D/k', ((2 * s.h) / s.Sh) * 1e6, 'µm'], ['Limiting current density from this Sherwood number', ilimC, 'A/m²'], ['Sherwood number of the spacer correlation (2h basis)', (hd0.Sh * 2 * r.G.h) / hd0.dh, '–'], ['Pressure gradient of the spacer correlation', hd0.dpPerM, 'Pa/m'], ['Flow iterations', s.iters, ''], ['Converged', s.converged ? 'yes' : 'no', '']],
+      note: `The stack model takes its mass-transfer coefficient and pressure gradient from this solution${s.spacer ? `, rescaled along the flow path with Sh ∝ Re^${fmt(ns.nRe, 2)}·Sc^⅓ and Δp ∝ u^1.7` : ', rescaled with Sh ∝ (Re·Sc)^⅓ and Δp ∝ μ·u'}. Two-dimensional section: filaments are transverse cylinders; the 3-D mesh of a woven spacer is not resolved.` });
+    bal.push({ name: '2-D channel salt: inflow vs outflow + wall flux (mol/s per m width, solver units)', in: s.saltIn, out: s.saltOut });
+    out.cfdSherwood = s.Sh; out.cfdDpPerM = s.dpdx; out.cfdFrictionRe = s.fRe;
+  } else if (r.par.ns) {
     const tm = 0.5 * (1 + r.par.alphaC), ts = e0.Dc / (e0.Dc + e0.Da), u0 = r.par.ns.U, jw = ((tm - ts) * r.iAvg) / F;
     const s = channelNS({ U: u0, h: r.G.h, L: r.G.L, T, D: e0.Ds, c0: e0.ceq, jw: [jw, jw], pOut: (p.pOut || 0) * 1e5 }), ilimNS = (F * s.ShMean * e0.Ds * e0.ceq) / (2 * r.G.h) / (tm - ts);
     kpis.push({ label: 'Channel inlet pressure (Navier–Stokes)', value: s.pIn / 1e5, unit: 'bar', help: `Outlet pressure ${p.pOut || 0} bar plus the momentum-equation pressure drop of one stage` }, { label: 'Mean Sherwood number (Navier–Stokes–Nernst–Planck)', value: s.ShMean, unit: '–' }, { label: 'Hydrodynamic entrance length', value: s.entrance * 1000, unit: 'mm' });
@@ -980,12 +1210,14 @@ function advancedED(r, p, W) {
   if (p.surrogate) try {
     const sg = stackSurrogate(r, clamp(Math.round(p.nTrain || 48), 16, 120)), Us = linspace(0.25, 1.2, 20), uNow = clamp(seg0.u * 100, 3, 16), mech = Us.map((U) => sg.at(1, U, uNow));
     if (sg.sec.r2 < 0.95) W.push({ level: 'warn', msg: `The surrogate reproduces held-out model runs only with R² = ${fmt(sg.sec.r2, 3)} — increase the number of training runs.` });
-    kpis.push({ label: 'Surrogate R², specific energy (held-out)', value: sg.sec.r2, unit: '–', status: sg.sec.r2 < 0.95 ? 'warn' : 'ok', help: `${sg.train.length} training and ${sg.test.length} held-out runs of the mechanistic stack model` }, { label: 'Surrogate R², salt removal (held-out)', value: sg.removal.r2, unit: '–' });
-    plots.push({ type: 'line', title: 'Surrogate parity on held-out runs', xlabel: 'Mechanistic model', ylabel: 'Surrogate', series: [{ name: 'Specific DC energy (kWh/m³)', x: sg.test.map((q) => q.sec), y: sg.test.map((q) => q.p.sec), mode: 'points' }, { name: 'Salt removal (–)', x: sg.test.map((q) => q.removal), y: sg.test.map((q) => q.p.removal), mode: 'points' }, { name: '1 : 1', x: [0, Math.max(1, ...sg.test.map((q) => q.sec))], y: [0, Math.max(1, ...sg.test.map((q) => q.sec))], dash: true }], note: 'Squared-exponential kernel regression trained on a Latin-hypercube sample of feed salinity (0.4–2.5 ×), voltage (0.25–1.2 V) and velocity (3–16 cm/s).' },
+    kpis.push({ label: 'Surrogate R², specific energy (held-out)', value: sg.sec.r2, unit: '–', status: sg.sec.r2 < 0.95 ? 'warn' : 'ok', help: `${SURROGATES[sg.best.sec]} selected by validation; ${sg.train.length} training and ${sg.test.length} held-out runs of the mechanistic stack model` }, { label: 'Surrogate R², salt removal (held-out)', value: sg.removal.r2, unit: '–', help: `${SURROGATES[sg.best.removal]} selected by validation` }, { label: 'Selected surrogate (specific energy)', value: SURROGATES[sg.best.sec], help: `Held-out RMSE: ${Object.keys(sg.models).map((n) => `${SURROGATES[n]} ${fmt(sg.models[n].sec.rmse, 3)}`).join(', ')} kWh/m³` });
+    const okM = Object.keys(sg.models).filter((n) => sg.models[n].sec.ok && sg.models[n].removal.ok), pmax = Math.max(1, ...sg.test.map((q) => q.sec));
+    plots.push({ type: 'line', title: 'Surrogate parity on held-out runs: three learners', xlabel: 'Mechanistic model', ylabel: 'Surrogate', series: [...okM.map((n) => ({ name: `Specific DC energy, ${SURROGATES[n].toLowerCase()} (kWh/m³)`, x: sg.test.map((q) => q.sec), y: sg.models[n].sec.pred, mode: 'points' })), ...okM.map((n) => ({ name: `Salt removal, ${SURROGATES[n].toLowerCase()} (–)`, x: sg.test.map((q) => q.removal), y: sg.models[n].removal.pred, mode: 'points' })), { name: '1 : 1', x: [0, pmax], y: [0, pmax], dash: true }], note: `Kernel ridge regression, Gaussian process and neural network trained on the same Latin-hypercube sample of feed salinity (0.4–2.5 ×), voltage (0.25–1.2 V) and velocity (3–16 cm/s); the ${sg.test.length} plotted runs were used neither for training nor for selecting the learner (seed ${sg.seed}).` },
       { type: 'line', title: 'Surrogate versus mechanistic model along the voltage', xlabel: 'Voltage per cell pair (V)', ylabel: 'kWh/m³ · –', series: [{ name: 'Specific DC energy, mechanistic', x: Us, y: mech.map((q) => q.sec), mode: 'points' }, { name: 'Specific DC energy, surrogate', x: Us, y: Us.map((U) => sg.pred(1, U, uNow).sec) }, { name: 'Salt removal, mechanistic', x: Us, y: mech.map((q) => q.removal), mode: 'points' }, { name: 'Salt removal, surrogate', x: Us, y: Us.map((U) => sg.pred(1, U, uNow).removal) }], note: `Present feed, ${fmt(uNow, 3)} cm/s, ${r.nSt} stage${r.nSt > 1 ? 's' : ''}.` });
-    tables.push({ title: 'Surrogate model (kernel regression)', columns: ['Quantity', 'Specific DC energy', 'Salt removal'], rows: [['Kernel length scale (unit cube)', sg.mS.ell, sg.mR.ell], ['Leave-one-out RMSE (training; ln kWh/m³ · –)', sg.mS.rmseLoo, sg.mR.rmseLoo], ['Held-out R²', sg.sec.r2, sg.removal.r2], ['Held-out RMSE (kWh/m³ · –)', sg.sec.rmse, sg.removal.rmse], ['Training runs', sg.train.length, sg.train.length], ['Held-out runs', sg.test.length, sg.test.length]] },
+    tables.push({ title: 'Surrogate learners compared on the same design points', columns: ['Learner', 'Validation RMSE, ln SEC', 'Held-out R², SEC', 'Held-out RMSE, SEC (kWh/m³)', 'Validation RMSE, removal', 'Held-out R², removal', 'Held-out RMSE, removal (–)', 'Selected for'], rows: Object.keys(sg.models).map((n) => { const m = sg.models[n], f = (x) => (Number.isFinite(x) ? x : null); return [SURROGATES[n], f(m.sec.val), m.sec.ok ? m.sec.r2 : null, f(m.sec.rmse), f(m.removal.val), m.removal.ok ? m.removal.r2 : null, f(m.removal.rmse), [sg.best.sec === n ? 'specific energy' : null, sg.best.removal === n ? 'salt removal' : null].filter(Boolean).join(' + ') || '–']; }), note: `Selection: each learner is trained on ${sg.nFit} runs and scored on ${sg.nVal} validation runs; the one with the lowest validation error is retrained on all ${sg.train.length} runs. Held-out columns: ${sg.test.length} further runs. Neural network: two tanh layers (10 and 8 units), Adam with early stopping. Gaussian process: anisotropic squared-exponential kernel, maximum marginal likelihood.` },
+      { title: 'Surrogate model details', columns: ['Quantity', 'Specific DC energy', 'Salt removal'], rows: [['Selected learner', SURROGATES[sg.best.sec], SURROGATES[sg.best.removal]], ['Kernel regression: length scale (unit cube)', sg.mS.ell, sg.mR.ell], ['Kernel regression: leave-one-out RMSE (training; ln kWh/m³ · –)', sg.mS.rmseLoo, sg.mR.rmseLoo], ['Held-out R² of the selected learner', sg.sec.r2, sg.removal.r2], ['Held-out RMSE of the selected learner (kWh/m³ · –)', sg.sec.rmse, sg.removal.rmse], ['Training runs', sg.train.length, sg.train.length], ['Held-out runs', sg.test.length, sg.test.length]] },
       { title: 'Surrogate held-out runs', columns: ['Salinity ×', 'Voltage (V)', 'Velocity (cm/s)', 'SEC model (kWh/m³)', 'SEC surrogate (kWh/m³)', 'Removal model (–)', 'Removal surrogate (–)'], rows: sg.test.map((q) => [q.sf, q.U, q.u, q.sec, q.p.sec, q.removal, q.p.removal]) });
-    out.surrogateR2 = sg.sec.r2;
+    out.surrogateR2 = sg.sec.r2; out.surrogateModel = sg.best.sec;
   } catch (e) { W.push({ level: 'warn', msg: `The surrogate could not be trained: ${e.message}` }); }
   // ---- operating-condition optimisation
   if (p.optimise && p.mode === 'design') {
@@ -993,9 +1225,9 @@ function advancedED(r, p, W) {
     if (o.best) {
       const zf = o.z.flat().filter((x) => x !== null), zm = zf.length ? Math.max(...zf) : base;
       kpis.push({ label: 'Lowest unit cost (optimised operation)', value: Math.min(o.best.cost, base), unit: '$/m³', help: `Present operating point: ${fmt(base, 3)} $/m³ (electricity + membrane replacement)` }, { label: 'Optimal i / i_lim', value: o.best.cost <= base ? o.best.phi : p.safety, unit: '%' }, { label: 'Optimal linear velocity', value: o.best.cost <= base ? o.best.u : p.uLin, unit: 'cm/s' });
-      plots.push({ type: 'field', title: 'Unit cost versus operating current fraction and velocity', xlabel: 'Operating current ÷ limiting current (%)', ylabel: 'Linear velocity (cm/s)', zlabel: 'Unit cost', zunit: '$/m³', x: o.phis, y: o.us, z: o.z.map((row) => row.map((x) => (x === null ? zm : x))), cmap: 'viridis', contours: 8, markers: [{ x: o.best.phi, y: o.best.u, label: 'optimum' }, { x: clamp(p.safety, o.phis[0], o.phis[o.phis.length - 1]), y: clamp(p.uLin, o.us[0], o.us[o.us.length - 1]), label: 'present' }], note: 'Each cell is a complete re-design for the same product target (coarse path resolution); cells that miss the target take the highest cost of the map.' });
-      tables.push({ title: 'Operating-condition optimisation', columns: ['i / i_lim (%)', 'Velocity (cm/s)', 'Unit cost ($/m³)', 'Specific energy (kWh/m³)', 'Membrane area (m²)', 'Stages', 'Cell pairs per stage'], rows: [...o.cells].sort((a, b) => a.cost - b.cost).slice(0, 8).map((c) => [c.phi, c.u, c.cost, c.sec, c.area, c.nSt, c.Ncp]), note: `Eight best of ${o.cells.length} feasible designs. A higher current fraction saves membrane area but costs energy; the optimum balances the two at ${p.cElecED} $/kWh and ${p.cMem} $/m² over ${p.memLife} years.` });
-      if (o.best.cost < 0.97 * base) recs.push(`Operating at ${o.best.phi} % of the limiting current and ${o.best.u} cm/s lowers the unit cost from ${fmt(base, 3)} to ${fmt(o.best.cost, 3)} $/m³.`);
+      plots.push({ type: 'field', title: 'Unit cost versus operating current fraction and velocity', xlabel: 'Operating current ÷ limiting current (%)', ylabel: 'Linear velocity (cm/s)', zlabel: 'Unit cost', zunit: '$/m³', x: o.phis, y: o.us, z: o.z.map((row) => row.map((x) => (x === null ? zm : x))), cmap: 'viridis', contours: 8, markers: [{ x: o.best.phi, y: o.best.u, label: 'optimum' }, { x: clamp(p.safety, o.phis[0], o.phis[o.phis.length - 1]), y: clamp(p.uLin, o.us[0], o.us[o.us.length - 1]), label: 'present' }], shapes: o.path.length > 1 ? [{ x: o.path.map((c) => c.phi), y: o.path.map((c) => c.u), closed: false, dash: true }] : [], note: `Backdrop: grid of complete re-designs for the same product target (coarse path resolution; cells that miss the target take the highest cost of the map). Optimum: Nelder–Mead simplex over the continuous variables, started from the best cell (${o.evals} designs in total; dashed line = designs visited). Best grid cell ${fmt(o.gridBest.cost, 4)} $/m³, optimised ${fmt(o.best.cost, 4)} $/m³.` });
+      tables.push({ title: 'Operating-condition optimisation', columns: ['i / i_lim (%)', 'Velocity (cm/s)', 'Unit cost ($/m³)', 'Specific energy (kWh/m³)', 'Membrane area (m²)', 'Stages', 'Cell pairs per stage'], rows: [[o.best.phi, o.best.u, o.best.cost, o.best.sec, o.best.area, o.best.nSt, o.best.Ncp], ...[...o.cells].sort((a, b) => a.cost - b.cost).slice(0, 7).map((c) => [c.phi, c.u, c.cost, c.sec, c.area, c.nSt, c.Ncp])], note: `First row: optimum of the simplex search (${o.iterations} iterations); then the seven best of ${o.cells.length} feasible grid designs. A higher current fraction saves membrane area but costs energy; the optimum balances the two at ${p.cElecED} $/kWh and ${p.cMem} $/m² over ${p.memLife} years.` });
+      if (o.best.cost < 0.97 * base) recs.push(`Operating at ${fmt(o.best.phi, 3)} % of the limiting current and ${fmt(o.best.u, 3)} cm/s lowers the unit cost from ${fmt(base, 3)} to ${fmt(o.best.cost, 3)} $/m³.`);
       out.optimalCurrentFraction = o.best.phi; out.optimalVelocity = o.best.u; out.optimalCost = o.best.cost;
     } else W.push({ level: 'warn', msg: 'No operating point of the optimisation grid reaches the product target.' });
   }
@@ -1015,8 +1247,8 @@ const suite = {
   implemented: ['nernst-planck equation', 'poisson equation', 'electroneutral nernst-planck', 'nernst equation', 'donnan-equilibrium', 'ohm', 'faraday', 'butler-volmer', 'tafel', 'charge-conservation', 'current-continuity', 'ionic mass balance', 'convection-diffusion', 'water-dissociation', 'membrane partition', 'poisson-nernst-planck', 'goldman-hodgkin-katz', 'navier-stokes equation',
     'donnan-nernst-planck', 'electro-osmosis-ion-transport', 'electrodialysis-water-splitting', 'bipolar-membrane', 'electrode-reaction-ion-transport', 'nernst-planck-poisson', 'nernst-planck-navier-stokes', 'maxwell-stefan-electrochemical', 'electroconvection model', 'electrochemical-thermal', 'electrochemical-machine-learning',
     'ion concentration', 'electric potential', 'membrane charge', 'temperature', 'velocity', 'electrode state', 'fixed-potential', 'imposed-current', 'electrode butler-volmer', 'donnan-interface', 'ion-partition', 'specified-concentration', 'inlet-flow', 'membrane-interface continuity', 'insulating/zero-current', 'specified-ion-flux', 'no-flux', 'outlet-pressure',
-    'electrolyte chemistry', 'ionic-species transport', 'diffusion', 'electromigration', 'convection', 'electric-potential calculation', 'current-density prediction', 'ion-exchange membrane modelling', 'membrane selectivity', 'membrane resistance', 'electrode reactions', 'electrode compartments', 'concentration and diluate channels', 'concentration polarisation', 'limiting-current assessment', 'water transport', 'electro-osmosis', 'acid-base chemistry', 'electrochemical reactions', 'electrical-energy consumption', 'stack configuration', 'dynamic simulation', 'fouling and scaling', 'operating-condition optimisation'],
-  equationsNote: 'Stack model: channels are one-dimensional plug flow with a film (Sherwood) boundary layer; the film solution is the exact electroneutral Nernst–Planck result for an equivalent binary salt built from the equivalent-weighted ion diffusivities, and membrane transport numbers split the current between counter-ions in proportion to mobility × concentration × selectivity. Optional sub-models on Model setup resolve what this leaves out: (1) a steady 1-D Poisson–Nernst–Planck solver (finite volumes, Scharfetter–Gummel fluxes, Newton iteration, mesh graded to the Debye length) for a binary 1:1 electrolyte across film | membrane | film, at an insulating charged wall or in the depleted diffusion layer — it is a local analysis shown beside the stack result, not fed back into it; (2) the Goldman–Hodgkin–Katz constant-field membrane potential, solved ion by ion for the bulk compositions with its local slope carrying the polarisation correction; (3) Maxwell–Stefan friction transport of all feed ions in the cation membrane with electro-osmotic water drag (ideal activities, constant friction diffusivities); (4) electroconvection from the Rubinstein–Zaltzman limiting electro-osmotic slip model — linear-stability threshold and a 2-D non-linear Stokes / salt-transport solution for a vortex pair of wavelength 2δ with the flow truncated to three Fourier modes, which regularises the short-wave singularity of the limiting slip formula; it replaces the empirical plateau length and over-limiting conductance, while the share of water splitting stays an input; (5) boundary-layer (parabolised) Navier–Stokes with electroneutral Nernst–Planck salt transport for developing laminar flow in an open, spacer-free channel (no axial diffusion or recirculation), which then supplies the mass-transfer coefficient and pressure gradient of the stack; (6) a stack energy balance with temperature-dependent properties at the mean stack temperature; (7) reduced-order fouling and scaling kinetics at constant current with polarity reversal homogenised to a first-order removal rate; (8) a kernel-regression surrogate trained on the mechanistic single-pass rating; and (9) a grid search of current fraction and velocity for the lowest unit cost. Electrode kinetics follow Butler–Volmer with a selectable transfer coefficient or its Tafel limit. Activity coefficients are ideal except in the gypsum and calcite saturation ratios (Davies), which are screening values — use suite 2 for speciation. Bipolar-membrane ED and capacitive deionisation are reduced-order models (lumped unit voltage with empirical current efficiency; equilibrium modified-Donnan / Gouy–Chapman–Stern double layers with RC charging) intended for sizing, not for stack design. Valid for roughly 0.2–40 g/L and 5–45 °C.',
+    'electrolyte chemistry', 'ionic-species transport', 'diffusion', 'electromigration', 'convection', 'electric-potential calculation', 'current-density prediction', 'ion-exchange membrane modelling', 'membrane selectivity', 'membrane resistance', 'electrode reactions', 'electrode compartments', 'concentration and diluate channels', 'concentration polarisation', 'limiting-current assessment', 'water transport', 'electro-osmosis', 'acid-base chemistry', 'electrochemical reactions', 'electrical-energy consumption', 'stack configuration', 'dynamic simulation', 'fouling and scaling', 'operating-condition optimisation', 'navier-stokes equations', 'nernst-planck-navier-stokes models', 'electroconvection models', 'electrochemical-machine-learning models'],
+  equationsNote: 'Stack model: channels are one-dimensional plug flow with a film (Sherwood) boundary layer; the film solution is the exact electroneutral Nernst–Planck result for an equivalent binary salt built from the equivalent-weighted ion diffusivities, and membrane transport numbers split the current between counter-ions in proportion to mobility × concentration × selectivity. Optional sub-models on Model setup resolve what this leaves out: (1) a steady 1-D Poisson–Nernst–Planck solver (finite volumes, Scharfetter–Gummel fluxes, Newton iteration, mesh graded to the Debye length) for a binary 1:1 electrolyte across film | membrane | film, at an insulating charged wall or in the depleted diffusion layer — it is a local analysis shown beside the stack result, not fed back into it; (2) the Goldman–Hodgkin–Katz constant-field membrane potential, solved ion by ion for the bulk compositions with its local slope carrying the polarisation correction; (3) Maxwell–Stefan friction transport of all feed ions in the cation membrane with electro-osmotic water drag (ideal activities, constant friction diffusivities); (4) electroconvection from the Rubinstein–Zaltzman electro-osmotic slip model with a short-wave cut-off of the slip (an input length, 0.2 δ by default, standing for the finite extended space charge; without it the limiting formula has no preferred wavelength and no grid-converged solution): the critical wavenumber is the minimum of the marginal-stability curve, the vortex-cell wavelength is the most-transporting of a scan, and the 2-D non-linear Stokes / salt-transport problem is solved with second-order differences on a grid clustered towards the depleted interface (all Fourier modes the cut-off passes, ADI time stepping) on three systematically refined grids; the Richardson-extrapolated Sherwood number, its observed order and grid-convergence index are reported and the extrapolated value replaces the empirical plateau length and over-limiting conductance, while the share of water splitting stays an input; (5) channel flow, either as a boundary-layer (parabolised) Navier–Stokes march with electroneutral Nernst–Planck salt transport in an open, spacer-free channel (fast; no axial diffusion or recirculation), or as the full two-dimensional steady Navier–Stokes and salt-transport solution of the finite-volume solver of suite 4 around transverse spacer filaments (zigzag, cavity, submerged) or in the open channel, with the salt flux of the operating current at both membranes — either one then supplies the mass-transfer coefficient and pressure gradient of the stack (the 2-D section does not resolve the three-dimensional weave of a real spacer); (6) a stack energy balance with temperature-dependent properties at the mean stack temperature; (7) reduced-order fouling and scaling kinetics at constant current with polarity reversal homogenised to a first-order removal rate; (8) three surrogates of the mechanistic single-pass rating trained on the same Latin-hypercube runs — a feed-forward neural network (Adam, early stopping), a Gaussian process (maximum marginal likelihood) and kernel ridge regression — selected on a validation split and compared on held-out runs; and (9) a Nelder–Mead simplex search of current fraction and velocity for the lowest unit cost, started from a coarse grid of re-designs that is kept as the cost map. Electrode kinetics follow Butler–Volmer with a selectable transfer coefficient or its Tafel limit. Activity coefficients are ideal except in the gypsum and calcite saturation ratios (Davies), which are screening values — use suite 2 for speciation. Bipolar-membrane ED and capacitive deionisation are reduced-order models (lumped unit voltage with empirical current efficiency; equilibrium modified-Donnan / Gouy–Chapman–Stern double layers with RC charging) intended for sizing, not for stack design. Valid for roughly 0.2–40 g/L and 5–45 °C.',
 
   inputs: [
     { group: 'Process and duty', help: 'What the electro-membrane system must do.', fields: [
@@ -1092,13 +1324,17 @@ const suite = {
       { key: 'dpManifold', label: 'Manifold and piping loss per stage', unit: 'bar', value: 0.3, min: 0, max: 3, showIf: (v) => v.process !== 'mcdi', help: 'Added to the channel pressure drop.' },
       { key: 'plateau', label: 'Limiting-plateau length', unit: 'V per cell pair', value: 0.6, min: 0.05, max: 3, showIf: (v) => v.olModel !== 'rz', help: 'Extra voltage beyond the limiting current before over-limiting conduction sets in.' },
       { key: 'olSlope', label: 'Over-limiting conductance ÷ ohmic conductance', unit: '–', value: 0.5, min: 0, max: 2, showIf: (v) => v.olModel !== 'rz', help: 'Slope of the over-limiting branch of the polarisation curve.' },
+      { key: 'ecEll', label: 'Electroconvection: slip cut-off length ÷ δ', unit: '–', value: 0.2, min: 0.1, max: 0.4, showIf: (v) => v.olModel === 'rz', help: 'Short-wave cut-off of the electro-osmotic slip (finite thickness of the extended space charge). The limiting slip formula alone has no preferred wavelength; 0.2 puts the critical vortex pair at the ≈ 2δ seen in experiments and direct simulations.' },
       { key: 'fws', label: 'Share of over-limiting current from water splitting', unit: '–', value: 0.5, min: 0, max: 1, help: 'The remainder is carried by salt through electro-convection.' },
     ] },
     { group: 'Membrane-scale and channel models', tab: 'setup', showIf: isED, help: 'Optional detailed models. The first three change the stack solution; the Poisson–Nernst–Planck and Maxwell–Stefan solvers are local analyses at the stack inlet (continuous operation).', fields: [
       { key: 'membModel', label: 'Membrane potential', type: 'select', value: 'tms', options: [{ value: 'tms', label: 'Permselectivity × Nernst potential' }, { value: 'ghk', label: 'Goldman–Hodgkin–Katz constant-field equation' }], help: 'GHK solves the zero-current potential of each membrane ion by ion for the bulk compositions; concentration polarisation enters through its local slope.' },
       { key: 'olModel', label: 'Over-limiting current', type: 'select', value: 'empirical', options: [{ value: 'empirical', label: 'Empirical plateau length and conductance' }, { value: 'rz', label: 'Electroconvection (Rubinstein–Zaltzman slip model)' }], help: 'The electroconvection model computes the instability threshold and the vortex-enhanced current from a 2-D Stokes / salt-transport solution (adds about a second).' },
-      { key: 'flowModel', label: 'Channel flow and mass transfer', type: 'select', value: 'corr', options: [{ value: 'corr', label: 'Spacer correlation Sh = a·Re^b·Sc^⅓' }, { value: 'ns', label: 'Navier–Stokes + Nernst–Planck, open channel' }], help: 'The Navier–Stokes option marches the developing laminar flow and the salt boundary layers between two membranes without a spacer and uses its Sherwood number and pressure drop.' },
-      { key: 'pOut', label: 'Channel outlet pressure', unit: 'bar', value: 0.2, min: 0, max: 5, showIf: (v) => v.flowModel === 'ns', help: 'Gauge pressure at the stage outlet (boundary condition of the momentum equation); the inlet pressure follows.' },
+      { key: 'flowModel', label: 'Channel flow and mass transfer', type: 'select', value: 'corr', options: [{ value: 'corr', label: 'Spacer correlation Sh = a·Re^b·Sc^⅓' }, { value: 'ns', label: 'Parabolised (boundary-layer) Navier–Stokes march, open channel — fast' }, { value: 'cfd2d', label: 'Full 2-D Navier–Stokes + salt transport, spacer-filled or open channel (finite volumes)' }], help: 'Parabolised: marches the developing laminar flow and the salt boundary layers between two membranes without a spacer (no recirculation, no streamwise diffusion). Full 2-D: solves the elliptic Navier–Stokes equations and the salt balance around the spacer filaments with the finite-volume solver of suite 4. Either way the stack model uses the resulting Sherwood number and pressure gradient.' },
+      { key: 'spArr', label: 'Spacer filaments (2-D solution)', type: 'select', value: 'zigzag', options: [{ value: 'zigzag', label: 'Zigzag (alternating membranes)' }, { value: 'cavity', label: 'Cavity (all on one membrane)' }, { value: 'submerged', label: 'Submerged (mid-channel)' }, { value: 'none', label: 'No filaments — open channel over the whole flow path' }], showIf: (v) => isED(v) && v.flowModel === 'cfd2d', help: 'Transverse filaments of the 2-D section. Eight pitches are solved; the Sherwood number and pressure gradient are taken over whole pitches away from the inlet.' },
+      { key: 'spDf', label: 'Filament diameter ÷ channel thickness', unit: '–', value: 0.5, min: 0.2, max: 0.8, showIf: (v) => isED(v) && v.flowModel === 'cfd2d' && v.spArr !== 'none', help: 'Woven and extruded ED spacers have filaments of about half the channel thickness.' },
+      { key: 'spLm', label: 'Filament pitch ÷ channel thickness', unit: '–', value: 4, min: 2, max: 12, showIf: (v) => isED(v) && v.flowModel === 'cfd2d' && v.spArr !== 'none', help: 'Distance between neighbouring filaments along the flow.' },
+      { key: 'pOut', label: 'Channel outlet pressure', unit: 'bar', value: 0.2, min: 0, max: 5, showIf: (v) => v.flowModel === 'ns' || v.flowModel === 'cfd2d', help: 'Gauge pressure at the stage outlet (boundary condition of the momentum equation); the inlet pressure follows.' },
       { key: 'pnp', label: 'Poisson–Nernst–Planck solver', type: 'select', value: 'off', options: [{ value: 'off', label: 'Off' }, { value: 'membrane', label: 'Film | cation membrane | film at the operating current' }, { value: 'wall', label: 'Double layer at an insulating charged wall' }, { value: 'depleted', label: 'Depleted diffusion layer: current–voltage curve with space charge' }], showIf: cont, help: 'Resolves the space-charge regions that the electroneutral model replaces by Donnan jumps. Equivalent 1:1 salt at the stack inlet.' },
       { key: 'pnpPsi0', label: 'Wall potential', unit: 'mV', value: 100, min: 1, max: 300, showIf: (v) => cont(v) && v.pnp === 'wall', help: 'Potential of the insulating wall relative to the bulk solution.' },
       { key: 'msModel', label: 'Maxwell–Stefan transport in the cation membrane', type: 'bool', value: false, showIf: cont, help: 'Multi-ion friction model with electro-osmotic water drag, compared with Nernst–Planck.' },
@@ -1121,9 +1357,9 @@ const suite = {
       { key: 'revEff', label: 'Deposit removed per polarity reversal', unit: '%', value: 60, min: 0, max: 99.9, showIf: (v) => v.foulModel && v.edr, help: 'Share of deposit and scale shed at every reversal.' },
       { key: 'tCamp', label: 'Operating campaign', unit: 'd', value: 60, min: 1, max: 1000, showIf: (v) => v.foulModel, help: 'Simulated time between cleanings.' },
       { key: 'cipTrig', label: 'Cleaning trigger: cell-pair voltage rise', unit: '%', value: 10, min: 1, max: 100, showIf: (v) => v.foulModel, help: 'Clean-in-place is planned when the voltage at constant current has risen by this much.' },
-      { key: 'surrogate', label: 'Train a surrogate (machine-learning) model', type: 'bool', value: false, help: 'Kernel regression of specific energy and salt removal versus feed salinity, voltage and velocity, trained on runs of the mechanistic stack model and tested on held-out runs.' },
+      { key: 'surrogate', label: 'Train a surrogate (machine-learning) model', type: 'bool', value: false, help: 'Neural network, Gaussian process and kernel regression of specific energy and salt removal versus feed salinity, voltage and velocity, compared on held-out runs; the best on validation is used. Trained on runs of the mechanistic stack model and tested on held-out runs.' },
       { key: 'nTrain', label: 'Training runs', unit: '', value: 48, min: 16, max: 120, step: 1, showIf: (v) => v.surrogate, help: 'Latin-hypercube sample; 16 further runs are held out for the parity test.' },
-      { key: 'optimise', label: 'Optimise the operating conditions', type: 'bool', value: false, showIf: (v) => v.mode === 'design', help: 'Grid search of the allowed current fraction (which sets the number of stages) and the velocity (which sets the cell pairs) for the lowest unit cost: 20 re-designs, a few seconds.' },
+      { key: 'optimise', label: 'Optimise the operating conditions', type: 'bool', value: false, showIf: (v) => v.mode === 'design', help: 'Nelder–Mead search (started from a coarse grid of re-designs, shown as the cost map) of the allowed current fraction (which sets the number of stages) and the velocity (which sets the cell pairs) for the lowest unit cost.' },
       { key: 'cElecED', label: 'Electricity price', unit: '$/kWh', value: 0.08, min: 0, max: 1, showIf: (v) => v.mode === 'design' && v.optimise, help: 'For the energy part of the unit cost.' },
       { key: 'cMem', label: 'Installed membrane cost', unit: '$/m²', value: 100, min: 1, max: 2000, showIf: (v) => v.mode === 'design' && v.optimise, help: 'Membranes with spacers and stack hardware per m² of membrane.' },
       { key: 'memLife', label: 'Membrane life', unit: 'y', value: 7, min: 0.5, max: 20, showIf: (v) => v.mode === 'design' && v.optimise, help: 'Straight-line replacement over this period at 90 % availability.' },
@@ -1151,7 +1387,8 @@ const suite = {
       { key: 'nt', label: 'Time steps (batch and CDI cycle)', unit: '', value: 120, min: 4, max: 2000, step: 1, help: 'RK4 steps for batch ED and for each CDI half-cycle.' },
       { key: 'nProf', label: 'Points across the membrane (profile solver)', unit: '', value: 40, min: 6, max: 400, step: 1, help: 'RK4 steps of the Nernst–Planck–Donnan and Maxwell–Stefan profiles inside the membrane.' },
       { key: 'pnpRatio', label: 'Poisson–Nernst–Planck mesh growth ratio', unit: '–', value: 1.25, min: 1.05, max: 2, showIf: (v) => cont(v) && v.pnp && v.pnp !== 'off', help: 'Ratio of neighbouring cell sizes away from each interface; the first cell is a fifth of the local Debye length. Smaller = finer.' },
-      { key: 'ecN', label: 'Electroconvection grid cells across the layer', unit: '', value: 20, min: 12, max: 48, step: 1, showIf: (v) => isED(v) && v.olModel === 'rz', help: 'Finite-difference cells across the depleted diffusion layer in the 2-D vortex solution.' },
+      { key: 'cfdNy', label: '2-D Navier–Stokes cells across the channel', unit: '', value: 24, min: 12, max: 48, step: 1, showIf: (v) => isED(v) && v.flowModel === 'cfd2d', help: 'Finite volumes across the channel, clustered towards both membranes; the streamwise count follows (20 per filament pitch at 24 across).' },
+      { key: 'ecN', label: 'Electroconvection grid cells across the layer', unit: '', value: 20, min: 12, max: 48, step: 1, showIf: (v) => isED(v) && v.olModel === 'rz', help: 'Cells across the depleted diffusion layer on the medium grid of the 2-D vortex solution. The model also solves a 1.5 × coarser and a 1.5 × finer grid and Richardson-extrapolates, so the reported over-limiting current does not depend on this number beyond the stated grid-convergence index.' },
     ] },
   ],
 
@@ -1172,10 +1409,11 @@ const suite = {
   ],
   site: (site) => [{ key: 'T', value: site?.data?.sst !== undefined && site?.data?.sst !== null ? clamp(site.data.sst, 5, 45) : undefined, from: 'Sea-surface temperature at site' }],
 
-  run(v) {
-    if (v.process === 'bpmed') return runBPMED(v);
-    if (v.process === 'mcdi') return runCDI(v);
-    return v.mode === 'batch' ? runBatch(v) : runED(v);
+  run(v, ctx) { // synchronous by default; asynchronous with the 2-D Navier–Stokes channel option (finite-volume solver) and, when the caller can yield, with the longer opt-in sub-models
+    const go = () => (v.process === 'bpmed' ? runBPMED(v) : v.process === 'mcdi' ? runCDI(v) : v.mode === 'batch' ? runBatch(v) : runED(v));
+    if (isED(v) && v.flowModel === 'cfd2d') { ctx?.progress?.(0.05, 'Solving the 2-D Navier–Stokes channel flow'); return prepareChannelCFD(v, ctx).then(async () => { ctx?.progress?.(0.6, 'Solving the stack'); await ctx?.tick?.(); return go(); }); }
+    if (isED(v) && (v.olModel === 'rz' || v.surrogate || v.optimise || (v.pnp && v.pnp !== 'off')) && ctx?.tick) return (async () => { ctx.progress?.(0.2, 'Solving the stack and the selected sub-models'); await ctx.tick(); return go(); })(); // yield once so the interface can show progress before the longer sub-models
+    return go();
   },
 
   mesh: [
@@ -1198,7 +1436,7 @@ const suite = {
     get validationSample() { return (this._v ||= synth(23, [[0.4, 10, 1], [0.7, 10, 1], [1.0, 10, 1], [0.55, 6, 0.8], [0.85, 14, 1.3], [1.2, 9, 1], [0.35, 7, 1.2]])); },
   },
 
-  verify() {
+  async verify() {
     const d = defaultsOf(suite), C = [], add = (name, expected, got, tol, note) => C.push({ name, expected, got, tol, pass: Math.abs(got - expected) <= tol, note });
     add('Nernst potential per decade at 25 °C', 59.16, 1000 * nernst(10, 25), 0.01, 'RT/F · ln 10 (mV)');
     add('Donnan potential (Teorell–Meyer–Sievers)', -vt(25) * Math.log((3000 + Math.sqrt(3000 ** 2 + 4 * 100 ** 2)) / 200), donnanPotential(100, 3000), 1e-12, 'Δφ = −(RT/F)·asinh(X/2c) = −(RT/F)·ln(c₊ᵐ/c); X = 3 mol/L, c = 0.1 mol/L');
@@ -1282,6 +1520,11 @@ const suite = {
     const vcE = ecMarginal(Math.PI, 0.32), eLo = ecSolve({ V: 0.85 * vcE, Pe: 0.32, k: Math.PI, ny: 16, tEnd: 3 }), eHi = ecSolve({ V: 1.5 * vcE, Pe: 0.32, k: Math.PI, ny: 16, tEnd: 3 });
     add('Electroconvection: the quiescent layer is stable below the threshold', 1, eLo.nu, 2e-3, 'Non-linear 2-D solution at 0.85 × the linear-stability voltage decays to i = i_lim');
     add('Electroconvection: vortices raise the current above the threshold', 1, eHi.nu > 1.15 && eHi.nu < 4 ? 1 : 0, 0, `i/i_lim = ${fmt(eHi.nu, 4)} at 1.5 × threshold (measured over-limiting currents reach 1.5–3 × i_lim)`);
+    const ecr = electroconvection(0.32, { ny: 20 }), ecr2 = electroconvection(0.32, { ny: 14 });
+    add('Electroconvection: three-grid sequence is monotone with a grid-convergence index below 3 %', 1, ecr.monotone && ecr.steady && ecr.gciPct < 3 ? 1 : 0, 0, `i/i_lim at 1.7 × threshold: ${ecr.richardson.nu.map((q) => fmt(q, 5)).join(' → ')}, extrapolated ${fmt(ecr.nuExtrap, 5)}, GCI ${fmt(ecr.gciPct, 3)} %`);
+    add('Electroconvection: observed order of convergence matches the second-order scheme', 2, ecr.order, 0.4, 'Richardson estimate from the three grids (central differences, clustered grid, Peaceman–Rachford ADI)');
+    add('Electroconvection: extrapolated over-limiting current is independent of the grid input', ecr.nuExtrap, ecr2.nuExtrap, 0.02 * ecr.nuExtrap, `14 and 20 cells across the layer on the medium grid (previously the result drifted by 15 % between 16 and 32 cells)`);
+    add('Electroconvection: critical wavenumber is the minimum of the marginal curve', 1, ecMarginal(ecr.kc, 0.32, 0.2) <= Math.min(ecMarginal(0.9 * ecr.kc, 0.32, 0.2), ecMarginal(1.1 * ecr.kc, 0.32, 0.2)) ? 1 : 0, 0, `k_c·δ = ${fmt(ecr.kc, 4)} with the slip cut-off 0.2 δ`);
     const ecp = { ...par, ol: { Vc: vcE, slope: 0.1 } }, cpE = cellPair(na, na, 0.08, G, ecp, 25), uT = cpE.U(0.98 * cpE.ilim) + 2 * vcE * V25;
     add('Electroconvection sets the plateau length of the cell pair', 0, currentAt(cpE, uT, ecp).iOver + (currentAt(cpE, uT + 0.2, ecp).iOver > 0 ? 0 : 1), 1e-12, 'No over-limiting current up to two depleted layers at the threshold voltage, some beyond');
     // ---- Navier–Stokes / Nernst–Planck channel
@@ -1290,6 +1533,14 @@ const suite = {
     add('Navier–Stokes: fully developed centre-line velocity 1.5·U', 1.5, nsv.uc[nsv.uc.length - 1], 2e-3, 'Parabolic profile at the outlet');
     add('Navier–Stokes: entrance length L_e ≈ 0.011·Re·D_h', 0.011, nsv.entrance / (4e-3 * nsv.Re), 0.002, 'Distance to 99 % of the developed centre-line velocity');
     add('Navier–Stokes: incremental pressure drop of the entrance', 0.67, nsv.Kinc, 0.08, '(Δp − Δp_Poiseuille)/(½ρU²); literature 0.64–0.69 for parallel plates');
+    // ---- full 2-D Navier–Stokes + salt transport (finite volumes of suite 4)
+    const cfE = await channelCFD({ U: 0.08, h: 0.75e-3, L: 0.2, D: 1e-6, c0: 1, jw: 1e-6, ny: 20 }), cfS = await channelCFD({ U: 0.064, h: 0.75e-3, L: 1.5, D: 1.6e-9, arr: 'zigzag', ny: 16 }), cfO = await channelCFD({ U: 0.064, h: 0.75e-3, L: 1.5, D: 1.6e-9, ny: 16 });
+    add('2-D Navier–Stokes, empty channel: friction factor × Reynolds number', 96, cfE.fRe, 1.5, 'Fully developed plane Poiseuille flow, f·Re = 96 on the 2h basis (same analytic value as the parabolised march)');
+    add('2-D Navier–Stokes, empty channel: fully developed Sherwood number', 8.235, cfE.Sh, 0.12, 'Uniform flux through both walls, Sc ≈ 1 so that the salt profile develops inside the solved length');
+    add('2-D channel solution conserves salt', 0, (cfE.saltIn - cfE.saltOut) / cfE.saltIn, 1e-3, 'Inflow = outflow + flux through both membranes');
+    add('2-D Navier–Stokes: spacer filaments raise the Sherwood number and the pressure gradient', 1, cfS.Sh > 2 * cfO.Sh && cfS.dpdx > 2 * cfO.dpdx && cfS.converged ? 1 : 0, 0, `Zigzag filaments: Sh ${fmt(cfS.Sh, 4)} against ${fmt(cfO.Sh, 4)} in the open channel; pressure gradient ${fmt(cfS.dpdx, 4)} against ${fmt(cfO.dpdx, 4)} Pa/m`);
+    const nsO = channelNS({ U: 0.064, h: 0.75e-3, L: 1.5, D: 1.6e-9, c0: 1, jw: [1e-9, 1e-9] });
+    add('2-D and parabolised Navier–Stokes agree on the open-channel pressure gradient', nsO.dpFd / 1.5, cfO.dpdx, 0.03 * (nsO.dpFd / 1.5), 'Developed pressure gradient 12·μ·U/h² (Pa/m)');
     const nsm = channelNS({ U: 0.01, h: 1e-3, L: 2, D: 1e-7, c0: 50, jw: [1e-5, 1e-5] });
     add('Navier–Stokes–Nernst–Planck: developed Sherwood number 8.235', 8.235, nsm.ShEnd, 0.03, 'Uniform ion flux through both walls (specified-flux boundary), parallel plates');
     add('Navier–Stokes–Nernst–Planck: salt balance of the channel', 0, (nsm.saltIn - nsm.saltOut) / nsm.saltIn, 2e-3, 'Inflow = outflow + wall fluxes');
@@ -1305,8 +1556,13 @@ const suite = {
     const sgt = stackSurrogate(r, 40, 12);
     add('Surrogate reproduces held-out mechanistic runs', 1, sgt.sec.r2, 0.03, `R² of the specific energy on ${sgt.test.length} runs not used for training (removal: ${fmt(sgt.removal.r2, 4)})`);
     add('Surrogate interpolates its training runs', 1, sgt.fitSec.r2, 1e-3, 'Kernel regression with a small ridge term');
-    const og = optimiseED(d, [50, 90], [6, 12]), lo6 = og.cells.find((q) => q.phi === 50 && q.u === 12), hi6 = og.cells.find((q) => q.phi === 90 && q.u === 12);
-    add('Optimiser returns the cheapest feasible operating point', Math.min(...og.cells.map((q) => q.cost)), og.best.cost, 0, 'Grid search over current fraction and velocity ($/m³)');
+    add('Surrogate comparison: all three learners train and the selected one is the best on validation', 1, Object.values(sgt.models).every((m) => m.sec.ok && m.removal.ok) && Object.values(sgt.models).every((m) => m.sec.val >= sgt.models[sgt.best.sec].sec.val) ? 1 : 0, 0, `Held-out R² of the specific energy: ${Object.keys(sgt.models).map((n) => `${SURROGATES[n]} ${fmt(sgt.models[n].sec.r2, 4)}`).join(', ')}; selected: ${SURROGATES[sgt.best.sec]}`);
+    add('Neural-network and Gaussian-process surrogates reproduce held-out runs', 1, Math.min(sgt.models.nn.sec.r2, sgt.models.gp.sec.r2, sgt.models.nn.removal.r2, sgt.models.gp.removal.r2), 0.06, 'Lowest held-out R² of the two new learners over both outputs');
+    const sgt2 = stackSurrogate(r, 40, 12);
+    add('Surrogate training is deterministic for a given seed', sgt.sec.rmse, sgt2.sec.rmse, 1e-12, 'Two trainings with the same seed give identical held-out errors');
+    const og = optimiseED(d, [50, 90], [6, 12]), ogN = optimiseED(d, [50, 90], [6, 12], false), lo6 = og.cells.find((q) => q.phi === 50 && q.u === 12), hi6 = og.cells.find((q) => q.phi === 90 && q.u === 12);
+    add('Grid stage of the optimiser returns the cheapest feasible grid design', Math.min(...og.cells.map((q) => q.cost)), ogN.best.cost, 0, 'Coarse grid of re-designs over current fraction and velocity ($/m³)');
+    add('Nelder–Mead optimum is at least as cheap as the best grid design', 1, og.best.cost <= og.gridBest.cost + 1e-12 && og.evals > og.cells.length ? 1 : 0, 0, `Simplex search over the continuous variables: ${fmt(og.gridBest.cost, 5)} → ${fmt(og.best.cost, 5)} $/m³ in ${og.evals} designs (at ${fmt(og.best.phi, 3)} % and ${fmt(og.best.u, 3)} cm/s)`);
     add('Energy–area trade-off behind the optimum', 1, lo6 && hi6 && hi6.area < lo6.area && hi6.sec > lo6.sec ? 1 : 0, 0, 'A higher allowed current fraction saves a stage of membrane area but costs energy (12 cm/s)');
     return C;
   },

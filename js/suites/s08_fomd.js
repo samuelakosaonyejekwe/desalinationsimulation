@@ -10,7 +10,8 @@ import { brent, solve1, newtonN, clamp, linspace, interp1, sum, rng, fmt, rk4, s
 import { R, F, KELVIN, density, viscosity, cp, conductivityThermal, psat, tsat, psatSeawater, antoine, latentHeat, enthalpyLiquid as hL, diffusivityNaCl, salinityFromTDS, tdsFromSalinity } from '../core/props.js';
 import { IONS, ION_IDS, WATERS, cloneIons, tds, scaleIons, osmoticPressureIons } from '../core/water.js';
 import roSuite, { simulateRO } from './s01_ro.js';
-import edSuite, { simulateED, gcs, pnpRamp, debyeLength } from './s07_ed.js';
+import edSuite, { simulateED, gcs, mDonnan, pnpRamp, debyeLength } from './s07_ed.js';
+import { nsga2 } from './s11_opt.js';
 
 const MW_W = 0.018015, KB = 1.380649e-23, SIGMA_W = 2.641e-10, CPA = 1006, CPV = 1860, H0V = 2501e3;
 const K = (T) => T + KELVIN;
@@ -31,6 +32,18 @@ export const DRAWS = {
 export function drawOsmotic(key, c, T = 25) {
   const d = DRAWS[key], cm = Math.max(c, 0) / 1000;
   return d.nu * (d.phi[0] + d.phi[1] * cm + d.phi[2] * cm * cm) * Math.max(c, 0) * R * K(T);
+}
+
+/**
+ * Ion analysis (mg/L) that represents a draw solution of concentration c (mol/m³) in the ion-based RO, ED and MD models. Ionic draws: their own ions.
+ * Non-ionic draws (glucose): the osmotically equivalent NaCl solution — equal osmotic pressure, hence equal water activity, vapour-pressure lowering
+ * and RO driving pressure; the solute itself stays on the draw side (it is neither volatile nor charged).
+ */
+export function drawAsIons(key, c, T = 25) {
+  const d = DRAWS[key];
+  if (d.ions) return { ions: cloneIons(Object.fromEntries(Object.entries(d.ions).map(([k, m]) => [k, m * c]))), equivalent: false, cEq: c };
+  const pi = drawOsmotic(key, c, T), cEq = pi > 0 ? brent((x) => drawOsmotic('nacl', x, T) - pi, 0, 8000, 1e-9, 100) : 0;
+  return { ions: cloneIons(Object.fromEntries(Object.entries(DRAWS.nacl.ions).map(([k, m]) => [k, m * cEq]))), equivalent: true, cEq };
 }
 
 /** Spacer-channel mass transfer (same correlation family as the RO suite): Sh = 0.065 Re^0.875 Sc^0.25. */
@@ -202,7 +215,7 @@ export function mdLocal(c, Tf, S, cold) {
 }
 
 function mdConfig(p, Tf, Tp, S) {
-  const mem = { r: (p.dPore * 1e-6) / 2, eps: p.epsM, tau: p.tauM, delta: p.deltaM * 1e-6, sg: p.poreDist === 'lognormal' ? Math.max(p.sigmaPore, 1) : 1 }, hF = p.hF / 1000, L = p.Lmd, opt = { spacer: !!p.spacerMD, nuA: p.nuA, fh: p.fh };
+  const mem = { r: (p.dPore * 1e-6) / 2, eps: p.epsM, tau: p.tauM, delta: p.deltaM * 1e-6, sg: p.poreDist === 'lognormal' || p.poreDist === 'network' ? Math.max(p.sigmaPore, 1) : 1, net: p.poreDist === 'network' ? { nx: p.pnNx ?? 24, nz: p.pnNz ?? 12, seed: Math.round(p.pnSeed ?? 7), theta: p.theta, gamma: surfaceTension(Tf, p.gammaF ?? 1), dP: Math.max(0, (p.pFeed ?? 0) * 1e5), B: p.lepB ?? 1 } : null }, hF = p.hF / 1000, L = p.Lmd, opt = { spacer: !!p.spacerMD, nuA: p.nuA, fh: p.fh };
   const chF = mdChannel(p.uFm, hF, 0.5 * (Tf + Tp) + 0.25 * (Tf - Tp), S, L, opt), chP = mdChannel(p.uPm, hF, Tp + 0.25 * (Tf - Tp), 0, L, opt), km = mem.eps * 0.027 + (1 - mem.eps) * p.kPoly;
   const P = 101325, hg = (7.54 * 0.027) / (2 * hF) * p.fh; // laminar parallel-plate Nusselt number for the sweep gas
   return { type: p.mdType, mem, P, model: p.mdModel, kelvin: !!p.kelvin, antoine: p.vpModel === 'antoine', theta: p.theta, hf: chF.h, hp: chP.h, hm: km / mem.delta, km, kMass: chF.kMass, rhoF: chF.rho, chF, chP,
@@ -317,7 +330,106 @@ export function dustyGasPSD(mem, T, P, pv, model = 'auto', vacuum = false, n = 2
   }
   return { ...one, B: acc.B / wsum, Bk: acc.Bk / wsum, Bd: acc.Bd / wsum, Bv: acc.Bv / wsum, Bmean: one.B, knudsenShare: kn / wsum, classes: cls.map((q) => ({ r: q.r, area: q.w / wsum, flux: (q.w * q.B) / acc.B, Kn: q.Kn })) };
 }
-const memCoeff = (mem, ...a) => (mem.sg > 1.0001 ? dustyGasPSD(mem, ...a) : dustyGas(mem, ...a));
+// ---- pore network: 2-D lattice of throats between the two membrane faces ---------------------------------------------------
+const netCache = new Map();
+/**
+ * Build (and cache) a pore network: nz rows of nx pore bodies between the feed face and the permeate face, joined by (nz + 1)·nx through-plane throats and
+ * nz·nx in-plane throats (periodic sideways). Throat radii are log-normal (median r, geometric standard deviation sg, truncated at ±3σ) from a seeded generator.
+ * Wetting by invasion percolation: liquid at the feed face enters a throat when the pressure excess dP exceeds its liquid-entry pressure −2Bγcosθ/r and the throat
+ * touches liquid already; the pore body behind an invaded throat fills. Returns radii, invaded throats, wet bodies, breakthrough flag and invasion depth.
+ */
+export function poreNetwork({ r, sg = 1, nx = 24, nz = 12, seed = 7, theta = 120, gamma = 0.066, dP = 0, B = 1 }) {
+  nx = clamp(Math.round(nx), 3, 80); nz = clamp(Math.round(nz), 2, 60);
+  const key = [r, sg, nx, nz, seed, theta, gamma, dP, B].map((x) => (+x).toPrecision(8)).join('|');
+  let net = netCache.get(key);
+  if (net) return net;
+  const g = rng(seed), s = Math.log(Math.max(sg, 1)), draw = () => r * Math.exp(s * clamp(g.normal(), -3, 3));
+  const rv = Float64Array.from({ length: (nz + 1) * nx }, draw), rh = Float64Array.from({ length: nz * nx }, draw); // through-plane throat (k, i): body row k−1 → row k; in-plane throat (k, i): body (k, i) → (k, i+1)
+  const rc = dP > 0 && theta > 90 ? liquidEntryPressure(1, theta, gamma, B) / dP : Infinity; // throats wider than rc can be invaded
+  const invade = (rCrit) => {
+    const wv = new Uint8Array(rv.length), wh = new Uint8Array(rh.length), wet = new Uint8Array(nz * nx), stack = [];
+    let through = false, depth = 0;
+    const fill = (k, i) => { const n = k * nx + i; if (!wet[n]) { wet[n] = 1; stack.push(n); if (k + 1 > depth) depth = k + 1; } };
+    for (let i = 0; i < nx; i++) if (rv[i] > rCrit) { wv[i] = 1; fill(0, i); }
+    while (stack.length) {
+      const n = stack.pop(), i = n % nx, k = (n - i) / nx, il = (i + nx - 1) % nx, ir = (i + 1) % nx;
+      if (rv[(k + 1) * nx + i] > rCrit && !wv[(k + 1) * nx + i]) { wv[(k + 1) * nx + i] = 1; if (k + 1 < nz) fill(k + 1, i); else through = true; }
+      if (k > 0 && rv[k * nx + i] > rCrit && !wv[k * nx + i]) { wv[k * nx + i] = 1; fill(k - 1, i); }
+      if (rh[k * nx + i] > rCrit && !wh[k * nx + i]) { wh[k * nx + i] = 1; fill(k, ir); }
+      if (rh[k * nx + il] > rCrit && !wh[k * nx + il]) { wh[k * nx + il] = 1; fill(k, il); }
+    }
+    let nw = 0; for (let q = 0; q < wv.length; q++) nw += wv[q]; for (let q = 0; q < wh.length; q++) nw += wh[q];
+    let nb = 0; for (let q = 0; q < wet.length; q++) nb += wet[q];
+    return { wv, wh, wet, through, depth: depth / nz, fraction: nw / (wv.length + wh.length), bodies: nb / wet.length };
+  };
+  const inv = invade(rc);
+  // breakthrough radius of this network: the largest critical radius for which liquid still reaches the permeate face (bisection over the sorted throat radii)
+  const all = Float64Array.from([...rv, ...rh]).sort(); let lo = 0, hi = all.length - 1;
+  if (!invade(all[0] * 0.999).through) hi = -1; else while (hi - lo > 1) { const m = (lo + hi) >> 1; if (invade(all[m] * 0.999999).through) lo = m; else hi = m; }
+  const rBreak = hi < 0 ? Infinity : all[lo], lepNet = theta > 90 && Number.isFinite(rBreak) ? liquidEntryPressure(rBreak, theta, gamma, B) : Infinity; let sv2 = 0; for (let q = 0; q < rv.length; q++) sv2 += rv[q] * rv[q];
+  net = { r, sg, nx, nz, seed, rv, rh, rc, ...inv, invade, rBreak, lepNet, sumRv2: sv2, rMaxThroat: all[all.length - 1], rMinThroat: all[0] };
+  if (netCache.size > 30) netCache.clear();
+  netCache.set(key, net);
+  return net;
+}
+/**
+ * Vapour transport through a pore network: every throat carries the dusty-gas (Knudsen ‖ molecular, or viscous under vacuum) conductance of its own radius,
+ * g = πr²·b(r)/ℓ; the vapour pressures of the pore bodies follow from the linear network equations Σ g·(p_i − p_j) = 0 (banded Cholesky factorisation) between
+ * the feed face (and every wetted body, where the meniscus sits) and the permeate face. gOf(r) → b(r) for unit length. Returns the network conductance K (per
+ * unit pressure difference), the flow through every layer of through-plane throats (equal in a dry network: conservation across cut planes) and the body pressures.
+ */
+export function solvePoreNetwork(net, gOf) {
+  const { nx, nz, rv, rh, wv, wet } = net, N = nx * nz, bw = nx, gv = new Float64Array(rv.length), gh = new Float64Array(rh.length);
+  for (let q = 0; q < rv.length; q++) gv[q] = Math.PI * rv[q] * rv[q] * gOf(rv[q]);
+  for (let q = 0; q < rh.length; q++) gh[q] = Math.PI * rh[q] * rh[q] * gOf(rh[q]);
+  for (let i = 0; i < nx; i++) if (wv[nz * nx + i]) gv[nz * nx + i] = 0; // a liquid bridge to the permeate face carries no vapour
+  // lower band storage A[n·(bw+1) + (bw − (n − m))] for m ≤ n; unknowns: body vapour pressures with p_feed = 1, p_permeate = 0
+  const W = bw + 1, A = new Float64Array(N * W), b = new Float64Array(N), at = (n, m) => n * bw + bw + m; // = n·W + (bw − (n − m))
+  const link = (n, m, g) => { // conductance g between bodies n and m (m > n)
+    const dn = wet[n], dm = wet[m];
+    if (!dn) A[at(n, n)] += g; if (!dm) A[at(m, m)] += g;
+    if (!dn && !dm) A[at(m, n)] -= g; else if (dn && !dm) b[m] += g; else if (!dn && dm) b[n] += g;
+  };
+  for (let k = 0; k < nz; k++) for (let i = 0; i < nx; i++) {
+    const n = k * nx + i;
+    if (wet[n]) { A[at(n, n)] = 1; b[n] = 1; }
+    if (k === 0 && !wet[n]) { A[at(n, n)] += gv[i]; b[n] += gv[i]; }
+    if (k === nz - 1 && !wet[n]) A[at(n, n)] += gv[nz * nx + i];
+    if (k < nz - 1) link(n, n + nx, gv[(k + 1) * nx + i]);
+    if (i < nx - 1) link(n, n + 1, gh[n]); else if (nx > 2) link(k * nx, n, gh[n]); // periodic in-plane throat
+  }
+  for (let n = 0; n < N; n++) { // banded Cholesky A = L·Lᵀ (row n stored at n·bw + bw + column)
+    const m0 = Math.max(0, n - bw), rn = n * bw + bw;
+    for (let m = m0; m <= n; m++) { const rm = m * bw + bw; let q = A[rn + m]; for (let j = Math.max(m0, m - bw); j < m; j++) q -= A[rn + j] * A[rm + j]; A[rn + m] = m === n ? Math.sqrt(Math.max(q, 1e-300)) : q / A[rm + m]; }
+  }
+  const pb = new Float64Array(N);
+  for (let n = 0; n < N; n++) { const rn = n * bw + bw; let q = b[n]; for (let j = Math.max(0, n - bw); j < n; j++) q -= A[rn + j] * pb[j]; pb[n] = q / A[rn + n]; }
+  for (let n = N - 1; n >= 0; n--) { let q = pb[n]; for (let j = n + 1, je = Math.min(N - 1, n + bw); j <= je; j++) q -= A[j * bw + bw + n] * pb[j]; pb[n] = q / A[n * bw + bw + n]; }
+  const layers = new Array(nz + 1).fill(0);
+  for (let k = 0; k <= nz; k++) for (let i = 0; i < nx; i++) layers[k] += gv[k * nx + i] * ((k === 0 ? 1 : pb[(k - 1) * nx + i]) - (k === nz ? 0 : pb[k * nx + i]));
+  return { K: layers[nz], layers, p: pb, gv, gh };
+}
+/**
+ * Membrane coefficient from the pore network (same fields as dustyGas). The network value is put on the same open-area (porosity) basis as the continuum
+ * models: B = B_single·[K_net / K_uniform]·[n·r² / Σr_t²] over the through-plane throats, so that a network of equal throats returns the single-pore coefficient exactly.
+ */
+export function dustyGasNetwork(mem, T, P, pv, model = 'auto', vacuum = false) {
+  const one = dustyGas(mem, T, P, pv, model, vacuum), net = poreNetwork({ r: mem.r, sg: mem.sg, ...mem.net });
+  // the network ÷ single-pore ratio depends on the state only through the Knudsen : molecular mix, which changes slowly: it is solved once per 1 K and 2 % of
+  // vapour pressure and reused (the single-pore coefficient in front is always evaluated at the exact state)
+  const Tq = Math.round(T), pq = +pv.toPrecision(2) || pv, Pq = +P.toPrecision(3), key = `${Tq}|${Pq}|${pq}|${model}|${vacuum ? 1 : 0}`, memo = (net.memo ||= new Map());
+  let m = memo.get(key);
+  if (!m) {
+    const unit = { eps: 1, tau: 1, delta: 1, r: mem.r }, gOf = (r) => { unit.r = r; return dustyGas(unit, Tq, Pq, pq, model, vacuum).B; }, sol = solvePoreNetwork(net, gOf), gMed = Math.PI * mem.r * mem.r * gOf(mem.r);
+    m = { ratio: (sol.K * (net.nz + 1) ** 2 * mem.r * mem.r) / (gMed * net.sumRv2), bundle: mem.sg > 1.0001 ? dustyGasPSD(mem, Tq, Pq, pq, model, vacuum).B / dustyGas(mem, Tq, Pq, pq, model, vacuum).B : 1, K: sol.K, layers: sol.layers, p: sol.p, gv: sol.gv };
+    if (memo.size > 400) memo.clear();
+    memo.set(key, m);
+  }
+  // a membrane wetted through has no vapour gap left: a residual coefficient (0.1 % of the dry single-pore value) keeps the module model defined while the result reports the breakthrough
+  const ratio = Math.max(m.ratio, 1e-3);
+  return { ...one, B: one.B * ratio, Bmean: one.B, Bbundle: one.B * m.bundle, network: { ratio, flooded: m.ratio < 1e-3, K: m.K, layers: m.layers, p: m.p, gv: m.gv, net } };
+}
+const memCoeff = (mem, ...a) => (mem.net ? dustyGasNetwork(mem, ...a) : mem.sg > 1.0001 ? dustyGasPSD(mem, ...a) : dustyGas(mem, ...a));
 /** Pores that the liquid can enter at a trans-membrane pressure dP (Pa): critical radius r* = −2Bγcosθ/dP and the number / area fractions of a log-normal distribution above it. */
 export function wettedFraction(rMed, sg, thetaDeg, gamma, dP, B = 1) {
   const rc = dP > 0 && thetaDeg > 90 ? liquidEntryPressure(1, thetaDeg, gamma, B) / dP : thetaDeg > 90 ? Infinity : 0;
@@ -326,7 +438,7 @@ export function wettedFraction(rMed, sg, thetaDeg, gamma, dP, B = 1) {
   return { rc, number: Number.isFinite(u) ? 0.5 * erfc(u / Math.SQRT2) : u < 0 ? 1 : 0, area: Number.isFinite(u) ? 0.5 * erfc((u - 2 * s) / Math.SQRT2) : u < 0 ? 1 : 0 };
 }
 /** Geometric standard deviation of the pore sizes: the input for a log-normal membrane, otherwise inferred from the largest pore taken as the 99th percentile. */
-const poreSigma = (p) => (p.poreDist === 'lognormal' ? Math.max(p.sigmaPore, 1.0001) : Math.max(1.02, ((p.rMax * 2) / p.dPore) ** (1 / 2.326)));
+const poreSigma = (p) => (p.poreDist === 'lognormal' || p.poreDist === 'network' ? Math.max(p.sigmaPore, 1.0001) : Math.max(1.02, ((p.rMax * 2) / p.dPore) ** (1 / 2.326)));
 
 // ---- membrane-material library -----------------------------------------------------------------------------------------
 /** Typical published properties of conventional and novel membrane materials. MD: pore diameter (µm), porosity, tortuosity, thickness (µm), polymer conductivity (W/m·K), contact angle (°). FO: A (L/m²·h·bar), B (L/m²·h), S (µm). */
@@ -354,67 +466,166 @@ export function applyMaterial(v) {
 // ---- capacitive deionisation: porous-electrode (transmission-line) model -------------------------------------------
 const EPS_W = 78.4 * 8.8541878128e-12, LAM_NACL = 0.01264; // permittivity of water (F/m), molar conductivity of NaCl at 25 °C (S·m²/mol)
 /**
+ * Unified double layer of a charged pore, valid from thin to overlapping layers. Per m² of pore wall of one electrode, for the symmetric
+ * electrode pair (σ = surface charge, mol/m²; c = salt concentration of the electroneutral liquid in equilibrium with the pore, mol/m³):
+ *   thin layers (Gouy–Chapman):        φ_g = 2·asinh(σ / 4λ_D c),        S_g = b + √(σ² + (4λ_D c)²) − 4λ_D c
+ *   overlapping layers (mod. Donnan):  φ_d = asinh(σ / b),               S_d = √(σ² + b²),            b = 2h·c·e^μ
+ * φ = diffuse/Donnan potential in RT/F, S = salt held by the pore (liquid + double-layer excess) and so removed from the cell, h = pore volume
+ * per wall area (half-width of a slit pore), μ = non-electrostatic attraction of the ions into the pore (kT). Co-ion expulsion is part of both:
+ * the differential charge efficiency ∂S/∂σ is tanh(φ_g/2) and tanh(φ_d), always below one. Automatic switch on the pore size against the Debye
+ * length, r = h/λ_D(c):  θ = smoothstep of ln r between r = 2 (θ = 0, Donnan) and r = 4 (θ = 1, Gouy–Chapman),
+ *   φ = θφ_g + (1 − θ)φ_d,   S = θS_g + (1 − θ)S_d.
+ * For r ≥ 2 the Gouy–Chapman pore content exceeds the Donnan one at every charge (S_g ≥ S_d, because b ≥ 4λ_D c) and its salt capacity is positive, so
+ * ∂S/∂c > 0, 0 ≤ ∂S/∂σ < 1 and ∂φ/∂σ > 0 hold in every regime: the salt inventory is a monotone state function and the cell balance is well posed
+ * for any salinity and pore size (the thin-layer formula alone gives a negative co-ion content once the layers overlap).
+ * o = { kL: λ_D·√c, h, emu: e^μ, model: 'auto' | 'gcs' | 'md' }.
+ */
+export function edlState(sigma, c, o) {
+  const s = Math.abs(sigma), sg = sigma < 0 ? -1 : 1, B = 4 * o.kL * Math.sqrt(c), Rg = Math.sqrt(s * s + B * B), w = (s * s) / (Rg + B), pg = 2 * Math.asinh(s / B), b = 2 * o.h * c * o.emu, Sd = Math.sqrt(s * s + b * b), pd = Math.asinh(s / b), Sg = b + w;
+  let th = 1;
+  if (o.model === 'md') th = 0;
+  else if (o.model !== 'gcs') { const xi = Math.log(b / (o.emu * B)) / EDL_LN3; th = xi <= 0 ? 0 : xi >= 1 ? 1 : xi * xi * (3 - 2 * xi); } // b/(e^μ·B) = r/2
+  return { pd: sg * (th * pg + (1 - th) * pd), S: th * Sg + (1 - th) * Sd, theta: th, ceff: th * c + ((1 - th) * Sd) / (2 * o.h), phiG: sg * pg, phiD: sg * pd, Sg, Sd, eff: th * Math.tanh(pg / 2) + (1 - th) * Math.tanh(pd), r: (2 * b) / (o.emu * B) };
+}
+const EDL_LN3 = Math.LN2; // ln(r₁/r₀) of the blending zone, r₀ = 2, r₁ = 4
+/** Equilibrium of the unified double layer with a Stern layer in series at half-cell voltage Vh (V): Newton on the surface charge. */
+export function edlEquilibrium(Vh, c, o, Cst, T = 25) {
+  const Vt = (R * K(T)) / F, f = (s) => Vt * edlState(s, c, o).pd + (s * F) / Cst - Vh;
+  if (!(Vh > 0)) return { sigma: 0, ...edlState(0, c, o) };
+  const hi = (Vh * Cst) / F; let s = brent(f, 0, hi, 1e-12 * hi, 80);
+  if (!Number.isFinite(s)) s = 0;
+  return { sigma: s, ...edlState(s, c, o), lamD: o.kL / Math.sqrt(c) };
+}
+/**
  * Porous carbon electrode pair with a flow-by spacer. Along the electrode depth x (0 = spacer side, L_e = current collector):
- *   charge balance      a·F·∂σ/∂t = ∂/∂x(κ_e ∂Δφ/∂x),     Δφ = Δφ_Stern + Δφ_diffuse = σF/C_St + (2RT/F)·asinh(σ / 4λ_D c)   (Gouy–Chapman–Stern)
+ *   charge balance      a·F·∂σ/∂t = ∂/∂x(κ_e ∂Δφ/∂x),     Δφ = σF/C_St + (RT/F)·φ(σ, c)      (Stern layer + unified diffuse / Donnan layer, edlState)
  *   boundaries          ∂Δφ/∂x = 0 at the collector (no ion flux);  spacer side: prescribed half-cell voltage through the series resistance, or prescribed current
- *   spacer (mixed)      V_mix dc/dt = q(c_in − c) − dΓ_EDL/dt − dΓ_L/dt,   Γ_EDL = a·∫w dx,  w = 8λ_D c·sinh²(FΔφ_d/4RT)
+ *   salt (mixed)        d/dt[V_sp·c + a·∫S(σ, c) dx + Γ_L] = q(c_in − c)         (S holds the pore liquid and the double-layer excess, so the balance closes by construction)
  *   Langmuir            dθ/dt = k[Kc(1 − θ) − θ],  Γ_L = q_m·θ   (non-electrostatic adsorption on the carbon)
- * σ is the surface charge (mol/m² of double-layer area). Finite volumes in x, RK4 in time with stability-limited sub-steps.
+ *   pore conductivity   κ_e = Λ·ε^1.5·c_pore, c_pore = c for thin layers and the mean ion concentration of the pore (surface conduction) for overlapping ones
+ * Finite volumes in x; fully implicit variable-step BDF2 in time (first step of every half-cycle backward Euler, steps graded from the fastest electrode time
+ * constant), Newton iteration on (σ₁ … σ_n, ln c) with a bordered-tridiagonal Jacobian. The integrals (charge, energy, salt taken from the flow) use the same
+ * formula, so the charge and salt balances close to the Newton tolerance for any step size, salinity and double-layer area.
  */
 export function simulatePorousCDI(v, c0, ov = {}) {
-  const p = { ...v, ...ov }, T = p.T, Vt = (R * K(T)) / F, Le = p.cdiLe * 1e-6, pM = p.cdiPor, kap0 = LAM_NACL * (1 + 0.0191 * (T - 25)) * 3 * c0 * pM ** 1.5, tHalf = 60 * Math.max(p.cdiTc, p.cdiTd);
-  // explicit time stepping needs dt ∝ dx²: very conductive feeds or long cycles get a coarser electrode grid so that a half-cycle stays below about 20 000 steps
-  const nAsk = clamp(Math.round(p.cdiNx), 3, 60), n = clamp(Math.min(nAsk, Math.floor(Math.sqrt((20000 * 0.3 * Le * Le * p.cdiArea * p.cdiRho * 1e6 * (1 / (1 / p.cdiCst + Math.sqrt((EPS_W * R * K(T)) / (2 * F * F * 3 * c0)) / EPS_W))) / (kap0 * tHalf)))), 3, 60), dx = Le / n, av = p.cdiArea * p.cdiRho * 1e6, Cst = p.cdiCst, hsp = p.cdiHsp * 1e-6, psp = 0.7;
-  const Rc = p.cdiRc * 1e-4, qA = p.cdiQ / 1000 / 60, Lam = LAM_NACL * (1 + 0.0191 * (T - 25)), mE = 2 * Le * p.cdiRho * 1e6, qmA = (p.lgQm / 58.44e3) * mE, KL = p.lgK, ka = p.lgKa / 60, Vmix = hsp * psp + 2 * Le * pM, cMin = 1e-4 * c0;
-  const kL = Math.sqrt((EPS_W * R * K(T)) / (2 * F * F)), lam = (c) => kL / Math.sqrt(c), pdOf = (s, c) => 2 * Math.asinh(s / (4 * kL * Math.sqrt(c))), dphi = (s, c) => Vt * pdOf(s, c) + (s * F) / Cst;
-  // Gouy–Chapman salt excess w = 8λc·sinh²(Δφ_d/4) = √(σ² + 16k²c) − 4k√c with λ_D = k/√c; ∂w/∂σ = tanh(Δφ_d/2), ∂w/∂c = 8k²/√(σ² + 16k²c) − 2λ_D
-  const wOf = (s, c) => Math.sqrt(s * s + 16 * kL * kL * c) - 4 * kL * Math.sqrt(c), dwds = (s, c) => s / Math.sqrt(s * s + 16 * kL * kL * c), dwdc = (s, c) => (8 * kL * kL) / Math.sqrt(s * s + 16 * kL * kL * c) - (2 * kL) / Math.sqrt(c);
-  let thick = 0; // largest share of the pore volume taken by the depleted double layers (thin-double-layer criterion)
-  const kapE = (c) => Lam * c * pM ** 1.5, Rhalf = (c) => (0.5 * hsp) / (Lam * c * psp ** 1.5) + 0.5 * Rc + dx / (2 * kapE(c)), Imax = p.cdiMode === 'cc' ? p.cdiI : Infinity;
-  const eq = gcs(p.cdiV / 2, c0, { T, cSternA: Cst }), thEq = (KL * c0) / (1 + KL * c0);
-  const state = (y, Vh) => {
-    const c = Math.max(y[n], cMin), ph = new Array(n), ke = kapE(c); let dwc = 0;
-    for (let j = 0; j < n; j++) { ph[j] = dphi(y[j], c); dwc += dwdc(y[j], c); }
-    // den: salt capacity of the pore liquid that remains after the double layers have depleted their surroundings (must stay positive: thin-double-layer condition)
-    const den = Vmix + av * dx * dwc, I0 = clamp((Vh - ph[0]) / Rhalf(c), -Imax, Imax);
-    return { c, ph, ke, I0, den, Vcell: 2 * (ph[0] + I0 * Rhalf(c)) };
+  const p = { ...v, ...ov }, ask = p.cdiEdl === 'gcs' || p.cdiEdl === 'md' ? p.cdiEdl : 'auto';
+  let r = porousCDICore(p, Math.max(c0, 1e-9), ask);
+  if (!r) { r = porousCDICore(p, Math.max(c0, 1e-9), 'auto'); r.fallback = ask; } // the forced thin-layer model has no solution when its double layers would hold more salt than the pores: the unified model is used instead
+  return r;
+}
+function porousCDICore(p, c0, model) {
+  const T = p.T, Vt = (R * K(T)) / F, Le = p.cdiLe * 1e-6, pM = p.cdiPor, n = clamp(Math.round(p.cdiNx), 3, 60), nAsk = n, dx = Le / n, av = p.cdiArea * p.cdiRho * 1e6, Cst = p.cdiCst, hsp = p.cdiHsp * 1e-6, psp = 0.7;
+  const Rc = p.cdiRc * 1e-4, qA = p.cdiQ / 1000 / 60, Lam = LAM_NACL * (1 + 0.0191 * (T - 25)), mE = 2 * Le * p.cdiRho * 1e6, qmA = (p.lgQm / 58.44e3) * mE, KL = p.lgK, ka = p.lgKa / 60, Vsp = hsp * psp, Vmix = Vsp + 2 * Le * pM;
+  const kL = Math.sqrt((EPS_W * R * K(T)) / (2 * F * F)), lam = (c) => kL / Math.sqrt(c), hP = pM / av, th0 = edlState(0, c0, { kL, h: hP, emu: 1, model }).theta, muEff = clamp(p.cdiMu ?? 0, 0, 4) * (1 - th0), eo = { kL, h: hP, emu: Math.exp(muEff), model } /* the attraction term belongs to overlapped (micro)pores: it fades out as the feed makes the layers thin */, kp = Lam * pM ** 1.5, ksp = Lam * psp ** 1.5;
+  const pdOf = (s, c) => edlState(s, c, eo).pd, dphi = (s, c) => Vt * pdOf(s, c) + (s * F) / Cst, wOf = (s, c) => edlState(s, c, eo).S - 2 * hP * c;
+  const Imax = p.cdiMode === 'cc' ? p.cdiI : Infinity, eq = edlEquilibrium(p.cdiV / 2, c0, eo, Cst, T), thEq = (KL * c0) / (1 + KL * c0), sScale = Math.max(eq.sigma, (1e-3 * Cst * Vt) / F), mScale = Vmix * c0 + av * Le * sScale;
+  // differential capacitance (F/m²) at zero charge and pore conductivity: fastest and slowest electrode time constants
+  const cap = (c) => { const e = edlState(0, c, eo), dpd = e.theta / (2 * kL * Math.sqrt(c)) + (1 - e.theta) / (2 * hP * c * eo.emu); return 1 / (1 / Cst + (Vt * dpd) / F); }, kapE = (c) => kp * edlState(0, c, eo).ceff;
+  const tauRC = (Le * Le * av * cap(c0)) / kapE(c0), dtFast = Math.min((0.3 * dx * dx * av * cap(c0)) / kapE(c0), 0.2 * (Vmix / qA));
+  // work arrays; state vector Y = [σ_1 … σ_n, ln c, θ_L, M (salt inventory), E, Q, salt taken from the flow]
+  const NY = n + 6, PH = new Float64Array(n), SS = new Float64Array(n), KP = new Float64Array(n), TH = new Float64Array(n), R0 = new Float64Array(n + 1), R1 = new Float64Array(n + 1), sg = new Float64Array(n), sp = new Float64Array(n), be = new Float64Array(NY);
+  const tl = new Float64Array(n), td = new Float64Array(n), tu = new Float64Array(n), bc = new Float64Array(n), gr = new Float64Array(n), S0 = new Float64Array(n), xa = new Float64Array(n), xb = new Float64Array(n), cw = new Float64Array(n);
+  let al = 1, dt = 0, Vh = 0, thick = 0, thMin = 1, dtMin = Infinity, nSteps = 0, nNewton = 0, nFail = 0, bad = false, abort = false;
+  const resid = (s, u, out) => {
+    const c = Math.exp(u);
+    for (let j = 0; j < n; j++) { const e = edlState(s[j], c, eo); PH[j] = Vt * e.pd + (s[j] * F) / Cst; SS[j] = e.S; KP[j] = kp * e.ceff; TH[j] = e.theta; }
+    const Rh = (0.5 * hsp) / (ksp * c) + 0.5 * Rc + dx / (2 * KP[0]), I0 = clamp((Vh - PH[0]) / Rh, -Imax, Imax);
+    let Ip = I0, ms = 0;
+    for (let j = 0; j < n; j++) { const In = j < n - 1 ? (((2 * KP[j] * KP[j + 1]) / (KP[j] + KP[j + 1])) * (PH[j] - PH[j + 1])) / dx : 0; out[j] = al * s[j] - be[j] - (dt * (Ip - In)) / (av * F * dx); Ip = In; ms += SS[j]; }
+    const th = (be[n + 1] + dt * ka * KL * c) / (al + dt * ka * (KL * c + 1)), M = Vsp * c + av * dx * ms + qmA * th;
+    out[n] = al * M - be[n + 2] - dt * qA * (c0 - c);
+    return { I0, th, M, c, Vcell: 2 * (PH[0] + I0 * Rh) };
   };
-  const rhs = (Vh) => (t, y) => {
-    const s = state(y, Vh), d = new Array(n + 5), c = s.c; let Ip = s.I0, up = 0;
-    for (let j = 0; j < n; j++) {
-      const In = j < n - 1 ? (s.ke * (s.ph[j] - s.ph[j + 1])) / dx : 0; // no ionic current into the collector
-      d[j] = (Ip - In) / (av * F * dx); Ip = In;
-      up += dwds(y[j], c) * d[j];
+  const norm = (Rv) => { let m = 0; for (let j = 0; j < n; j++) m = Math.max(m, Math.abs(Rv[j]) / sScale); return m + Math.abs(Rv[n]) / mScale; };
+  /** One implicit step from Y1 (and Y0 for BDF2, step ratio rho) to a new state; null if Newton fails. */
+  const step = (Y1, Y0, h, rho, V) => {
+    dt = h; Vh = V; al = Y0 ? (1 + 2 * rho) / (1 + rho) : 1;
+    const b1 = Y0 ? 1 + rho : 1, b0 = Y0 ? -(rho * rho) / (1 + rho) : 0;
+    for (let q = 0; q < NY; q++) be[q] = b1 * Y1[q] + (Y0 ? b0 * Y0[q] : 0);
+    for (let j = 0; j < n; j++) sg[j] = Y1[j];
+    let u = Y1[n], st = resid(sg, u, R0), nr = norm(R0), ok = false;
+    for (let it = 0; it < 40; it++) {
+      nNewton++;
+      for (let j = 0; j < n; j++) S0[j] = SS[j];
+      for (let k = 0; k < 3; k++) { // tridiagonal block by three coloured perturbations
+        for (let j = 0; j < n; j++) sp[j] = sg[j] + (j % 3 === k ? 1e-7 * (Math.abs(sg[j]) + sScale) : 0);
+        resid(sp, u, R1);
+        for (let j = k; j < n; j += 3) { const e = sp[j] - sg[j]; td[j] = (R1[j] - R0[j]) / e; if (j > 0) tu[j - 1] = (R1[j - 1] - R0[j - 1]) / e; if (j < n - 1) tl[j + 1] = (R1[j + 1] - R0[j + 1]) / e; gr[j] = (al * av * dx * (SS[j] - S0[j])) / e; }
+      }
+      resid(sg, u + 1e-6, R1);
+      for (let j = 0; j < n; j++) bc[j] = (R1[j] - R0[j]) / 1e-6;
+      const dd = (R1[n] - R0[n]) / 1e-6;
+      // bordered tridiagonal solve: T·xa = −R, T·xb = bc, then the salt row
+      cw[0] = tu[0] / td[0]; xa[0] = -R0[0] / td[0]; xb[0] = bc[0] / td[0];
+      for (let j = 1; j < n; j++) { const m = td[j] - tl[j] * cw[j - 1]; cw[j] = tu[j] / m; xa[j] = (-R0[j] - tl[j] * xa[j - 1]) / m; xb[j] = (bc[j] - tl[j] * xb[j - 1]) / m; }
+      for (let j = n - 2; j >= 0; j--) { xa[j] -= cw[j] * xa[j + 1]; xb[j] -= cw[j] * xb[j + 1]; }
+      let ga = 0, gb = 0; for (let j = 0; j < n; j++) { ga += gr[j] * xa[j]; gb += gr[j] * xb[j]; }
+      let du = (-R0[n] - ga) / (dd - gb);
+      if (!Number.isFinite(du)) break;
+      let f = Math.abs(du) > 1.5 ? 1.5 / Math.abs(du) : 1, mx = 0, nrN = 0, stN = null, tiny = Math.abs(du) < 1e-9;
+      if (tiny) for (let j = 0; j < n; j++) if (Math.abs(xa[j] - xb[j] * du) > 1e-9 * sScale) { tiny = false; break; }
+      for (let ls = 0; ls < (tiny ? 1 : 6); ls++) { // damped update (a Newton step below 1e-9 of the scales is taken in full: the residual is then at its round-off floor)
+        for (let j = 0; j < n; j++) sp[j] = sg[j] + f * (xa[j] - xb[j] * du);
+        stN = resid(sp, u + f * du, R1); nrN = norm(R1);
+        if (Number.isFinite(nrN) && (nrN <= nr * (1 - 0.1 * f) + 1e-14 || ls === 5)) break;
+        f *= 0.4;
+      }
+      if (!Number.isFinite(nrN)) break;
+      for (let j = 0; j < n; j++) { const d = sp[j] - sg[j]; mx = Math.max(mx, Math.abs(d) / sScale); sg[j] = sp[j]; R0[j] = R1[j]; }
+      R0[n] = R1[n]; u += f * du; st = stN; nr = nrN;
+      if (tiny || nr < 1e-13) { ok = true; break; }
     }
-    const th = y[n + 1], dth = ka * (KL * c * (1 - th) - th);
-    thick = Math.max(thick, 1 - s.den / Vmix);
-    d[n] = (qA * (c0 - c) - av * dx * up - qmA * dth) / Math.max(s.den, 0.2 * Vmix); d[n + 1] = dth; d[n + 2] = s.Vcell * s.I0; d[n + 3] = s.I0; d[n + 4] = qA * (c0 - c); // energy, charge and salt taken from the flow are integrated with the state
-    return d;
+    if (!ok) return null;
+    const Yn = new Float64Array(NY);
+    for (let j = 0; j < n; j++) Yn[j] = sg[j];
+    Yn[n] = u; Yn[n + 1] = st.th; Yn[n + 2] = st.M; Yn[n + 3] = (be[n + 3] + dt * st.Vcell * st.I0) / al; Yn[n + 4] = (be[n + 4] + dt * st.I0) / al; Yn[n + 5] = (be[n + 5] + dt * qA * (c0 - st.c)) / al;
+    Yn.I0 = st.I0; Yn.Vcell = st.Vcell;
+    return Yn;
   };
-  const cap = (c) => 1 / (1 / Cst + lam(c) / EPS_W), dtStab = Math.min(...[0.3, 1, 3].map((f) => (0.3 * dx * dx * av * cap(f * c0)) / kapE(f * c0)), 0.2 * (Vmix / qA)); // the spacer-side cell couples up to 1.5 × more strongly than interior cells
-  const tc = p.cdiTc * 60, td = p.cdiTd * 60, nOut = clamp(Math.round(p.cdiNt || 120), 20, 600), nCyc = clamp(Math.round(p.cdiCycles), 1, 8);
-  let y = [...new Array(n).fill((clamp(p.cdiQ0, 0, 100) / 100) * eq.sigma), c0, (clamp(p.lgTheta0, 0, 100) / 100) * thEq, 0, 0, 0];
-  const stored = (yy) => { const c = Math.max(yy[n], cMin); let g = 0, q = 0; for (let j = 0; j < n; j++) { g += wOf(yy[j], c); q += yy[j]; } return { edl: av * dx * g, lang: qmA * yy[n + 1], mix: Vmix * c, charge: F * av * dx * q }; };
+  const inventory = (s, c, th) => { let ms = 0, q = 0; for (let j = 0; j < n; j++) { ms += edlState(s[j], c, eo).S; q += s[j]; } return { edl: av * dx * ms - 2 * Le * pM * c /* excess over the pore liquid at the spacer concentration */, lang: qmA * th, mix: Vmix * c, charge: F * av * dx * q, M: Vsp * c + av * dx * ms + qmA * th }; };
+  const capacity = (Y) => { const c = Math.exp(Y[n]); let d = 0; for (let j = 0; j < n; j++) { d += (edlState(Y[j], c * 1.001, eo).S - edlState(Y[j], c * 0.999, eo).S) / (0.002 * c); thMin = Math.min(thMin, edlState(Y[j], c, eo).theta); } return Vsp + av * dx * d; };
+  const tc = p.cdiTc * 60, tdis = p.cdiTd * 60, nOut = clamp(Math.round(p.cdiNt || 120), 20, 600), nCyc = clamp(Math.round(p.cdiCycles), 1, 8), sub = 2;
+  let Y = new Float64Array(NY);
+  { const s0 = (clamp(p.cdiQ0, 0, 100) / 100) * eq.sigma, th0 = (clamp(p.lgTheta0, 0, 100) / 100) * thEq; for (let j = 0; j < n; j++) Y[j] = s0; Y[n] = Math.log(c0); Y[n + 1] = th0; Y[n + 2] = inventory(Y, c0, th0).M; }
+  const legacy = (Yv) => [...Array.from(Yv.subarray(0, n)), Math.exp(Yv[n]), Yv[n + 1], Yv[n + 3], Yv[n + 4], Yv[n + 5]];
   const tt = [], cEff = [], cur = [], volt = [], snaps = [];
   let last = null, tOff = 0;
   for (let cyc = 0; cyc < nCyc; cyc++) {
-    const keep = cyc === nCyc - 1, half = (Vh, dur, tag) => {
-      const sub = Math.max(1, Math.ceil(dur / nOut / dtStab)), sol = rk4(rhs(Vh), y, 0, dur, nOut * sub), y0 = y, s0 = stored(y0);
-      if (keep) for (let k = 0; k <= nOut; k++) { const yy = sol.y[k * sub], s = state(yy, Vh); if (!Number.isFinite(s.c) || !Number.isFinite(s.I0)) throw new Error('the electrode integration became unstable — increase the number of time steps or cells'); tt.push((tOff + sol.t[k * sub]) / 60); cEff.push(s.c); cur.push(s.I0); volt.push(s.Vcell); if (tag === 'c' && k % Math.ceil(nOut / 5) === 0) snaps.push({ t: sol.t[k * sub], sigma: yy.slice(0, n), phi: s.ph }); }
-      y = sol.y[nOut * sub]; tOff += dur;
-      if (!y.every(Number.isFinite)) throw new Error('the electrode integration became unstable — increase the number of time steps or cells');
-      if (thick > 0.75) throw new Error(`The depleted double layers would take ${fmt(100 * Math.min(thick, 1), 3)} % of the pore and spacer volume: the thin-double-layer (Gouy–Chapman–Stern) electrode model does not apply. Lower the double-layer area or the voltage, treat a more saline feed, or use the modified-Donnan capacitive-deionisation model of suite 7 for microporous carbon.`);
-      const s1 = stored(y);
-      return { flow: y[n + 4] - y0[n + 4], y0, y1: y, s0, s1, E: y[n + 2] - y0[n + 2], Q: y[n + 3] - y0[n + 3], sub };
+    const keep = cyc === nCyc - 1, half = (V, dur, tag) => {
+      const Dt = dur / nOut, Ya = Y, sA = inventory(Ya, Math.exp(Ya[n]), Ya[n + 1]);
+      // advance over [0, h] by one step; on Newton failure restart with backward Euler on halved steps
+      let Yp = null, hp = 0;
+      const adv = (h, depth) => {
+        if (abort) return;
+        let Yn = step(Y, Yp, h, Yp ? h / hp : 1, V);
+        if (!Yn && Yp) Yn = step(Y, null, h, 1, V);
+        if (Yn) { Yp = Y; hp = h; Y = Yn; nSteps++; dtMin = Math.min(dtMin, h); const den = capacity(Y); thick = Math.max(thick, 1 - den / Vmix); if (!(den > 0)) { bad = true; if (model === 'gcs') abort = true; } return; }
+        if (model === 'gcs') { bad = true; abort = true; return; } // the forced thin-layer model is abandoned at the first failure (the caller switches to the unified model)
+        if (depth >= 6 || nNewton > 60000) { nFail++; if (nFail > 24) abort = true; return; } // keep the last converged state (reported as a warning); balances stay closed
+        Yp = null; adv(h / 2, depth + 1); adv(h / 2, depth + 1);
+      };
+      const rec = (k, t) => { if (!keep) return; const c = Math.exp(Y[n]); tt.push((tOff + t) / 60); cEff.push(c); cur.push(k === 0 ? clamp((V - dphi(Y[0], c)) / ((0.5 * hsp) / (ksp * c) + 0.5 * Rc + dx / (2 * kp * edlState(Y[0], c, eo).ceff)), -Imax, Imax) : Y.I0); volt.push(k === 0 ? 2 * V - (Number.isFinite(Imax) ? 2 * (V - dphi(Y[0], c)) - 2 * cur[cur.length - 1] * ((0.5 * hsp) / (ksp * c) + 0.5 * Rc + dx / (2 * kp * edlState(Y[0], c, eo).ceff)) : 0) : Y.Vcell); if (tag === 'c' && k % Math.ceil(nOut / 5) === 0) snaps.push({ t, sigma: Array.from(Y.subarray(0, n)), phi: Array.from(Y.subarray(0, n), (s) => dphi(s, c)) }); };
+      rec(0, 0);
+      // first output interval: steps graded geometrically from the fastest time constant
+      const g = 1.4, d0 = Math.min(Math.max(dtFast, 1e-7 * Dt), Dt / sub), m = Math.max(sub, Math.ceil(Math.log(1 + ((g - 1) * Dt) / d0) / Math.log(g))), sc = (Dt * (g - 1)) / (g ** m - 1);
+      for (let q = 0; q < m; q++) adv(sc * g ** q, 0);
+      rec(1, Dt);
+      for (let k = 2; k <= nOut; k++) { for (let q = 0; q < sub; q++) adv(Dt / sub, 0); rec(k, k * Dt); }
+      tOff += dur;
+      const sB = inventory(Y, Math.exp(Y[n]), Y[n + 1]);
+      return { flow: Y[n + 5] - Ya[n + 5], y0: legacy(Ya), y1: legacy(Y), s0: sA, s1: sB, E: Y[n + 3] - Ya[n + 3], Q: Y[n + 4] - Ya[n + 4], sub };
     };
     if (keep) tOff = 0;
-    const ch = half(p.cdiV / 2, tc, 'c'), dis = half(p.cdiVdis / 2, td, 'd');
+    const ch = half(p.cdiV / 2, tc, 'c'), dis = half(p.cdiVdis / 2, tdis, 'd');
     last = { ch, dis };
+    if (bad && model === 'gcs') return null;
+    if (abort) break;
   }
-  const { ch, dis } = last, salt = ch.flow, charge = ch.Q, Enet = ch.E - (clamp(p.cdiRecov, 0, 95) / 100) * Math.max(0, -dis.E), vol = qA * tc;
-  return { p, T, c0, n, nAsk, Le, dx, av, mE, eq, thEq, tt, cEff, cur, volt, snaps, x: Array.from({ length: n }, (_, j) => (j + 0.5) * dx), ch, dis, salt, charge, Enet, vol, lamD: lam(c0), tauRC: (Le * Le * av * cap(c0)) / kapE(c0), dtStab,
-    cAvg: Math.max(0, c0 - salt / vol), removal: salt / (vol * c0), sac: (salt * 58.44e3) / mE, eff: charge > 0 ? (F * salt) / charge : 0, sec: Enet / 3.6e6 / vol, ePerMol: Enet / Math.max(salt, 1e-30) / 1000, waterRec: tc / (tc + td), prod: (qA * 3.6e6 * tc) / (tc + td),
-    thick, sigmaEnd: ch.y1.slice(0, n), cEnd: Math.max(ch.y1[n], cMin), thetaEnd: ch.y1[n + 1], storedEDL: ch.s1.edl - ch.s0.edl, storedLang: ch.s1.lang - ch.s0.lang, storedMix: ch.s1.mix - ch.s0.mix, chargeStored: ch.s1.charge - ch.s0.charge, pdOf, wOf, dphi };
+  const { ch, dis } = last, salt = ch.flow, charge = ch.Q, Enet = ch.E - (clamp(p.cdiRecov, 0, 95) / 100) * Math.max(0, -dis.E), vol = qA * tc, e0 = edlState(0, c0, eo), cEnd = ch.y1[n];
+  return { p, T, c0, n, nAsk, Le, dx, av, mE, eq, thEq, tt, cEff, cur, volt, snaps, x: Array.from({ length: n }, (_, j) => (j + 0.5) * dx), ch, dis, salt, charge, Enet, vol, lamD: lam(c0), tauRC, dtStab: Number.isFinite(dtMin) ? dtMin : 0,
+    cAvg: Math.max(0, c0 - salt / vol), removal: salt / (vol * c0), sac: (salt * 58.44e3) / mE, eff: charge > 0 ? (F * salt) / charge : 0, sec: Enet / 3.6e6 / vol, ePerMol: Enet / Math.max(Math.abs(salt), 1e-30) / 1000, waterRec: tc / (tc + tdis), prod: (qA * 3.6e6 * tc) / (tc + tdis),
+    thick, sigmaEnd: ch.y1.slice(0, n), cEnd, thetaEnd: ch.y1[n + 1], storedEDL: ch.s1.edl - ch.s0.edl, storedLang: ch.s1.lang - ch.s0.lang, storedMix: ch.s1.mix - ch.s0.mix, chargeStored: ch.s1.charge - ch.s0.charge, pdOf, wOf, dphi,
+    edlModel: model, muEff, hPore: hP, poreRatio: hP / lam(c0), thetaFeed: e0.theta, thetaMin: thMin, thetaEnd2: edlState(ch.y1[0], cEnd, eo).theta, regime: e0.theta >= 0.999 ? 'thin double layers (Gouy–Chapman–Stern)' : e0.theta <= 0.001 ? 'overlapping double layers (modified Donnan)' : 'transition (blended)', steps: nSteps, newton: nNewton, failedSteps: nFail, fallback: null, edl: (s, c) => edlState(s, c, eo) };
 }
 /** Diffuse layer at the electrode surface resolved with the Poisson–Nernst–Planck solver of suite 7 (insulating wall at the diffuse-layer potential). */
 export function edlProfile(psiD, c, T) {
@@ -494,6 +705,40 @@ export function paretoFront(pts, fx, fy) {
   for (const q of front) { const u = (fx(q) - fx(a)) / dx, w = (fy(q) - fy(a)) / dy, dist = u - w; if (dist > best) { best = dist; knee = q; } }
   return { front, knee };
 }
+/** Hypervolume (area dominated relative to a reference point) of a two-objective set: maximise fx, minimise fy. */
+export function hypervolume2(pts, fx, fy, refX, refY) {
+  const f = paretoFront(pts.filter((q) => fx(q) > refX && fy(q) < refY), fx, fy).front.sort((a, b) => fx(b) - fx(a));
+  let hv = 0, prevY = refY;
+  for (const q of f) { if (fy(q) < prevY) { hv += (fx(q) - refX) * (prevY - fy(q)); prevY = fy(q); } }
+  return hv;
+}
+/**
+ * Flux-versus-energy designs of an MD module (hot-feed temperature, velocity, channel length) or an FO module (draw concentration, velocity).
+ * A coarse grid of full module solutions is kept as backdrop; the Pareto front itself is searched with NSGA-II (suite 11) over the continuous variables
+ * and merged with the grid, so it is never worse than the grid front. Deterministic for a given seed.
+ */
+export function paretoDesigns(v, S, md, { pop = 16, gens = 5, seed = 3 } = {}) {
+  const grid = [], ga = [];
+  let evalMD = null, evalFO = null, lo, hi, dec;
+  if (md) {
+    const Sm = v.mdRec > 0 ? Math.min(S / (1 - clamp(v.mdRec / 100, 0, 0.95)), 330) : S, Tlo = Math.min(Math.max(v.Tp + 13, 45), 86);
+    evalMD = (Tf, u, L) => { try { const m = mdModule(v, Sm, { Tf, uFm: u, uPm: u, Lmd: L, nSeg: 8 }); if (m.fluxLMH > 0 && Number.isFinite(m.stec) && Number.isFinite(m.sec)) return { a: Tf, b: u, c: L, flux: m.fluxLMH, en: m.stec, aux: m.sec }; } catch { /* infeasible point */ } return null; };
+    for (const Tf of [50, 60, 70, 80, 88].filter((t) => t > v.Tp + 12)) for (const u of [0.08, 0.15, 0.3, 0.6]) for (const L of [0.5, 1, 2.5]) { const q = evalMD(Tf, u, L); if (q) grid.push(q); }
+    lo = [Tlo, Math.log(0.08), Math.log(0.5)]; hi = [88, Math.log(0.6), Math.log(2.5)]; dec = (x) => evalMD(x[0], Math.exp(x[1]), Math.exp(x[2]));
+  } else {
+    const d = DRAWS[v.draw] || DRAWS.nacl, cHi = Math.min(d.sol, Math.max(3, 2 * v.cDraw));
+    evalFO = (cD, u) => { try { const r = simulateFO(v, { cDraw: cD, uF: u, uD: u, nSeg: 8 }), Vw = r.tot.Vw * 3600; if (!(Vw > 0)) return null; const reg = regeneration(r, { ...v, cDraw: cD }), en = r.Ppump / 1000 / Vw + reg.elec + 0.1 * reg.heat; if (Number.isFinite(en)) return { a: cD, b: u, c: r.dilution, flux: r.JwLMH, en, aux: r.srsf }; } catch { /* infeasible point */ } return null; };
+    for (const cD of linspace(0.4, cHi, 6)) for (const u of [5, 10, 20, 35]) { const q = evalFO(cD, u); if (q) grid.push(q); }
+    lo = [0.4, Math.log(5)]; hi = [Math.max(cHi, 0.41), Math.log(35)]; dec = (x) => evalFO(x[0], Math.exp(x[1]));
+  }
+  let evals = grid.length;
+  if (grid.length > 2 && hi.every((h, k) => h > lo[k])) {
+    const res = nsga2((x) => { const q = dec(x); evals++; if (!q) return { f: [0, 1e30], cv: 1 }; ga.push(q); return { f: [-q.flux, q.en], cv: 0 }; }, lo, hi, { pop, gens, seed });
+    void res;
+  }
+  const all = [...grid, ...ga], fx = (q) => q.flux, fy = (q) => q.en, refX = 0, refY = 1.05 * Math.max(...all.map(fy), 1e-9);
+  return { grid, ga, all, evals, seed, gridFront: paretoFront(grid, fx, fy).front.length, hvGrid: hypervolume2(grid, fx, fy, refX, refY), hvAll: hypervolume2(all, fx, fy, refX, refY) };
+}
 /**
  * Grey-box (physics-informed) correction of the mechanistic flux: ln(J_measured / J_model) = β₀ + β₁x₁ + β₂x₂ fitted by ridge regression,
  * so that the model keeps its structure and the data only shift it; leave-one-out errors show whether the correction generalises.
@@ -564,11 +809,11 @@ const suite = {
     'Adjust membrane properties and transport correlations on Model setup; calibrate A, B and S (FO) or tortuosity and heat-transfer multiplier (MD) against test data.',
     'Run. Check the polarisation losses, the wetting margin (MD) and the regeneration or heat demand; for hybrids read the per-process contribution table.',
   ],
-  implemented: ['solution-diffusion', 'water-flux', 'solute-flux', 'vant hoff', 'external concentration-polarization', 'internal concentration-polarization', 'structural-parameter', 'mass-transfer film', 'knudsen-diffusion', 'molecular-diffusion', 'knudsen-molecular transition', 'dusty-gas', 'vapour-pressure', 'antoine', 'kelvin', 'heat-conduction', 'convective heat-transfer', 'latent-heat balance', 'temperature-polarization', 'poisson-nernst-planck', 'gouy-chapman', 'stern-layer', 'langmuir adsorption', 'porous-electrode charge-balance',
+  implemented: ['solution-diffusion', 'water-flux', 'solute-flux', 'vant hoff', 'external concentration-polarization', 'internal concentration-polarization', 'structural-parameter', 'mass-transfer film', 'knudsen-diffusion', 'molecular-diffusion', 'knudsen-molecular transition', 'dusty-gas', 'vapour-pressure', 'antoine', 'kelvin', 'heat-conduction', 'convective heat-transfer', 'latent-heat balance', 'temperature-polarization', 'poisson-nernst-planck', 'gouy-chapman', 'stern-layer', 'langmuir adsorption', 'porous-electrode charge-balance', 'donnan', 'pore-scale/continuum models', 'capacitive-deionization–ro',
     'fo-ro', 'ro-md', 'solar-md', 'heat-and-mass-transfer md', 'osmotic-hydraulic coupled', 'fo-md', 'md-crystallization', 'electrodialysis-fo', 'capacitive-deionization-ro', 'electrochemical-membrane', 'pore-scale/continuum', 'physics-informed emerging-process',
     'feed/draw concentration', 'temperatures', 'pressures', 'pore vapour state', 'feed/draw inlet', 'osmotic membrane-interface', 'vapour-liquid equilibrium', 'membrane heat/mass-flux continuity', 'convective thermal boundar', 'insulated boundar', 'membrane hydration', 'electrode charge', 'ion concentration as applicable', 'prescribed voltage/current', 'no-ion-flux',
     'membrane transport', 'draw-solution modelling', 'osmotic-property calculation', 'internal and external concentration polarisation', 'reverse-solute flux', 'porous-membrane transport', 'heat transfer', 'mass transfer', 'vapour transport', 'temperature polarisation', 'membrane wetting', 'scaling', 'module hydrodynamics', 'solar and waste-heat integration', 'hybrid-process configuration', 'energy analysis', 'sensitivity analysis', 'pore-scale transport', 'fouling', 'crystallisation', 'novel membrane-material', 'dynamic operation', 'multi-objective optimisation'],
-  equationsNote: 'FO/PRO: steady solution–diffusion with film-theory ECP and a support-layer ICP described by the structural parameter (divided by the support hydration when the support is not fully wetted); draw osmotic coefficients are quadratic fits at 25 °C and the feed solutes are lumped into one species with the permeability of NaCl; a feed-side hydraulic pressure gives pressure-assisted FO. MD: one-dimensional film model with the dusty-gas membrane coefficient (Knudsen, molecular, their series combination, plus Poiseuille flow under vacuum) for the mean pore or, optionally, integrated over a log-normal pore-size distribution with every pore class in its own regime (the pore-scale / continuum link; no pore-network or lattice simulation); the vapour-pressure lowering of the brine follows the seawater correlation of the property library and the Kelvin correction is optional (below 1 % for 0.1–0.5 µm pores). Heat-transfer coefficients come from a spacer or open-channel Nusselt correlation. Capacitive deionisation: 1-D porous-electrode charge balance (transmission line) with Gouy–Chapman–Stern double layers of a 1:1 salt, a mixed spacer volume and Langmuir adsorption on the carbon; the diffuse layer at the carbon surface is additionally resolved with the Poisson–Nernst–Planck solver of suite 7 as a check on the Gouy–Chapman relation; Faradaic side reactions and micropore overlap are not modelled (the modified-Donnan MCDI model is in suite 7). Hybrid chains solve each process with its own model and link them by the shared streams; the electrodialysis step uses the stack model of suite 7 and the RO steps the element model of suite 1. The MD–crystalliser treats the total salinity as NaCl-equivalent with an MSMPR population balance (size-independent growth, secondary nucleation). Batch dynamics are lumped (well-mixed tanks, module flux scaled from the inlet coupon) with reduced-order kinetics for cake or deposit growth, surface scaling, contact-angle loss and progressive pore wetting; scaling is otherwise screened by NaCl saturation and a gypsum ratio scaled from seawater — use suite 2 for speciation. The Pareto sweep is a fixed grid of full module solutions, not a continuous optimiser, and the grey-box correction is a three-coefficient ridge regression on the ratio of measured to modelled flux. Humidification–dehumidification is an effectiveness-based cycle model.',
+  equationsNote: 'FO/PRO: steady solution–diffusion with film-theory ECP and a support-layer ICP described by the structural parameter (divided by the support hydration when the support is not fully wetted); draw osmotic coefficients are quadratic fits at 25 °C and the feed solutes are lumped into one species with the permeability of NaCl; a feed-side hydraulic pressure gives pressure-assisted FO. MD: one-dimensional film model with the dusty-gas membrane coefficient (Knudsen, molecular, their series combination, plus Poiseuille flow under vacuum) for the mean pore, optionally integrated over a log-normal pore-size distribution with every pore class in its own regime (bundle of parallel capillaries), or from a pore network: a two-dimensional lattice of throats with seeded log-normal radii between the two membrane faces, each throat with its own Knudsen / molecular (or viscous) conductance, solved as a linear network by banded Cholesky factorisation, with wetting by invasion percolation from the feed face (a throat is invaded when the pressure exceeds its entry pressure and it touches liquid; the breakthrough pressure of the lattice is reported). The network is two-dimensional and isothermal across the membrane; its coefficient is put on the same porosity, tortuosity and thickness basis as the continuum models; the vapour-pressure lowering of the brine follows the seawater correlation of the property library and the Kelvin correction is optional (below 1 % for 0.1–0.5 µm pores). Heat-transfer coefficients come from a spacer or open-channel Nusselt correlation. Capacitive deionisation: 1-D porous-electrode charge balance (transmission line) with a unified double layer of a 1:1 salt — Gouy–Chapman–Stern while the pore half-width exceeds four Debye lengths, modified Donnan (overlapping layers, with the micropore attraction term) below two, smoothly blended in between and re-evaluated as the pore liquid is depleted — so that co-ion expulsion, a charge efficiency below one and a positive salt capacity hold for feeds from a few mg/L to seawater; the pore conductivity includes the counter-ions of overlapped pores; a mixed spacer volume and Langmuir adsorption on the carbon complete the cell. Time integration is fully implicit (variable-step BDF2, Newton with a bordered-tridiagonal Jacobian) in conservative form, so the salt and charge balances close to round-off. The blend is an interpolation between the two limiting theories, not a solution of the Poisson–Boltzmann equation in a slit; the diffuse layer at the carbon surface is additionally resolved with the Poisson–Nernst–Planck solver of suite 7 as a check on the Gouy–Chapman relation; Faradaic side reactions are not modelled. Non-ionic draws (glucose) enter the ion-based RO and MD steps of the hybrids as the osmotically equivalent NaCl solution; electrodialysis cannot regenerate them and the hybrid then reports the FO step alone. Hybrid chains solve each process with its own model and link them by the shared streams; the electrodialysis step uses the stack model of suite 7 and the RO steps the element model of suite 1. The MD–crystalliser treats the total salinity as NaCl-equivalent with an MSMPR population balance (size-independent growth, secondary nucleation). Batch dynamics are lumped (well-mixed tanks, module flux scaled from the inlet coupon) with reduced-order kinetics for cake or deposit growth, surface scaling, contact-angle loss and progressive pore wetting; scaling is otherwise screened by NaCl saturation and a gypsum ratio scaled from seawater — use suite 2 for speciation. The Pareto front is searched with NSGA-II (elitist non-dominated sorting genetic algorithm, suite 11) over the continuous design variables and merged with a grid of full module solutions that is kept as backdrop; the grey-box correction is a three-coefficient ridge regression on the ratio of measured to modelled flux. Humidification–dehumidification is an effectiveness-based cycle model.',
 
   inputs: [
     { group: 'Process and feed', help: 'Which process is solved and what water it treats.', fields: [
@@ -661,8 +906,8 @@ const suite = {
     ] },
     { group: 'MD membrane', tab: 'setup', showIf: isMD, help: 'Hydrophobic microporous membrane.', fields: [
       { key: 'dPore', label: 'Mean pore diameter', unit: 'µm', value: 0.2, min: 0.01, max: 2, typical: [0.1, 0.45], help: 'Controls the Knudsen number and the membrane coefficient.' },
-      { key: 'poreDist', label: 'Pore-size model', type: 'select', value: 'mean', options: [{ value: 'mean', label: 'Single mean pore (continuum)' }, { value: 'lognormal', label: 'Log-normal pore-size distribution (pore classes)' }], help: 'With a distribution every pore class carries the dusty-gas flux of its own Knudsen number, weighted by its open area.' },
-      { key: 'sigmaPore', label: 'Geometric standard deviation of the pore sizes', unit: '–', value: 1.3, min: 1, max: 2.5, showIf: (v) => v.poreDist === 'lognormal', help: '1 = uniform pores; commercial MD membranes show 1.1–1.5.' },
+      { key: 'poreDist', label: 'Pore-size model', type: 'select', value: 'mean', options: [{ value: 'mean', label: 'Single mean pore (continuum)' }, { value: 'lognormal', label: 'Log-normal pore-size distribution (bundle of parallel capillaries)' }, { value: 'network', label: 'Pore network (2-D lattice of throats, invasion-percolation wetting)' }], help: 'Bundle: every pore class carries the dusty-gas flux of its own Knudsen number, weighted by its open area (pores in parallel). Network: log-normal throats on a lattice between the two faces, solved as a linear conductance network — narrow throats in series throttle the flux, cross-links let it by-pass them, and liquid invades from the feed side through connected wide throats.' },
+      { key: 'sigmaPore', label: 'Geometric standard deviation of the pore sizes', unit: '–', value: 1.3, min: 1, max: 2.5, showIf: (v) => v.poreDist === 'lognormal' || v.poreDist === 'network', help: '1 = uniform pores; commercial MD membranes show 1.1–1.5.' },
       { key: 'rMax', label: 'Largest pore radius', unit: 'µm', value: 0.2, min: 0.01, max: 3, help: 'Sets the liquid-entry pressure (the largest pores wet first).' },
       { key: 'epsM', label: 'Porosity', unit: '–', value: 0.8, min: 0.2, max: 0.95, help: 'Void fraction of the membrane.' },
       { key: 'tauM', label: 'Tortuosity', unit: '–', value: 2, min: 1, max: 6, help: 'Often estimated as (2 − ε)²/ε. Calibrate from a flux test.' },
@@ -686,11 +931,13 @@ const suite = {
     { group: 'Membrane material', tab: 'setup', showIf: (v) => isFO(v) || isMD(v), help: 'Library of conventional and novel membrane materials; every run also lists how each of them would perform here.', fields: [
       { key: 'memMat', label: 'Membrane material', type: 'select', value: 'custom', options: [{ value: 'custom', label: 'Custom — use the membrane fields as entered' }, ...Object.entries(MATERIALS).map(([k, m]) => ({ value: k, label: `${m.kind === 'md' ? 'MD' : 'FO'} · ${m.name}` }))], help: 'A library entry replaces the membrane properties of its process family (MD: pore size, porosity, tortuosity, thickness, conductivity, contact angle; FO: A, B and S). Entries of the other family are ignored.' },
     ] },
-    { group: 'Porous electrode and double layer', tab: 'setup', showIf: isCDI, help: 'Transmission-line model of the carbon electrodes with Gouy–Chapman–Stern double layers and Langmuir adsorption.', fields: [
+    { group: 'Porous electrode and double layer', tab: 'setup', showIf: isCDI, help: 'Transmission-line model of the carbon electrodes with a unified double layer (Gouy–Chapman–Stern for thin layers, modified Donnan for overlapping ones) and Langmuir adsorption.', fields: [
       { key: 'cdiLe', label: 'Electrode thickness', unit: 'µm', value: 400, min: 20, max: 2000, help: 'Each electrode; the charging time constant grows with its square.' },
       { key: 'cdiPor', label: 'Macroporosity of the electrode', unit: '–', value: 0.4, min: 0.1, max: 0.8, help: 'Electrolyte-filled transport pores; pore conductivity = κ·porosity^1.5.' },
       { key: 'cdiRho', label: 'Electrode density', unit: 'g/cm³', value: 0.5, min: 0.1, max: 1.5, help: 'Carbon mass per electrode volume.' },
-      { key: 'cdiArea', label: 'Double-layer area of the meso- and macropores', unit: 'm²/g', value: 80, min: 5, max: 3000, help: 'Surface carrying thin (non-overlapping) double layers. The Gouy–Chapman–Stern model requires pores much wider than the Debye length; micropore area belongs to the modified-Donnan model of suite 7.' },
+      { key: 'cdiArea', label: 'Double-layer area of the meso- and macropores', unit: 'm²/g', value: 80, min: 5, max: 3000, help: 'Wall area of the electrolyte-filled pores. Together with the porosity it sets the pore half-width (pore volume ÷ area); the double-layer model switches from Gouy–Chapman–Stern to modified Donnan when that width falls below a few Debye lengths, so microporous carbons (large area) and dilute feeds are covered too.' },
+      { key: 'cdiEdl', label: 'Double-layer model', type: 'select', value: 'auto', options: [{ value: 'auto', label: 'Unified: Gouy–Chapman–Stern ↔ modified Donnan, switched on pore size ÷ Debye length' }, { value: 'gcs', label: 'Gouy–Chapman–Stern only (thin layers)' }, { value: 'md', label: 'Modified Donnan only (overlapping layers)' }], help: 'The unified model uses the thin-layer relations while the pore half-width exceeds four Debye lengths, the modified-Donnan relations below two, and blends smoothly in between — also when the pore liquid is depleted during charging. It has a solution for every feed from a few mg/L to seawater.' },
+      { key: 'cdiMu', label: 'Ion attraction into overlapped pores', unit: 'kT', value: 1.5, min: 0, max: 4, help: 'Non-electrostatic attraction term of the modified-Donnan model. It is faded out as the feed makes the double layers thin, so it does not act on wide pores.' },
       { key: 'cdiCst', label: 'Stern-layer capacitance', unit: 'F/m²', value: 0.2, min: 0.02, max: 2, help: 'Compact-layer capacitance in series with the diffuse (Gouy–Chapman) layer.' },
       { key: 'cdiHsp', label: 'Spacer thickness', unit: 'µm', value: 200, min: 30, max: 2000, help: 'Flow channel between the electrodes (porosity 0.7).' },
       { key: 'cdiRc', label: 'Contact and lead resistance', unit: 'Ω·cm²', value: 10, min: 0, max: 500, help: 'Electronic resistances of the cell.' },
@@ -719,7 +966,7 @@ const suite = {
       { key: 'wet0', label: 'Initially wetted pore area', unit: '%', value: 0, min: 0, max: 100, showIf: (v) => v.dynamic && v.process === 'md', help: 'Initial condition of the membrane (0 = dry pores).' },
     ] },
     { group: 'Multi-objective sweep and grey-box model', tab: 'setup', showIf: hasDyn, help: 'Design trade-offs and data-driven correction of the mechanistic flux.', fields: [
-      { key: 'pareto', label: 'Pareto sweep: flux versus specific energy', type: 'bool', value: false, help: 'Solves a grid of designs (MD: temperature × velocity × length; FO: draw strength × velocity) and extracts the non-dominated set. Adds about a second.' },
+      { key: 'pareto', label: 'Pareto sweep: flux versus specific energy', type: 'bool', value: false, help: 'Multi-objective optimisation with NSGA-II over the continuous design variables (MD: temperature, velocity, length; FO: draw strength, velocity); a grid of designs is shown as backdrop.' },
       { key: 'greybox', label: 'Grey-box correction from test data', type: 'bool', value: false, help: 'Fits a three-coefficient correction of the modelled flux to the test rows below and reports whether it generalises (leave-one-out).' },
       { key: 'gbFO', label: 'FO test data', type: 'table', columns: [{ key: 'cDraw', label: 'Draw concentration', unit: 'mol/L' }, { key: 'uF', label: 'Cross-flow velocity', unit: 'cm/s' }, { key: 'Jw', label: 'Measured water flux', unit: 'L/m²·h' }], value: GB_FO, showIf: (v) => v.greybox && v.process === 'fo', help: 'Coupon tests with the present feed and membrane.' },
       { key: 'gbMD', label: 'MD test data', type: 'table', columns: [{ key: 'Tf', label: 'Hot-feed temperature', unit: '°C' }, { key: 'uFm', label: 'Feed velocity', unit: 'm/s' }, { key: 'Jw', label: 'Measured flux', unit: 'L/m²·h' }], value: GB_MD, showIf: (v) => v.greybox && v.process === 'md', help: 'Flat-sheet tests at the present coolant temperature and feed salinity.' },
@@ -729,8 +976,11 @@ const suite = {
     ] },
     { group: 'Discretisation', tab: 'mesh', help: 'Number of segments along the membrane in the module models; cells and time steps of the dynamic models.', showIf: (v) => v.process !== 'hdh', fields: [
       { key: 'nSeg', label: 'Segments along the module', unit: '', value: 24, min: 2, max: 400, step: 1, showIf: (v) => v.process !== 'cdi', help: 'Use the sensitivity study to confirm that the result no longer depends on it.' },
-      { key: 'cdiNx', label: 'Cells across the electrode', unit: '', value: 8, min: 3, max: 60, step: 1, showIf: isCDI, help: 'Finite volumes of the porous-electrode charge balance. The explicit time step shrinks with the square of the cell size; the grid is coarsened automatically when a half-cycle would need more than about 20 000 steps (the cells used are listed in the results).' },
-      { key: 'cdiNt', label: 'Output steps per half-cycle', unit: '', value: 120, min: 20, max: 600, step: 1, showIf: isCDI, help: 'Stability-limited sub-steps are added automatically.' },
+      { key: 'pnNx', label: 'Pore network: throats across the lattice', unit: '', value: 24, min: 6, max: 64, step: 1, showIf: (v) => isMD(v) && v.poreDist === 'network', help: 'In-plane size of the 2-D lattice (periodic). Larger lattices average out the random radii.' },
+      { key: 'pnNz', label: 'Pore network: pore bodies through the thickness', unit: '', value: 12, min: 3, max: 40, step: 1, showIf: (v) => isMD(v) && v.poreDist === 'network', help: 'Rows of pore bodies between the feed face and the permeate face.' },
+      { key: 'pnSeed', label: 'Pore network: random seed', unit: '', value: 7, min: 1, max: 9999, step: 1, showIf: (v) => isMD(v) && v.poreDist === 'network', help: 'Seed of the log-normal throat radii; change it to see the sample-to-sample scatter.' },
+      { key: 'cdiNx', label: 'Cells across the electrode', unit: '', value: 8, min: 3, max: 60, step: 1, showIf: isCDI, help: 'Finite volumes of the porous-electrode charge balance. The time integration is implicit, so the grid is used as entered whatever the salinity or cycle length.' },
+      { key: 'cdiNt', label: 'Output steps per half-cycle', unit: '', value: 120, min: 20, max: 600, step: 1, showIf: isCDI, help: 'Each output interval is covered by two implicit (BDF2) steps; the first interval of every half-cycle is graded from the fastest electrode time constant to resolve the current peak.' },
       { key: 'ntDyn', label: 'Time steps of the batch simulation', unit: '', value: 200, min: 20, max: 2000, step: 1, showIf: (v) => hasDyn(v) && v.dynamic, help: 'RK4 steps over the simulated time.' },
     ] },
   ],
@@ -763,10 +1013,13 @@ const suite = {
     { key: 'ghi', value: site?.data?.ghiDaily, from: 'Daily solar irradiation at site' },
   ],
 
-  run(v0) {
-    const v = applyMaterial(v0), pr = v.process;
-    const res = pr === 'md' ? runMD(v) : pr === 'ro_md' ? runROMD(v) : pr === 'hdh' ? runHDH(v) : pr === 'cdi' ? runCDI(v) : pr === 'cdi_ro' ? runCDIRO(v) : pr === 'md_cr' ? runMDC(v) : pr === 'fo_md' || pr === 'ed_fo' ? runFOChain(v) : runFO(v);
-    return addExtras(res, v);
+  run(v0, ctx) { // synchronous by default; with the Pareto search or the pore network it yields once first (when the caller can) so the interface shows progress
+    const v = applyMaterial(v0), pr = v.process, go = () => {
+      const res = pr === 'md' ? runMD(v) : pr === 'ro_md' ? runROMD(v) : pr === 'hdh' ? runHDH(v) : pr === 'cdi' ? runCDI(v) : pr === 'cdi_ro' ? runCDIRO(v) : pr === 'md_cr' ? runMDC(v) : pr === 'fo_md' || pr === 'ed_fo' ? runFOChain(v) : runFO(v);
+      return addExtras(res, v);
+    };
+    if ((v.pareto || (isMD(v) && v.poreDist === 'network')) && ctx?.tick) return (async () => { ctx.progress?.(0.1, v.pareto ? 'Multi-objective search (NSGA-II)' : 'Solving the pore network'); await ctx.tick(); return go(); })();
+    return go();
   },
 
   mesh: { name: 'Segments along the module', keys: ['nSeg'], min: 2, note: 'Membrane area, flows and inlet conditions are held constant.',
@@ -786,7 +1039,7 @@ const suite = {
     get validationSample() { return (this._v ||= synth(31, [[0.75, 1, 15], [1.25, 1, 15], [1.75, 0.6, 20], [1, 1.5, 10], [0.6, 0.5, 12], [2, 2, 15]])); },
   },
 
-  verify() {
+  async verify() {
     const d = defaultsOf(suite), C = [], add = (name, expected, got, tol, note) => C.push({ name, expected, got, tol, pass: Math.abs(got - expected) <= tol, note });
     // FO limits
     const s0 = foSetup({ ...d, Sfo: 0, BFO: 1e-12, uF: 1e5, uD: 1e5, kcp: 1e4 }), f0 = foFlux({ f: 1, cFd: 0, cD: 1000 }, s0.m), ideal = s0.m.A * (drawOsmotic('nacl', 1000) - s0.m.piF(1));
@@ -831,6 +1084,16 @@ const suite = {
     add('Pore-size distribution: Knudsen coefficient of log-normal pores', Math.exp(2.5 * Math.log(1.4) ** 2), dustyGasPSD(mk, 50, 101325, 1e4, 'knudsen').B / dustyGas(mk, 50, 101325, 1e4, 'knudsen').B, 2e-4, 'Area-weighted integral of B_K ∝ r: ⟨r³⟩/(⟨r²⟩·r_median) = exp(2.5·ln²σ_g)');
     add('Pore-size distribution collapses to the mean pore for uniform pores', 1, dustyGasPSD({ ...mem, sg: 1.0002 }, 40, 101325, 1e4).B / dg.B, 1e-5, 'σ_g → 1');
     add('Pore-size distribution: molecular diffusion does not depend on the pore size', 1, dustyGasPSD(mk, 50, 101325, 1e4, 'molecular').B / dustyGas(mk, 50, 101325, 1e4, 'molecular').B, 1e-9, 'Only the Knudsen part gains from large pores');
+    {
+      const mN = { ...mem, sg: 1.3, net: { nx: 24, nz: 12, seed: 7, theta: 120, gamma: 0.066, dP: 0, B: 1 } }, nU = dustyGasNetwork({ ...mN, sg: 1 }, 50, 101325, 1e4), nR = dustyGasNetwork(mN, 50, 101325, 1e4), nBig = dustyGasNetwork({ ...mN, net: { ...mN.net, nx: 48, nz: 24 } }, 50, 101325, 1e4);
+      add('Pore network of equal throats returns the single-pore (analytic) coefficient', 1, nU.B / nU.Bmean, 1e-10, 'Uniform radius: only the through-plane throats carry flow, K = n_x·g/(n_z + 1)');
+      add('Pore network conserves the vapour flow across every cut plane', 0, Math.max(...nR.network.layers.map((q) => Math.abs(q - nR.network.K) / nR.network.K)), 1e-10, `Flow through each of the ${nR.network.layers.length} layers of through-plane throats (log-normal radii, σ_g = 1.3)`);
+      add('Pore network: series bottlenecks put the coefficient below the parallel-capillary bundle', 1, nR.B < nR.Bbundle && nR.B < nR.Bmean && nR.B > 0.6 * nR.Bmean ? 1 : 0, 0, `Network ${fmt(nR.B / nR.Bmean, 4)}, bundle ${fmt(nR.Bbundle / nR.Bmean, 4)} × the single mean pore`);
+      add('Pore network result is insensitive to the lattice size', nR.B / nR.Bmean, nBig.B / nBig.Bmean, 0.03, '24 × 12 against 48 × 24 lattice');
+      const lepM = liquidEntryPressure(mem.r, 120, 0.066), nDry = poreNetwork({ r: mem.r, sg: 1.3, nx: 24, nz: 12, seed: 7, theta: 120, gamma: 0.066, dP: 0.5 * nR.network.net.lepNet }), nWet = poreNetwork({ r: mem.r, sg: 1.3, nx: 24, nz: 12, seed: 7, theta: 120, gamma: 0.066, dP: 1.02 * nR.network.net.lepNet });
+      add('Invasion percolation: breakthrough near the entry pressure of the median throat', lepM, nR.network.net.lepNet, 0.15 * lepM, 'Bond-percolation threshold of the square lattice is one half: liquid spans the membrane once the wider half of the throats can be entered (Pa)');
+      add('Invasion percolation: no liquid path below the breakthrough pressure, one above it', 1, !nDry.through && nWet.through && nDry.fraction < nWet.fraction ? 1 : 0, 0, `Wetted throats ${fmt(100 * nDry.fraction, 3)} % at half the breakthrough pressure, ${fmt(100 * nWet.fraction, 3)} % just above it`);
+    }
     add('Half of the pores lie above the median radius', 0.5, wettedFraction(1e-7, 1.3, 120, 0.066, liquidEntryPressure(1e-7, 120, 0.066)).number, 1e-6, 'Feed pressure equal to the liquid-entry pressure of the median pore');
     // ---- pressure-assisted FO, hydration
     const sP = foSetup({ ...d, Sfo: 0, BFO: 1e-12, uF: 1e5, uD: 1e5, kcp: 1e4, dPfeed: 5 }), fP = foFlux({ f: 1, cFd: 0, cD: 1000 }, sP.m);
@@ -851,6 +1114,38 @@ const suite = {
     add('Langmuir adsorption reaches θ = K·c/(1 + K·c)', (cd.lgK * lg.cEnd) / (1 + cd.lgK * lg.cEnd), lg.thetaEnd, 1e-4, 'Fresh electrode at zero voltage after 30 min');
     const cc = simulatePorousCDI({ ...cd, cdiMode: 'cc', cdiI: 8 }, 20, { cdiTc: 1, cdiTd: 1, cdiNt: 30 });
     add('Prescribed-current boundary: the cell current equals the set value', 8, cc.cur[1], 1e-9, 'Constant-current charging below the voltage limit (A/m²)');
+    // ---- unified double layer (Gouy–Chapman–Stern ↔ modified Donnan)
+    {
+      const kL = Math.sqrt((EPS_W * R * K(25)) / (2 * F * F)), hP = 1e-8, o = (model, mu = 0) => ({ kL, h: hP, emu: Math.exp(mu), model });
+      const cThin = 100, cOver = 0.5, gT = gcs(0.5, cThin, { T: 25, cSternA: 0.2 }), uT = edlEquilibrium(0.5, cThin, o('auto'), 0.2, 25), mO = mDonnan(0.5, cOver, { T: 25, muAtt: 1.5, cStern: 0.2 / hP / 1e6 }), uO = edlEquilibrium(0.5, cOver, o('auto', 1.5), 0.2, 25);
+      add('Unified double layer: thin-layer limit equals Gouy–Chapman–Stern (suite 7)', gT.sigma, uT.sigma, 1e-6 * gT.sigma, `Surface charge at 0.5 V, pore half-width ÷ Debye length = ${fmt(hP / (kL / Math.sqrt(cThin)), 3)} (mol/m²)`);
+      add('Unified double layer: overlapping limit equals the modified-Donnan model (suite 7)', mO.sigma * hP, uO.sigma, 1e-6 * mO.sigma * hP, `Charge at 0.5 V with 1.5 kT attraction, pore half-width ÷ Debye length = ${fmt(hP / (kL / Math.sqrt(cOver)), 3)} (mol/m²)`);
+      let minCap = Infinity, minGcs = Infinity, maxEff = -Infinity, minEff = Infinity, minSlope = Infinity;
+      for (const h of [3e-10, 3e-9, 3e-8, 3e-7]) for (const mu of [0, 2]) for (let a = -3; a <= 3; a += 0.25) for (let b = -9; b <= -3.5; b += 0.5) {
+        const c = 10 ** a, sg = 10 ** b, q = o('auto', mu); q.h = h;
+        const e0 = edlState(sg, c, q), e1 = edlState(sg, c * 1.001, q), e2 = edlState(sg * 1.001, c, q), qg = { ...q, model: 'gcs' };
+        minGcs = Math.min(minGcs, (edlState(sg, c * 1.001, qg).S - edlState(sg, c, qg).S) / (0.001 * c) / (2 * h));
+        minCap = Math.min(minCap, (e1.S - e0.S) / (0.001 * c) / (2 * h)); const le = (e2.S - e0.S) / (0.001 * sg); maxEff = Math.max(maxEff, le); minEff = Math.min(minEff, le); minSlope = Math.min(minSlope, e2.pd - e0.pd);
+      }
+      add('Unified double layer: salt capacity ∂S/∂c is never negative in any regime', 1, minCap >= 0 && minGcs < 0 ? 1 : 0, 0, `Lowest value ${fmt(minCap, 3)} × the pore volume over 0.001–1000 mol/m³, 10⁻⁹–3·10⁻⁴ mol/m² and pore half-widths of 0.3–300 nm; the thin-layer formula alone reaches ${fmt(minGcs, 3)} on the same grid, which is why it had no solution for dilute feeds`);
+      add('Unified double layer: differential charge efficiency stays between 0 and 1 (co-ion expulsion)', 1, minEff >= -1e-9 && maxEff < 1 && minSlope > 0 ? 1 : 0, 0, `∂S/∂σ from ${fmt(Math.max(minEff, 0), 3)} to ${fmt(maxEff, 4)} on the same grid; the potential rises monotonically with the charge`);
+      const cdU = { ...d, ...suite.presets[10].values, cdiMu: 0, cdiCycles: 1, cdiNt: 40 }, cZone = (3 * kL / (cdU.cdiPor / (cdU.cdiArea * cdU.cdiRho * 1e6))) ** 2;
+      const zg = simulatePorousCDI({ ...cdU, cdiEdl: 'gcs' }, cZone), zm = simulatePorousCDI({ ...cdU, cdiEdl: 'md' }, cZone), za = simulatePorousCDI(cdU, cZone);
+      add('Gouy–Chapman–Stern and modified-Donnan cycles agree in their overlap region', zg.sac, zm.sac, 0.2 * zg.sac, `Salt adsorption per cycle at pore half-width = 3 Debye lengths (${fmt(cZone * 58.44, 3)} mg/L), no attraction term: ${fmt(zg.sac, 4)} and ${fmt(zm.sac, 4)} mg/g; unified model ${fmt(za.sac, 4)} mg/g`);
+      add('Unified model lies between the two limiting models in the overlap region', 1, za.sac >= Math.min(zg.sac, zm.sac) - 0.02 * zg.sac && za.sac <= Math.max(zg.sac, zm.sac) + 0.02 * zg.sac && !zg.fallback ? 1 : 0, 0, `Charge efficiency ${fmt(100 * zg.eff, 3)} % (thin), ${fmt(100 * zm.eff, 3)} % (Donnan), ${fmt(100 * za.eff, 3)} % (unified)`);
+      let wS = 0, wQ = 0, effOk = true, nSw = 0;
+      for (const mgL of [5, 20, 100, 300, 1000, 3500, 12000, 35000]) { const q = simulatePorousCDI({ ...cdU, cdiMu: 1.5 }, mgL / 58.44); nSw++; wS = Math.max(wS, Math.abs(q.salt - q.storedEDL - q.storedLang - q.storedMix) / Math.max(Math.abs(q.salt), 1e-12)); wQ = Math.max(wQ, Math.abs(q.charge - q.chargeStored) / Math.abs(q.charge)); effOk = effOk && q.eff > 0 && q.eff < 1 && q.failedSteps === 0 && Number.isFinite(q.sec); }
+      add('Capacitive deionisation: salt balance closes from 5 mg/L to seawater', 0, wS, 1e-7, `Largest relative imbalance over ${nSw} feeds (5 … 35 000 mg/L) — implicit conservative integration`);
+      add('Capacitive deionisation: charge balance closes from 5 mg/L to seawater', 0, wQ, 1e-8, 'Charge passed versus charge stored, same sweep');
+      add('Capacitive deionisation: charge efficiency below one over the whole salinity sweep', 1, effOk ? 1 : 0, 0, 'Co-ion expulsion in both double-layer regimes; every implicit step converged');
+      let nBad = 0, nRun = 0; const lohi = (k) => { const f = suite.inputs.flatMap((g) => g.fields).find((q) => q.key === k); return [f.min, f.max]; };
+      const corner = ['cdiArea', 'cdiV', 'cdiLe', 'cdiQ', 'cdiTc', 'cdiCst', 'cdiPor', 'cdiHsp', 'cdiI'];
+      for (let m = 0; m < 12; m++) { // corners of the allowed input ranges (Gray-code-like pattern) at 5 mg/L and at seawater strength
+        const ov = { cdiCycles: 1, cdiNt: 24, cdiNx: 5, cdiMode: m % 3 === 0 ? 'cc' : 'cv' }; corner.forEach((k, q) => { ov[k] = lohi(k)[((m >> (q % 4)) + q + (m > 5 ? 1 : 0)) % 2]; });
+        try { const q = simulatePorousCDI({ ...cdU, cdiMu: 1.5, ...ov }, m % 2 ? 600 : 0.0856); nRun++; if (![q.removal, q.sec, q.eff, q.sac, q.cEnd].every(Number.isFinite) || Math.abs(q.charge - q.chargeStored) > 1e-6 * Math.max(Math.abs(q.charge), 1e-9)) nBad++; } catch { nBad++; }
+      }
+      add('Capacitive deionisation: no input corner of the allowed ranges fails', 0, nBad, 0, `${nRun} extreme combinations of area, voltage, thickness, flow, time, capacitance, porosity and spacer at 5 mg/L and 35 g/L, constant voltage and constant current`);
+    }
     const ep = edlProfile(0.1, 20, 25);
     add('Poisson–Nernst–Planck double layer reproduces the Gouy–Chapman potential', 0, Math.max(...ep.psi.map((q, k) => Math.abs(q - ep.gc[k]))), 2e-4, 'Insulating wall at 100 mV in 20 mol/m³ (largest deviation, V)');
     add('Poisson–Nernst–Planck surface charge equals the Grahame equation', ep.sigmaGC, ep.sigmaLeft, 0.01 * ep.sigmaGC, 'C/m²');
@@ -863,7 +1158,7 @@ const suite = {
     add('MD–crystalliser loop is supersaturated by the MSMPR value', mc.cr.sigma, mc.Sloop / saltSolubility(mc.p.Tcr) - 1, 1e-12, 'Loop salinity = solubility × (1 + σ)');
     const nc = simulateMDC({ ...d, ...suite.presets[9].values, bleed: 40 });
     add('MD–crystalliser: a large bleed keeps the loop unsaturated and gives no crystals', 0, nc.solids + Math.max(0, nc.Sloop - saltSolubility(nc.p.Tcr)), 0, `Loop at ${fmt(nc.Sloop, 4)} g/kg with a 40 % bleed`);
-    const chain = [7, 8, 11].map((k) => suite.run({ ...d, ...suite.presets[k].values })), worst = Math.max(...chain.flatMap((q) => q.balances.map((b) => Math.abs(b.in - b.out) / Math.max(Math.abs(b.in), 1e-30))));
+    const chain = await Promise.all([7, 8, 11].map((k) => suite.run({ ...d, ...suite.presets[k].values }))), worst = Math.max(...chain.flatMap((q) => q.balances.map((b) => Math.abs(b.in - b.out) / Math.max(Math.abs(b.in), 1e-30))));
     add('Hybrid chains (FO–MD, electrodialysis–FO, RO–CDI) close all their balances', 0, worst, 2e-3, 'Largest relative imbalance over water, solute, energy, salt and charge balances of the three chains');
     add('Electrodialysis reaches the product target on the diluted draw', d.edTarget, chain[1].kpis.find((q) => q.label === 'Product TDS').value, 1, 'mg/L');
     // ---- dynamics, Pareto, grey box
@@ -875,6 +1170,11 @@ const suite = {
     const df = dynamicFO({ ...d, dynamic: true, tDyn: 48, batchVol: 10, drawVol: 5, cFou: 0, kRem: 0.02, alphaCake: 5, tauHyd: 2, ntDyn: 400 });
     add('Batch FO: water and draw solute are conserved', 0, Math.abs(df.waterBal.in - df.waterBal.out) / df.waterBal.in + Math.abs(df.soluteBal.in - df.soluteBal.out) / df.soluteBal.in, 1e-9, 'Feed tank + draw tank');
     add('Batch FO runs down to osmotic equilibrium', 0, df.fluxEnd / df.fluxMax, 0.02, 'Flux at the end ÷ largest flux of the batch');
+    { const dm = { ...d, process: 'md' }, pd = paretoDesigns(dm, 35, true, { pop: 12, gens: 3 }), fr = paretoFront(pd.all, (q) => q.flux, (q) => q.en).front;
+      add('NSGA-II front is never worse than the grid front (hypervolume)', 1, pd.hvAll >= pd.hvGrid - 1e-12 && pd.ga.length > 0 ? 1 : 0, 0, `Dominated area ${fmt(pd.hvGrid, 5)} (grid of ${pd.grid.length}) → ${fmt(pd.hvAll, 5)} with ${pd.ga.length} NSGA-II designs`);
+      add('Pareto front holds no dominated design', 0, fr.filter((a) => pd.all.some((b) => b.flux >= a.flux && b.en <= a.en && (b.flux > a.flux || b.en < a.en))).length, 0, `${fr.length} non-dominated designs of ${pd.all.length}`);
+      const pd2 = paretoDesigns(dm, 35, true, { pop: 12, gens: 3 });
+      add('NSGA-II search is deterministic for a given seed', pd.hvAll, pd2.hvAll, 1e-12, 'Two runs, same seed'); }
     const pp = [[1, 5], [2, 4], [3, 6], [4, 8], [2.5, 7], [5, 20], [4.5, 9]].map(([f, e]) => ({ f, e })), pf = paretoFront(pp, (q) => q.f, (q) => q.e);
     add('Pareto front keeps exactly the non-dominated designs', 5, pf.front.length + (pf.front.some((a) => pp.some((b) => b.f >= a.f && b.e <= a.e && (b.f > a.f || b.e < a.e))) ? 100 : 0), 0, 'Seven test points (flux, energy): (2,4), (3,6), (4,8), (4.5,9) and (5,20) survive; (1,5) and (2.5,7) are dominated');
     const gbT = greyBox(GB_FO.map((q) => ({ ...q, Jw: 1.2 * (q.cDraw * 10 + q.uF) })), (q) => q.cDraw * 10 + q.uF, (q) => [Math.log(q.cDraw), Math.log(q.uF / 15)], 1e-9);
@@ -899,10 +1199,10 @@ function runFO(v) {
   // hybrid: RO regeneration with the element-by-element model of suite 1
   let ro = null, roErr = null;
   if (hybrid) {
-    if (!d.ions) roErr = 'An RO regeneration cannot be simulated ion-by-ion for a non-ionic draw solute.';
-    else {
-      const ionsD = cloneIons(Object.fromEntries(Object.entries(d.ions).map(([k, m]) => [k, m * r.cDout]))), rec = clamp(r.tot.Vw / r.drawOut.Q, 0.05, 0.85);
+    {
+      const da = drawAsIons(p.draw, r.cDout, T), ionsD = da.ions, rec = clamp(r.tot.Vw / r.drawOut.Q, 0.05, 0.85);
       try { ro = simulateRO({ ...defaultsOf(roSuite), ions: ionsD, Qf: r.drawOut.Q * 3600, T, pH: 7, recovery: 100 * rec, targetFlux: p.roFlux, design: 'auto', mode: 'recovery', nSeg: 2 }); } catch (e) { roErr = e.message; }
+      if (da.equivalent && !roErr) W.push({ level: 'info', msg: `${d.name} carries no ions: the regeneration RO is solved for the osmotically equivalent NaCl solution (${fmt((da.cEq * 58.44) / 1000, 3)} g/L, same osmotic pressure). Pressure, area and energy carry over; the permeate salinity shown is that equivalent and is an upper bound, because RO rejects the larger sugar molecule better than NaCl.` });
     }
     if (roErr) W.push({ level: 'bad', msg: `RO regeneration of the diluted draw could not be solved: ${roErr}` });
     else if (ro.p1.Pf > ro.cfg.M.pmax) W.push({ level: 'bad', msg: `The regeneration RO needs ${fmt(ro.p1.Pf, 3)} bar, above the ${ro.cfg.M.pmax} bar element rating — lower the draw concentration.` });
@@ -1116,10 +1416,12 @@ function cdiResult(r, p, W, name = 'CDI') {
   if (p.cdiV > 1.23) W.push({ level: 'warn', msg: 'Charging above 1.23 V risks water electrolysis and carbon oxidation.' });
   if (r.c0 > 100) W.push({ level: 'warn', msg: `The electrode feed holds ${fmt(r.c0, 3)} eq/m³: capacitive deionisation suits water below about 3–5 g/L.` });
   if (r.removal < 0.1) W.push({ level: 'info', msg: `Only ${fmt(100 * r.removal, 3)} % of the salt is removed per pass — lower the flow per cell area or lengthen the charging step.` });
-  if (r.thick > 0.5) W.push({ level: 'warn', msg: `The depleted double layers take up to ${fmt(100 * r.thick, 3)} % of the pore and spacer volume: the thin-double-layer (Gouy–Chapman–Stern) model is at the edge of its range. Lower the double-layer area or the voltage, or use the modified-Donnan model of suite 7 for microporous carbon.` });
+  if (r.fallback) W.push({ level: 'warn', msg: `The thin-layer (Gouy–Chapman–Stern) model has no solution here — its double layers would hold more co-ions than the pores contain — so the unified double-layer model was used instead.` });
+  else if (r.edlModel === 'auto' && r.thetaMin < 0.999) W.push({ level: 'info', msg: `Double layers ${r.thetaFeed < 0.001 ? 'overlap in the pores' : 'approach the pore size'}: pore half-width ${fmt(r.hPore * 1e9, 3)} nm against a Debye length of ${fmt(r.lamD * 1e9, 3)} nm in the feed. The unified model uses ${r.thetaFeed < 0.001 ? 'the modified-Donnan relations' : `a blend (thin-layer weight ${fmt(r.thetaFeed, 2)} in the feed, down to ${fmt(r.thetaMin, 2)} in the depleted pore liquid)`}.` });
+  if (r.failedSteps > 0) W.push({ level: 'warn', msg: `${r.failedSteps} implicit time step(s) did not converge and were skipped; the balances still close but the cycle is slightly shortened. Raise the number of output steps.` });
   if (r.tauRC * 3 > p.cdiTc * 60) W.push({ level: 'info', msg: `The charging step (${p.cdiTc} min) is shorter than three electrode time constants (${fmt((3 * r.tauRC) / 60, 3)} min): the inner part of the electrode stays under-used.` });
   let edl = null; try { edl = edlProfile(Math.max(psiD, 1e-4), r.cEnd, r.T); if (!edl.converged) edl = null; } catch { edl = null; }
-  kpis.push({ label: `${name} salt removal`, value: 100 * r.removal, unit: '%' }, { label: 'Salt adsorption per cycle', value: r.sac, unit: 'mg/g', help: 'mg NaCl per gram of both electrodes' }, { label: 'Charge efficiency', value: 100 * r.eff, unit: '%', help: 'Salt removed per unit of charge; tanh(Δφ_d/2) locally in the Gouy–Chapman–Stern layer' },
+  kpis.push({ label: `${name} salt removal`, value: 100 * r.removal, unit: '%' }, { label: 'Salt adsorption per cycle', value: r.sac, unit: 'mg/g', help: 'mg NaCl per gram of both electrodes' }, { label: 'Charge efficiency', value: 100 * r.eff, unit: '%', help: 'Salt removed per unit of charge; locally tanh(Δφ_d/2) for thin (Gouy–Chapman–Stern) and tanh(Δφ_D) for overlapping (modified-Donnan) double layers' },
     { label: `${name} specific energy`, value: r.sec, unit: 'kWh/m³' }, { label: 'Energy per mole of salt', value: r.ePerMol, unit: 'kJ/mol' }, { label: 'Electrode time constant L²·a·C/κ', value: r.tauRC, unit: 's' }, { label: 'Diffuse-layer potential at end of charge', value: 1000 * psiD, unit: 'mV', help: `Stern-layer drop ${fmt(1000 * stern, 4)} mV` },
     { label: 'Langmuir coverage at end of charge', value: r.thetaEnd, unit: '–', help: `Equilibrium coverage at the feed concentration ${fmt(r.thEq, 3)}` });
   const prof = r.snaps.filter((_, k) => k > 0);
@@ -1128,8 +1430,8 @@ function cdiResult(r, p, W, name = 'CDI') {
     { type: 'line', title: 'Charge penetrating the porous electrode (transmission-line charging)', xlabel: 'Depth from the spacer (µm)', ylabel: 'Surface charge (mC/m²)', series: prof.map((q) => ({ name: `t = ${fmt(q.t, 3)} s`, x: r.x.map((x) => x * 1e6), y: q.sigma.map((s) => s * F * 1000) })), note: 'No ionic flux at the current collector (right edge); the charging front diffuses in with the time constant L²·a·C/κ.' });
   if (edl) plots.push({ type: 'line', title: 'Double layer at the carbon surface: Poisson–Nernst–Planck versus Gouy–Chapman', xlabel: 'Distance from the surface (nm)', ylabel: 'mV · c/c_bulk', series: [{ name: 'Potential, Poisson–Nernst–Planck (mV)', x: edl.x.map((x) => x * 1e9), y: edl.psi.map((q) => 1000 * q) }, { name: 'Potential, Gouy–Chapman (mV)', x: edl.x.map((x) => x * 1e9), y: edl.gc.map((q) => 1000 * q), mode: 'points' }, { name: 'Counter-ion c/c_bulk', x: edl.x.map((x) => x * 1e9), y: edl.c[1].map((c) => c / r.cEnd) }, { name: 'Co-ion c/c_bulk × 10', x: edl.x.map((x) => x * 1e9), y: edl.c[0].map((c) => (10 * c) / r.cEnd) }], vlines: [{ x: edl.lam * 1e9, label: 'Debye length' }], note: 'Diffuse part of the double layer at the end of charging, resolved on a Debye-graded mesh; the Stern layer carries the rest of the electrode potential.' });
   tables.push({ title: `${name} cycle`, columns: ['Quantity', 'Value', 'Unit'], rows: [['Feed concentration (1:1 equivalent)', r.c0, 'mol/m³'], ['Average product concentration', r.cAvg, 'mol/m³'], ['Salt removed per cycle', r.salt * 1000, 'mmol/m²'], ['— stored in the double layers', r.storedEDL * 1000, 'mmol/m²'], ['— adsorbed (Langmuir)', r.storedLang * 1000, 'mmol/m²'], ['— change of spacer and macropore inventory', r.storedMix * 1000, 'mmol/m²'], ['Charge passed on charging', r.charge, 'C/m²'], ['Charge stored in the double layers', r.chargeStored, 'C/m²'], ['Charge efficiency', 100 * r.eff, '%'], ['Net energy', r.Enet, 'J/m²'], ['Water recovery', 100 * r.waterRec, '%'], ['Productivity', r.prod, 'L/m²·h']] },
-    { title: 'Double layer and electrode', columns: ['Quantity', 'Value', 'Unit'], rows: [['Equilibrium surface charge at the charging voltage (Gouy–Chapman–Stern)', r.eq.sigma * F * 1000, 'mC/m²'], ['Surface charge at the spacer side, end of charge', r.sigmaEnd[0] * F * 1000, 'mC/m²'], ['Surface charge at the collector side, end of charge', r.sigmaEnd[r.n - 1] * F * 1000, 'mC/m²'], ['Diffuse-layer potential', 1000 * psiD, 'mV'], ['Stern-layer potential', 1000 * stern, 'mV'], ['Debye length in the feed', r.lamD * 1e9, 'nm'], ['Surface charge from the Poisson–Nernst–Planck profile', edl ? edl.sigmaLeft * 1000 : null, 'mC/m²'], ['Diffuse charge, Gouy–Chapman (Grahame)', edl ? edl.sigmaGC * 1000 : null, 'mC/m²'],
-      ['Double-layer area per electrode volume', r.av / 1e6, 'm²/cm³'], ['Electrode mass (both)', r.mE, 'g/m²'], ['Electrode time constant', r.tauRC, 's'], ['Time sub-step', r.dtStab, 's'], ['Cells across the electrode (used)', r.n, ''], ['Depleted double-layer volume ÷ pore volume (largest)', r.thick, '–'], ['Langmuir equilibrium coverage at the feed concentration', r.thEq, '–'], ['Initial electrode charge', p.cdiQ0, '% of equilibrium']] });
+    { title: 'Double layer and electrode', columns: ['Quantity', 'Value', 'Unit'], rows: [['Double-layer model used', r.edlModel === 'auto' ? `unified — ${r.regime}` : r.edlModel === 'gcs' ? 'Gouy–Chapman–Stern (forced)' : 'modified Donnan (forced)', ''], ['Pore half-width (pore volume ÷ wall area)', r.hPore * 1e9, 'nm'], ['Pore half-width ÷ Debye length in the feed', r.poreRatio, '–'], ['Thin-layer weight θ in the feed / lowest during the cycle', `${fmt(r.thetaFeed, 3)} / ${fmt(r.thetaMin, 3)}`, '–'], ['Attraction term applied', r.muEff, 'kT'], ['Equilibrium surface charge at the charging voltage', r.eq.sigma * F * 1000, 'mC/m²'], ['Surface charge at the spacer side, end of charge', r.sigmaEnd[0] * F * 1000, 'mC/m²'], ['Surface charge at the collector side, end of charge', r.sigmaEnd[r.n - 1] * F * 1000, 'mC/m²'], ['Diffuse-layer potential', 1000 * psiD, 'mV'], ['Stern-layer potential', 1000 * stern, 'mV'], ['Debye length in the feed', r.lamD * 1e9, 'nm'], ['Surface charge from the Poisson–Nernst–Planck profile', edl ? edl.sigmaLeft * 1000 : null, 'mC/m²'], ['Diffuse charge, Gouy–Chapman (Grahame)', edl ? edl.sigmaGC * 1000 : null, 'mC/m²'],
+      ['Double-layer area per electrode volume', r.av / 1e6, 'm²/cm³'], ['Electrode mass (both)', r.mE, 'g/m²'], ['Electrode time constant', r.tauRC, 's'], ['Smallest implicit time step', r.dtStab, 's'], ['Implicit steps / Newton iterations', `${r.steps} / ${r.newton}`, ''], ['Cells across the electrode (used)', r.n, ''], ['Share of the liquid salt capacity taken up by the double layers (largest)', r.thick, '–'], ['Langmuir equilibrium coverage at the feed concentration', r.thEq, '–'], ['Initial electrode charge', p.cdiQ0, '% of equilibrium']] });
   const terms = [r.storedEDL, r.storedLang, r.storedMix].map((x) => 1000 * x), pos = (a) => sum(a.map((x) => Math.max(x, 0))); // gross balance: inventories that shrink are sources
   return { kpis, plots, tables, bal: [{ name: `${name} salt: taken from the flow and released inventories vs stored (mmol/m²)`, in: Math.max(r.salt * 1000, 0) + pos(terms.map((x) => -x)), out: pos(terms) + Math.max(-r.salt * 1000, 0) }, { name: `${name} charge: passed vs stored in the double layers (C/m²)`, in: r.charge, out: r.chargeStored }] };
 }
@@ -1143,7 +1445,7 @@ function runCDI(v) {
     summary: `The capacitive-deionisation cell removes ${fmt(100 * r.removal, 3)} % of the salt (${fmt(tds(ions), 4)} → ${fmt(tds(ionsP), 4)} mg/L) with ${fmt(r.sac, 3)} mg/g per cycle at ${fmt(100 * r.eff, 3)} % charge efficiency and ${fmt(r.sec, 3)} kWh/m³; ${fmt(cell, 4)} m² of cell area treat ${fmt(p.Qf, 3)} m³/h.`,
     warnings: W,
     kpis: [{ label: 'Product TDS (cycle average)', value: tds(ionsP), unit: 'mg/L' }, ...q.kpis, { label: 'Cell area required', value: cell, unit: 'm²' }, { label: 'Productivity', value: r.prod, unit: 'L/m²·h' }, { label: 'Water recovery', value: 100 * r.waterRec, unit: '%' }],
-    recommendations: [r.eff < 0.6 ? 'Charge efficiency is low: co-ion expulsion dominates at this salinity and voltage — raise the voltage towards 1.2 V or add ion-exchange membranes (MCDI, suite 7).' : null, 'Compare with the modified-Donnan MCDI model and with electrodialysis in suite 7 for the same water.'].filter(Boolean),
+    recommendations: [r.eff < 0.6 ? 'Charge efficiency is low: co-ion expulsion dominates at this salinity and voltage — raise the voltage towards 1.2 V or add ion-exchange membranes (MCDI, suite 7).' : null, 'Compare with the membrane (MCDI) model and with electrodialysis in suite 7 for the same water.'].filter(Boolean),
     plots: clean([...q.plots, { type: 'line', title: 'Effect of the charging voltage', xlabel: 'Cell voltage (V)', ylabel: 'mg/g · % · kWh/m³', series: [{ name: 'Salt adsorption per cycle (mg/g)', x: Vs, y: sw.map((s) => s[0]), mode: 'both' }, { name: 'Charge efficiency (% ÷ 10)', x: Vs, y: sw.map((s) => s[1] / 10), mode: 'both' }, { name: 'Specific energy × 10 (kWh/m³)', x: Vs, y: sw.map((s) => 10 * s[2]), mode: 'both' }], vlines: [{ x: p.cdiV, label: 'operating' }], note: 'One cycle from the same initial state on a coarse electrode grid.' }]),
     tables: q.tables, balances: q.bal,
     outputs: { flux: r.prod, secThermal: 0, secElec: r.sec, area: cell, recovery: r.waterRec, saltAdsorption: r.sac, chargeEfficiency: r.eff, process: 'cdi', streams: { product: stream(p.Qf, p.T, p.pH, ionsP), concentrate: stream((p.Qf * p.cdiTd) / p.cdiTc, p.T, p.pH, ionsC) } },
@@ -1174,11 +1476,23 @@ function runCDIRO(v) {
 /** FO followed by a second process that re-concentrates the diluted draw and delivers the product: membrane distillation or electrodialysis. */
 function runFOChain(v) {
   const p = v, W = [], r = simulateFO(p), d = r.d, T = r.T, Vw = r.tot.Vw * 3600, Qdil = r.drawOut.Q * 3600, md = p.process === 'fo_md';
-  if (!(Vw > 1e-9)) throw new Error('No water crosses the FO membrane: the draw osmotic pressure does not exceed that of the feed. Raise the draw concentration.');
-  if (!d.ions) throw new Error('This hybrid needs an ionic draw solute.');
+  if (!(Vw > 1e-6 * Math.max(p.Qf, 1e-9))) { // nothing for the downstream step to treat: show the FO step on its own instead of failing
+    const res = runFO({ ...v, process: 'fo' });
+    res.warnings = [{ level: 'bad', msg: `Practically no water crosses the FO membrane (${fmt(Math.max(Vw, 0), 3)} m³/h), so the ${md ? 'membrane-distillation' : 'electrodialysis'} step of the hybrid has nothing to recover. The forward-osmosis step is shown on its own — raise the draw concentration or the membrane area.` }, ...res.warnings.filter((w) => w.level !== 'info' || !/module solved/.test(w.msg))];
+    res.outputs = { ...res.outputs, process: 'fo (hybrid step skipped: no water transferred)' };
+    return res;
+  }
+  if (!d.ions && !md) { // electrodialysis moves ions only: show the FO step on its own instead of failing
+    const res = runFO({ ...v, process: 'fo' });
+    res.warnings = [{ level: 'bad', msg: `Electrodialysis cannot regenerate a ${d.name.split(' ')[0].toLowerCase()} draw: the solute carries no charge, so no current would move it. The forward-osmosis step is shown on its own with the regeneration chosen under "Draw regeneration". Pick an ionic draw solute for this hybrid, or use the FO + MD or FO + RO hybrid, which both work with this draw.` }, ...res.warnings.filter((w) => w.level !== 'info' || !/module solved/.test(w.msg))];
+    res.outputs = { ...res.outputs, process: 'fo (electrodialysis not applicable to a non-ionic draw)' };
+    return res;
+  }
   if (!r.conv) W.push({ level: 'warn', msg: 'The counter-current FO iteration did not fully converge.' });
-  const ionsD = cloneIons(Object.fromEntries(Object.entries(d.ions).map(([k, m]) => [k, m * r.cDout]))), frac = clamp(Vw / Qdil, 0.02, 0.97), eFO = r.Ppump / 1000, fracM = clamp((Vw * density(25, 0)) / (Qdil * density(25, salinityFromTDS(tds(ionsD), 25))), 0.02, 0.95); // mass fraction of the diluted draw that is the transferred water
-  const feedOutIons = scaleIons(r.ions, r.fOut); for (const [k, m] of Object.entries(d.ions)) feedOutIons[k] = (feedOutIons[k] || 0) + m * (r.feedOut.nd / r.feedOut.Q);
+  const da = drawAsIons(p.draw, r.cDout, T);
+  if (da.equivalent) W.push({ level: 'info', msg: `${d.name} carries no ions: membrane distillation is solved for the osmotically equivalent NaCl solution (${fmt((da.cEq * 58.44) / 1000, 3)} g/L), which has the same water activity and therefore the same vapour-pressure lowering. The sugar is non-volatile and stays in the draw loop; its higher viscosity is not included.` });
+  const ionsD = da.ions, frac = clamp(Vw / Qdil, 0.02, 0.97), eFO = r.Ppump / 1000, fracM = clamp((Vw * density(25, 0)) / (Qdil * density(25, salinityFromTDS(tds(ionsD), 25))), 0.02, 0.95); // mass fraction of the diluted draw that is the transferred water
+  const feedOutIons = scaleIons(r.ions, r.fOut); if (d.ions) for (const [k, m] of Object.entries(d.ions)) feedOutIons[k] = (feedOutIons[k] || 0) + m * (r.feedOut.nd / r.feedOut.Q);
   const common = { xs: r.segs.map((g) => g.x) }, foPlot = { type: 'line', title: 'FO water flux and osmotic pressures along the module', xlabel: 'Position along the feed path (fraction)', ylabel: 'L/m²·h · bar', series: [{ name: 'Water flux (L/m²·h)', x: common.xs, y: r.segs.map((g) => g.Jw * 3.6e6) }, { name: 'Draw osmotic pressure, bulk (bar)', x: common.xs, y: r.segs.map((g) => g.piDb / 1e5) }, { name: 'Feed osmotic pressure, bulk (bar)', x: common.xs, y: r.segs.map((g) => g.piFb / 1e5) }] };
   const foK = [{ label: 'FO water flux', value: r.JwLMH, unit: 'L/m²·h' }, { label: 'Water transferred by FO', value: Vw, unit: 'm³/h' }, { label: 'FO feed recovery', value: 100 * r.recovery, unit: '%' }, { label: 'Draw dilution factor', value: r.dilution, unit: '×' }, { label: 'Reverse solute flux', value: r.JsGMH, unit: 'g/m²·h' }];
   const foBal = [{ name: 'FO water (m³/h)', in: (r.QF0 + r.QD0) * 3600, out: (r.feedOut.Q + r.drawOut.Q) * 3600 }, { name: 'FO draw solute (mol/s)', in: r.QD0 * r.cD0, out: r.drawOut.n + r.feedOut.nd }];
@@ -1201,6 +1515,12 @@ function runFOChain(v) {
   let ed;
   try { ed = simulateED({ ...defaultsOf(edSuite), ions: ionsD, Qp: Vw, T, pH: 7, mode: 'design', targetTDS: p.edTarget, recovery: clamp(100 * frac, 30, 97), maxStages: 16, nSeg: 6, edr: false }, { tol: 1e-5 }); }
   catch (e) { throw new Error(`Electrodialysis of the diluted draw could not be solved: ${e.message}`); }
+  if (![ed.sec, ed.tdsP, ed.Qprod, ed.area, ed.Pel, ed.eff].every(Number.isFinite) || !(ed.Qprod > 0)) { // the diluted draw is outside what an ED stack can treat: show the FO step alone
+    const res = runFO({ ...v, process: 'fo' });
+    res.warnings = [{ level: 'bad', msg: `Electrodialysis has no solution for the diluted draw (${fmt(tds(ionsD) / 1000, 3)} g/L): this hybrid needs a dilute draw, below about 0.3 mol/L. The forward-osmosis step is shown on its own.` }, ...res.warnings.filter((w) => w.level !== 'info' || !/module solved/.test(w.msg))];
+    res.outputs = { ...res.outputs, process: 'fo (electrodialysis step has no solution)' };
+    return res;
+  }
   if (!ed.reached) W.push({ level: 'bad', msg: `Electrodialysis does not desalt the diluted draw (${fmt(tds(ionsD) / 1000, 3)} g/L) to ${p.edTarget} mg/L within ${ed.nSt} stages — use a weaker draw solution.` });
   if (100 * frac < 30) W.push({ level: 'warn', msg: `FO adds only ${fmt(100 * frac, 3)} % of water to the draw; the electrodialysis step was solved at its minimum recovery of 30 %.` });
   if (tds(ionsD) > 15000) W.push({ level: 'info', msg: `The diluted draw holds ${fmt(tds(ionsD) / 1000, 3)} g/L: electrodialysis energy grows in proportion to the salt it must move, so this hybrid suits dilute draws.` });
@@ -1264,10 +1584,26 @@ function addExtras(res, v) {
   if (md) {
     const { c, lo } = coupon(v), sg = poreSigma(v), gamma = surfaceTension(v.Tf, v.gammaF), wf = wettedFraction(c.mem.r, sg, v.theta, gamma, v.pFeed * 1e5, v.lepB), kel = kelvinFactor(v.Tf, c.mem.r, v.theta), one = dustyGas({ ...c.mem, sg: 1 }, 0.5 * (lo.Tfm + lo.Tc), c.P, 0.5 * (lo.pF + lo.pP), c.model, c.type === 'vmd');
     const leak = (wf.area * c.mem.eps * c.mem.r ** 2 * v.pFeed * 1e5 * density(v.Tf, S)) / (8 * viscosity(v.Tf, S) * c.mem.tau * c.mem.delta), tdsLeak = lo.N + leak > 0 ? (1e3 * leak * S) / (lo.N + leak) : 0;
-    Tb.push({ title: 'Pore-scale relations', columns: ['Quantity', 'Value', 'Unit'], rows: [['Kelvin vapour-pressure factor at the pore mouth', kel, '–'], ['Kelvin correction applied', v.kelvin ? 'yes' : 'no', ''], ['Geometric standard deviation of the pore sizes', sg, '–'], ['Pore-size model', v.poreDist === 'lognormal' ? 'log-normal distribution' : 'single mean pore', ''], ['Membrane coefficient used', lo.B * 1e7, '10⁻⁷ kg/m²·s·Pa'], ['Membrane coefficient of the single mean pore', one.B * 1e7, '10⁻⁷ kg/m²·s·Pa'], ['Critical wetting radius at the feed pressure', Number.isFinite(wf.rc) ? wf.rc * 1e6 : null, 'µm'], ['Pores above the critical radius (number)', 100 * wf.number, '%'], ['Pores above the critical radius (open area)', 100 * wf.area, '%'], ['Liquid leak through wetted pores', leak * 3600, 'kg/m²·h'], ['Distillate salinity from the leak', tdsLeak, 'g/kg']], note: 'The distribution of pore sizes is log-normal around the mean pore; when only the mean pore is modelled its spread is inferred from the largest pore (taken as the 99th percentile) for the wetting estimate.' });
+    Tb.push({ title: 'Pore-scale relations', columns: ['Quantity', 'Value', 'Unit'], rows: [['Kelvin vapour-pressure factor at the pore mouth', kel, '–'], ['Kelvin correction applied', v.kelvin ? 'yes' : 'no', ''], ['Geometric standard deviation of the pore sizes', sg, '–'], ['Pore-size model', v.poreDist === 'lognormal' ? 'log-normal distribution (parallel capillaries)' : v.poreDist === 'network' ? 'pore network (2-D lattice)' : 'single mean pore', ''], ['Membrane coefficient used', lo.B * 1e7, '10⁻⁷ kg/m²·s·Pa'], ['Membrane coefficient of the single mean pore', one.B * 1e7, '10⁻⁷ kg/m²·s·Pa'], ['Critical wetting radius at the feed pressure', Number.isFinite(wf.rc) ? wf.rc * 1e6 : null, 'µm'], ['Pores above the critical radius (number)', 100 * wf.number, '%'], ['Pores above the critical radius (open area)', 100 * wf.area, '%'], ['Liquid leak through wetted pores', leak * 3600, 'kg/m²·h'], ['Distillate salinity from the leak', tdsLeak, 'g/kg']], note: 'The distribution of pore sizes is log-normal around the mean pore; when only the mean pore is modelled its spread is inferred from the largest pore (taken as the 99th percentile) for the wetting estimate.' });
     if (lo.dg.classes) {
       K.push({ label: 'Membrane coefficient ÷ single-pore value', value: lo.dg.B / lo.dg.Bmean, unit: '–', help: `Log-normal pore sizes, geometric standard deviation ${fmt(sg, 3)}; ${fmt(100 * lo.dg.knudsenShare, 3)} % of the open area is in the Knudsen regime` });
       P.push({ type: 'line', title: 'Pore-size distribution and where the vapour flows', xlabel: 'Pore radius (µm)', ylabel: 'share per class (%)', logx: true, series: [{ name: 'Open area', x: lo.dg.classes.map((q) => q.r * 1e6), y: lo.dg.classes.map((q) => 100 * q.area), mode: 'both' }, { name: 'Vapour flux', x: lo.dg.classes.map((q) => q.r * 1e6), y: lo.dg.classes.map((q) => 100 * q.flux), mode: 'both' }], vlines: [{ x: c.mem.r * 1e6, label: 'mean pore' }, ...(Number.isFinite(wf.rc) && wf.rc < c.mem.r * 60 ? [{ x: wf.rc * 1e6, label: 'wetting' }] : [])], note: 'Each pore class carries the dusty-gas flux of its own Knudsen number; large pores carry more than their share of area.' });
+    }
+    if (lo.dg.network) {
+      const nw = lo.dg.network, net = nw.net, dPf = v.pFeed * 1e5, lepMed = liquidEntryPressure(c.mem.r, v.theta, gamma, v.lepB), ps = linspace(0.3, 1.6, 14).map((f) => f * lepMed), curve = ps.map((q) => net.invade(liquidEntryPressure(1, v.theta, gamma, v.lepB) / q));
+      K.push({ label: 'Network membrane coefficient ÷ single-pore value', value: lo.dg.B / lo.dg.Bmean, unit: '–', help: `Bundle of parallel capillaries: ${fmt(lo.dg.Bbundle / lo.dg.Bmean, 4)}; ${net.nx} × ${net.nz} lattice, geometric standard deviation ${fmt(sg, 3)}` },
+        { label: 'Wetted throats (invasion percolation)', value: 100 * net.fraction, unit: '%', status: net.through ? 'bad' : net.fraction > 0 ? 'warn' : 'ok', help: `Liquid front reaches ${fmt(100 * net.depth, 3)} % of the thickness at ${v.pFeed} bar` },
+        { label: 'Network breakthrough pressure', value: Number.isFinite(net.lepNet) ? net.lepNet / 1e5 : 0, unit: 'bar', status: net.through ? 'bad' : 'ok', help: `Pressure at which a connected path of invaded throats first spans the membrane; the widest throat alone would wet at ${fmt(liquidEntryPressure(net.rMaxThroat, v.theta, gamma, v.lepB) / 1e5, 3)} bar, the median throat at ${fmt(lepMed / 1e5, 3)} bar` });
+      if (net.through) W.push({ level: 'bad', msg: `Pore network: at ${v.pFeed} bar the invaded throats form a liquid path through the whole membrane (breakthrough pressure ${fmt(net.lepNet / 1e5, 3)} bar) — the membrane wets and brine reaches the distillate.` });
+      else if (net.fraction > 0) W.push({ level: 'warn', msg: `Pore network: liquid has entered ${fmt(100 * net.fraction, 3)} % of the throats from the feed side (front at ${fmt(100 * net.depth, 3)} % of the thickness) without spanning the membrane; the shorter vapour path raises the flux but the margin to breakthrough at ${fmt(net.lepNet / 1e5, 3)} bar is ${fmt((net.lepNet - dPf) / 1e5, 3)} bar.` });
+      const pz = Array.from({ length: net.nz }, (_, k) => Array.from({ length: net.nx }, (_, i) => nw.p[k * net.nx + i])), fluxV = Array.from({ length: net.nz + 1 }, (_, k) => Array.from({ length: net.nx }, (_, i) => nw.gv[k * net.nx + i] * ((k === 0 ? 1 : nw.p[(k - 1) * net.nx + i]) - (k === net.nz ? 0 : nw.p[k * net.nx + i])))), fmax = Math.max(...fluxV.flat(), 1e-300), Kn = Math.max(nw.K, 1e-300);
+      const order = Array.from(net.rv.keys()).sort((a, b) => net.rv[a] - net.rv[b]), nb = 8, cls = Array.from({ length: nb }, (_, q) => { const idx = order.slice(Math.floor((q * order.length) / nb), Math.floor(((q + 1) * order.length) / nb)); return { r: Math.exp(sum(idx.map((t) => Math.log(net.rv[t]))) / idx.length), area: sum(idx.map((t) => net.rv[t] ** 2)) / net.sumRv2, flux: sum(idx.map((t) => fluxV[Math.floor(t / net.nx)][t % net.nx])) / (Kn * (net.nz + 1)) }; });
+      P.push({ type: 'field', title: 'Pore network: vapour pressure of the pore bodies', xlabel: 'Position along the membrane (throat spacings)', ylabel: 'Depth from the feed face (pore bodies)', zlabel: 'Vapour pressure', zunit: '(p − p_permeate)/(p_feed − p_permeate)', x: Array.from({ length: net.nx }, (_, i) => i + 1), y: Array.from({ length: net.nz }, (_, k) => k + 1), z: pz, cmap: 'thermal', contours: 6, note: `Linear conductance network of ${net.rv.length + net.rh.length} throats (seed ${net.seed}); wetted bodies sit at the feed vapour pressure. Flow through every cut plane below the liquid front: ${fmt(Math.min(...nw.layers.slice(Math.min(net.nz, Math.ceil(net.depth * net.nz)))) / Kn, 6)}–${fmt(Math.max(...nw.layers.slice(Math.min(net.nz, Math.ceil(net.depth * net.nz)))) / Kn, 6)} of the total.` },
+        { type: 'field', title: 'Pore network: vapour flow through the through-plane throats', xlabel: 'Position along the membrane (throat spacings)', ylabel: 'Throat layer from the feed face', zlabel: 'Flow', zunit: '÷ largest throat flow', x: Array.from({ length: net.nx }, (_, i) => i + 1), y: Array.from({ length: net.nz + 1 }, (_, k) => k + 1), z: fluxV.map((row) => row.map((q) => q / fmax)), cmap: 'viridis', note: 'Preferential paths through connected wide throats; narrow throats in series throttle whole columns.' },
+        { type: 'line', title: 'Pore network: where the vapour flows, and wetting by invasion percolation', xlabel: 'Throat radius (µm)  ·  or feed pressure ÷ 10 (bar)', ylabel: 'share per class (%)  ·  wetted throats (%)', series: [{ name: 'Open area per radius class', x: cls.map((q) => q.r * 1e6), y: cls.map((q) => 100 * q.area), mode: 'both' }, { name: 'Vapour flow per radius class', x: cls.map((q) => q.r * 1e6), y: cls.map((q) => 100 * q.flux), mode: 'both' }, { name: 'Wetted throats versus feed pressure (x = bar ÷ 10)', x: ps.map((q) => q / 1e6), y: curve.map((q) => 100 * q.fraction), mode: 'both' }], vlines: Number.isFinite(net.lepNet) ? [{ x: net.lepNet / 1e6, label: 'breakthrough' }] : [], note: 'Unlike the bundle of parallel capillaries, the widest throats do not carry a flux in proportion to their conductance: each is in series with its neighbours.' });
+      Tb.push({ title: 'Pore network compared with the continuum models', columns: ['Model', 'Membrane coefficient (10⁻⁷ kg/m²·s·Pa)', '÷ single mean pore'], rows: [['Single mean pore (dusty gas)', lo.dg.Bmean * 1e7, 1], ['Bundle of parallel capillaries (log-normal classes)', lo.dg.Bbundle * 1e7, lo.dg.Bbundle / lo.dg.Bmean], ['Pore network (used)', lo.dg.B * 1e7, lo.dg.B / lo.dg.Bmean]], note: `Same porosity, tortuosity and thickness in all three. Lattice ${net.nx} × ${net.nz}, throat radii ${fmt(net.rMinThroat * 1e6, 3)}–${fmt(net.rMaxThroat * 1e6, 3)} µm (median ${fmt(c.mem.r * 1e6, 3)} µm).` },
+        { title: 'Pore network: wetting by invasion percolation', columns: ['Feed pressure (bar)', 'Wetted throats (%)', 'Wetted pore bodies (%)', 'Liquid front (% of thickness)', 'Breakthrough'], rows: ps.map((q, k) => [q / 1e5, 100 * curve[k].fraction, 100 * curve[k].bodies, 100 * curve[k].depth, curve[k].through ? 'yes' : 'no']), note: `Operating feed pressure ${v.pFeed} bar: ${fmt(100 * net.fraction, 3)} % of the throats wetted. A throat is invaded only if it is wider than the critical radius and touches liquid already, so isolated wide pores inside the membrane stay dry — the analytic distribution estimate above counts them as wetted.` });
+      O.networkCoefficientRatio = lo.dg.B / lo.dg.Bmean; O.networkWettedFraction = net.fraction; O.networkBreakthroughBar = Number.isFinite(net.lepNet) ? net.lepNet / 1e5 : 0;
     }
     if (wf.area > 0.001) W.push({ level: wf.area > 0.05 ? 'bad' : 'warn', msg: `${fmt(100 * wf.area, 3)} % of the pore area lies above the critical wetting radius of ${fmt(wf.rc * 1e6, 3)} µm at ${v.pFeed} bar: brine leaks through and the distillate reaches about ${fmt(tdsLeak, 3)} g/kg.` });
     O.wettedPoreArea = wf.area; O.kelvinFactor = kel;
@@ -1295,13 +1631,11 @@ function addExtras(res, v) {
   } catch (e) { W.push({ level: 'warn', msg: `The dynamic batch simulation failed: ${e.message}` }); }
   // ---- multi-objective sweep
   if (v.pareto && (v.process === 'md' || v.process === 'fo')) {
-    const pts = [];
-    if (md) { const Sm = v.mdRec > 0 ? Math.min(S / (1 - clamp(v.mdRec / 100, 0, 0.95)), 330) : S; for (const Tf of [50, 60, 70, 80, 88].filter((t) => t > v.Tp + 12)) for (const u of [0.08, 0.15, 0.3, 0.6]) for (const L of [0.5, 1, 2.5]) { try { const m = mdModule(v, Sm, { Tf, uFm: u, uPm: u, Lmd: L, nSeg: 8 }); if (m.fluxLMH > 0 && Number.isFinite(m.stec) && Number.isFinite(m.sec)) pts.push({ a: Tf, b: u, c: L, flux: m.fluxLMH, en: m.stec, aux: m.sec }); } catch { /* infeasible point */ } } }
-    else { const d = DRAWS[v.draw] || DRAWS.nacl; for (const cD of linspace(0.4, Math.min(d.sol, Math.max(3, 2 * v.cDraw)), 6)) for (const u of [5, 10, 20, 35]) { try { const r = simulateFO(v, { cDraw: cD, uF: u, uD: u, nSeg: 8 }), Vw = r.tot.Vw * 3600; if (!(Vw > 0)) continue; const reg = regeneration(r, { ...v, cDraw: cD }), en = r.Ppump / 1000 / Vw + reg.elec + 0.1 * reg.heat; if (Number.isFinite(en)) pts.push({ a: cD, b: u, c: r.dilution, flux: r.JwLMH, en, aux: r.srsf }); } catch { /* infeasible point */ } } }
+    const po = paretoDesigns(v, S, md), pts = po.all;
     if (pts.length > 2) {
       const pf = paretoFront(pts, (q) => q.flux, (q) => q.en), kn = pf.knee, unit = md ? 'kWh heat per m³' : 'kWh-equivalent per m³';
-      K.push({ label: 'Pareto-optimal designs', value: pf.front.length, unit: `of ${pts.length}` }, { label: 'Knee of the Pareto front: flux', value: kn.flux, unit: 'L/m²·h', help: md ? `Hot feed ${fmt(kn.a, 3)} °C, velocity ${fmt(kn.b, 3)} m/s, channel length ${fmt(kn.c, 3)} m` : `Draw ${fmt(kn.a, 3)} mol/L, velocity ${fmt(kn.b, 3)} cm/s` }, { label: 'Knee of the Pareto front: energy', value: kn.en, unit: unit });
-      P.push({ type: 'line', title: 'Multi-objective sweep: flux versus specific energy', xlabel: 'Average flux (L/m²·h)', ylabel: md ? 'Specific heat (kWh/m³)' : 'Specific energy (kWh-equivalent/m³)', logy: true, series: [{ name: 'All designs', x: pts.map((q) => q.flux), y: pts.map((q) => Math.max(q.en, 1e-6)), mode: 'points' }, { name: 'Pareto front', x: pf.front.map((q) => q.flux), y: pf.front.map((q) => Math.max(q.en, 1e-6)), mode: 'both' }, { name: 'Knee', x: [kn.flux], y: [Math.max(kn.en, 1e-6)], mode: 'points' }], note: md ? 'Feed temperature × velocity × channel length, each a full module solution; a design is Pareto-optimal when no other design has both more flux and less heat demand.' : 'Draw concentration × cross-flow velocity, each a full module solution with its regeneration energy (heat counted at 10 % of its value as electricity).' });
+      K.push({ label: 'Pareto-optimal designs', value: pf.front.length, unit: `of ${pts.length}`, help: `${po.grid.length} grid designs (backdrop) + ${po.ga.length} designs of the NSGA-II search (${po.evals} model evaluations, seed ${po.seed}); hypervolume ${fmt(po.hvGrid, 4)} → ${fmt(po.hvAll, 4)}` }, { label: 'Knee of the Pareto front: flux', value: kn.flux, unit: 'L/m²·h', help: md ? `Hot feed ${fmt(kn.a, 3)} °C, velocity ${fmt(kn.b, 3)} m/s, channel length ${fmt(kn.c, 3)} m` : `Draw ${fmt(kn.a, 3)} mol/L, velocity ${fmt(kn.b, 3)} cm/s` }, { label: 'Knee of the Pareto front: energy', value: kn.en, unit: unit });
+      P.push({ type: 'line', title: 'Multi-objective sweep: flux versus specific energy', xlabel: 'Average flux (L/m²·h)', ylabel: md ? 'Specific heat (kWh/m³)' : 'Specific energy (kWh-equivalent/m³)', logy: true, series: [{ name: 'Grid designs (backdrop)', x: po.grid.map((q) => q.flux), y: po.grid.map((q) => Math.max(q.en, 1e-6)), mode: 'points' }, { name: 'NSGA-II population', x: po.ga.map((q) => q.flux), y: po.ga.map((q) => Math.max(q.en, 1e-6)), mode: 'points' }, { name: 'Pareto front', x: pf.front.map((q) => q.flux), y: pf.front.map((q) => Math.max(q.en, 1e-6)), mode: 'both' }, { name: 'Knee', x: [kn.flux], y: [Math.max(kn.en, 1e-6)], mode: 'points' }], note: (md ? 'Feed temperature × velocity × channel length, each a full module solution; a design is Pareto-optimal when no other design has both more flux and less heat demand.' : 'Draw concentration × cross-flow velocity, each a full module solution with its regeneration energy (heat counted at 10 % of its value as electricity).') + ` Front: elitist non-dominated sorting genetic algorithm (NSGA-II) over the continuous design variables, merged with the grid; the grid alone gives ${po.gridFront} front designs.` });
       Tb.push({ title: 'Pareto-optimal designs', columns: md ? ['Hot-feed temperature (°C)', 'Velocity (m/s)', 'Channel length (m)', 'Flux (L/m²·h)', 'Specific heat (kWh/m³)', 'Specific electricity (kWh/m³)'] : ['Draw concentration (mol/L)', 'Velocity (cm/s)', 'Draw dilution (×)', 'Flux (L/m²·h)', 'Specific energy (kWh-eq/m³)', 'Specific reverse solute flux (g/L)'], rows: pf.front.map((q) => [q.a, q.b, q.c, q.flux, q.en, q.aux]) });
       O.pareto = pf.front.map((q) => ({ flux: q.flux, energy: q.en })); O.paretoKneeFlux = kn.flux;
     } else W.push({ level: 'warn', msg: 'Too few feasible designs for a Pareto front.' });
