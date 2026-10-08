@@ -353,7 +353,8 @@ export function renderSuite(suite, root, app) {
     const auto = h('input', { type: 'checkbox', checked: true, id: 'live_auto' });
     const norm = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, '');
     const note = (msg, kind) => { log.prepend(h('li', { class: kind || '' }, `${new Date().toLocaleTimeString()} — ${msg}`)); while (log.children.length > 12) log.lastChild.remove(); };
-    const paint = (extra) => fill(state, kpiGrid([{ label: 'Feed', value: liveTimer ? 'following' : liveHandle ? 'paused' : 'not linked', status: liveTimer ? 'ok' : '' }, { label: 'File', value: liveHandle?.name || '—' }, { label: 'Rows loaded', value: (store.inputs(suite.id)[L2.key] || field.value || []).length }, ...(extra || [])]));
+    const pauseBtn = btn('Pause', () => { if (!liveHandle) return toast('Link a file first.', 'warn'); if (liveTimer) stopLive(); else start(); paint(); }, 'ghost', 'Stop or continue checking the linked file');
+    const paint = (extra) => { pauseBtn.textContent = liveTimer ? 'Pause' : 'Resume'; pauseBtn.hidden = !liveHandle; return fill(state, kpiGrid([{ label: 'Feed', value: liveTimer ? 'following' : liveHandle ? 'paused' : 'not linked', status: liveTimer ? 'ok' : '' }, { label: 'File', value: liveHandle?.name || '—' }, { label: 'Rows loaded', value: (store.inputs(suite.id)[L2.key] || field.value || []).length }, ...(extra || [])])); };
     const ingest = async (file, why) => {
       const sig = file.size + ':' + file.lastModified;
       if (sig === liveSeen) return false;
@@ -383,7 +384,7 @@ export function renderSuite(suite, root, app) {
     return h('div', { class: 'groups' },
       h('p', { class: 'summary' }, L2.help || `Follow a file on this computer that your plant historian or SCADA export keeps appending to. Each time it grows, the new rows are loaded into “${field.label}” and the suite is re-run, so trends, alarms and forecasts stay current.`),
       h('fieldset', { class: 'group' }, h('legend', null, 'Live feed', help('The file is read locally through a permission you grant for that one file. Nothing is uploaded and no network connection to the plant is opened.')),
-        h('div', { class: 'row-tools' }, canFollow ? link : null, once, btn(liveTimer ? 'Pause' : 'Resume', (e) => { if (!liveHandle) return toast('Link a file first.', 'warn'); if (liveTimer) { stopLive(); e.target.textContent = 'Resume'; } else { start(); e.target.textContent = 'Pause'; } paint(); }, 'ghost'), h('label', { class: 'inline' }, 'Check ', period), h('label', { class: 'inline', for: 'live_auto' }, auto, ' re-run automatically')),
+        h('div', { class: 'row-tools' }, canFollow ? link : null, once, pauseBtn, h('label', { class: 'inline' }, 'Check ', period), h('label', { class: 'inline', for: 'live_auto' }, auto, ' re-run automatically')),
         canFollow ? null : h('p', { class: 'note' }, 'This browser cannot keep a file open for following (Chrome and Edge on a computer can). Use “Load a snapshot…” each time the export is refreshed; everything else works the same.'),
         state, h('h3', null, 'Activity'), log),
       h('details', { class: 'ref' }, h('summary', null, 'Expected columns'), h('p', null, field.columns.map((c) => `${c.label}${c.unit ? ' (' + c.unit + ')' : ''}`).join(' · ') + '. Columns are matched by name; order does not matter.')));

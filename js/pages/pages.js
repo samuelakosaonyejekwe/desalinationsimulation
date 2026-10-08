@@ -330,12 +330,17 @@ export function chainPage(root) {
 export function appPage(root, app) {
   const mirrorBox = h('div', { class: 'sources' }), stBox = h('div');
   const check = async () => {
-    fill(mirrorBox, MIRRORS.map((m) => h('div', { class: 'source loading', dataset: { url: m.url } }, h('b', null, m.name), h('span', null, m.note), h('small', null, m.url), h('em', null, 'checking…'))));
+    fill(mirrorBox, MIRRORS.map((m) => h('div', { class: 'source loading', dataset: { url: m.url, kind: m.kind || '' } }, h('b', null, m.name), h('span', null, m.note), h('small', null, m.url), h('em', null, 'checking…'))));
     for (const el of mirrorBox.children) {
       const url = el.dataset.url;
-      try { const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 9000); const r = await fetch(url + 'version.json?t=' + Date.now(), { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'cors' }); clearTimeout(tm); const j = await r.json(); el.className = 'source ok'; el.lastChild.textContent = `online · build ${String(j.version).slice(0, 12)}`; }
+      const arch = el.dataset.kind === 'archive';
+      try {
+        const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 12000);
+        if (arch) { await fetch(url, { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'no-cors' }); clearTimeout(tm); el.className = 'source ok'; el.lastChild.textContent = 'reachable'; }
+        else { const r = await fetch(url + 'version.json?t=' + Date.now(), { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'cors' }); clearTimeout(tm); const j = await r.json(); el.className = 'source ok'; el.lastChild.textContent = `online · build ${String(j.version).slice(0, 12)}`; }
+      }
       catch { el.className = 'source fail'; el.lastChild.textContent = navigator.onLine ? 'not reachable from this network' : 'offline'; }
-      el.append(h('a', { class: 'btn mini', href: url + 'index.html', rel: 'noopener' }, 'Open'));
+      el.append(h('a', { class: 'btn mini', href: arch ? url : url + 'index.html', rel: 'noopener' }, 'Open'));
     }
   };
   const paintStorage = async () => {
@@ -357,7 +362,7 @@ export function appPage(root, app) {
         h('li', null, h('b', null, 'macOS Safari: '), 'File → “Add to Dock”.'), h('li', null, h('b', null, 'Firefox desktop: '), 'no install prompt, but the app still works offline in a normal tab once loaded; or use the single-file edition.'))),
     card(h('h2', null, 'Works in aeroplane mode'), h('p', null, 'All 13 calculation engines, the plotting, file import and your cases run entirely on the device. Only two things need a connection: pulling live site data and checking for a newer build. Site data already fetched remain stored with the case.'),
       h('p', { class: 'note' }, 'While you are online the app checks for a newer build in the background and refreshes stored site data that are more than six hours old; installed copies on supporting browsers also refresh periodically in the background.')),
-    card(h('h2', null, 'Availability and mirrors'), h('p', null, MIRRORS.length > 1 ? 'The same build is published at more than one independent address. If one host is down, open another — or simply keep using the installed copy, which needs no host at all.' : 'Once installed (or saved as the single-file edition) the application needs no host at all: it keeps running if the web address is unreachable. The build is host-independent, so it can also be published to a second, independent host; none has been set up yet.'), mirrorBox, h('div', { class: 'row-tools' }, btn('Check mirrors now', check))),
+    card(h('h2', null, 'Availability and mirrors'), h('p', null, MIRRORS.length > 1 ? 'The same build is published at more than one independent address. If one host is down, open another — or simply keep using the installed copy, which needs no host at all.' : 'Once installed (or saved as the single-file edition) the application needs no host at all.'), mirrorBox, h('div', { class: 'row-tools' }, btn('Check mirrors now', check))),
     card(h('h2', null, 'Security and privacy'), h('ul', { class: 'steps' },
       h('li', null, 'No account, no tracking, no analytics, no cookies. Cases, inputs and results never leave this device unless you export them.'),
       h('li', null, 'A strict content-security policy blocks inline and third-party scripts; the app loads no external code libraries.'),

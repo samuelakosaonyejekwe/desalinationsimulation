@@ -63,7 +63,9 @@ project is involved, so the data are as fresh as the sources whenever and wherev
 
 ## Availability
 
-The static build is host-independent (relative paths only). It is published on GitHub Pages. Installed
+The static build is host-independent (relative paths only). It is published on GitHub Pages, and the
+single-file edition is also preserved by the Internet Archive (`tools/deploy-mirrors.sh archive` refreshes that copy),
+where all engines run but live site data are not available. Installed
 copies and the single-file edition (`standalone.html`) keep working with no host at all, so an outage of
 the web address does not stop existing users. To add a second, fully independent web address, run
 `tools/deploy-mirrors.sh` with a Cloudflare Pages, Netlify, GitLab or Codeberg account, then list the new

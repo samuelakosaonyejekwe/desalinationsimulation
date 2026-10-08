@@ -34,7 +34,7 @@ const app = {
     toast(/iphone|ipad|ipod/i.test(navigator.userAgent) ? 'On iPhone/iPad: tap Share, then “Add to Home Screen”.' : 'Use your browser menu → “Install app” / “Add to Home screen”. Steps are listed on this page.', 'info', 9000);
   },
   async checkUpdate(manual) {
-    if (!/^https?:$/.test(location.protocol)) { if (manual) toast('This is the single-file edition: download a newer copy from the web address to update.', 'info'); return; }
+    if (!/^https?:$/.test(location.protocol) || !document.querySelector('link[rel=manifest]')) { if (manual) toast('This is the single-file edition: download a newer copy from the web address to update.', 'info'); return; }
     if (!navigator.onLine) { if (manual) toast('You are offline — the installed copy keeps working.', 'warn'); return; }
     try {
       const j = await (await fetch('version.json?t=' + Date.now(), { cache: 'no-store' })).json();
@@ -121,7 +121,7 @@ async function refreshSite() {
 }
 
 async function setupServiceWorker() {
-  if (!/^https?:$/.test(location.protocol)) { version = 'single-file'; return; }
+  if (!/^https?:$/.test(location.protocol) || !document.querySelector('link[rel=manifest]')) { version = 'single-file'; return; } // the single-file edition has no service worker
   try { version = (await (await fetch('version.json', { cache: 'no-store' })).json()).version || ''; } catch { version = ''; }
   if (!('serviceWorker' in navigator) || !/^https?:$/.test(location.protocol)) return;
   try {
