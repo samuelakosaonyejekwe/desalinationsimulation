@@ -93,7 +93,7 @@ function drawLine(canvas, spec) {
   ctx.save(); ctx.beginPath(); ctx.rect(m.l, m.t, w - m.l - m.r, h - m.t - m.b); ctx.clip();
   for (const q of spec.hlines || []) {
     ctx.strokeStyle = q.color || '#ef4444'; ctx.setLineDash([6, 4]); ctx.beginPath(); ctx.moveTo(m.l, Y(q.y)); ctx.lineTo(w - m.r, Y(q.y)); ctx.stroke(); ctx.setLineDash([]);
-    if (q.label) { ctx.fillStyle = q.color || '#ef4444'; ctx.textAlign = 'right'; ctx.textBaseline = 'bottom'; ctx.fillText(q.label, w - m.r - 4, Y(q.y) - 2); }
+    if (q.label) { const under = Y(q.y) < m.t + 46; ctx.fillStyle = q.color || '#ef4444'; ctx.textAlign = 'right'; ctx.textBaseline = under ? 'top' : 'bottom'; ctx.fillText(q.label, w - m.r - 4, Y(q.y) + (under ? 3 : -2)); } // below the line when the line runs through the legend rows at the top
   }
   for (const q of spec.vlines || []) {
     ctx.strokeStyle = q.color || '#ef4444'; ctx.setLineDash([6, 4]); ctx.beginPath(); ctx.moveTo(X(q.x), m.t); ctx.lineTo(X(q.x), h - m.b); ctx.stroke(); ctx.setLineDash([]);
