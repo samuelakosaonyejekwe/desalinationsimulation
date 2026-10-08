@@ -909,7 +909,7 @@ const suite = {
     { group: 'Crystallizer and solids handling', fields: [
       { key: 'cxDrive', label: 'Crystallizer drive', type: 'select', value: 'steam', options: [{ value: 'steam', label: 'Steam (single effect)' }, { value: 'mvr', label: 'Mechanical vapour recompression' }, { value: 'md', label: 'Membrane-distillation crystallizer' }], help: 'In a membrane-distillation crystallizer the modules remove the water below the boiling point and the crystals form in the circulated tank.' },
       { key: 'Tcx', label: 'Crystallizer temperature', unit: '°C', value: 80, min: 30, max: 125 },
-      { key: 'purge', label: 'Mother-liquor purge', unit: '% of crystallizer feed water', value: 12, min: 0.5, max: 100, help: 'Water left in the mother liquor that is not evaporated. The purge removes highly soluble Mg, K and Ca salts; 100 % means no crystallizer.' },
+      { key: 'purge', label: 'Mother-liquor purge', unit: '% of crystallizer feed water', value: 18, min: 0.5, max: 100, help: 'Water left in the mother liquor that is not evaporated. The purge removes highly soluble Mg, K and Ca salts; 100 % means no crystallizer. For this seawater-type brine about 18 % keeps magnesium sulphate (kieserite) out of the salt cake up to a crystallizer temperature of 90 °C; a smaller purge or a hotter crystallizer puts the cake under sales grade, and the results then state the purge that restores it.' },
       { key: 'tau', label: 'Crystal residence time', unit: 'h', value: 1.5, min: 0.1, max: 12 },
       { key: 'MT', label: 'Magma (slurry) density', unit: 'kg/m³', value: 250, min: 20, max: 700, help: 'Mass of crystals per m³ of slurry; 150–350 kg/m³ is typical.' },
       { key: 'cakeMoist', label: 'Centrifuge cake moisture', unit: '% liquor', value: 4, min: 0.5, max: 40 },
@@ -1026,6 +1026,11 @@ const suite = {
     if (!zld) W.push({ level: 'warn', msg: `${fmt(r.liquid, 3)} m³/h of mother-liquor purge still leaves as liquid — this is minimal, not zero, liquid discharge.` });
     else W.unshift({ level: 'info', msg: 'No liquid discharge remains: all water leaves as product water, vapour or moisture bound in solids.' });
     if (r.cxSolids.halite > 0 && r.main === 'halite' && r.purity < v.purityMin / 100) W.push({ level: 'info', msg: `Salt-cake purity ${fmt(100 * r.purity, 4)} % is below the ${v.purityMin} % sales grade — increase the purge or the wash, separate the seed solids, or soften the brine first.` });
+    // smallest purge that brings the cake to sales grade: a short upward scan with the same engine (at most eight further solutions, only when the grade is missed)
+    let purgeFix = null;
+    if (r.cxSolids.halite > 0 && r.main === 'halite' && r.purity < v.purityMin / 100 && cx.on && v.purge < 60) {
+      try { for (let p = Math.ceil(v.purge) + 1, n = 0; p <= 60 && n < 8; p += p < v.purge + 6 ? 1 : 3, n++) { const q = simulateZLD({ ...v, purge: p }); if (q.main === 'halite' && q.purity >= v.purityMin / 100) { purgeFix = { purge: p, purity: q.purity, prod: q.prod }; break; } } } catch { purgeFix = null; }
+    }
     if (!cx.on && v.purge < 100) W.push({ level: 'info', msg: 'The crystallizer is idle: the brine concentrator already reaches the requested end point.' });
     const rev = sum(r.salts.map((s) => td(s.kg) * s.value)), energyCost = 24 * (r.kWe * v.elecPrice + (r.kWt * v.steamPrice) / 1000);
     const reagCost = 24 * sum(Object.entries(r.reagents).map(([k, kg]) => (kg / 1000) * ({ naoh: 450, lime: 130, soda: 280, hcl: 180 }[k] || 0)));
@@ -1118,6 +1123,7 @@ const suite = {
         !ro.on && steps[0].S < 100 ? 'Add a membrane pre-concentration step: every tonne of water removed by membranes instead of evaporation saves roughly 15–20 kWh.' : null,
         r.softSolids.length === 0 && (on('gypsum') ?? on('anhydrite') ?? 99) < (lastOf('ro')?.cf ?? 0) ? 'Calcium sulphate saturates inside the membrane step: soften the brine or rely on a seeded-slurry design.' : null,
         cx.on && v.cxDrive === 'steam' && cx.bpe < 0.6 * v.bpeMax ? 'The crystallizer boiling-point elevation is moderate: a vapour-recompression drive would cut the steam demand.' : null,
+        purgeFix ? `Raise the mother-liquor purge from ${fmt(v.purge, 3)} % to about ${purgeFix.purge} %: the salt cake then reaches ${fmt(100 * purgeFix.purity, 4)} % purity (sales grade ${v.purityMin} %) at ${fmt((purgeFix.prod * 24) / 1000, 4)} t/d of product, because the magnesium salts leave with the purge instead of crystallising in the cake.` : null,
         r.purity < v.purityMin / 100 && r.softSolids.length === 0 && r.prod > 0 ? 'For saleable salt, remove magnesium and calcium upstream (selective precipitation) so that less bittern contaminates the cake.' : null,
         v.purgeFate === 'discharge' ? 'Route the purge to a dryer or an evaporation pond to reach true zero liquid discharge.' : null,
         'Use suite 13 (Economics) for the full cost of water including this ZLD train, and suite 6 for effect-by-effect evaporator design.',
