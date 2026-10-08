@@ -2,6 +2,7 @@
 // key-less HTTPS service on the allow-list below; nothing passes through any server of this app, so the
 // data stay fresh wherever the app is opened. Responses are treated as untrusted numbers/text only.
 import { clamp, mean, quantile } from './num.js';
+import { ATLAS } from '../data/atlas.js';
 
 export const SOURCES = [
   { id: 'place', name: 'Place and country', host: 'api.bigdatacloud.net', provider: 'BigDataCloud reverse geocoding', gives: 'Locality, country' },
@@ -208,7 +209,8 @@ function keyOf(id, lat, lon, site) {
  *  - onData(site) is called after each answer so the page fills in progressively instead of waiting for the slowest source.
  * Returns { meta, data, status: { id: { ok, message, at, cached } } }.
  */
-export async function fetchSite(lat, lon, onStatus = () => {}, onData = () => {}, { fresh = false } = {}) {
+export async function fetchSite(lat, lon, onStatus = () => {}, onData = () => {}, opt = {}) {
+  const { fresh = false } = opt;
   lat = clamp(+lat, -90, 90); lon = ((((+lon + 180) % 360) + 360) % 360) - 180;
   const site = { lat, lon, data: {}, name: '', country: '', countryCode: '' }, status = {};
   const snapshot = () => ({ ...site, data: { ...site.data }, status: { ...status }, fetchedAt: new Date().toISOString() });
@@ -232,16 +234,48 @@ export async function fetchSite(lat, lon, onStatus = () => {}, onData = () => {}
   };
   const finish = () => {
     const d = site.data;
-    if (d.salinity == null) { d.salinity = regionalSalinity(lat, lon); d.salinityEstimated = true; } else if (status.salinity?.ok) d.salinityEstimated = false;
+    const at = d.salinity == null || d.sst == null ? atlasSite(lat, lon) : null;
+    const reg = regionalSalinity(lat, lon), enclosed = reg !== 35.5 && reg !== 34.3; // enclosed seas are finer than the atlas grid: the regional value wins there
+    if (d.salinity == null) { d.salinity = at && !enclosed ? at.salinity : reg; d.salinityEstimated = true; if (at) { d.salinityMonthly ??= at.salinityMonthly; d.sstMonthly ??= at.sstMonthly; d.atlas = true; } } else if (status.salinity?.ok) d.salinityEstimated = false;
+    if (d.sst == null && at) { d.sst = at.sst; d.sstMin ??= at.sstMin; d.sstMax ??= at.sstMax; d.sstEstimated = true; d.atlas = true; }
+    if (d.ghiAnnual == null && d.ghiDaily == null) { d.ghiDaily = solarEstimate(lat); d.solarEstimated = true; }
     if (d.sst == null && d.sstMonthly) d.sst = d.sstMonthly[new Date().getUTCMonth()] || null;
     if (d.ghiAnnual != null) d.ghiDaily = d.ghiAnnual; // the long-term mean is the better design basis than this week's weather
     if (d.electricityPrice == null && d.electricityPriceWB != null) d.electricityPrice = d.electricityPriceWB;
   };
+  if (opt.atlasOnly) { // no network at all: answer from the built-in atlas
+    for (const src of SOURCES) { status[src.id] = { ok: false, message: 'No connection', at: new Date().toISOString() }; onStatus(src.id, 'fail', 'No connection'); }
+    finish(); return snapshot();
+  }
   const national = run('place').then(() => Promise.all([run('fx'), run('economy').then(() => run('energy'))])); // these need the country
   await Promise.all([national, ...['weather', 'marine', 'bathy', 'salinity', 'climate'].map(run)]);
   finish();
   return snapshot();
 }
+
+/**
+ * Built-in atlas value for a point: nearest ocean cell of the bundled 4° climatology (searched outwards up to
+ * three cells). Returns null far inland. Used whenever the live services cannot be reached.
+ */
+export function atlasSite(lat, lon) {
+  const A = ATLAS, i0 = Math.round((lat - A.lat0) / A.step), j0 = Math.round((((lon - A.lon0) % 360) + 360) % 360 / A.step);
+  let best = null;
+  for (let r = 0; r <= 3 && !best; r++) for (let di = -r; di <= r; di++) for (let dj = -r; dj <= r; dj++) {
+    if (Math.max(Math.abs(di), Math.abs(dj)) !== r) continue;
+    const i = i0 + di, j = (((j0 + dj) % A.nlon) + A.nlon) % A.nlon;
+    if (i < 0 || i >= A.nlat) continue;
+    const k = i * A.nlon + j;
+    if (A.sal[k] < 0) continue;
+    const d = Math.hypot(di, dj * Math.cos((lat * Math.PI) / 180));
+    if (!best || d < best.d) best = { d, k };
+  }
+  if (!best) return null;
+  const k = best.k, t0 = A.t0[k] / 10, ta = A.ta[k] / 10, tp = A.tp[k] / 10, month = new Date().getUTCMonth();
+  const sstMonthly = Array.from({ length: 12 }, (_, m) => +(t0 + ta * Math.cos((2 * Math.PI * (m - tp)) / 12)).toFixed(2));
+  return { salinity: A.sal[k] / 10, sst: sstMonthly[month], sstMin: +(t0 - ta).toFixed(2), sstMax: +(t0 + ta).toFixed(2), sstMonthly, salinityMonthly: new Array(12).fill(A.sal[k] / 10) };
+}
+/** Clear-sky-based estimate of the long-term mean solar irradiation (kWh/m²·d) from latitude alone. */
+export const solarEstimate = (lat) => +clamp(6.4 * Math.cos((Math.abs(lat) * Math.PI) / 180) ** 1.15 + 0.6, 1.5, 6.8).toFixed(2);
 
 /** Coarse regional climatology used only when the live salinity service cannot be reached. */
 export function regionalSalinity(lat, lon) {

@@ -6,7 +6,7 @@ import { SUITES, byId, loadSuite, downstream } from './suites/index.js';
 import { renderSuite } from './core/suiteview.js';
 import { home, casePage, sitePage, portalPage, chainPage, appPage } from './pages/pages.js';
 import { fetchSite } from './core/live.js';
-import { APP } from './data/app.js';
+import { APP, ARCHIVE_SOURCE } from './data/app.js';
 import { advisorPage } from './core/advisorview.js';
 
 const PAGES = [
@@ -133,10 +133,25 @@ async function setupServiceWorker() {
   } catch (e) { console.warn('Service worker unavailable', e); }
 }
 
+/**
+ * Keep the independent copy current without relying on anyone's computer: the first time a browser sees a new build on the
+ * primary address it asks the Internet Archive to capture the single-file edition (the Archive ignores repeats within a short
+ * window, so many visitors cause one capture). Nothing about the visitor is sent beyond the request itself.
+ */
+function refreshArchiveCopy() {
+  try {
+    if (!version || version === 'single-file' || !navigator.onLine || !ARCHIVE_SOURCE.startsWith(location.origin + '/')) return;
+    if (store.pref('archived') === version) return;
+    store.pref('archived', version);
+    fetch('https://web.archive.org/save/' + ARCHIVE_SOURCE, { mode: 'no-cors', credentials: 'omit', referrerPolicy: 'no-referrer', cache: 'no-store' }).catch(() => store.pref('archived', ''));
+  } catch { /* storage or network unavailable: try again on a later visit */ }
+}
+
 buildNav(); setupChrome();
 window.addEventListener('hashchange', route);
 route();
 setupServiceWorker();
 setTimeout(refreshSite, 4000);
+setTimeout(refreshArchiveCopy, 25000);
 setInterval(() => { app.checkUpdate(false); refreshSite(); }, 30 * 60e3);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) { app.checkUpdate(false); refreshSite(); } });

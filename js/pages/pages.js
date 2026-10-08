@@ -12,6 +12,7 @@ import { fmt } from '../core/num.js';
 import { summarize, WATERS, cloneIons, ION_IDS, IONS } from '../core/water.js';
 import { download, readTable, extOf, checkFile } from '../core/io.js';
 import { MIRRORS, APP } from '../data/app.js';
+import { LAND } from '../data/atlas.js';
 
 const card = (...kids) => h('section', { class: 'card' }, ...kids);
 const pc = (spec) => plotCard(spec, { onDownload: download });
@@ -100,12 +101,21 @@ function loadTile(z, x, y) {
 function slippyMap(lat, lon, onPick) {
   let zoom = lat === null || lat === undefined ? 2 : 8, cLat = lat ?? 22, cLon = lon ?? 30, mLat = lat, mLon = lon;
   const box = h('div', { class: 'map', tabindex: '0', role: 'application', 'aria-label': 'World map. Click or tap to choose the site.' }), layer = h('div', { class: 'map-layer' }), pin = h('div', { class: 'map-pin', hidden: true }, '📍');
-  box.append(layer, pin, h('div', { class: 'map-zoom' }, h('button', { type: 'button', 'aria-label': 'Zoom in', onclick: (e) => { e.stopPropagation(); zoom = Math.min(15, zoom + 1); draw(); } }, '+'), h('button', { type: 'button', 'aria-label': 'Zoom out', onclick: (e) => { e.stopPropagation(); zoom = Math.max(2, zoom - 1); draw(); } }, '−')),
-    h('div', { class: 'map-attr' }, '© OpenStreetMap contributors · © CARTO'));
+  const baseCv = h('canvas', { class: 'map-base', 'aria-hidden': 'true' }); // built-in coastlines: always there, tiles are drawn over them when reachable
+  box.append(baseCv, layer, pin, h('div', { class: 'map-zoom' }, h('button', { type: 'button', 'aria-label': 'Zoom in', onclick: (e) => { e.stopPropagation(); zoom = Math.min(15, zoom + 1); draw(); } }, '+'), h('button', { type: 'button', 'aria-label': 'Zoom out', onclick: (e) => { e.stopPropagation(); zoom = Math.max(2, zoom - 1); draw(); } }, '−')),
+    h('div', { class: 'map-attr' }, 'Coastlines: Natural Earth · tiles © OpenStreetMap contributors · © CARTO'));
   const X = (lo, z) => ((lo + 180) / 360) * 2 ** z * 256, Y = (la, z) => { const r = (la * Math.PI) / 180; return ((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * 2 ** z * 256; };
   const invX = (x, z) => (x / (2 ** z * 256)) * 360 - 180, invY = (y, z) => (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / (2 ** z * 256)))) * 180) / Math.PI;
   function draw() {
     const w = box.clientWidth || 600, hgt = box.clientHeight || 360, cx = X(cLon, zoom), cy = Y(cLat, zoom), n = 2 ** zoom;
+    { const dpr = Math.min(window.devicePixelRatio || 1, 2); baseCv.width = w * dpr; baseCv.height = hgt * dpr; const g = baseCv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.fillStyle = '#a9d3e8'; g.fillRect(0, 0, w, hgt); g.fillStyle = '#eef0e4'; g.strokeStyle = '#8fa3ad'; g.lineWidth = 0.8;
+      const world = n * 256;
+      for (const k of [-1, 0, 1]) { const ox = k * world - cx + w / 2; if (ox > w || ox + world < 0) continue;
+        for (const ring of LAND) { g.beginPath(); for (let q = 0; q < ring.length; q += 2) { const px = X(ring[q], zoom) + ox, py = Y(Math.max(-85, Math.min(85, ring[q + 1])), zoom) - cy + hgt / 2; if (q) g.lineTo(px, py); else g.moveTo(px, py); } g.closePath(); g.fill(); g.stroke(); } }
+      g.strokeStyle = 'rgba(60,90,110,.18)'; g.lineWidth = 0.6; const stepDeg = zoom <= 3 ? 30 : zoom <= 5 ? 10 : zoom <= 8 ? 2 : 0.5;
+      for (let lo = -180; lo <= 180; lo += stepDeg) { const px = X(lo, zoom) - cx + w / 2; if (px >= 0 && px <= w) { g.beginPath(); g.moveTo(px, 0); g.lineTo(px, hgt); g.stroke(); } }
+      for (let la = -80; la <= 80; la += stepDeg) { const py = Y(la, zoom) - cy + hgt / 2; if (py >= 0 && py <= hgt) { g.beginPath(); g.moveTo(0, py); g.lineTo(w, py); g.stroke(); } } }
     clear(layer);
     for (let tx = Math.floor((cx - w / 2) / 256); tx <= Math.floor((cx + w / 2) / 256); tx++) for (let ty = Math.floor((cy - hgt / 2) / 256); ty <= Math.floor((cy + hgt / 2) / 256); ty++) {
       if (ty < 0 || ty >= n) continue;
@@ -143,8 +153,8 @@ export function sitePage(root) {
     if (!site.fetchedAt) return dataBox.append(h('p', { class: 'note' }, 'Pick a coastal or inland point on the map (or search / type coordinates) and press “Fetch live site data”.'));
     const K = (label, v, unit, extra) => (v === null || v === undefined ? null : { label, value: v, unit, help: extra });
     dataBox.append(h('h2', { class: 'sect' }, `${site.name || 'Site'}${site.country ? ', ' + site.country : ''} — ${fmt(site.lat, 5)}°, ${fmt(site.lon, 5)}°`),
-      kpiGrid([K('Sea-surface temperature', d.sst, '°C'), K(d.salinityEstimated ? 'Salinity (regional estimate)' : 'Salinity (climatology)', d.salinity, 'g/kg'), K('Water depth at point', d.depth, 'm'), K('Deepest nearby', d.maxDepthNearby, 'm'), K('Mean current', d.currentSpeed, 'm/s'), K('Peak current', d.currentMax, 'm/s'), K('Tidal range', d.tideRange, 'm'), K('Wave height', d.waveHeight, 'm'), K('Wave period', d.wavePeriod, 's'),
-        K('Air temperature', d.airTemp, '°C'), K('Wind speed', d.windSpeed, 'm/s'), K('Humidity', d.humidity, '%'), K('Solar resource (long-term)', d.ghiDaily, 'kWh/m²·d'), K('Wind (long-term, 10 m)', d.windAnnual, 'm/s'), K('Land elevation', d.elevation, 'm'),
+      kpiGrid([K(d.sstEstimated ? 'Sea temperature (built-in atlas)' : 'Sea-surface temperature', d.sst, '°C'), K(d.salinityEstimated ? (d.atlas ? 'Salinity (built-in atlas)' : 'Salinity (regional estimate)') : 'Salinity (climatology)', d.salinity, 'g/kg'), K('Water depth at point', d.depth, 'm'), K('Deepest nearby', d.maxDepthNearby, 'm'), K('Mean current', d.currentSpeed, 'm/s'), K('Peak current', d.currentMax, 'm/s'), K('Tidal range', d.tideRange, 'm'), K('Wave height', d.waveHeight, 'm'), K('Wave period', d.wavePeriod, 's'),
+        K('Air temperature', d.airTemp, '°C'), K('Wind speed', d.windSpeed, 'm/s'), K('Humidity', d.humidity, '%'), K(d.solarEstimated ? 'Solar resource (latitude estimate)' : 'Solar resource (long-term)', d.ghiDaily, 'kWh/m²·d'), K('Wind (long-term, 10 m)', d.windAnnual, 'm/s'), K('Land elevation', d.elevation, 'm'),
         K('Inflation' + (d.inflationYear ? ` (${d.inflationYear})` : ''), d.inflation, '%/y'), K('Lending rate' + (d.lendingRateYear ? ` (${d.lendingRateYear})` : ''), d.lendingRate, '%/y'), K(`${d.currency || ''} per USD`, d.fxPerUSD, ''), K('Electricity (indicative)', d.electricityPrice, '$/kWh'), K(d.gridCarbonLive ? `Grid carbon (${d.gridCarbonYear || 'latest'})` : 'Grid carbon (indicative)', d.gridCarbon, 'kgCO₂/kWh'), K('Renewable electricity', d.renewableShare, '%'), K('Water stress', d.waterStress, '%')].filter(Boolean)));
     const plots = [];
     if (d.bathy) {
@@ -174,7 +184,7 @@ export function sitePage(root) {
   const doFetch = async (opt = {}) => {
     const la = +latI.value, lo = +lonI.value;
     if (!Number.isFinite(la) || !Number.isFinite(lo) || latI.value === '' || lonI.value === '' || Math.abs(la) > 90 || Math.abs(lo) > 180) return toast('Enter a valid latitude (−90…90) and longitude (−180…180), or click the map.', 'warn');
-    if (!navigator.onLine) return toast('You are offline. Stored site data stay available; live data refresh when you reconnect.', 'warn');
+    if (!navigator.onLine) opt = { ...opt, atlasOnly: true }; // no connection: answer from the built-in atlas instead of refusing
     const t0 = performance.now(), live = {}, old = store.case.site, same = old.lat !== null && Math.abs(old.lat - la) < 0.02 && Math.abs(old.lon - lo) < 0.02;
     fetchBtn.disabled = true; fetchBtn.textContent = 'Fetching…';
     let raf = 0, latest = null, first = true;
@@ -188,7 +198,7 @@ export function sitePage(root) {
       if (raf) { cancelAnimationFrame(raf); raf = 0; }
       commit(site); map.setView(site.lat, site.lon);
       const ok = Object.values(site.status).filter((x) => x.ok).length, stored = Object.values(site.status).filter((x) => x.cached).length;
-      toast(`Site data ready in ${((performance.now() - t0) / 1000).toFixed(1)} s: ${ok} of ${SOURCES.length} sources${stored ? ` (${stored} from the copy kept on this device)` : ''}.`, ok ? 'ok' : 'bad');
+      toast(ok ? `Site data ready in ${((performance.now() - t0) / 1000).toFixed(1)} s: ${ok} of ${SOURCES.length} sources${stored ? ` (${stored} from the copy kept on this device)` : ''}.` : 'Live services could not be reached from here — showing the built-in atlas (approximate sea temperature, salinity and solar resource).', ok ? 'ok' : 'warn', ok ? 4200 : 9000);
     } catch (e) { toast('Could not fetch site data: ' + e.message, 'bad'); }
     fetchBtn.disabled = false; fetchBtn.textContent = 'Fetch live site data'; paintSources(); paintData();
   };
@@ -360,7 +370,7 @@ export function appPage(root, app) {
         h('li', null, h('b', null, 'Android (Chrome, Edge, Samsung Internet): '), 'press “Install app”, or menu ⋮ → “Add to Home screen / Install app”.'),
         h('li', { class: ios ? 'hl' : '' }, h('b', null, 'iPhone · iPad (Safari): '), 'tap the Share button, then “Add to Home Screen”. Apple does not allow an install button inside web pages.'),
         h('li', null, h('b', null, 'macOS Safari: '), 'File → “Add to Dock”.'), h('li', null, h('b', null, 'Firefox desktop: '), 'no install prompt, but the app still works offline in a normal tab once loaded; or use the single-file edition.'))),
-    card(h('h2', null, 'Works in aeroplane mode'), h('p', null, 'All 13 calculation engines, the plotting, file import and your cases run entirely on the device. Only two things need a connection: pulling live site data and checking for a newer build. Site data already fetched remain stored with the case.'),
+    card(h('h2', null, 'Works in aeroplane mode'), h('p', null, 'All 13 calculation engines, the plotting, file import and your cases run entirely on the device. Only two things need a connection: pulling live site data and checking for a newer build. Site data already fetched remain stored with the case, and without a connection the Global site data page still answers from a built-in world atlas (approximate sea temperature, salinity and solar resource) on a built-in coastline map.'),
       h('p', { class: 'note' }, 'While you are online the app checks for a newer build in the background and refreshes stored site data that are more than six hours old; installed copies on supporting browsers also refresh periodically in the background.')),
     card(h('h2', null, 'Availability and mirrors'), h('p', null, MIRRORS.length > 1 ? 'The same build is published at more than one independent address. If one host is down, open another — or simply keep using the installed copy, which needs no host at all.' : 'Once installed (or saved as the single-file edition) the application needs no host at all.'), mirrorBox, h('div', { class: 'row-tools' }, btn('Check mirrors now', check))),
     card(h('h2', null, 'Security and privacy'), h('ul', { class: 'steps' },
