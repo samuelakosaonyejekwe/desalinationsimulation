@@ -2,6 +2,7 @@
 // machine-readable outputs of the last run of each suite (which is what links the suites together).
 // Persisted in localStorage on the user's device only; nothing is sent to any server.
 import { WATERS, cloneIons } from './water.js';
+import { buildIdNow } from './build.js';
 
 const KEY = 'brinelab.case.v1', LIB = 'brinelab.cases.v1', PREF = 'brinelab.prefs.v1';
 const MAX_IMPORT = 8e6; // characters
@@ -85,7 +86,7 @@ export const store = {
   outputs(id) { return current.outputs[id]; },
   setOutputs(id, o) { current.outputs[id] = { ...sanitize(o), _at: new Date().toISOString() }; persist(); emit('outputs', id); },
   reset() { current = blankCase(); persist(); emit('case', current); },
-  exportJSON() { return JSON.stringify({ app: 'BrineLab', ...current }, null, 1); },
+  exportJSON(build) { return JSON.stringify({ app: 'BrineLab', exportedWithBuild: build || buildIdNow(), exportedAt: new Date().toISOString(), ...current }, null, 1); },
   importJSON(text) {
     if (typeof text !== 'string' || text.length > MAX_IMPORT) throw new Error('Case file is too large or not text.');
     const raw = JSON.parse(text);

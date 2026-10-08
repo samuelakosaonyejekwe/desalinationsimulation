@@ -8,6 +8,7 @@ import { home, casePage, sitePage, portalPage, chainPage, appPage } from './page
 import { fetchSite } from './core/live.js';
 import { APP, ARCHIVE_SOURCE } from './data/app.js';
 import { advisorPage } from './core/advisorview.js';
+import { buildId } from './core/build.js';
 
 const PAGES = [
   { path: 'home', label: 'Overview', icon: '🏠', render: home },
@@ -151,6 +152,7 @@ function refreshArchiveCopy() {
 }
 
 buildNav(); setupChrome();
+buildId(); // learn the build once, so results and exports can be stamped with it
 window.addEventListener('hashchange', route);
 route();
 setupServiceWorker();

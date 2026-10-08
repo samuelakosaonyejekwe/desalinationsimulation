@@ -11,6 +11,8 @@ import { geometryTab } from './geomview.js';
 import { advicePanel } from './advisorview.js';
 import { wording } from '../data/wording.js';
 import { solve, cancelRun } from './runner.js';
+import { changesFor } from '../data/changelog.js';
+import { buildId, buildIdNow } from './build.js';
 import { readTable } from './io.js';
 
 const lastResult = new Map(); // suite id -> full result of the last run (kept in memory)
@@ -70,9 +72,9 @@ export async function runSuite(suite, ctxExtra) {
   const solved = await solve(suite, v, context(ctxExtra)), res = solved.res || {};
   res._threaded = solved.threaded;
   res.kpis ||= []; res.tables ||= []; res.plots ||= []; res.warnings ||= []; res.outputs ||= {};
-  res._ms = performance.now() - t0; res._inputs = v;
+  res._ms = performance.now() - t0; res._inputs = v; res._build = await buildId(); res._at = new Date().toISOString();
   lastResult.set(suite.id, res);
-  store.setOutputs(suite.id, { ...res.outputs, _kpis: res.kpis.slice(0, 8).map((k) => ({ label: k.label, value: k.value, unit: k.unit || '', status: k.status || '' })), _warnings: res.warnings.length });
+  store.setOutputs(suite.id, { ...res.outputs, _build: res._build, _kpis: res.kpis.slice(0, 8).map((k) => ({ label: k.label, value: k.value, unit: k.unit || '', status: k.status || '' })), _warnings: res.warnings.length });
   return res;
 }
 export const getResult = (id) => lastResult.get(id);
@@ -92,7 +94,7 @@ function exportReport(suite, res, plotEls) {
   add(doc.head, 'style', 'body{font:14px/1.5 system-ui,sans-serif;max-width:1000px;margin:24px auto;padding:0 16px;color:#0f172a}table{border-collapse:collapse;width:100%;margin:8px 0 20px;font-size:12px}th,td{border:1px solid #cbd5e1;padding:4px 8px;text-align:right}th:first-child,td:first-child{text-align:left}th{background:#f1f5f9}img{max-width:100%;border:1px solid #e2e8f0;margin:6px 0 18px}h1{font-size:22px}h2{font-size:16px;margin-top:28px;border-bottom:2px solid #0ea5e9;padding-bottom:4px}.w{color:#b45309}');
   const b = doc.body;
   add(b, 'h1', `${suite.num}. ${suite.title}`);
-  add(b, 'p', `Case: ${store.case.name} · Site: ${store.case.site.name || 'not set'} · Generated ${new Date().toLocaleString()}`);
+  add(b, 'p', `Case: ${store.case.name} · Site: ${store.case.site.name || 'not set'} · Generated ${new Date().toLocaleString()} · Engine build ${res._build || buildIdNow()}`);
   if (res.warnings.length) { add(b, 'h2', 'Warnings and checks'); const ul = add(b, 'ul'); res.warnings.forEach((w) => add(ul, 'li', `[${w.level || 'info'}] ${w.msg}`, { class: 'w' })); }
   add(b, 'h2', 'Key results');
   const kt = add(b, 'table'); res.kpis.forEach((k) => { const tr = add(kt, 'tr'); add(tr, 'td', k.label); add(tr, 'td', `${typeof k.value === 'number' ? fmt(k.value) : k.value} ${k.unit || ''}`); });
@@ -220,10 +222,11 @@ export function renderSuite(suite, root, app) {
     const box = h('div', { class: 'results' });
     if (res.warnings.length) box.append(h('div', { class: 'warns' }, res.warnings.map((w) => h('div', { class: 'warn ' + (w.level || 'info') }, h('b', null, w.level === 'bad' ? 'Limit exceeded' : w.level === 'warn' ? 'Check' : 'Note'), ' ', w.msg))));
     if (res.summary) box.append(h('p', { class: 'summary' }, res.summary));
+    { const ch = changesFor(suite.id); box.append(h('p', { class: 'note stamp' }, `Engine build ${res._build || 'unknown'} · solved ${new Date(res._at || Date.now()).toLocaleString()}`, ch.length ? h('span', null, ' · ', h('button', { type: 'button', class: 'linklike', onclick: () => tabset.show('theory') }, `${ch.length} recorded model change${ch.length > 1 ? 's' : ''} affect this suite`)) : null)); }
     box.append(kpiGrid(res.kpis));
     box.append(h('div', { class: 'row-tools' },
       btn('Report (HTML)', () => exportReport(suite, res, plotEls), 'mini', 'Self-contained report with inputs, KPIs, plots and tables — print it to PDF from your browser'),
-      btn('Results (JSON)', () => download(JSON.stringify({ suite: suite.id, case: store.case.name, inputs: sanitize(res._inputs), kpis: res.kpis, tables: res.tables, outputs: res.outputs, warnings: res.warnings }, null, 1), `${suite.id}_results.json`, 'application/json'), 'mini'),
+      btn('Results (JSON)', () => download(JSON.stringify({ suite: suite.id, case: store.case.name, build: res._build, solvedAt: res._at, inputs: sanitize(res._inputs), kpis: res.kpis, tables: res.tables, outputs: res.outputs, warnings: res.warnings }, null, 1), `${suite.id}_results.json`, 'application/json'), 'mini'),
       btn('All tables (CSV)', () => download(res.tables.map((t) => `# ${t.title}\n` + toCSV(t.columns, t.rows)).join('\n\n'), `${suite.id}_tables.csv`, 'text/csv'), 'mini')));
     if (plotEls.length) box.append(h('div', { class: 'plots' }, plotEls));
     res.tables.forEach((t) => box.append(dataTable(t)));
@@ -334,7 +337,10 @@ export function renderSuite(suite, root, app) {
       h('fieldset', { class: 'group' }, h('legend', null, 'Classical governing equations ', h('small', null, count(cat.classical))), chips(cat.classical)),
       h('fieldset', { class: 'group' }, h('legend', null, 'Hybrid and coupled formulations ', h('small', null, count(cat.hybrid))), chips(cat.hybrid)),
       h('fieldset', { class: 'group' }, h('legend', null, 'Initial and boundary conditions ', h('small', null, count(cat.icbc))), chips(cat.icbc), h('p', { class: 'note' }, cat.icbcText || '')),
-      h('fieldset', { class: 'group' }, h('legend', null, 'Modules ', h('small', null, count(cat.modules))), chips(cat.modules)));
+      h('fieldset', { class: 'group' }, h('legend', null, 'Modules ', h('small', null, count(cat.modules))), chips(cat.modules)),
+      (() => { const ch = changesFor(suite.id); return h('fieldset', { class: 'group' }, h('legend', null, 'Model change log ', h('small', null, ch.length ? `${ch.length} change${ch.length > 1 ? 's' : ''} that moved results` : 'no recorded changes')),
+        h('p', { class: 'note' }, 'Every change to this engine that moves results is recorded here with its size and reason. Results, reports and case files carry the build that produced them, so an earlier number can always be traced to its version.'),
+        ch.length ? h('div', { class: 'changes' }, ch.map((c) => h('article', { class: 'change' }, h('header', null, h('span', { class: 'badge' }, c.date), h('b', null, ' ' + c.title)), h('dl', null, h('dt', null, 'What changed'), h('dd', null, c.what), h('dt', null, 'Effect on results'), h('dd', null, c.effect), h('dt', null, 'Earlier behaviour'), h('dd', null, c.revert))))) : null); })());
   };
 
   const guideTab = () => h('div', { class: 'groups' },

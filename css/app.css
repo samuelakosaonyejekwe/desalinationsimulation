@@ -359,3 +359,7 @@ main:focus, main:focus-visible { outline: none; }
 
 .map-base { position: absolute; inset: 0; width: 100%; height: 100%; }
 .map { background: #a9d3e8; }
+
+.stamp { margin: -4px 0 10px; } .stamp .linklike { padding: 0; font-size: inherit; }
+.changes { display: grid; gap: 10px; } .change { border: 1px solid var(--line); border-left: 4px solid var(--brand-2); border-radius: 10px; padding: 10px 12px; background: var(--card); }
+.change dl { margin: 6px 0 0; } .change dt { font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 700; margin-top: 6px; } .change dd { margin: 0; font-size: 13.5px; }
