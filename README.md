@@ -26,6 +26,17 @@ validate → Verify → Theory**, with plots, tables, CSV/PNG/JSON/HTML-report e
 grid-convergence (GCI) study where a discretisation exists, least-squares calibration with parameter
 identifiability, independent validation metrics, and live verification checks.
 
+Beyond the suites the app provides:
+
+* **Decision support and sustainability** — every result is benchmarked against published practice and the live site
+  context, then turned into ranked recommendations and a scorecard; each recommendation can pull current literature.
+* **Universal geometry import** — CAD, surface, mesh, drawing, GIS, point-cloud, voxel and network formats are
+  read on the device, previewed, measured and routed to the suites that can use them; closed formats get an
+  exact conversion instruction. Procedural geometry (spacers, lattices, minimal surfaces, packed beds) is built in.
+* **Background solving** — engines run in a worker thread with progress and Cancel.
+* **Live plant feed** — the monitoring suite can follow an export file on the user's computer and re-analyse as it grows.
+* **Data provenance** — thermodynamic constants are checked against published databases and listed with their sources.
+
 ## How the suites are connected
 
 One case holds the site, the feed-water analysis, and each suite's inputs and published outputs.

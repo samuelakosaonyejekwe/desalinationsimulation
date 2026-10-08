@@ -249,7 +249,7 @@ const carnot = (T0, Ts) => Math.max(0, 1 - (T0 + 273.15) / (Math.max(Ts, T0 + 0.
  */
 export function exergoeconomics(c, an, v) {
   const r = c.rec, T0 = v.T0 ?? 25, wmin = ((osmoticPressure(T0, clamp(v.feedSalinity ?? 35, 0.01, 120)) / 3.6e6) * -Math.log(1 - Math.min(r, 0.985))) / Math.min(r, 0.985);
-  const eEl = c.elecKWh / c.prod, cn = carnot(T0, v.steamT ?? 70), eTh = (c.thermKWh / c.prod) * cn, thShare = c.cap > 0 ? clamp(v.thermalCapacity / c.cap, 0, 1) : 0, memShare = 1 - thShare;
+  const eEl = c.elecKWh / c.prod, cn = carnot(T0, v.steamT ?? 70), eTh = (c.thermKWh / c.prod) * cn, thShare = c.cap > 0 && eTh > 0 ? clamp(v.thermalCapacity / c.cap, 0, 1) : 0, memShare = 1 - thShare; // no heat supplied: all product comes from the membrane plant
   const etaP = clamp((v.etaPumpSet ?? 82) / 100, 0.2, 0.98), etaE = clamp((v.etaErd ?? 95) / 100, 0, 0.99), Whp = Math.min(eEl, (clamp((v.hpShare ?? 78) / 100, 0.05, 1) * c.sec) / 1), aux = eEl - Whp;
   const p = (Whp * etaP * r) / (1 - etaE * (1 - r)), brineEx = (p * (1 - r)) / r, wm = wmin * memShare, cEl = c.elecP, cHeatEx = eTh > 0 ? c.o.thermal / c.prod / eTh : 0;
   // non-energy cost rates ($ per m³) allocated to the subsystems by installed cost, with their own consumables
@@ -357,6 +357,8 @@ const suite = {
       { key: 'memLife', label: 'Membrane life', unit: 'years', value: 6, min: 1, max: 15, help: 'Average age at replacement; the annual replacement rate is 1 ÷ life.' },
       { key: 'cleanings', label: 'Chemical cleanings per year', unit: '1/y', value: 3, min: 0, max: 24 },
       { key: 'outfallLength', label: 'Outfall length', unit: 'm', value: 1000, min: 0, max: 20000 },
+      { key: 'linkScope', label: 'Plant scope being costed', type: 'select', value: 'membrane', options: [{ value: 'membrane', label: 'Membrane plant only' }, { value: 'hybrid', label: 'Membrane plant + thermal units (hybrid)' }, { value: 'zld', label: 'Membrane plant + brine concentration and crystallisation (ZLD)' }, { value: 'all', label: 'Hybrid plant with ZLD' }], help: 'Decides which of the quantities below are costed. The thermal and ZLD suites describe additional plant: their linked results are only included when the scope says they are part of this project, so a membrane-plant study is not silently loaded with the cost of a thermal plant or a crystalliser.' },
+      { key: 'autoScale', label: 'Scale default staffing, land and laboratory cost with plant size', type: 'bool', value: true, help: 'The default staffing table, land and laboratory budget describe a 100 000 m³/d plant. When this is on and those inputs are still at their defaults, they are scaled to the entered capacity (staff ∝ capacity^0.3, land ∝ capacity^0.6, laboratory ∝ capacity^0.5). Anything you have edited is used exactly as entered.' },
       { key: 'thermalCapacity', label: 'Thermal-desalination capacity (hybrid plants)', unit: 'm³/d', value: 0, min: 0, max: 1e6 },
       { key: 'bcFeed', label: 'Brine-concentrator feed', unit: 'm³/h', value: 0, min: 0, max: 5000 },
       { key: 'solids', label: 'Crystalliser solids', unit: 't/d', value: 0, min: 0, max: 20000 },
@@ -558,7 +560,24 @@ const suite = {
     return P;
   },
 
-  run(v, ctx) {
+  run(v0, ctx) {
+    // Scope: thermal and ZLD quantities only count when they are declared part of the project being costed.
+    const sc = v0.linkScope || 'membrane', inclTh = sc === 'hybrid' || sc === 'all', inclZ = sc === 'zld' || sc === 'all';
+    const dropped = [!inclTh && (v0.thermalCapacity > 0 || v0.secThermal > 0) ? 'thermal units' : null, !inclZ && (v0.solids > 0 || v0.zldPower > 0 || v0.bcFeed > 0 || v0.saltTpd > 0) ? 'brine concentration / crystallisation' : null].filter(Boolean);
+    const v = { ...v0, ...(inclTh ? { thermalCapacity: Math.min(v0.thermalCapacity, v0.capacity) } : { thermalCapacity: 0, secThermal: 0 }), ...(inclZ ? {} : { solids: 0, zldPower: 0, bcFeed: 0, saltTpd: 0 }) };
+    let scaled = null;
+    if (v0.autoScale !== false && v.capacity > 0 && Math.abs(v.capacity / REF.cap - 1) > 0.05) {
+      const D = defaultsOf(suite), r = v.capacity / REF.cap, same = (a, b) => JSON.stringify(a) === JSON.stringify(b), did = [];
+      if (same(v.staff, D.staff)) { v.staff = D.staff.map((q) => ({ ...q, n: Math.max(1, Math.round(q.n * r ** 0.3)) })); did.push('staffing'); }
+      if (v.land === D.land) { v.land = +(D.land * r ** 0.6).toPrecision(3); did.push('land'); }
+      if (v.labCost === D.labCost) { v.labCost = Math.round(D.labCost * r ** 0.5); did.push('laboratory budget'); }
+      if (did.length) scaled = did;
+    }
+    const res = this._run(v, ctx);
+    const add = (r) => { if (scaled) r.warnings.push({ level: 'info', msg: `Default ${scaled.join(', ')} scaled from the 100 000 m³/d reference plant to ${fmt(v.capacity, 4)} m³/d. Edit those inputs, or switch the scaling off, to use your own figures.` }); if (dropped.length) r.warnings.push({ level: 'info', msg: `Scope is “${sc === 'membrane' ? 'membrane plant only' : sc}”: linked or entered quantities for ${dropped.join(' and ')} are not costed. Change “Plant scope being costed” to include them.` }); return r; };
+    return res && typeof res.then === 'function' ? res.then(add) : add(res);
+  },
+  _run(v, ctx) {
     const K = prepare(v), E = evaluate(v, {}, true, K), { c, f, an, cash } = E, W = [], M = 1e6;
     const ccy = String(v.currency || 'USD').slice(0, 8), fx = v.fx > 0 ? v.fx : 1;
     // ---- finance indicators

@@ -5,7 +5,7 @@
 // ion-interaction model (Harvie–Møller–Weare 25 °C parameter set), Bromley or SIT; temperature- and pressure-dependent
 // solubility products; saturation indices; equilibrium precipitation; concentration paths; chemical
 // dosing; nucleation and growth kinetics; scaling and corrosion indices.
-import { brent, clamp, linspace, logspace, sum, rng, fmt, interp1, tridiag, trapz, solveLinear as solveLin } from '../core/num.js';
+import { brent, clamp, linspace, logspace, sum, rng, fmt, interp1, tridiag, trapz, gci, solveLinear as solveLin } from '../core/num.js';
 import { density, viscosity, diffusivityNaCl, osmoticPressure, R, KELVIN } from '../core/props.js';
 import { IONS, ION_IDS, WATERS, cloneIons, tds, chargeBalance, conductivity, hardness, molar } from '../core/water.js';
 import { solveChannel, buildMask, channel1D, yGrid } from './s04_cfd.js';
@@ -76,21 +76,26 @@ const SA = SID.map((id) => (SIZE[id] || [4, 0.041])[0]), SB = SID.map((id) => (S
 // Pitzer parameters at 25 °C. Every entry was compared with a database file:
 //  · Na–K–Mg–Ca–H–Cl–SO4–OH–HCO3–CO3–CO2 system: Harvie, Møller & Weare (1984) as held in the LLNL EQ3/6 file
 //    data0.hmw (β0, β1, β2, Cφ, θ, ψ and the CO2 λ: 229 numbers, all identical);
-//  · Sr and Ba chlorides, Sr sulphate, borate (Felmy & Weare 1986): USGS PHREEQC pitzer.dat (PHRQPITZ lineage);
+//  · Ba chloride (Pitzer & Mayorga 1973) and borate (Felmy & Weare 1986): USGS PHREEQC pitzer.dat (PHRQPITZ lineage) and data0.ypf;
+//  · strontium: the complete 25 °C set of the THEREDA database (Scharge 2016, release of 2020-10-22 for PHREEQC): Sr–Cl,
+//    Sr–SO4, θ(Sr,Na), θ(Sr,K), θ(Sr,Mg), θ(Sr,Ca), the four ψ(Sr,M,Cl) and log K(celestite) = −6.550, which belong together;
+//    it replaces the Sr–SO4 entry of pitzer.dat, which is numerically the Ca–SO4 set. Checked here against the SrCl2
+//    activity table of Goldberg & Nuttall (1978) and the celestite solubilities of Brower & Renault (1971);
 //  · fluorides, KNO3, Mg(NO3)2, phosphates and θ(Cl,NO3) (Pitzer 1991 tabulation), NaNO3 and Ca(NO3)2 (refits with
 //    α1 = 2): LLNL EQ3/6 Yucca Mountain Pitzer file data0.ypf (25 °C terms);
 //  · silica λ: PHREEQC pitzer.dat (Appelo 2015).
-// Analogue assignments (no measured set in these files for the suite's species list): Ba–SO4 uses the Ca–SO4 set,
-// NH4 uses K, Fe/Mn use Mg, H3SiO4 uses HCO3.
+// Analogue assignments (no measured set in these files for the suite's species list): Ba–SO4 uses the Ca–SO4 set
+// (no published Ba–SO4 set could be retrieved; barite solubility in water and in NaCl solutions does not depend on it,
+// in a sulphate-rich concentrate it shifts the barite index by about 0.04), NH4 uses K, Fe/Mn use Mg, H3SiO4 uses HCO3.
 const PZ_ID = { NH4: 'K', Fe: 'Mg', Mn: 'Mg', H3SiO4: 'HCO3' };
 const PZ_BIN = 'Na Cl .0765 .2664 0 .00127|Na SO4 .01958 1.113 0 .00497|Na HSO4 .0454 .398 0 0|Na OH .0864 .253 0 .0044|Na HCO3 .0277 .0411 0 0|Na CO3 .0399 1.389 0 .0044|Na NO3 .00357079 .231963 0 -.0000415038|Na F .0215 .2107 0 0|Na B(OH)4 -.0427 .089 0 .0114|Na HPO4 -.0583 1.4655 0 .02938|'
   + 'K Cl .04835 .2122 0 -.00084|K SO4 .04995 .7793 0 0|K HSO4 -.0003 .1735 0 0|K OH .1298 .32 0 .0041|K HCO3 .0296 -.013 0 -.008|K CO3 .1488 1.43 0 -.0015|K NO3 -.0816 .0494 0 .0066|K F .08089 .2021 0 .00093|K B(OH)4 .035 .14 0 0|K HPO4 .0248 1.2743 0 .016387|'
   + 'Ca Cl .3159 1.614 0 -.00034|Ca SO4 .2 3.1973 -54.24 0|Ca HSO4 .2145 2.53 0 0|Ca OH -.1747 -.2303 -5.72 0|Ca HCO3 .4 2.977 0 0|Ca NO3 .14844 2.44408 0 -.0041168|'
   + 'Mg Cl .35235 1.6815 0 .00519|Mg SO4 .221 3.343 -37.23 .025|Mg HSO4 .4746 1.729 0 0|Mg HCO3 .329 .6072 0 0|Mg NO3 .3671 1.5848 0 -.020625|MgOH Cl -.1 1.658 0 0|'
-  + 'Sr Cl .2858 1.667 0 -.0013|Sr SO4 .2 3.1973 -54.24 0|Ba Cl .2628 1.49625 0 -.0193782|Ba SO4 .2 3.1973 -54.24 0|H Cl .1775 .2945 0 .0008|H SO4 .0298 0 0 .0438|H HSO4 .2065 .5556 0 0';
-const PZ_THETA = 'Na K -.012|Na Ca .07|Na Mg .07|Na H .036|K Ca .032|K H .005|Ca Mg .007|Ca H .092|Mg H .1|Cl SO4 .02|Cl HSO4 -.006|Cl OH -.05|Cl HCO3 .03|Cl CO3 -.02|SO4 OH -.013|SO4 HCO3 .01|SO4 CO3 .02|OH CO3 .1|HCO3 CO3 -.04|Cl NO3 .016';
+  + 'Sr Cl .282054 1.44967 0 -.000552|Sr SO4 .2 1.30949 -24.31 0|Ba Cl .2628 1.49625 0 -.0193782|Ba SO4 .2 3.1973 -54.24 0|H Cl .1775 .2945 0 .0008|H SO4 .0298 0 0 .0438|H HSO4 .2065 .5556 0 0';
+const PZ_THETA = 'Na K -.012|Na Ca .07|Na Mg .07|Na H .036|K Ca .032|K H .005|Ca Mg .007|Ca H .092|Mg H .1|Na Sr .101684|K Sr .041523|Mg Sr .0014857|Ca Sr .45946|Cl SO4 .02|Cl HSO4 -.006|Cl OH -.05|Cl HCO3 .03|Cl CO3 -.02|SO4 OH -.013|SO4 HCO3 .01|SO4 CO3 .02|OH CO3 .1|HCO3 CO3 -.04|Cl NO3 .016';
 const PZ_PSI = 'Na K Cl -.0018|Na K SO4 -.01|Na K HCO3 -.003|Na K CO3 .003|Na Ca Cl -.007|Na Ca SO4 -.055|Na Mg Cl -.012|Na Mg SO4 -.015|Na H Cl -.004|Na H HSO4 -.0129|K Ca Cl -.025|K Mg Cl -.022|K Mg SO4 -.048|K H Cl -.011|K H SO4 .197|K H HSO4 -.0265|'
-  + 'Ca Mg Cl -.012|Ca Mg SO4 .024|Ca H Cl -.015|Mg MgOH Cl .028|Mg H Cl -.011|Mg H HSO4 -.0178|Cl SO4 Na .0014|Cl SO4 Ca -.018|Cl SO4 Mg -.004|Cl HSO4 Na -.006|Cl HSO4 H .013|Cl OH Na -.006|Cl OH K -.006|Cl OH Ca -.025|Cl HCO3 Na -.015|Cl HCO3 Mg -.096|'
+  + 'Na Sr Cl -.014575|K Sr Cl -.02144|Mg Sr Cl -.0031398|Ca Sr Cl -.081237|Ca Mg Cl -.012|Ca Mg SO4 .024|Ca H Cl -.015|Mg MgOH Cl .028|Mg H Cl -.011|Mg H HSO4 -.0178|Cl SO4 Na .0014|Cl SO4 Ca -.018|Cl SO4 Mg -.004|Cl HSO4 Na -.006|Cl HSO4 H .013|Cl OH Na -.006|Cl OH K -.006|Cl OH Ca -.025|Cl HCO3 Na -.015|Cl HCO3 Mg -.096|'
   + 'Cl CO3 Na .0085|Cl CO3 K .004|SO4 HSO4 Na -.0094|SO4 HSO4 K -.0677|SO4 HSO4 Mg -.0425|SO4 OH Na -.009|SO4 OH K -.05|SO4 HCO3 Na -.005|SO4 HCO3 Mg -.161|SO4 CO3 Na -.005|SO4 CO3 K -.009|OH CO3 Na -.017|OH CO3 K -.01|HCO3 CO3 Na .002|HCO3 CO3 K .012';
 const PZ_LAM = 'CO2 Na .1|CO2 K .051|CO2 Ca .183|CO2 Mg .183|CO2 Cl -.005|CO2 SO4 .097|CO2 HSO4 -.003|B(OH)3 Na -.097|B(OH)3 K -.14|B(OH)3 Cl .091|B(OH)3 SO4 .018|SiO2 Na .0566|SiO2 K .0298|SiO2 Mg .238|SiO2 Ca .238|SiO2 SO4 -.085';
 const PZ = (() => {
@@ -200,17 +205,20 @@ function dhOsm(s, b) { const y = b * s; return y < 0.01 ? (s * s * s) / 3 - (b *
 // Bromley (1973) and the Brønsted–Guggenheim–Scatchard specific-ion-interaction (SIT) model.
 // SIT ε(i,k), kg/mol at 25 °C: OECD-NEA thermochemical database, 2020 update of the SIT tables (Tables B-6/B-7), each
 // value also compared with the ThermoChimie sit.dat distributed with USGS PHREEQC where that file lists the pair.
-// Sr–Cl is not in either table and takes the Ca–Cl value as an analogue. Unlisted pairs use ε = 0.
-// Bromley salt constants B: twelve of the fifteen (all but SrCl2, BaCl2 and MgSO4) were re-derived here by least
-// squares from the NIST activity-coefficient tables (Hamer & Wu 1972; Goldberg & Nuttall 1978; Goldberg 1981) and agree
-// within 0.003 kg/mol (K2SO4, with data only to 0.7 mol/kg, within 0.013). Bromley's individual-ion table
-// (B = B₊ + B₋ + δ₊δ₋, used only for salts without a fitted constant) could not be compared with a retrievable copy
-// of the 1973 paper and is reported as unconfirmed in the provenance table; the Bromley model is opt-in.
+// ε(Sr²⁺, Cl⁻) is in neither table: 0.10 is a least-squares fit made here to the SrCl2 activity coefficients of Goldberg &
+// Nuttall (1978) up to I = 3 mol/kg (rms 0.004 in log γ±); the same fit returns 0.135 for CaCl2, 0.198 for MgCl2 and 0.057 for
+// BaCl2 against the NEA values 0.14, 0.19 and 0.07. Unlisted pairs use ε = 0.
+// Bromley constants: the salt constants B and the individual-ion table (B = B₊ + B₋ + δ₊δ₋, used for salts without a
+// fitted constant) are those of Bromley (1973, AIChE J. 19, 313) as reproduced in Appendix 4.2 of Zemaitis, Clark, Rafal &
+// Scrivner, Handbook of Aqueous Electrolyte Thermodynamics (DIPPR/AIChE 1986, pp. 170–174); all 15 salt constants and 17 ion
+// pairs (B, δ) below were compared with that reproduction (the 1973 paper itself was not available). They are corroborated
+// by an independent refit from the NIST evaluations (BR_REFIT, fitBromleyB, fitBromleyIons below).
 // Both models return the osmotic coefficient that satisfies the Gibbs–Duhem equation with their activity coefficients.
 const PFAM = { pitzer: 1, bromley: 1 }; // model families that use the strong-electrolyte species set (no sulphate ion pairs)
 const BR_ION = { H: [0.0875, 0.103], Na: [0, 0.028], K: [-0.0452, -0.079], NH4: [-0.042, -0.02], Mg: [0.057, 0.157], Ca: [0.0374, 0.119], Sr: [0.0245, 0.11], Ba: [0.0022, 0.098], Mn: [0.037, 0.21], Fe: [0.046, 0.21], F: [0.0295, -0.93], Cl: [0.0643, -0.067], NO3: [-0.025, 0.27], OH: [0.076, -1], SO4: [0, -0.4], CO3: [0.028, -0.67], HPO4: [-0.01, -0.57] };
+const BR_PUB = { Li: [0.0691, 0.138], Rb: [-0.0537, -0.1], Cs: [-0.071, -0.138], Br: [0.0741, 0.064], I: [0.089, 0.196], ClO4: [0.002, 0.79] }; // Bromley's values for ions outside the species list, used only to compare the two ion tables
 const BR_SALT = 'Na Cl .0574|K Cl .024|H Cl .1433|Ca Cl .0948|Mg Cl .1129|Sr Cl .0847|Ba Cl .0638|NH4 Cl .02|Na SO4 -.0204|K SO4 -.032|Mg SO4 -.0153|Na NO3 -.0128|K NO3 -.0862|Na OH .0747|K OH .1131';
-const SIT_EPS = 'Na Cl .03|K Cl 0|H Cl .12|NH4 Cl -.01|Ca Cl .14|Sr Cl .14|Mg Cl .19|Ba Cl .07|Na SO4 -.12|K SO4 -.06|Na HSO4 -.01|Na NO3 -.04|K NO3 -.11|H NO3 .07|Ca NO3 .02|Mg NO3 .17|Na OH .04|K OH .09|Na HCO3 0|K HCO3 -.06|Na CO3 -.08|K CO3 .02|Na F .02|K F .03|Na B(OH)4 -.07|Na HPO4 -.15|K HPO4 -.1|Fe Cl .17|Mn Cl .13|Na H3SiO4 -.08';
+const SIT_EPS = 'Na Cl .03|K Cl 0|H Cl .12|NH4 Cl -.01|Ca Cl .14|Sr Cl .1|Mg Cl .19|Ba Cl .07|Na SO4 -.12|K SO4 -.06|Na HSO4 -.01|Na NO3 -.04|K NO3 -.11|H NO3 .07|Ca NO3 .02|Mg NO3 .17|Na OH .04|K OH .09|Na HCO3 0|K HCO3 -.06|Na CO3 -.08|K CO3 .02|Na F .02|K F .03|Na B(OH)4 -.07|Na HPO4 -.15|K HPO4 -.1|Fe Cl .17|Mn Cl .13|Na H3SiO4 -.08';
 const PAIRPAR = (() => {
   const BR = new Float64Array(NS * NS), EPS = new Float64Array(NS * NS), rows = (t) => t.split('|').map((r) => r.split(' '));
   for (const c of PZ.cat) for (const a of PZ.an) { const p = BR_ION[SID[c]] || [0, 0], q = BR_ION[SID[a]] || [0, 0]; BR[c * NS + a] = p[0] + q[0] + p[1] * q[1]; }
@@ -243,6 +251,78 @@ function pairModel(model, m, T, lnG) {
   for (let i = 0; i < NS; i++) lnG[i] = clamp(lnG[i] * LN10, -45, 45);
   const phi = sm > 1e-12 ? 1 + (os * LN10) / sm : 1;
   return { I, aw: clamp(Math.exp(-phi * sm * MW_W), 0.02, 1), phi };
+}
+
+// Independent refit of the Bromley constants from the NIST evaluations (this work). BR_REFIT: per salt "cation anion B rms n Imax
+// [B published]" — B by fitBromleyB on the tabulated γ± (Hamer & Wu 1972 for 1:1 salts; Goldberg & Nuttall 1978 for the
+// alkaline-earth halides; Goldberg 1981 for the sulphates), rms = weighted root-mean-square deviation in log₁₀ γ±, n points to
+// the ionic strength Imax ≤ 6 mol/kg. BR_DATA: the rows [m γ± m γ± …] behind the suite's own salts, so that the regression can
+// be repeated. BR_ION_REFIT: [B, δ] per ion from fitBromleyIons over the 52 refitted salts whose ions occur in at least three
+// of them (anchors B(Na⁺) = 0, δ(OH⁻) = −1 as in Bromley's table, δ(Na⁺) = 0.028 and δ(Cl⁻) = −0.067 taken from it).
+const BR_REFIT = 'H Cl .1434 .0022 29 6 .1433|H Br .1807 .0137 24 5.5 .1734|H I .2037 .0057 26 6 .2054|H ClO4 .1651 .0221 17 6 .1639|H NO3 .0770 .0210 25 6 .0776|Li Cl .1279 .0095 25 6 .1283|Li Br .1547 .0207 13 6 .1527|Li I .1802 .0058 20 3 .1815|Li OH -.0061 .0196 23 4 -.0097|Li ClO4 .1682 .0069 20 4.5 .1702|Li NO3 .0934 .0155 27 6 .0938|Na F .0042 .0004 13 0.9 .0041|Na Cl .0572 .0029 29 6 .0574|Na OH .0744 .0097 28 6 .0747|Na ClO3 .0105 .0035 17 3 .0127|Na ClO4 .0328 .0058 23 5.5 .0330|Na BrO3 -.0271 .0021 20 2.5 -.0278|Na NO3 -.0130 .0023 27 6 -.0128|Na H2PO4 -.0462 .0320 26 6 -.0460|K F .0564 .0067 27 6 .0565|K Cl .0236 .0005 22 4.5 .0240|K Br .0294 .0027 27 5.5 .0296|K I .0419 .0078 26 4.5 .0428|K OH .1136 .0090 23 6 .1131|K ClO3 -.0725 .0025 13 0.7 -.0739|K BrO3 -.0886 .0021 11 0.5 -.0884|K NO3 -.0855 .0112 21 3.5 -.0862|K H2PO4 -.1121 .0068 12 1.8|Rb F .0683 .0109 24 3.5 .0650|Rb Br .0110 .0035 18 5 .0111|Rb I .0100 .0048 12 4 -.0108|Rb NO3 -.0863 .0213 26 4.5 -.0869|Cs F .0936 .0034 21 3 .0906|Cs Cl .0009 .0130 21 5 .0025|Cs Br -.0030 .0137 25 5 -.0039|Cs I -.0189 .0057 17 2.5 -.0188|Cs OH .1280 .0030 14 1.2 .1299|Cs NO3 -.1174 .0041 16 1.4 -.1173|NH4 Cl .0200 .0043 24 6 .0200|NH4 ClO4 -.0621 .0096 15 1.8 -.0640|NH4 NO3 -.0351 .0111 24 6 -.0358|Mg Cl .1129 .0050 10 4.5 .1129|Mg Br .1388 .0075 9 3.75 .1419|Mg I .1596 .0078 20 3 .1695|Ca Cl .0930 .0053 22 5.25 .0948|Ca I .1433 .0051 19 5.7 .1440|Sr Cl .0809 .0052 17 6 .0847|Sr Br .1052 .0036 25 5.7 .1038|Sr I .1351 .0038 33 5.7 .1339|Ba Br .0840 .0034 32 6 .0852|Ba I .1286 .0057 30 5.99 .1254|Ba Cl .0606 .0038 21 5.35 .0638|Ca Br .1190 .0047 17 6 .1179|Na SO4 -.0206 .0088 17 6 -.0204|K SO4 -.0420 .0103 10 2.08 -.0320|Li SO4 .0204 .0036 17 6 .0207|Rb SO4 -.0138 .0106 16 5.12 -.0091|Cs SO4 -.0055 .0100 16 4.89 -.0012';
+const BR_DATA = {
+  'Na Cl': '0.001 .965 0.002 .952 0.005 .928 0.01 .903 0.02 .872 0.05 .822 0.1 .779 0.2 .734 0.3 .709 0.4 .693 0.5 .681 0.6 .673 0.7 .667 0.8 .662 0.9 .659 1 .657 1.2 .655 1.4 .656 1.6 .658 1.8 .662 2 .668 2.5 .688 3 .714 3.5 .746 4 .783 4.5 .826 5 .874 5.5 .928 6 .986',
+  'K Cl': '0.001 .965 0.002 .951 0.005 .927 0.01 .901 0.02 .869 0.05 .816 0.3 .687 0.4 .665 0.5 .649 0.6 .636 0.7 .626 0.8 .617 0.9 .610 1 .604 1.6 .580 1.8 .576 2 .573 2.5 .568 3 .568 3.5 .571 4 .576 4.5 .584',
+  'H Cl': '0.001 .965 0.002 .952 0.005 .929 0.01 .905 0.02 .876 0.05 .832 0.1 .797 0.2 .768 0.3 .758 0.4 .756 0.5 .759 0.6 .765 0.7 .774 0.8 .785 0.9 .797 1 .811 1.2 .842 1.4 .877 1.6 .917 1.8 .961 2 1.009 2.5 1.148 3 1.316 3.5 1.517 4 1.757 4.5 2.040 5 2.380 5.5 2.770 6 3.230',
+  'NH4 Cl': '0.001 .965 0.002 .952 0.005 .927 0.02 .869 0.05 .816 0.1 .769 0.2 .718 0.4 .666 0.5 .649 0.6 .636 0.7 .626 0.8 .617 1 .603 1.2 .592 1.4 .584 1.6 .578 2 .569 2.5 .563 3 .560 3.5 .560 4 .560 5 .563 5.5 .564 6 .565',
+  'Na NO3': '0.001 .965 0.002 .951 0.005 .926 0.01 .900 0.02 .867 0.05 .811 0.1 .760 0.2 .702 0.3 .666 0.5 .618 0.6 .600 0.7 .585 0.8 .571 0.9 .559 1 .549 1.2 .530 1.4 .515 1.6 .501 1.8 .489 2 .478 3 .437 3.5 .422 4 .408 4.5 .396 5 .386 5.5 .378 6 .372',
+  'K NO3': '0.001 .964 0.002 .950 0.005 .924 0.01 .896 0.05 .797 0.1 .735 0.2 .662 0.3 .614 0.4 .577 0.5 .546 0.6 .521 0.8 .478 0.9 .460 1 .444 1.2 .415 1.4 .390 1.6 .369 1.8 .350 2.5 .297 3 .269 3.5 .246',
+  'Na OH': '0.001 .965 0.002 .952 0.005 .927 0.01 .902 0.02 .870 0.05 .819 0.1 .775 0.2 .731 0.3 .708 0.4 .694 0.5 .685 0.6 .679 0.8 .674 0.9 .673 1 .674 1.2 .678 1.4 .684 1.6 .692 1.8 .702 2 .714 2.5 .749 3 .794 3.5 .847 4 .911 4.5 .987 5 1.076 5.5 1.181 6 1.302',
+  'K OH': '0.001 .965 0.002 .952 0.005 .927 0.01 .902 0.05 .821 0.2 .740 0.4 .713 0.5 .710 0.6 .711 0.7 .714 0.8 .718 0.9 .725 1 .733 1.2 .752 1.4 .774 1.6 .800 2 .860 3 1.058 4 1.331 4.5 1.501 5 1.697 5.5 1.923 6 2.180',
+  'Na F': '0.001 .965 0.002 .951 0.005 .926 0.01 .901 0.05 .813 0.1 .764 0.2 .710 0.3 .676 0.4 .652 0.6 .617 0.7 .604 0.8 .592 0.9 .582',
+  'K F': '0.001 .965 0.002 .952 0.005 .927 0.01 .902 0.02 .870 0.05 .818 0.1 .773 0.2 .726 0.3 .700 0.4 .682 0.5 .670 0.6 .662 0.8 .650 0.9 .647 1 .645 1.2 .643 1.4 .644 1.6 .647 1.8 .651 2 .658 2.5 .678 3 .705 3.5 .738 4 .777 4.5 .821 5.5 .927 6 .989',
+  'Mg Cl': '0.001 .8893 0.002 .8522 0.003 .8265 0.008 .7525 0.009 .7426 0.07 .5619 0.08 .5513 0.4 .4796 1.25 .6561 1.5 .7622',
+  'Ca Cl': '0.001 .8885 0.002 .8508 0.003 .8245 0.004 .8039 0.005 .7869 0.006 .7724 0.007 .7596 0.008 .7483 0.009 .7380 0.01 .7287 0.02 .6644 0.04 .5982 0.05 .5773 0.08 .5355 0.09 .5256 0.2 .4692 0.4 .4442 0.601 .4486 0.701 .4564 0.9 .4801 1.5 .6070 1.75 .6861',
+  'Sr Cl': '0.01 .7255 0.02 .6595 0.05 .5694 0.1 .5063 0.2 .4550 0.3 .4336 0.4 .4241 0.5 .4209 0.6 .4219 0.7 .4260 0.8 .4324 0.9 .4409 1 .4513 1.25 .4846 1.5 .5283 1.75 .5829 2 .6496 2.25 .7303 2.5 .8270 2.75 .9427 3 1.0808',
+  'Ba Cl': '0.01 .7214 0.02 .6532 0.05 .5591 0.1 .4924 0.2 .4365 0.3 .4115 0.4 .3983 0.5 .3911 0.6 .3877 0.7 .3867 0.8 .3875 0.9 .3897 1 .3929 1.1 .3970 1.2 .4019 1.3 .4074 1.4 .4135 1.5 .4202 1.6 .4273 1.7 .4349 1.785 .4417',
+  'Na SO4': '0.01 .7117 0.02 .6369 0.05 .5289 0.1 .4457 0.2 .3656 0.3 .3212 0.4 .2910 0.5 .2684 0.6 .2506 0.7 .2359 0.8 .2236 0.9 .2131 1 .2040 1.25 .1859 1.5 .1725 1.75 .1623 2 .1546',
+  'K SO4': '0.01 .7029 0.02 .6251 0.05 .5109 0.1 .4239 0.2 .3429 0.3 .3000 0.4 .2719 0.5 .2514 0.6 .2355 0.692 .2237',
+};
+const BR_ION_REFIT = { c: { H: [.0888, .118], Li: [.0727, .163], Na: [.0000, .028], K: [-.0512, -.066], Rb: [-.0620, -.091], Cs: [-.0790, -.127], NH4: [-.0338, -.049], Mg: [.0556, .087], Ca: [.0363, .103], Sr: [.0242, .122], Ba: [.0056, .185] }, a: { Cl: [.0639, -.067], Br: [.0796, .025], I: [.0901, .166], ClO4: [.0067, .577], NO3: [-.0141, .148], OH: [.0914, -1.000], F: [.0345, -1.081], SO4: [.0040, -.412] } };
+/**
+ * Bromley salt constant B of one electrolyte by weighted least squares on log₁₀ γ± (the equation is linear in B).
+ * rows = [[molality, γ±], …]; points up to the ionic strength Imax are used, each weighted by the ionic-strength
+ * interval it represents (trapezoid rule), so the result does not depend on how densely a table is printed.
+ */
+export function fitBromleyB(zc, za, rows, { Imax = 6, T = 25 } = {}) {
+  const nc = za === zc ? 1 : za, na = za === zc ? 1 : zc, If = 0.5 * (nc * zc * zc + na * za * za), zz = zc * za, A = (3 * aphi(T)) / LN10, d = rows.filter((r) => If * r[0] <= Imax + 1e-9).sort((p, q) => p[0] - q[0]);
+  let sxx = 0, sxy = 0, sw = 0, ss = 0, max = 0;
+  const pts = d.map((r, i) => { const I = If * r[0], sq = Math.sqrt(I), q = (1 + (1.5 * I) / zz) ** 2; return { w: 0.5 * If * (d[Math.min(i + 1, d.length - 1)][0] - d[Math.max(i - 1, 0)][0]), x: (0.6 * zz * I) / q + I, y: Math.log10(r[1]) + (A * zz * sq) / (1 + sq) - (0.06 * zz * I) / q }; });
+  for (const q of pts) { sxx += q.w * q.x * q.x; sxy += q.w * q.x * q.y; sw += q.w; }
+  const B = sxx > 0 ? sxy / sxx : 0;
+  for (const q of pts) { const e = q.y - B * q.x; ss += q.w * e * e; max = Math.max(max, Math.abs(e)); }
+  return { B, rms: sw > 0 ? Math.sqrt(ss / sw) : 0, max, n: pts.length, Imax: d.length ? If * d[d.length - 1][0] : 0 };
+}
+/**
+ * Individual-ion values of the Bromley model, B(salt) = B₊ + B₋ + δ₊·δ₋, by alternating linear least squares over a
+ * list of salts [[cation, anion, B], …]. The bilinear form has four free constants (a shift between B₊ and B₋, a scale
+ * between δ₊ and δ₋ and a shift of each δ set), which `fix` removes: { Bc: {Na: 0}, dc: {Na: 0.028}, da: {OH: −1, Cl: −0.067} }.
+ */
+export function fitBromleyIons(salts, fix = { Bc: { Na: 0 }, dc: { Na: 0.028 }, da: { OH: -1, Cl: -0.067 } }, iters = 400) {
+  const cats = [...new Set(salts.map((q) => q[0]))], ans = [...new Set(salts.map((q) => q[1]))], F = { Bc: fix.Bc || {}, dc: fix.dc || {}, Ba: fix.Ba || {}, da: fix.da || {} };
+  const V = { Bc: Object.fromEntries(cats.map((c) => [c, F.Bc[c] ?? 0])), dc: Object.fromEntries(cats.map((c) => [c, F.dc[c] ?? 0.05])), Ba: Object.fromEntries(ans.map((a) => [a, F.Ba[a] ?? 0])), da: Object.fromEntries(ans.map((a) => [a, F.da[a] ?? 0])) };
+  const model = (c, a) => V.Bc[c] + V.Ba[a] + V.dc[c] * V.da[a];
+  const pass = (side) => { // side 0: B₊, B₋ and δ₊ with δ₋ held; side 1: B₊, B₋ and δ₋ with δ₊ held
+    const vars = [], idx = {}, add = (t, k) => { if (!(k in F[t])) { idx[t + ' ' + k] = vars.length; vars.push([t, k]); } };
+    cats.forEach((c) => add('Bc', c)); ans.forEach((a) => add('Ba', a));
+    if (side === 0) cats.forEach((c) => add('dc', c)); else ans.forEach((a) => add('da', a));
+    const nv = vars.length, N = Array.from({ length: nv }, () => new Array(nv).fill(0)), rhs = new Array(nv).fill(0);
+    for (const [c, a, B] of salts) {
+      const row = [], set = (t, k, coef) => { const j = idx[t + ' ' + k]; if (j != null) row.push([j, coef]); return j != null; };
+      let y = B;
+      if (!set('Bc', c, 1)) y -= V.Bc[c];
+      if (!set('Ba', a, 1)) y -= V.Ba[a];
+      if (!(side === 0 ? set('dc', c, V.da[a]) : set('da', a, V.dc[c]))) y -= V.dc[c] * V.da[a];
+      for (const [j, cj] of row) { rhs[j] += cj * y; for (const [k, ck] of row) N[j][k] += cj * ck; }
+    }
+    for (let j = 0; j < nv; j++) N[j][j] = N[j][j] * (1 + 1e-10) + 1e-12;
+    const x = solveLin(N, rhs);
+    vars.forEach(([t, k], j) => { V[t][k] = x[j]; });
+  };
+  let prev = Infinity, rms = 0, it = 0;
+  for (; it < iters; it++) { pass(it % 2); rms = Math.sqrt(sum(salts.map(([c, a, B]) => (model(c, a) - B) ** 2)) / salts.length); if (it > 4 && Math.abs(prev - rms) < 1e-12) break; prev = rms; }
+  const res = salts.map(([c, a, B]) => [c, a, model(c, a) - B]);
+  return { ...V, rms, max: Math.max(...res.map((r) => Math.abs(r[2]))), res, iterations: it, n: salts.length, nPar: 2 * (cats.length + ans.length) - Object.values(F).reduce((q, o) => q + Object.keys(o).length, 0) };
 }
 
 // species lists used in the inner loops: derived species active per model family, and alkalinity carriers
@@ -391,7 +471,7 @@ export const MINERALS = {
   gypsum: mk('Gypsum', 'CaSO₄·2H₂O', 172.17, { Ca: 1, SO4: 1 }, analytic(68.2401, 0, -3221.51, -25.0627), { nW: 2, rho: 2320, sigma: 40, kg: 1e-9, dV: -42.4, siAS: 0.36 }),
   anhydrite: mk('Anhydrite', 'CaSO₄', 136.14, { Ca: 1, SO4: 1 }, analytic(197.52, 0, -8669.8, -69.835), { rho: 2960, sigma: 60, kg: 3e-10, dV: -49.8, siAS: 0.36 }),
   barite: mk('Barite', 'BaSO₄', 233.39, { Ba: 1, SO4: 1 }, analytic(136.035, 0, -7680.41, -48.595), { rho: 4480, sigma: 120, kg: 3e-10, dV: -50.6, siAS: 1.78 }),
-  celestite: mk('Celestite', 'SrSO₄', 183.68, { Sr: 1, SO4: 1 }, vh(-6.63, -4.3), { rho: 3960, sigma: 85, kg: 3e-10, dV: -49.7, siAS: 0.9 }),
+  celestite: mk('Celestite', 'SrSO₄', 183.68, { Sr: 1, SO4: 1 }, vh(-6.63, -4.3), { kP: vh(-6.55, -4.3), rho: 3960, sigma: 85, kg: 3e-10, dV: -49.7, siAS: 0.9 }),
   fluorite: mk('Fluorite', 'CaF₂', 78.07, { Ca: 1, F: 2 }, analytic(66.348, 0, -4298.2, -25.271), { rho: 3180, sigma: 140, dV: -44.7, siAS: 2.08 }),
   silica: mk('Amorphous silica', 'SiO₂(am)', 60.084, { Si: 1 }, analytic(-0.26, 0, -731, 0), { awx: -2, rho: 2200, sigma: 45, kg: 1e-12, siAS: 0.18 }),
   brucite: mk('Brucite', 'Mg(OH)₂', 58.32, { Mg: 1 }, vh(-10.88, -2), { kI: vh(-11.16, -1.6), nOH: 2, rho: 2370, sigma: 100, dV: -53.9 }),
@@ -610,7 +690,7 @@ export function solutionToIons(sol) {
 /** Molality of a mineral that dissolves to saturation in a solution (mol/kg of the original water). */
 export function solubility(sol, id, o = {}) {
   const r = precipitateSolution(sol, [id], { ...o, reservoir: { [id]: o.excess ?? 60 } });
-  return { m: -r.solids[id] / sol.w, sol: r.sol };
+  return { m: -r.solids[id] / sol.w, sol: r.sol, molality: r.sol.n[MINERALS[id]._i[0]] / MINERALS[id]._n[0] / r.sol.w }; // m: mol dissolved per kg of the initial water; molality: per kg of water of the saturated solution (differs for hydrates)
 }
 
 // ---- classical indices -----------------------------------------------------------------------------
@@ -1150,13 +1230,25 @@ export function channelCFD({ L = 6, H = 3.55e-4, u0 = 0.15, vw = 4e-6, D = 1.5e-
  * follows the rejection `rej`. Returns the wall-concentration profiles on both membranes, the mixing-cup bulk
  * concentration, the local flux and shear, the concentration field and the salt balance.
  */
-export async function spacerChannelCFD({ h = 7.1e-4, u0 = 0.1, vw = 4e-6, D = 1.5e-9, rej = 1, rho = 1000, mu = 1e-3, arr = 'zigzag', lm = 3e-3, df = 3.6e-4, nFil = 6, nxFil = 24, ny = 32, stretch = 8, dP = 0, pi = null, maxIter = 500, tol = 2e-5, scalIter = 300, solver = {} } = {}, ctx) {
-  const nF = clamp(Math.round(nFil), 1, 40), L = nF * lm, nx = clamp(Math.round(nxFil), 6, 120) * nF, NY = clamp(2 * Math.round(ny / 2), 8, 160), g = yGrid(h, NY, stretch);
-  const mk = buildMask({ type: 'spacer', arr, L, H: h, df, lm, nFil: nF }, nx, NY, g.yc), R = clamp(rej, 0.5, 1), osm = typeof pi === 'function';
+export async function spacerChannelCFD({ h = 7.1e-4, u0 = 0.1, vw = 4e-6, D = 1.5e-9, rej = 1, rho = 1000, mu = 1e-3, arr = 'zigzag', lm = 3e-3, df = 3.6e-4, nFil = 6, nxFil = 24, ny = 32, stretch = 8, dP = 0, pi = null, contact = 0.15, precip = null, maxIter = 500, tol = 2e-5, scalIter = 300, solver = {} } = {}, ctx) {
+  const nF = clamp(Math.round(nFil), 1, 40), L = nF * lm, nx = clamp(Math.round(nxFil), 6, 240) * nF, NY = clamp(2 * Math.round(ny / 2), 8, 200), g = yGrid(h, NY, stretch);
+  const mk = buildMask({ type: 'spacer', arr, L, H: h, df, lm, nFil: nF }, nx, NY, g.yc), R = clamp(rej, 0.5, 1), osm = typeof pi === 'function', dx0 = L / nx;
+  // filament footprint: the membrane under the flattened contact of a wall-touching filament (half-width a) does not permeate.
+  // A cell that is partly covered permeates in proportion to its open length, so the footprint has the same width on every grid.
+  const aC = arr === 'zigzag' || arr === 'cavity' ? clamp(contact, 0, 0.5) * Math.min(df, 0.9 * h) : 0, permB = new Float64Array(nx).fill(1), permT = new Float64Array(nx).fill(1), feet = [];
+  if (aC > 0) for (let k = 0; k < nF; k++) {
+    const xc = (k + 0.3) * lm, top = arr === 'zigzag' && k % 2 === 1, pf = top ? permT : permB;
+    feet.push({ x: xc, a: aC, top });
+    // flattened contact: the cells lying wholly under the footprint (and always the column under the filament axis) are solid from the
+    // membrane to the filament axis, so the contact is sealed on every grid instead of leaking where the stair-step circle misses the wall row
+    const rF = Math.min(df, 0.9 * h) / 2;
+    for (let i = 0; i < nx; i++) if ((i * dx0 >= xc - aC - 1e-9 * dx0 && (i + 1) * dx0 <= xc + aC + 1e-9 * dx0) || Math.abs((i + 0.5) * dx0 - xc) <= 0.5 * dx0 * (1 + 1e-6)) for (let j = 0; j < NY; j++) if (top ? g.yc[j] >= h - rF : g.yc[j] <= rF) mk.solid[j * nx + i] = 1;
+    for (let i = Math.max(0, Math.floor((xc - aC) / dx0)); i <= Math.min(nx - 1, Math.floor((xc + aC) / dx0)); i++) pf[i] = Math.max(0, pf[i] - Math.max(0, Math.min((i + 1) * dx0, xc + aC) - Math.max(i * dx0, xc - aC)) / dx0);
+  }
   // uniform-flux mode: a very large driving pressure makes the flux independent of the (small) hydraulic pressure variation
-  const dPm = osm ? dP : 1e9, pi0 = osm ? pi(1) * R : 0, A = vw / Math.max(dPm - pi0, 1e-9), B = R < 1 ? (vw * (1 - R)) / R : 0;
+  const dPm = osm ? dP : 1e9, pi0 = osm ? pi(1) - pi(1 - R) : 0, A = vw / Math.max(dPm - pi0, 1e-9), B = R < 1 ? (vw * (1 - R)) / R : 0;
   const r = await solveChannel({ L, H: h, nx, ny: NY, stretch, solid: mk.solid, rho, mu, Uin: u0, inlet: 'parabolic', scheme: 'hybrid', steady: true, maxIter, tol, scalIter, ...solver,
-    species: { c0: 1, D, A, B, dP: dPm, pi: osm ? pi : () => 0, bot: 'membrane', top: 'membrane' } }, ctx);
+    species: { c0: 1, D, A, B, R, dP: dPm, pi: osm ? pi : () => 0, bot: 'membrane', top: 'membrane', ...(aC > 0 ? { permB, permT } : {}) }, ...(precip ? { precip: { D, c0: 1, kr: precip.kr, csat: precip.csat, bot: true, top: true } } : {}) }, ctx);
   const { dx, dy, yc, u, nu1, solid } = r, phi = r.spc.phi, x = Array.from({ length: nx }, (_, i) => (i + 0.5) * dx);
   const cb = new Array(nx), blockB = new Array(nx), blockT = new Array(nx);
   for (let i = 0; i < nx; i++) {
@@ -1164,13 +1256,18 @@ export async function spacerChannelCFD({ h = 7.1e-4, u0 = 0.1, vw = 4e-6, D = 1.
     for (let j = 0; j < NY; j++) { const P = j * nx + i; if (solid[P]) continue; const uc = 0.5 * (u[j * nu1 + i] + u[j * nu1 + i + 1]); q += uc * dy[j]; qc += uc * phi[P] * dy[j]; }
     cb[i] = q > 0 ? qc / q : 1; blockB[i] = !!solid[i]; blockT[i] = !!solid[(NY - 1) * nx + i];
   }
-  let sin = 0, sout = 0, qin = 0, qout = 0, perm = 0;
+  let sin = 0, sout = 0, qin = 0, qout = 0, perm = 0, aOpen = 0;
   for (let j = 0; j < NY; j++) { sin += r.uin[j] * dy[j]; qin += r.uin[j] * dy[j]; const uo = u[j * nu1 + nx]; qout += uo * dy[j]; sout += uo * phi[j * nx + nx - 1] * dy[j]; }
-  for (let i = 0; i < nx; i++) { sout += (r.Jb[i] * r.spc.pB[i] + r.Jt[i] * r.spc.pT[i]) * dx; perm += (r.Jb[i] + r.Jt[i]) * dx; }
-  const open = (blk) => blk.filter((b) => !b).length || 1, Jmean = perm / ((open(blockB) + open(blockT)) * dx);
-  return { x, y: Array.from(yc), dx, dy: Array.from(dy), nx, ny: NY, L, h, cwB: Array.from(r.spc.wB), cwT: Array.from(r.spc.wT), cb, JB: Array.from(r.Jb), JT: Array.from(r.Jt), tauB: Array.from(r.tauB), tauT: Array.from(r.tauT), blockB, blockT,
+  for (let i = 0; i < nx; i++) { sout += (r.Jb[i] * r.spc.pB[i] + r.Jt[i] * r.spc.pT[i]) * dx; perm += (r.Jb[i] + r.Jt[i]) * dx; aOpen += ((blockB[i] ? 0 : permB[i]) + (blockT[i] ? 0 : permT[i])) * dx; }
+  const Jmean = perm / Math.max(aOpen, dx);
+  // thermodynamic ceiling of the wall concentration: the flux stops where the osmotic-pressure difference across the membrane equals the applied pressure
+  let cCap = null;
+  if (osm) { const net = (c) => dP - (pi(c) - pi((1 - R) * c)); if (net(1) > 0 && net(40) < 0) cCap = brent(net, 1, 40, 1e-10); }
+  const out = { x, y: Array.from(yc), dx, dy: Array.from(dy), nx, ny: NY, L, h, cwB: Array.from(r.spc.wB), cwT: Array.from(r.spc.wT), cb, JB: Array.from(r.Jb), JT: Array.from(r.Jt), tauB: Array.from(r.tauB), tauT: Array.from(r.tauT), blockB, blockT, permB: Array.from(permB), permT: Array.from(permT), feet, contactHalfWidth: aC, cCap,
     field: Array.from({ length: NY }, (_, j) => Array.from({ length: nx }, (_, i) => phi[j * nx + i])), mask: Array.from({ length: NY }, (_, j) => Array.from({ length: nx }, (_, i) => !!solid[j * nx + i])), shapes: mk.shapes,
-    Jmean, recovery: perm / qin, massError: (qin - qout - perm) / qin, balance: { in: sin, out: sout }, converged: r.converged, iters: r.iters, scalRes: r.scalRes, A, B, osmotic: osm, solidFraction: mk.solidFraction };
+    Jmean, recovery: perm / qin, massError: (qin - qout - perm) / qin, balance: { in: sin, out: sout }, converged: r.converged, iters: r.iters, scalRes: r.scalRes, A, B, osmotic: osm, solidFraction: mk.solidFraction, Jopen: A * (osm ? dP : dPm) };
+  if (precip && r.scal) Object.assign(out, { scaleB: Array.from(r.scal.wB), scaleT: Array.from(r.scal.wT), scaleNB: Array.from(r.scal.nB), scaleNT: Array.from(r.scal.nT) });
+  return out;
 }
 
 // ---- surrogate of the saturation index: Gaussian-kernel ridge regression ------------------------------------
@@ -1231,16 +1328,29 @@ const MODEL_OPTS = Object.entries(ACTIVITY_MODELS).map(([value, label]) => ({ va
 const NACL_LIT = { m: [0.1, 0.2, 0.5, 1, 2, 3, 4, 5, 6], g: [0.779, 0.734, 0.681, 0.657, 0.668, 0.714, 0.783, 0.874, 0.986] }; // Hamer & Wu (1972), 25 °C
 // Critically evaluated mean activity coefficients γ± and osmotic coefficients φ at 25 °C, rows [molality, γ±, φ], as
 // printed in the NIST compilations: Hamer & Wu (1972, J. Phys. Chem. Ref. Data 1, 1047: tables 16 and 28), Goldberg &
-// Nuttall (1978, 7, 263: tables 17 and 20) and Goldberg (1981, 10, 671). lim = [model, highest molality used, tolerance]:
+// Nuttall (1978, 7, 263: tables 17, 20, 23 and 26) and Goldberg (1981, 10, 671). lim = [model, highest molality used, tolerance]:
 // each model is only tested inside its validity range (Davies I ≤ 0.3, SIT I ≤ 3, Bromley I ≤ 6 mol/kg).
 const ACT_REF = {
   NaCl: { c: 'Na', a: 'Cl', src: 'Hamer & Wu 1972', d: [[0.01, 0.903, 0.968], [0.05, 0.822, 0.944], [0.1, 0.779, 0.933], [0.2, 0.734, 0.924], [0.5, 0.681, 0.921], [1, 0.657, 0.936], [2, 0.668, 0.984], [3, 0.714, 1.045], [4, 0.783, 1.116], [5, 0.874, 1.191], [6, 0.986, 1.27]], lim: [['pitzer', 6, 0.006], ['bromley', 6, 0.02], ['sit', 3, 0.035], ['davies', 0.2, 0.03]] },
   KCl: { c: 'K', a: 'Cl', src: 'Hamer & Wu 1972', d: [[0.1, 0.768, 0.927], [0.2, 0.717, 0.913], [0.5, 0.649, 0.9], [1, 0.604, 0.898], [2, 0.573, 0.912], [3, 0.568, 0.936], [4, 0.576, 0.965]], lim: [['pitzer', 4, 0.005], ['bromley', 4, 0.008], ['sit', 3, 0.045], ['davies', 0.2, 0.06]] },
   'MgCl₂': { c: 'Mg', a: 'Cl', src: 'Goldberg & Nuttall 1978', d: [[0.1, 0.5347, 0.8648], [0.2, 0.4935, 0.876], [0.5, 0.4855, 0.9475], [1, 1 * 0.5769, 1.1092], [2, 1.0655, 1.525], [3, 2.3498, 2.0125], [4, 5.6692, 2.5313], [5, 14.396, 3.0645]], lim: [['pitzer', 5, 0.03], ['bromley', 1, 0.03], ['sit', 1, 0.035], ['davies', 0.1, 0.035]] },
   'CaCl₂': { c: 'Ca', a: 'Cl', src: 'Goldberg & Nuttall 1978', d: [[0.1, 0.5171, 0.8516], [0.2, 0.4692, 0.8568], [0.5, 0.4442, 0.9134], [1, 0.4956, 1.0444], [2, 0.7842, 1.3754], [3, 1.455, 1.7685]], lim: [['pitzer', 3, 0.03], ['bromley', 2, 0.035], ['sit', 1, 0.02], ['davies', 0.1, 0.055]] },
+  'SrCl₂': { c: 'Sr', a: 'Cl', src: 'Goldberg & Nuttall 1978', d: [[0.1, 0.5063, 0.8435], [0.2, 0.455, 0.8454], [0.5, 0.4209, 0.893], [1, 0.4513, 1.0041], [1.5, 0.5283, 1.1358], [2, 0.6496, 1.2835], [3, 1.0808, 1.6161]], lim: [['pitzer', 3, 0.03], ['bromley', 2, 0.045], ['sit', 1, 0.035], ['davies', 0.1, 0.07]] },
+  'BaCl₂': { c: 'Ba', a: 'Cl', src: 'Goldberg & Nuttall 1978', d: [[0.1, 0.4924, 0.8326], [0.2, 0.4365, 0.8301], [0.5, 0.3911, 0.8645], [1, 0.3929, 0.9401], [1.5, 0.4202, 1.0169], [1.785, 0.4417, 1.0603]], lim: [['pitzer', 1.785, 0.04], ['bromley', 1, 0.03], ['sit', 1, 0.04], ['davies', 0.1, 0.1]] },
   'Na₂SO₄': { c: 'Na', a: 'SO4', src: 'Goldberg 1981', d: [[0.1, 0.4457, 0.7869], [0.5, 0.2684, 0.6945], [1, 0.204, 0.6481], [2, 0.1546, 0.6257]], lim: [['pitzer', 2, 0.03], ['bromley', 1, 0.035], ['sit', 1, 0.045], ['davies', 0.1, 0.065]] },
   'K₂SO₄': { c: 'K', a: 'SO4', src: 'Goldberg 1981', d: [[0.1, 0.4239, 0.7687], [0.2, 0.3429, 0.7304], [0.5, 0.2514, 0.6875]], lim: [['pitzer', 0.5, 0.065], ['bromley', 0.5, 0.07], ['sit', 0.5, 0.04], ['davies', 0.1, 0.07]] },
 };
+// Independent measurements used by the verification list (25 °C).
+// MgSO4: osmotic coefficients measured isopiestically against KCl, [m, φ] (Miladinović, Ninković, Todorović & Rard 2007,
+// LLNL report UCRL-JRNL-231697, Table 4; J. Solution Chem. 2008); γ± and φ of pure MgSO4 from the Archer & Rard (1998)
+// extended ion-interaction model as tabulated in Table 6 of the same report, [I, γ±, φ] with m = I/4; φ of Phutela &
+// Pitzer (1986) as quoted in Table I-15 of the report ANL-EBS-MD-000045 REV 02 (2004).
+const MGSO4_REF = { iso: [[0.7222, 0.5219], [1.0718, 0.5347], [1.459, 0.5736], [1.9469, 0.6542], [2.3873, 0.7508], [3.14, 0.9669]], ar: [[1, 0.1073, 0.5487], [1.5, 0.0876, 0.5326], [2, 0.0758, 0.5241], [2.5, 0.0679, 0.5203], [3, 0.0622, 0.5204], [3.5, 0.058, 0.5236], [4, 0.0548, 0.5298], [4.5, 0.0523, 0.5386], [5, 0.0504, 0.5499], [5.5, 0.049, 0.5635], [6, 0.048, 0.5793]], pp: [[0.1, 0.596], [0.5, 0.527], [1, 0.527], [3, 0.925]] };
+// Barite in NaCl solutions, [NaCl, BaSO4 in mmol]: the table of Templeton (1960) as summarised by Blount (1977) and entered in
+// the data file Barite_NaCl.dat of Appelo (2015, Appl. Geochem. 55, 62, supplementary files). Celestite in NaCl solutions,
+// [NaCl in mol/L, SrSO4 in mmol/L]: Brower & Renault (1971), New Mexico Bureau of Mines Circular 116, Table 1.
+const BARITE_NACL = [[0, 0.0108], [0.05, 0.0302], [0.1, 0.0392], [0.2, 0.052], [0.4, 0.067], [0.6, 0.078], [0.8, 0.088], [1, 0.096], [1.5, 0.112], [2, 0.125], [2.5, 0.135], [3, 0.144], [3.5, 0.153], [4, 0.161], [4.5, 0.169], [5, 0.177]];
+const CELESTITE_NACL = [[0, 0.66], [0.001, 0.72], [0.01, 0.96], [0.025, 1.3], [0.1, 1.7], [1, 4.5]];
 /** Largest relative deviation of γ± and φ of one model from a reference table, up to the molality mMax. */
 function actDeviation(ref, model, mMax) {
   const rows = ref.d.filter((r) => r[0] <= mMax + 1e-12);
@@ -1255,29 +1365,35 @@ function pitzerSingle(zc, za, m, b0, b1, b2, cphi, T = 25) {
   const Bg = 2 * b0 + b1 * gf(a1 * s) + b2 * gf(a2 * s), Bp = b0 + b1 * Math.exp(-a1 * s) + b2 * Math.exp(-a2 * s);
   return { gamma: Math.exp(zc * za * f + m * ((2 * nc * na) / nu) * Bg + m * m * ((2 * (nc * na) ** 1.5) / nu) * 1.5 * cphi), phi: 1 - (zc * za * A * s) / (1 + 1.2 * s) + m * ((2 * nc * na) / nu) * Bp + m * m * ((2 * (nc * na) ** 1.5) / nu) * cphi };
 }
-/** Where every constant set of the suite comes from and how it was checked. Status: confirmed, replaced, analogue or unconfirmed. */
+const BR_STAT = (() => {
+  const rf = BR_REFIT.split('|').map((r) => r.split(' ')), own = rf.filter(([c, a]) => BR_DATA[c + ' ' + a]), d = rf.filter((r) => r[6] != null && !(r[0] === 'Rb' && r[1] === 'I')).map((r) => +r[2] - +r[6]);
+  return `Refitted B (published; rms in log γ±): ${own.map(([c, a, B, rms, , , pub]) => `${c}–${a} ${B} (${pub}; ${rms})`).join(', ')}. Over the ${d.length} salts with a published constant the difference is ${fmt(Math.sqrt(sum(d.map((x) => x * x)) / d.length), 2)} kg/mol rms (largest ${fmt(Math.max(...d.map(Math.abs)), 2)}). The refitted ion table reproduces the 52 salt constants with rms 0.0081 (largest 0.022), Bromley’s with 0.0110 (largest 0.037)`;
+})();
+/** Where every constant set of the suite comes from and how it was checked. Status: confirmed, corrected, replaced, fitted or refitted here, analogue or unconfirmed. */
 const PROVENANCE = [
   ['Pitzer β⁰, β¹, β², Cφ, θ, ψ and CO₂ λ of the Na–K–Mg–Ca–H–Cl–SO₄–OH–HCO₃–CO₃–CO₂ system', 'Harvie, Møller & Weare (1984), read from the LLNL EQ3/6 database file data0.hmw', '173 numbers compared by script: all identical', '25 °C; to salt saturation (I ≈ 20 mol/kg)', 'confirmed'],
-  ['Pitzer parameters of SrCl₂, BaCl₂, SrSO₄ and borate (B(OH)₄⁻, B(OH)₃ λ)', 'USGS PHREEQC pitzer.dat, PHRQPITZ lineage (Plummer et al. 1988; Felmy & Weare 1986)', '18 numbers compared; BaCl₂ β¹ and Cφ had been rounded and were restored', '25 °C', 'confirmed'],
+  ['Mg–SO₄ within that set (β⁰ 0.221, β¹ 3.343, β² −37.23, Cφ 0.025)', 'Harvie, Møller & Weare (1984) in data0.hmw; the Pitzer & Mayorga (1974) paper itself was not retrievable', 'Independent data: φ within 1.0 % of six isopiestic measurements from 0.72 to 3.14 mol/kg (Miladinović et al. 2007); γ± and φ within 0.5 % of the Archer & Rard (1998) evaluation from 0.25 to 1.5 mol/kg; epsomite solubility 2.97 mol/kg against 2.96 and 3.02 retrieved', '25 °C; to epsomite saturation', 'confirmed'],
+  ['Pitzer parameters of BaCl₂ and borate (B(OH)₄⁻, B(OH)₃ λ)', 'USGS PHREEQC pitzer_2012.dat and LLNL data0.ypf (Pitzer & Mayorga 1973 for BaCl₂; Felmy & Weare 1986 for borate)', 'Numbers compared with the files; BaCl₂ γ± and φ within 3.3 % and 1.2 % of Goldberg & Nuttall (1978) to saturation (1.785 mol/kg)', '25 °C', 'confirmed'],
+  ['Strontium: Pitzer Sr–Cl, Sr–SO₄, θ(Sr,Na), θ(Sr,K), θ(Sr,Mg), θ(Sr,Ca), ψ(Sr,M,Cl) and log K of celestite (−6.550) with the Pitzer model', 'THEREDA database, PHREEQC release of 2020-10-22 (reference SCH2016, Scharge 2016); β⁰(Sr–SO₄) = 0.2 is adopted there from CaSO₄, β¹ 1.30949 and β² −24.31 are fitted', 'Replaces the Sr–SO₄ entry of pitzer.dat, which is numerically the Ca–SO₄ set. SrCl₂: γ± within 2.4 %, φ within 1.1 % of Goldberg & Nuttall (1978) to 3 mol/kg (previous set 5.5 %). Celestite: +5 % in water (Brower & Renault 1971; Culberson), −5 % and −8 % in 0.1 and 1 mol/L NaCl; rms 0.043 log units over six NaCl solutions (previous set 0.072)', '25 °C; NaCl-dominated waters to 1 mol/L tested; fitted within the THEREDA oceanic-salt set and used here with the Harvie–Møller–Weare set', 'replaced'],
   ['Pitzer parameters of NaF, KF, KNO₃, Mg(NO₃)₂, Na₂HPO₄, K₂HPO₄, θ(Cl,NO₃)', 'Pitzer (1991) tabulation, read from the LLNL EQ3/6 Pitzer file data0.ypf', '19 numbers compared; Mg(NO₃)₂ restored to full precision, K₂HPO₄ added', '25 °C', 'confirmed'],
   ['Pitzer parameters of NaNO₃ and Ca(NO₃)₂', 'LLNL EQ3/6 data0.ypf (revision 0): refits with α₁ = 2 to the Archer (2000) and Oakes et al. (2000) evaluations', 'The earlier values could not be found in a retrievable file and were replaced by this set', '25 °C; NaNO₃ checked here against Hamer & Wu to 6 mol/kg', 'replaced'],
   ['Pitzer λ of dissolved silica with Na⁺, K⁺, Mg²⁺, Ca²⁺, SO₄²⁻', 'USGS PHREEQC pitzer.dat (Appelo 2015)', 'The earlier values could not be found in any database and were replaced', '25 °C', 'replaced'],
-  ['Pitzer analogues: Ba–SO₄ (uses Ca–SO₄), NH₄⁺ (uses K⁺), Fe²⁺ and Mn²⁺ (use Mg²⁺), H₃SiO₄⁻ (uses HCO₃⁻)', 'Assignment by chemical similarity, not a measured parameter set', 'Not applicable', 'Trace constituents only', 'analogue'],
+  ['Pitzer analogues: Ba–SO₄ (uses Ca–SO₄), NH₄⁺ (uses K⁺), Fe²⁺ and Mn²⁺ (use Mg²⁺), H₃SiO₄⁻ (uses HCO₃⁻)', 'Assignment by chemical similarity. No published Ba–SO₄ set could be retrieved (the PHREEQC pitzer.dat and the THEREDA file contain none; Monnin 1999 and Felmy et al. 1990 are not openly accessible)', 'Barite solubility in water and in NaCl solutions (Templeton 1960: within 7 % from 1 to 4 mol/kg NaCl) does not depend on the Ba–SO₄ term, so the retrieved data cannot fix it. Sensitivity in the default seawater concentrate: barite index 0.03 with the Ca–SO₄ set, 0.01 with the Sr–SO₄ set, −0.01 without a Ba–SO₄ term', 'Trace constituents only', 'analogue'],
   ['Debye–Hückel slope Aφ(T)', 'Grid of the LLNL EQ3/6 Pitzer file data0.ypf (0.3767, 0.3915, 0.4190, 0.4605 at 0, 25, 60, 100 °C)', 'Fit reproduces the four grid values within 0.0005', '0–100 °C', 'confirmed'],
   ['Carbonate, water, silicate, borate, HSO₄⁻ and HF dissociation; CO₂ Henry constant (ion-pair models)', 'USGS WATEQ4F database wateq4f.dat (Plummer & Busenberg 1982; Ball & Nordstrom 1991); borate log K as in MINTEQA2 v4', 'All coefficients of the six temperature functions and four log K/ΔH pairs compared', '0–90 °C', 'confirmed'],
   ['The same constants for the Pitzer and Bromley species set (pK₂ 10.339, pK₁ 6.337, HSO₄⁻ 1.979)', 'USGS PHRQPITZ/PHREEQC pitzer.dat; 25 °C values equal to data0.hmw', 'Corrected: the ion-pair values had been used with the Pitzer model', '25 °C exact, 0–90 °C by the shifted temperature function', 'corrected'],
   ['Ion-pair constants (CaSO₄°, MgSO₄°, NaSO₄⁻, KSO₄⁻, CaHCO₃⁺, MgHCO₃⁺, NaHCO₃°, NaCO₃⁻, CaCO₃°, MgCO₃°, CaOH⁺, MgOH⁺, CaF⁺, MgF⁺, BaSO₄°, SrSO₄°)', 'USGS WATEQ4F database wateq4f.dat (CaOH⁺ ΔH from MINTEQA2 v4); Pitzer-set CaCO₃°, MgCO₃°, MgOH⁺ from data0.hmw', '16 log K and 12 ΔH compared: identical after rounding; two Pitzer-set ΔH adjusted to pitzer.dat', 'I < 0.7 mol/kg', 'confirmed'],
   ['Ion-size å and b of the Truesdell–Jones and extended Debye–Hückel models', 'USGS WATEQ4F database wateq4f.dat', '18 ions compared; b of Ba²⁺, NH₄⁺, Fe²⁺, Mn²⁺, NO₃⁻, F⁻, OH⁻ and å of HPO₄²⁻ corrected', 'I < 1 mol/kg', 'corrected'],
   ['Ion-size default (å = 4, b = 0.041) for species without a tabulated entry', 'Model assumption', 'No source', 'Ion pairs and minor species only', 'unconfirmed'],
-  ['log K(T) of calcite, aragonite, gypsum, anhydrite, barite, celestite, fluorite, amorphous silica, strontianite, witherite, siderite, dolomite', 'USGS WATEQ4F database wateq4f.dat', 'All analytic coefficients and ΔH compared: identical; silica now carries the water activity of SiO₂ + 2 H₂O = H₄SiO₄', '0–90 °C', 'confirmed'],
+  ['log K(T) of calcite, aragonite, gypsum, anhydrite, barite, celestite, fluorite, amorphous silica, strontianite, witherite, siderite, dolomite', 'USGS WATEQ4F database wateq4f.dat', 'All analytic coefficients and ΔH compared: identical; silica now carries the water activity of SiO₂ + 2 H₂O = H₄SiO₄. Barite in water 0.0107 mmol/kg against 0.0108 (Templeton 1960) and 0.0106 (Blount 1977); celestite uses −6.550 with the Pitzer model (strontium row)', '0–90 °C', 'confirmed'],
   ['log K of calcite and aragonite with the Pitzer model (−8.406, −8.219)', 'Harvie, Møller & Weare (1984) in data0.hmw; temperature function of pitzer.dat', 'Corrected (was the ion-pair value −8.480, −8.336); verified against the seawater solubility of Mucci (1983)', '25 °C exact', 'corrected'],
   ['log K of halite, sylvite, the Na/Mg/K/Ca sulphate and chloride salts, brucite, portlandite, magnesite, nesquehonite', 'Harvie, Møller & Weare (1984) in data0.hmw and USGS PHREEQC pitzer.dat (PHRQPITZ lineage)', '19 values at 25 °C compared: identical to 0.001 (mirabilite follows pitzer.dat, −1.214)', '25 °C', 'confirmed'],
   ['The same minerals with the ion-pair models (brucite −11.16, magnesite −8.03, nesquehonite −5.62, epsomite −2.14, mirabilite −1.11, thenardite −0.18, halite 1.58)', 'USGS WATEQ4F database wateq4f.dat', 'Added: the Pitzer-set values had been used with every model', 'I < 0.7 mol/kg', 'corrected'],
   ['Temperature dependence of sylvite, hexahydrite, bischofite (analytic) and kieserite (ΔH −29 kJ/mol)', 'USGS PHREEQC pitzer.dat (PHRQPITZ expressions; kieserite slope from the Appelo 2015 expression)', 'Replaced: the earlier ΔH of hexahydrite and kieserite were not found in a database', '0–100 °C, indicative', 'replaced'],
   ['SIT interaction coefficients ε(cation, anion)', 'OECD-NEA thermochemical database, 2020 update of the SIT tables (B-6, B-7); ThermoChimie sit.dat of USGS PHREEQC', '26 of 27 pairs identical in the NEA tables; 19 also in sit.dat; FeCl₂, MnCl₂, NaH₃SiO₄ added from sit.dat', 'I ≤ 3 mol/kg', 'confirmed'],
-  ['SIT ε(Sr²⁺, Cl⁻)', 'Not in the retrieved tables: the Ca²⁺ value is used as an analogue', 'Not applicable', 'Trace constituent', 'analogue'],
-  ['Bromley salt constants B of NaCl, KCl, HCl, NH₄Cl, CaCl₂, MgCl₂, Na₂SO₄, K₂SO₄, NaNO₃, KNO₃, NaOH, KOH', 'Bromley (1973); the paper could not be retrieved, so each B was re-derived by least squares from the NIST tables (Hamer & Wu 1972; Goldberg & Nuttall 1978; Goldberg 1981)', 'Refit agrees within 0.003 kg/mol (K₂SO₄ within 0.013)', 'I ≤ 6 mol/kg; not for 2:2 salts', 'confirmed by refit'],
-  ['Bromley salt constants B of SrCl₂, BaCl₂, MgSO₄ and the individual-ion table (B₊, B₋, δ₊, δ₋) used for all other salts', 'Bromley (1973), not retrievable', 'Not checked — the Bromley model is opt-in and never used by other suites', 'I ≤ 6 mol/kg', 'unconfirmed'],
+  ['SIT ε(Sr²⁺, Cl⁻) = 0.10 kg/mol', 'Fitted in this work to the SrCl₂ activity coefficients of Goldberg & Nuttall (1978, Table 23) — the pair is not in the NEA tables', 'Weighted least squares on log γ± to I = 3 mol/kg: ε = 0.103, rms 0.004. The same fit gives 0.135, 0.198 and 0.057 for CaCl₂, MgCl₂ and BaCl₂ (NEA: 0.14, 0.19, 0.07)', 'I ≤ 3 mol/kg', 'fitted here'],
+  ['Bromley salt constants B of 15 salts and the individual-ion table (B₊, δ₊, B₋, δ₋) of 17 ions', 'Bromley (1973, AIChE J. 19, 313), Tables 1 and 2 as reproduced in Appendix 4.2 of Zemaitis, Clark, Rafal & Scrivner, Handbook of Aqueous Electrolyte Thermodynamics (DIPPR/AIChE 1986), pp. 170–174', 'All 15 salt constants and 34 ion values identical to the reproduction (the 1973 paper itself was not available; δ of Mn²⁺ and Fe²⁺ are marked as estimates there). The MgSO₄ constant −0.0153 is listed with a standard deviation of 0.051 in log γ±', 'I ≤ 6 mol/kg; not for 2:2 salts', 'confirmed'],
+  ['Bromley constants refitted in this work from NIST evaluations (corroboration; the published values stay in use)', 'γ± tables of Hamer & Wu (1972), Goldberg & Nuttall (1978) and Goldberg (1981): 58 salts, weighted least squares on log γ± to I = 6 mol/kg (fitBromleyB); ion values by a global fit of B = B₊ + B₋ + δ₊δ₋ over 52 salts (fitBromleyIons)', BR_STAT, 'I ≤ 6 mol/kg', 'refitted here'],
   ['Hydrous ferric oxide: site density, surface area, protonation and sorption constants', 'Dzombak & Morel (1990) and Swedlund & Webster (1999), read from the SURFACE_SPECIES block of USGS PHREEQC phreeqc.dat', '10 constants, 600 m²/g and 0.2 mol/mol compared: identical; solver reproduces PHREEQC example 8', '25 °C, I < 0.7 mol/kg', 'confirmed'],
   ['Interfacial energies, growth constants and antiscalant limits of the minerals', 'Order-of-magnitude engineering defaults', 'Not source-checked; adjustable through the kinetic inputs and the limit fields', 'Screening only', 'unconfirmed'],
 ];
@@ -1477,34 +1593,138 @@ function extendedModels(v, a, c) {
 /** Value below which the share q (0–1) of the entries lies. */
 const pctl = (arr, q) => { const b = [...arr].sort((x, y) => x - y); return b.length ? b[Math.min(b.length - 1, Math.max(0, Math.round(q * (b.length - 1))))] : 0; };
 /**
+ * Hot spot on one membrane of a spacer-channel solution: the peak cell value and the largest average of the wall
+ * concentration over a patch of fixed physical length Lp, both taken over the permeating membrane (outside the filament
+ * footprints) downstream of x0. The wall profile is integrated exactly as a piecewise-constant function, so the patch
+ * measure does not depend on how the cells happen to fall under the window.
+ */
+export function wallHotSpot(f, top, Lp, x0 = 0, cw = top ? f.cwT : f.cwB) {
+  const blk = top ? f.blockT : f.blockB, dx = f.dx, nx = f.nx, iv = [], cum = [0];
+  // open intervals: outside the footprints and outside runs of blocked wall cells
+  const cuts = (f.feet || []).filter((q) => q.top === top).map((q) => [q.x - q.a, q.x + q.a]);
+  for (let i = 0; i < nx; i++) if (blk[i]) { let k = i; while (k + 1 < nx && blk[k + 1]) k++; cuts.push([i * dx, (k + 1) * dx]); i = k; }
+  cuts.sort((p, q) => p[0] - q[0]);
+  let s = x0;
+  for (const [c0, c1] of cuts) { if (c1 <= s) continue; if (c0 > s + 1e-12 * f.L) iv.push([s, c0]); s = Math.max(s, c1); }
+  if (f.L > s + 1e-12 * f.L) iv.push([s, f.L]);
+  for (let i = 0; i < nx; i++) cum.push(cum[i] + cw[i] * dx);
+  const I = (x) => { const t = clamp(x / dx, 0, nx), i = Math.min(nx - 1, Math.floor(t)); return cum[i] + cw[i] * (t - i) * dx; };
+  let patch = 0, xPatch = x0, peak = 0, xPeak = x0, iPeak = -1;
+  for (const [lo, hi] of iv) {
+    for (let i = Math.max(0, Math.floor(lo / dx)); i < nx && i * dx < hi; i++) if (!blk[i] && Math.min(hi, (i + 1) * dx) - Math.max(lo, i * dx) > 1e-6 * dx && cw[i] > peak) { peak = cw[i]; xPeak = f.x[i]; iPeak = i; }
+    const w = Math.min(Lp, hi - lo), cand = [lo, hi - w];
+    for (let i = Math.ceil(lo / dx); i * dx <= hi; i++) cand.push(i * dx, i * dx - w);
+    for (const c of cand) if (c >= lo - 1e-12 * f.L && c + w <= hi + 1e-12 * f.L) { const q = (I(c + w) - I(c)) / w; if (q > patch) { patch = q; xPatch = c + 0.5 * w; } }
+  }
+  return { peak: peak || 1, xPeak, iPeak, patch: patch || peak || 1, xPatch, open: iv };
+}
+/**
+ * Discretisation error of a quantity on three systematically refined grids (h and f ordered fine → coarse) with `gci`.
+ * The observed order is reported as found; for the extrapolation and the grid-convergence index it is limited to the
+ * range 0.5–2 (the scheme is at most second order, and a stair-step boundary makes very high observed orders an
+ * accident of the sequence). A sequence that is not monotone is not extrapolated: the fine-grid value stands and the
+ * index is the safety factor times half the spread of the three values.
+ */
+export function gridConvergence(h, f, Fs = 1.25) {
+  const g = gci(h, f, Fs), r21 = h[1] / h[0], mono = g.type !== 'oscillatory', flat = g.type === 'grid-insensitive';
+  const p = flat ? 2 : clamp(Number.isFinite(g.p) ? g.p : 1, 0.5, 2), f1 = f[0], den = r21 ** p - 1;
+  const value = mono && !flat ? f1 + (f1 - f[1]) / den : f1, half = 0.5 * (Math.max(...f) - Math.min(...f));
+  const err = mono ? Math.abs(f1 - f[1]) / den : Math.max(half, Math.abs(f1 - f[1]) / den);
+  return { value, gci: (Fs * err) / Math.max(Math.abs(f1), 1e-300), pObs: Number.isFinite(g.p) ? g.p : 0, p, monotone: mono, type: g.type, change21: f[1] !== 0 ? f1 / f[1] - 1 : 0 };
+}
+/**
+ * Grid-convergence study of the filament hot spot: the same spacer-channel problem (a short section of `nSec` filament
+ * spacings) on three grids whose cell counts per spacing are multiples of ten (0.6, 0.8 and 1.0 times `nFine`), so that the
+ * filament axes fall on cell faces on every grid and the stair-step outline changes systematically. Returns, per grid, the
+ * peak and the patch-averaged hot spot, their Richardson estimates, the largest concentration anywhere (to compare
+ * with the osmotic ceiling) and the largest flux found through covered membrane (zero when the footprint is respected).
+ */
+export async function spacerHotSpotStudy(par, { nFine = 50, nSec = 2, Lp = 1e-4, tol = 3e-4, scalIter = 600 } = {}, ctx) {
+  const n3 = 10 * Math.max(5, Math.round(nFine / 10)), ns = [0.6 * n3, 0.8 * n3, n3].map((x) => 10 * Math.round(x / 10)), grids = [];
+  for (let k = 0; k < 3; k++) {
+    ctx?.progress?.(0.93 + 0.02 * k, `Hot-spot grid study: grid ${k + 1} of 3…`);
+    if (ctx?.tick) await ctx.tick();
+    const f = await spacerChannelCFD({ ...par, nFil: nSec, nxFil: ns[k], ny: 2 * Math.round(0.4 * ns[k]), tol, scalIter, maxIter: 400, solver: { alphaU: 0.85 } }, ctx), x0 = f.L / nSec;
+    const B = wallHotSpot(f, false, Lp, x0), T = wallHotSpot(f, true, Lp, x0), pk = B.peak >= T.peak ? B : T, pa = B.patch >= T.patch ? B : T;
+    let cMax = 0, jFoot = 0, nFoot = 0, cbHot = 1;
+    for (let i = 0; i < f.nx; i++) { cMax = Math.max(cMax, f.cwB[i], f.cwT[i]); for (const [pf, J, blk] of [[f.permB, f.JB, f.blockB], [f.permT, f.JT, f.blockT]]) if (pf[i] < 1) { jFoot = Math.max(jFoot, blk[i] ? Math.abs(J[i]) : J[i] - pf[i] * f.Jopen); nFoot++; } } // flux beyond what the open part of a footprint cell can carry
+    for (const row of f.field) for (const c of row) if (c > cMax) cMax = c;
+    cbHot = f.cb[clamp(Math.round(pa.xPatch / f.dx - 0.5), 0, f.nx - 1)];
+    grids.push({ nxFil: ns[k], nx: f.nx, ny: f.ny, dx: f.dx, dy0: f.dy[0], hRep: Math.sqrt(f.dx * f.dy[0]), peak: pk.peak, xPeak: pk.xPeak, peakTop: pk === T, patch: pa.patch, xPatch: pa.xPatch, patchTop: pa === T, cbHot, cMax, jFoot, nFoot, Jmean: f.Jmean, converged: f.converged, iters: f.iters, balance: f.balance.out / f.balance.in, cCap: f.cCap, f: k === 2 ? f : null });
+  }
+  const fine = grids.slice().reverse(), h = fine.map((q) => q.hRep), cap = grids[2].cCap, est = (key) => { const c = gridConvergence(h, fine.map((q) => q[key])); c.capped = !!cap && c.value > cap; if (c.capped) c.value = cap; return c; }; // the exact solution cannot exceed the osmotic ceiling, so neither may its estimate
+  return { grids, Lp, nSec, peak: est('peak'), patch: est('patch'), cCap: cap, cMax: Math.max(...grids.map((q) => q.cMax)), jFoot: Math.max(...grids.map((q) => q.jFoot)), nFoot: grids[2].nFoot, cbHot: grids[2].cbHot, fine: grids[2].f, contactHalfWidth: grids[2].f.contactHalfWidth };
+}
+/**
  * Scaling in a spacer-filled section at the concentrate end of the channel: Navier–Stokes + salt transport with
  * permeating membranes (suite 4 solver) → local wall concentration → speciation engine → saturation-index map,
- * deposition flux and hot spots; compared with the open-slit boundary-layer march and with film theory.
+ * deposition flux and hot spots; compared with the open-slit boundary-layer march and with film theory. The hot spot
+ * next to a filament is then resolved on three refined grids (spacerHotSpotStudy) and, on request, limited by the
+ * growth of the scale itself.
  */
 export async function spacerSection(v, a, m, kinId, ctx) {
   const { feed, P, dk } = a, h = Math.max(v.rtH ?? 0.71, 0.05) * 1e-3, arr = v.cfdArr || 'zigzag', lm = clamp(v.cfdLm ?? 3, 0.5, 20) * 1e-3, nFil = clamp(Math.round(v.cfdNFil ?? 6), 2, 20);
   const cfSec = m.cfIn * m.f.cb[m.f.cb.length - 1], uSec = Math.max(m.u * (1 - m.f.recovery), 1e-4), Ssec = Math.min(m.io.salinity * cfSec, 250), T = v.T;
   const rho = density(T, Ssec), mu = viscosity(T, Ssec), Dm = diffusivityNaCl(T, Math.min(Ssec, 200)), piOf = (c) => osmoticPressure(T, clamp(Ssec * c, 0, 260)), dPa = Math.max(v.P ?? 0, 0) * 1e5;
-  const osm = v.cfdOsm !== false && dPa - piOf(1) * a.rej > 0.1 * dPa;
-  const f = await spacerChannelCFD({ h, u0: uSec, vw: m.vw, D: Dm, rej: a.rej, rho, mu, arr, lm, df: clamp((v.cfdDf ?? 50) / 100, 0.1, 0.85) * h, nFil, nxFil: v.cfdNxFil ?? 24, ny: v.cfdNyFull ?? 32, dP: dPa, pi: osm ? piOf : null, tol: 1e-3, maxIter: 400, solver: { alphaU: 0.85 } }, ctx); // settings tuned against a fully converged run: wall concentrations within 1e-4
+  const osm = v.cfdOsm !== false && dPa - piOf(1) * a.rej > 0.1 * dPa, Lp = clamp(v.cfdPatch ?? 100, 10, 1000) * 1e-6;
+  const par = { h, u0: uSec, vw: m.vw, D: Dm, rej: a.rej, rho, mu, arr, lm, df: clamp((v.cfdDf ?? 50) / 100, 0.1, 0.85) * h, contact: clamp((v.cfdContact ?? 15) / 100, 0, 0.5), dP: dPa, pi: osm ? piOf : null };
+  const f = await spacerChannelCFD({ ...par, nFil, nxFil: v.cfdNxFil ?? 24, ny: v.cfdNyFull ?? 32, tol: 1e-3, maxIter: 400, solver: { alphaU: 0.85 } }, ctx);
+  const gs = v.cfdGci !== false ? await spacerHotSpotStudy(par, { nFine: v.cfdGciN ?? 50, Lp }, ctx) : null;
   // speciation engine on the local wall composition: bulk analysis × local concentration factor (tabulated on 9 factors)
-  const set = a.set.filter((id) => present(feed.eq, id)), cMax = Math.max(1.02, ...f.cwB, ...f.cwT, ...f.field.flat()), cfs = logspace(cfSec * 0.98, cfSec * cMax * 1.02, 9), lc = cfs.map(Math.log);
+  const set = a.set.filter((id) => present(feed.eq, id)), cMax = Math.max(1.02, ...f.cwB, ...f.cwT, ...f.field.flat(), gs ? gs.cMax : 1, f.cCap || 1), cfs = logspace(cfSec * 0.98, cfSec * cMax * 1.02, 9), lc = cfs.map(Math.log);
   const tab = cfs.map((cf) => saturation(concentrateSolution(feed, cf, a.copt).eq, P, dk, set)), id0 = kinId && set.includes(kinId) ? kinId : set.reduce((b, id) => (b == null || tab[8][id] / MINERALS[id]._nu > tab[8][b] / MINERALS[b]._nu ? id : b), null);
   const siOf = (id, c) => interp1(lc, tab.map((q) => q[id]), Math.log(Math.max(cfSec * c, 1e-9))), depOf = (si) => { const k = si > 0 ? nucleationKinetics(id0, si, T, v) : null; return k ? k.flux * 24 : 0; };
-  const i0 = Math.round(f.nx / nFil), side = (cw, blk, J, tau) => { // statistics over the open membrane downstream of the entrance spacing
+  const i0 = Math.round(f.nx / nFil), side = (cw, blk, pf, J, tau, top) => { // statistics over the permeating membrane downstream of the entrance spacing
     const xs = [], c = [], si = [], dep = [], jj = [], tt = [];
-    for (let i = 0; i < f.nx; i++) if (!blk[i]) { xs.push(f.x[i]); c.push(cw[i]); const s0 = siOf(id0, cw[i]); si.push(s0); dep.push(depOf(s0)); jj.push(J[i]); tt.push(Math.abs(tau[i])); }
-    const k0 = xs.findIndex((x) => x >= f.x[Math.min(i0, f.nx - 1)]), st = k0 < 0 ? 0 : k0, cs = c.slice(st), iPk = st + cs.indexOf(Math.max(...cs));
-    return { x: xs, c, si, dep, J: jj, tau: tt, cMean: sum(cs) / cs.length, c95: pctl(cs, 0.95), cPeak: c[iPk], xPeak: xs[iPk], siPeak: si[iPk], siMean: sum(si.slice(st)) / cs.length, depMean: sum(dep.slice(st)) / cs.length, depPeak: Math.max(...dep.slice(st)), tauPeak: tt[iPk], tauMean: sum(tt.slice(st)) / cs.length, share: cs.filter((x) => x > 1.1 * (sum(cs) / cs.length)).length / cs.length };
+    for (let i = 0; i < f.nx; i++) if (!blk[i] && pf[i] >= 0.5) { xs.push(f.x[i]); c.push(cw[i]); const s0 = siOf(id0, cw[i]); si.push(s0); dep.push(depOf(s0)); jj.push(J[i]); tt.push(Math.abs(tau[i])); }
+    const k0 = xs.findIndex((x) => x >= f.x[Math.min(i0, f.nx - 1)]), st = k0 < 0 ? 0 : k0, cs = c.slice(st), iPk = st + cs.indexOf(Math.max(...cs)), hs = wallHotSpot(f, top, Lp, f.L / nFil);
+    return { x: xs, c, si, dep, J: jj, tau: tt, cMean: sum(cs) / cs.length, c95: pctl(cs, 0.95), cPeak: c[iPk], xPeak: xs[iPk], cPatch: hs.patch, xPatch: hs.xPatch, siPeak: si[iPk], siMean: sum(si.slice(st)) / cs.length, depMean: sum(dep.slice(st)) / cs.length, depPeak: Math.max(...dep.slice(st)), tauPeak: tt[iPk], tauMean: sum(tt.slice(st)) / cs.length, share: cs.filter((x) => x > 1.1 * (sum(cs) / cs.length)).length / cs.length };
   };
-  const B = side(f.cwB, f.blockB, f.JB, f.tauB), Tp = side(f.cwT, f.blockT, f.JT, f.tauT), cbMean = sum(f.cb.slice(i0)) / (f.nx - i0), hot = B.cPeak >= Tp.cPeak ? B : Tp;
+  const B = side(f.cwB, f.blockB, f.permB, f.JB, f.tauB, false), Tp = side(f.cwT, f.blockT, f.permT, f.JT, f.tauT, true), cbMean = sum(f.cb.slice(i0)) / (f.nx - i0), hot = B.cPeak >= Tp.cPeak ? B : Tp;
   // references: open-slit boundary-layer march over the same section with the same mean flux, and film theory with the spacer Sherwood correlation
   const mar = channelCFD({ L: f.L, H: h / 2, u0: uSec, vw: f.Jmean, D: Dm, rej: a.rej, nx: 120, ny: v.cfdNy ?? 30, visc: () => mu }), marSI = mar.cw.map((c) => siOf(id0, c)), ms = mar.x.map((x, i) => i).filter((i) => mar.x[i] >= f.x[Math.min(i0, f.nx - 1)]);
   const marMean = sum(ms.map((i) => mar.cw[i])) / ms.length, marPeak = Math.max(...mar.cw);
   const c1 = channel1D({ T, c0: 1, propMode: 'custom', rho, mu: mu * 1000, Dsalt: Dm * 1e9, piCoef: 0, H: h * 1000, Uin: uSec, geom: 'spacer', arr, nFil, lm: lm * 1000, L: f.L * 1000, A: 0, B: 0, dPtm: 0 });
   const e = Math.exp(Math.min(8, f.Jmean / c1.k)), film = e / (1 + (1 - a.rej) * (e - 1));
   const mineral = (c) => Object.fromEntries(set.map((id) => [id, siOf(id, c)]));
-  return { f, id0, set, cfSec, uSec, Ssec, rho, mu, Dm, osm, B, T: Tp, hot, cbMean, mar, marSI, marMean, marPeak, film, c1, siOf, depOf, siBulk: mineral(cbMean), siWallMean: mineral(0.5 * (B.cMean + Tp.cMean)), siHot95: mineral(Math.max(B.c95, Tp.c95)), siPeak: mineral(hot.cPeak), siFilm: mineral(cbMean * film), siMarch: mineral(marMean), Re: (rho * uSec * 2 * h) / mu };
+  // grid-converged hot spot carried to the end of the full section: the polarisation of the study (hot spot ÷ local bulk)
+  // times the highest bulk concentration of the section, never above the osmotic ceiling
+  let hs = null;
+  if (gs) {
+    const cbEnd = Math.max(...f.cb.slice(i0)), lift = (c) => { const x = (c / gs.cbHot) * cbEnd; return f.cCap ? Math.min(x, f.cCap) : x; };
+    hs = { cPatch: lift(gs.patch.value), cPeak: lift(gs.peak.value), cbEnd, beta: gs.patch.value / gs.cbHot };
+    hs.si = mineral(hs.cPatch); hs.siPeak = mineral(hs.cPeak);
+    if (v.cfdSink && id0 && hs.si[id0] > 0) hs.sink = await scaleSink(v, a, par, gs, { id0, cfSec, T, P, dk, Lp }, ctx);
+  }
+  return { f, id0, set, cfSec, uSec, Ssec, rho, mu, Dm, osm, B, T: Tp, hot, cbMean, mar, marSI, marMean, marPeak, film, c1, siOf, depOf, gs, hs, Lp, cCap: f.cCap, siCap: f.cCap ? mineral(f.cCap) : null, siBulk: mineral(cbMean), siWallMean: mineral(0.5 * (B.cMean + Tp.cMean)), siHot95: mineral(Math.max(B.c95, Tp.c95)), siPeak: mineral(hot.cPeak), siFilm: mineral(cbMean * film), siMarch: mineral(marMean), Re: (rho * uSec * 2 * h) / mu };
+}
+/**
+ * Supersaturation at the hot spot limited by the growth of the scale: the lattice ion in shortest supply is transported
+ * as a second species that the membrane rejects completely and that the wall consumes at N = k_r (c_w − c_sat). k_r is the
+ * secant of the suite's growth law G = k_g (S − 1)² (nucleationKinetics) between saturation and the hot-spot state and is
+ * iterated until the state it was evaluated at is the state it produces; c_sat and the saturation index of the depleted
+ * water come from the speciation engine with the mineral withdrawn from the hot-spot water.
+ */
+async function scaleSink(v, a, par, gs, { id0, cfSec, T, P, dk, Lp }, ctx) {
+  const M = MINERALS[id0], cH = gs.patch.value, sol = concentrateSolution(a.feed, cfSec * cH, a.copt), st = M._st.map(([i, nu]) => [i, nu, sol.n[i] / sol.w / nu]).sort((p, q) => p[2] - q[2])[0];
+  const xiMax = st[2], qs = [0, 0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 0.7, 0.9], sis = qs.map((q) => saturationIndex(withdraw(sol, id0, q * xiMax).eq, id0, P, dk[id0] || 0));
+  const siQ = (q) => interp1(qs, sis, clamp(q, 0, 0.9)), qSat = sis[8] < 0 ? brent(siQ, 0, 0.9, 1e-10) : 0.9, csat = cH * (1 - qSat);
+  const solIn = concentrateSolution(a.feed, cfSec, a.copt), cL0 = (solIn.n[st[0]] / solIn.w) * solutionToIons(solIn).kgwPerL * 1000; // mol of the limiting ion per m³ at the section inlet
+  const rate = (si) => { const k = si > 0 ? nucleationKinetics(id0, si, T, v) : null; return k ? (st[1] * k.G * rhoMolar(id0)) / cL0 : 0; }; // relative concentration × m/s
+  const nMid = gs.grids[1].nxFil, hist = [];
+  let c2 = cH, si = sis[0], kr = 0, fS = null;
+  for (let it = 0; it < 4; it++) {
+    kr = rate(si) / Math.max(c2 - csat, 1e-9);
+    ctx?.progress?.(0.985, 'Scale growth at the hot spot…');
+    fS = await spacerChannelCFD({ ...par, nFil: gs.nSec, nxFil: nMid, ny: 2 * Math.round(0.4 * nMid), tol: 3e-4, scalIter: 600, maxIter: 400, solver: { alphaU: 0.85 }, precip: { kr, csat } }, ctx);
+    const x0 = fS.L / gs.nSec, hB = wallHotSpot(fS, false, Lp, x0, fS.scaleB), hT = wallHotSpot(fS, true, Lp, x0, fS.scaleT), c2n = Math.max(hB.patch, hT.patch), siN = siQ(1 - Math.min(1, c2n / cH));
+    hist.push({ kr, c2: c2n, si: siN });
+    const done = Math.abs(siN - si) < 0.005;
+    c2 = c2n; si = siN;
+    if (done) break;
+  }
+  const x0 = fS.L / gs.nSec, salt = Math.max(wallHotSpot(fS, false, Lp, x0).patch, wallHotSpot(fS, true, Lp, x0).patch);
+  return { id: id0, ion: MAST[st[0]], qSat, csat, kr, c2, si, si0: sis[0], hist, cMid: salt, flux: (rate(si) * cL0 / st[1]) * M.mw * 86400 /* g/m²·d */, iterations: hist.length };
 }
 async function spacerScaling(v, a, X, ctx) {
   let q;
@@ -1513,7 +1733,7 @@ async function spacerScaling(v, a, X, ctx) {
   const siF = f.field.map((row, j) => row.map((c, i) => (f.mask[j][i] ? 0 : clamp(q.siOf(id0, c), -12, 12))));
   X.PL.push({ type: 'field', title: `Spacer-filled section: ${nm.toLowerCase()} saturation index (Navier–Stokes model)`, xlabel: 'Distance along the section (mm)', ylabel: 'Height above the lower membrane (mm)', zlabel: 'SI', zunit: '', x: mm(f.x), y: mm(f.y), z: siF, mask: f.mask, cmap: 'turbo', contours: 8, shapes: f.shapes.map((sh) => ({ ...sh, x: mm(sh.x), y: mm(sh.y) })), markers: [{ x: hot.xPeak * 1000, y: hot === B ? 0 : f.h * 1000, label: 'hot spot' }],
     note: `Membranes at the bottom and the top, flow from left to right, ${arrName}. The salt rejected by the permeating membranes accumulates in the slow fluid next to and behind the filaments; the saturation index follows from the speciation engine at the local concentration.` });
-  X.PL.push({ type: 'line', title: `Spacer-filled section: ${nm.toLowerCase()} saturation index at the membranes`, xlabel: 'Distance along the section (mm)', ylabel: 'Saturation index', series: [{ name: 'Lower membrane (Navier–Stokes, spacer)', x: mm(B.x), y: B.si }, { name: 'Upper membrane (Navier–Stokes, spacer)', x: mm(Tp.x), y: Tp.si }, { name: 'Open slit (boundary-layer march)', x: mm(q.mar.x), y: q.marSI, dash: true }, { name: 'Bulk (mixing-cup)', x: mm(f.x), y: f.cb.map((c) => q.siOf(id0, c)), dash: true }], hlines: [{ y: q.siFilm[id0], label: 'film theory' }, { y: 0, label: 'saturation' }], note: 'Gaps in the membrane curves are the contact lines of filaments, where the membrane is covered.' });
+  X.PL.push({ type: 'line', title: `Spacer-filled section: ${nm.toLowerCase()} saturation index at the membranes`, xlabel: 'Distance along the section (mm)', ylabel: 'Saturation index', series: [{ name: 'Lower membrane (Navier–Stokes, spacer)', x: mm(B.x), y: B.si }, { name: 'Upper membrane (Navier–Stokes, spacer)', x: mm(Tp.x), y: Tp.si }, { name: 'Open slit (boundary-layer march)', x: mm(q.mar.x), y: q.marSI, dash: true }, { name: 'Bulk (mixing-cup)', x: mm(f.x), y: f.cb.map((c) => q.siOf(id0, c)), dash: true }], hlines: [{ y: q.siFilm[id0], label: 'film theory' }, { y: 0, label: 'saturation' }], note: 'Gaps in the membrane curves are the footprints of the filaments, where the membrane is covered and does not permeate.' });
   X.PL.push({ type: 'line', title: `Spacer-filled section: potential ${nm.toLowerCase()} deposition flux and permeate flux`, xlabel: 'Distance along the section (mm)', ylabel: 'Deposition (g/m²·d) · flux (L/m²·h)', series: [{ name: 'Deposition, lower membrane', x: mm(B.x), y: B.dep }, { name: 'Deposition, upper membrane', x: mm(Tp.x), y: Tp.dep }, { name: 'Deposition, open slit', x: mm(q.mar.x), y: q.marSI.map(q.depOf), dash: true }, { name: 'Permeate flux, lower membrane (L/m²·h)', x: mm(B.x), y: B.J.map((j) => j * 3.6e6), dash: true }] });
   const cf = q.cfSec, st = (b) => [b.cMean, b.c95, b.cPeak];
   X.TB.push({ title: 'Spacer-filled channel section (Navier–Stokes, finite-volume solver of suite 4)', columns: ['Quantity', 'Navier–Stokes, lower membrane', 'Navier–Stokes, upper membrane', 'Open-slit march', 'Film theory', 'Unit'], rows: [
@@ -1522,14 +1742,31 @@ async function spacerScaling(v, a, X, ctx) {
     ['Hot-spot position', B.xPeak * 1000, Tp.xPeak * 1000, f.L * 1000, null, 'mm'], ['Wall shear stress at the hot spot / mean', `${fq(B.tauPeak, 3)} / ${fq(B.tauMean, 3)}`, `${fq(Tp.tauPeak, 3)} / ${fq(Tp.tauMean, 3)}`, null, null, 'Pa'], ['Membrane more than 10 % above the mean wall concentration', 100 * B.share, 100 * Tp.share, null, null, '% of open area'],
     [`Potential ${nm.toLowerCase()} deposition flux: mean`, B.depMean, Tp.depMean, sum(q.marSI.map(q.depOf)) / q.marSI.length, q.depOf(q.siFilm[id0]), 'g/m²·d'], [`Potential ${nm.toLowerCase()} deposition flux: peak`, B.depPeak, Tp.depPeak, q.depOf(q.siOf(id0, q.marPeak)), null, 'g/m²·d'],
     ['Mean permeate flux', sum(B.J) / B.J.length * 3.6e6, sum(Tp.J) / Tp.J.length * 3.6e6, f.Jmean * 3.6e6, f.Jmean * 3.6e6, 'L/m²·h']],
-    note: `Section of ${fq(f.L * 1000, 3)} mm (${v.cfdNFil ?? 6} filament spacings of ${fq((v.cfdLm ?? 3), 3)} mm) at the concentrate end: inlet at ${fq(cf, 4)} times the feed concentration (${fq(q.Ssec, 3)} g/kg), ${fq(q.uSec, 3)} m/s, channel Reynolds number ${fq(q.Re, 3)}. Grid ${f.nx} × ${f.ny} cells, ${f.converged ? 'converged' : 'NOT converged'} in ${f.iters} iterations, salt balance error ${fq(Math.abs(f.balance.out / f.balance.in - 1), 2)}. ${q.osm ? `Solution–diffusion walls with A = ${fq(f.A * 3.6e11, 3)} L/m²·h·bar at ${fq(v.P, 3)} bar, so the flux falls where the wall concentration rises.` : 'Uniform permeate flux (the applied pressure does not exceed the osmotic pressure by enough for the flux law).'} Constant density and viscosity; molecular diffusivity ${fq(q.Dm, 3)} m²/s without a mixing factor. Statistics exclude the first filament spacing (entrance). The march and film-theory columns use the mean flux of the Navier–Stokes solution; film theory uses the spacer Sherwood correlation of suite 4 (Sh = ${fq(q.c1.Sh, 3)}). The peak value at a filament contact line depends on the grid — judge hot spots by the 95th percentile and refine the grid on the Mesh tab.` });
+    note: `Section of ${fq(f.L * 1000, 3)} mm (${v.cfdNFil ?? 6} filament spacings of ${fq((v.cfdLm ?? 3), 3)} mm) at the concentrate end: inlet at ${fq(cf, 4)} times the feed concentration (${fq(q.Ssec, 3)} g/kg), ${fq(q.uSec, 3)} m/s, channel Reynolds number ${fq(q.Re, 3)}. Grid ${f.nx} × ${f.ny} cells, ${f.converged ? 'converged' : 'NOT converged'} in ${f.iters} iterations, salt balance error ${fq(Math.abs(f.balance.out / f.balance.in - 1), 2)}. ${q.osm ? `Solution–diffusion walls with A = ${fq(f.A * 3.6e11, 3)} L/m²·h·bar at ${fq(v.P, 3)} bar, so the flux falls where the wall concentration rises.` : 'Uniform permeate flux (the applied pressure does not exceed the osmotic pressure by enough for the flux law).'} Constant density and viscosity; molecular diffusivity ${fq(q.Dm, 3)} m²/s without a mixing factor. Statistics exclude the first filament spacing (entrance). The march and film-theory columns use the mean flux of the Navier–Stokes solution; film theory uses the spacer Sherwood correlation of suite 4 (Sh = ${fq(q.c1.Sh, 3)}). ${f.contactHalfWidth > 0 ? `Each wall-touching filament covers the membrane over a flattened contact of ±${fq(f.contactHalfWidth * 1e6, 3)} µm, where the flux is zero.` : ''} The values of this table are those of the section grid; the hot spot next to a filament needs the finer grids of the convergence study below.` });
   X.TB.push({ title: 'Saturation indices in the spacer-filled section', columns: ['Mineral', 'Bulk', 'Wall, mean (Navier–Stokes)', 'Wall, 95th percentile', 'Wall, hot spot', 'Wall, open-slit march (mean)', 'Wall, film theory'], rows: q.set.map((id) => [MINERALS[id].name, q.siBulk[id], q.siWallMean[id], q.siHot95[id], q.siPeak[id], q.siMarch[id], q.siFilm[id]]), note: 'Speciation engine evaluated on the bulk analysis scaled by the local concentration factor (nine tabulated factors, interpolated in ln CF).' });
   X.BAL.push({ name: 'Spacer section (Navier–Stokes): salt entering vs leaving (relative)', in: 1, out: f.balance.out / f.balance.in });
-  const bMean = 0.5 * (B.cMean + Tp.cMean) / q.cbMean, b95 = Math.max(B.c95, Tp.c95) / q.cbMean;
-  X.K.push({ label: 'Spacer section: mean polarisation factor', value: bMean, unit: '–', help: `Navier–Stokes solution with ${arrName}; open-slit march ${fq(q.marMean / q.cbMean, 3)}, film theory ${fq(q.film, 3)}` }, { label: `Spacer section: hot-spot ${nm.toLowerCase()} SI`, value: Math.max(q.siHot95[id0], -99), unit: '', status: q.siHot95[id0] > Math.max(a.lim[id0] ?? 0, 0) ? 'warn' : 'ok', help: '95th percentile of the wall saturation index behind the filaments' });
+  const gs = q.gs, hs = q.hs;
+  if (gs) {
+    const pc = (x) => 100 * x, row = (g) => [`${g.nx} × ${g.ny}`, g.dx * 1e6, g.dy0 * 1e6, g.peak, g.patch, g.cMax, g.Jmean * 3.6e6, g.converged ? 'yes' : 'no'], est = (c) => `${fq(c.value, 5)} ± ${fq(pc(c.gci), 2)} %${c.capped ? ' (at the ceiling)' : ''}`;
+    X.TB.push({ title: 'Hot spot next to a filament: grid-convergence study', columns: ['Grid (cells)', 'Axial cell (µm)', 'Wall cell height (µm)', 'Peak c wall / c inlet', `Mean over the hottest ${fq(gs.Lp * 1e6, 3)} µm patch`, 'Largest concentration anywhere', 'Mean flux (L/m²·h)', 'Converged'],
+      rows: [...gs.grids.map(row), ['Richardson estimate ± grid-convergence index', null, null, est(gs.peak), est(gs.patch), null, null, null], ['Observed order of convergence', null, null, fq(gs.peak.pObs, 3), fq(gs.patch.pObs, 3), null, null, null], ['Change between the two finest grids (%)', null, null, pc(gs.peak.change21), pc(gs.patch.change21), null, null, null], ['Sequence', null, null, gs.peak.monotone ? 'monotone' : 'not monotone', gs.patch.monotone ? 'monotone' : 'not monotone', null, null, null],
+        ['Osmotic ceiling of the wall concentration', null, null, q.cCap, q.cCap, q.cCap, null, null]],
+      note: `The same problem — the first ${gs.nSec} filament spacings of the section — on three grids refined by the same factor along and across the channel (cells per spacing in multiples of ten, so the filament axes lie on cell faces on every grid). The peak is the highest wall-cell value on the permeating membrane; the patch value is the highest average over ${fq(gs.Lp * 1e6, 3)} µm of membrane, a length comparable with a nucleation site. Richardson extrapolation with the observed order limited to 0.5–2 and a safety factor of 1.25 (grid-convergence index); a sequence that is not monotone is not extrapolated and carries half its spread instead; an estimate above the osmotic ceiling is set to the ceiling. ${q.cCap ? `The flux law J = A·(ΔP − Δπ(c wall)) ≥ 0 stops permeation where the osmotic-pressure difference across the membrane reaches the applied pressure, so no wall concentration can exceed ${fq(q.cCap, 5)} times the section inlet; the largest value found on any grid is ${fq(gs.cMax, 5)}.` : 'Uniform flux: there is no osmotic ceiling; a flux that does not respond to the wall concentration keeps concentrating the stagnant corner, so these values are grid-dependent upper estimates.'} Flux through the membrane covered by the footprints: ${fq(Math.max(0, gs.jFoot) * 3.6e6, 2)} L/m²·h.` });
+    const rowsH = [['Polarisation at the hot spot (patch ÷ local bulk)', hs.beta, '–'], ['Highest bulk concentration of the section ÷ inlet', hs.cbEnd, '–'], ['Hot-spot wall concentration ÷ section inlet (patch, grid-converged)', hs.cPatch, '–'], ['Hot-spot wall concentration ÷ section inlet (peak, grid-converged)', hs.cPeak, '–'], ['Hot-spot concentration factor versus the feed', q.cfSec * hs.cPatch, '×'],
+      ...(q.cCap ? [['Osmotic ceiling ÷ section inlet', q.cCap, '–'], ['Share of the ceiling reached at the hot spot', 100 * (hs.cPatch - 1) / Math.max(q.cCap - 1, 1e-9), '%']] : []), ...q.set.map((id) => [`${MINERALS[id].name} saturation index at the hot spot${q.siCap ? ` (at the osmotic ceiling: ${fq(q.siCap[id], 3)})` : ''}`, hs.si[id], ''])];
+    if (hs.sink) { const k = hs.sink; rowsH.push([`${nm} saturation index at the hot spot with scale growth`, k.si, ''], [`…lattice ion in shortest supply (${k.ion}) left at the wall`, 100 * k.c2 / k.cMid, '% of its unreacted value'], ['…surface rate constant k_r (secant of the growth law)', k.kr * 1e6, 'µm/s'], [`…${nm.toLowerCase()} growth at the hot spot`, k.flux, 'g/m²·d']); }
+    X.TB.push({ title: 'Hot spot of the spacer section (grid-converged)', columns: ['Quantity', 'Value', 'Unit'], rows: rowsH, note: `The polarisation of the convergence study is applied to the highest bulk concentration of the full section${q.cCap ? ' and limited by the osmotic ceiling' : ''}.${hs.sink ? ` Scale growth: the lattice ion in shortest supply is transported as a second, fully rejected species that the wall consumes at N = k_r·(c wall − c sat); k_r is the secant of the suite’s growth law between saturation and the hot-spot state (${hs.sink.iterations} iterations), c sat and the saturation index of the depleted water come from the speciation engine. Same diffusivity as the salt; medium grid of the study.` : ''}` });
+    X.PL.push({ type: 'line', title: 'Hot spot next to a filament on three grids', xlabel: 'Representative cell size √(Δx·Δy wall) (µm)', ylabel: 'c wall / c section inlet', series: [{ name: 'Peak', x: gs.grids.map((g) => g.hRep * 1e6), y: gs.grids.map((g) => g.peak) }, { name: `Mean over ${fq(gs.Lp * 1e6, 3)} µm`, x: gs.grids.map((g) => g.hRep * 1e6), y: gs.grids.map((g) => g.patch) }], hlines: [...(q.cCap ? [{ y: q.cCap, label: 'osmotic ceiling' }] : []), { y: gs.patch.value, label: 'patch, extrapolated' }] });
+  }
+  const bMean = 0.5 * (B.cMean + Tp.cMean) / q.cbMean, b95 = Math.max(B.c95, Tp.c95) / q.cbMean, siHot = hs ? hs.si[id0] : q.siHot95[id0];
+  X.K.push({ label: 'Spacer section: mean polarisation factor', value: bMean, unit: '–', help: `Navier–Stokes solution with ${arrName}; open-slit march ${fq(q.marMean / q.cbMean, 3)}, film theory ${fq(q.film, 3)}` }, { label: `Spacer section: hot-spot ${nm.toLowerCase()} SI`, value: Math.max(siHot, -99), unit: '', status: siHot > Math.max(a.lim[id0] ?? 0, 0) ? 'warn' : 'ok', help: hs ? `Mean over the hottest ${fq(q.Lp * 1e6, 3)} µm of membrane next to a filament, Richardson estimate from three grids (grid-convergence index ${fq(100 * gs.patch.gci, 2)} %)` : '95th percentile of the wall saturation index behind the filaments' });
+  if (hs) X.K.push({ label: 'Spacer section: hot-spot polarisation factor', value: hs.cPatch / hs.cbEnd, unit: '–', help: `Patch-averaged wall concentration ÷ bulk; grid-convergence index ${fq(100 * gs.patch.gci, 2)} %, change between the two finest grids ${fq(100 * gs.patch.change21, 2)} %` });
+  if (q.cCap) X.K.push({ label: 'Spacer section: osmotic ceiling of the wall concentration', value: q.cCap, unit: '× section inlet', help: `Concentration at which the osmotic-pressure difference across the membrane equals the applied ${fq(v.P, 3)} bar and permeation stops; ${nm.toLowerCase()} SI there ${fq(q.siCap[id0], 3)}` });
   if (!f.converged) X.W.push({ level: 'warn', msg: 'The Navier–Stokes solution of the spacer section did not reach its tolerance — the flow behind the filaments is probably unsteady; treat the hot-spot values as indicative.' });
-  if (q.siHot95[id0] > 0 && q.siHot95[id0] - q.siWallMean[id0] > 0.05) X.W.push({ level: 'info', msg: `Behind the spacer filaments the wall ${nm.toLowerCase()} saturation index reaches ${fq(q.siHot95[id0], 3)} (95th percentile; mean ${fq(q.siWallMean[id0], 3)}, film theory ${fq(q.siFilm[id0], 3)}): scale starts at these stagnant spots.` });
-  Object.assign(X.out, { spacerBetaMean: bMean, spacerBeta95: b95, spacerBetaPeak: hot.cPeak / q.cbMean, spacerSIMean: q.siWallMean[id0], spacerSIHot: q.siHot95[id0], spacerDepositPeak: Math.max(B.depPeak, Tp.depPeak), spacerMineral: id0 });
+  if (siHot > 0 && siHot - q.siWallMean[id0] > 0.05) X.W.push({ level: 'info', msg: `Next to the spacer filaments the wall ${nm.toLowerCase()} saturation index reaches ${fq(siHot, 3)} (${hs ? 'grid-converged patch average' : '95th percentile'}; mean ${fq(q.siWallMean[id0], 3)}, film theory ${fq(q.siFilm[id0], 3)}): scale starts at these stagnant spots.` });
+  if (gs && !(Math.abs(gs.patch.change21) < 0.03)) X.W.push({ level: 'warn', msg: `The patch-averaged hot spot still changes by ${fq(100 * Math.abs(gs.patch.change21), 2)} % between the two finest grids — raise the cells per spacing of the convergence study on the Mesh tab.` });
+  if (gs && !q.osm) X.W.push({ level: 'info', msg: v.cfdOsm === false ? 'The spacer section was solved with a uniform flux: without the osmotic feedback the hot spot has no ceiling and does not converge with the grid — read it as an upper estimate.' : 'The entered pressure does not exceed the osmotic pressure of the section by enough for the flux law, so the spacer section was solved with a uniform flux: without the osmotic feedback the hot spot has no ceiling and does not converge with the grid — read it as an upper estimate.' });
+  Object.assign(X.out, { spacerBetaMean: bMean, spacerBeta95: b95, spacerBetaPeak: hot.cPeak / q.cbMean, spacerSIMean: q.siWallMean[id0], spacerSIHot: siHot, spacerSIHot95: q.siHot95[id0], spacerDepositPeak: Math.max(B.depPeak, Tp.depPeak), spacerMineral: id0, spacerCap: q.cCap ?? 0, ...(gs ? { spacerHotPatch: gs.patch.value, spacerHotPeak: gs.peak.value, spacerHotPatchGCI: gs.patch.gci, spacerHotPeakGCI: gs.peak.gci, spacerHotChange: gs.patch.change21, spacerHotMax: gs.cMax } : {}), ...(hs && hs.sink ? { spacerSIHotLimited: hs.sink.si } : {}) });
 }
 
 /**
@@ -1681,7 +1918,11 @@ const suite = {
       { key: 'cfdLm', label: 'Filament spacing', unit: 'mm', value: 3, min: 0.5, max: 20, typical: [2, 6], help: 'Centre-to-centre distance of successive transverse filaments.', showIf: (v) => v.cfdOn && v.cfdSpacer },
       { key: 'cfdDf', label: 'Filament diameter', unit: '% of channel height', value: 50, min: 10, max: 85, help: 'About half the channel height for a two-layer net spacer.', showIf: (v) => v.cfdOn && v.cfdSpacer && v.cfdArr !== 'none' },
       { key: 'cfdNFil', label: 'Filament spacings resolved', unit: '', value: 6, min: 2, max: 20, step: 1, help: 'Length of the resolved section = spacings × filament spacing, placed at the concentrate end of the channel. The first spacing is an entrance length and is left out of the statistics.', showIf: (v) => v.cfdOn && v.cfdSpacer },
-      { key: 'cfdOsm', label: 'Flux responds to the local osmotic pressure', type: 'bool', value: true, help: 'Solution–diffusion wall: J = A·(ΔP − Δπ(c wall)) with the pressure of the Inputs tab, A fitted so that the flux at the section inlet equals the entered flux. Unticked: uniform flux.', showIf: (v) => v.cfdOn && v.cfdSpacer },
+      { key: 'cfdOsm', label: 'Flux responds to the local osmotic pressure', type: 'bool', value: true, help: 'Solution–diffusion wall: J = A·(ΔP − Δπ(c wall)) ≥ 0 with the pressure of the Inputs tab, A fitted so that the flux at the section inlet equals the entered flux. The flux stops where the osmotic pressure reaches the applied pressure, which bounds the wall concentration. Unticked: uniform flux (no such bound).', showIf: (v) => v.cfdOn && v.cfdSpacer },
+      { key: 'cfdContact', label: 'Filament contact half-width', unit: '% of filament diameter', value: 15, min: 0, max: 50, typical: [10, 20], help: 'A filament pressed against the membrane is flattened and covers it over a strip of this half-width on each side of its axis; the covered membrane does not permeate. 0 = ideal line contact with permeation right up to it (the hot spot then depends on the grid).', showIf: (v) => v.cfdOn && v.cfdSpacer && (v.cfdArr === 'zigzag' || v.cfdArr === 'cavity') },
+      { key: 'cfdPatch', label: 'Hot-spot averaging length', unit: 'µm', value: 100, min: 10, max: 1000, typical: [50, 100], help: 'The hot spot is reported as the highest mean wall concentration over this length of membrane — comparable with a nucleation site or a young crystal.', showIf: (v) => v.cfdOn && v.cfdSpacer },
+      { key: 'cfdGci', label: 'Grid-convergence study of the hot spot', type: 'bool', value: true, help: 'Solves the first two filament spacings on three refined grids and reports the Richardson estimate of the hot spot with its grid-convergence index. Adds a few seconds.', showIf: (v) => v.cfdOn && v.cfdSpacer },
+      { key: 'cfdSink', label: 'Let scale growth limit the hot-spot supersaturation', type: 'bool', value: false, help: 'Adds wall crystallisation of the kinetic mineral with the growth law of the kinetics group: the lattice ion in shortest supply is consumed at the wall, which lowers the saturation index the hot spot can sustain. Adds several seconds.', showIf: (v) => v.cfdOn && v.cfdSpacer && v.cfdGci !== false },
     ] },
     { group: 'Pretreatment: sorption and softening', tab: 'setup', help: 'Optional steps ahead of the concentration: sorption of silica and boron on ferric-hydroxide floc (surface complexation) and sodium-cycle ion-exchange softening. Both change the water that is concentrated.', fields: [
       { key: 'scmOn', label: 'Ferric coagulation: sorb silica and boron', type: 'bool', value: false, help: 'Generalised two-layer surface-complexation model for hydrous ferric oxide with the diffuse-layer charge–potential relation.' },
@@ -1706,6 +1947,7 @@ const suite = {
       { key: 'rtN', label: 'Cells along the channel (reactive transport)', unit: '', value: 40, min: 8, max: 400, step: 1, help: 'Finite-volume cells of the advection–dispersion–reaction model.' },
       { key: 'cfdNxFil', label: 'Cells per filament spacing (spacer section)', unit: '', value: 24, min: 8, max: 80, step: 1, help: 'Axial finite-volume cells per filament spacing of the Navier–Stokes model.', showIf: (v) => v.cfdOn && v.cfdSpacer },
       { key: 'cfdNyFull', label: 'Cells across the full channel (spacer section)', unit: '', value: 32, min: 12, max: 120, step: 1, help: 'Wall-clustered cells between the two membranes of the Navier–Stokes model.', showIf: (v) => v.cfdOn && v.cfdSpacer },
+      { key: 'cfdGciN', label: 'Cells per filament spacing on the finest grid of the hot-spot study', unit: '', value: 50, min: 50, max: 120, step: 10, help: 'The three grids of the convergence study use 0.6, 0.8 and 1.0 times this number per spacing (multiples of ten) and 0.8 times as many cells across the channel.', showIf: (v) => v.cfdOn && v.cfdSpacer && v.cfdGci !== false },
       { key: 'cfdNy', label: 'Cells across the half-channel (flow model)', unit: '', value: 30, min: 8, max: 120, step: 1, help: 'Wall-refined cells between the membrane and the mid-plane.' },
       { key: 'nPB', label: 'Output steps of the population balance', unit: '', value: 120, min: 20, max: 2000, step: 1, help: 'Time levels (quadratically spaced) at which new nuclei classes are created.' },
     ] },
@@ -1858,7 +2100,7 @@ const suite = {
           ['Ryznar stability index', fd.rsi, cd.rsi, '< 6 scaling, 6–7 balanced, > 7 corrosive'], ['Puckorius index', fd.psi, cd.psi, '< 6 scaling, > 7 corrosive'], ['Larson–Skold index', fd.larsonSkold, cd.larsonSkold, '> 1.2 high corrosion rate on steel'], ['Aggressive index', fd.aggressiveIndex, cd.aggressiveIndex, '< 10 aggressive, > 12 non-aggressive'], ['CCPP (mg/L CaCO₃)', fd.ccpp, cd.ccpp, 'Mass of CaCO₃ that would precipitate (+) or dissolve (−)']] },
         ...X.TB,
         { title: 'Data provenance', columns: ['Parameter set', 'Source', 'How it was checked', 'Validity range', 'Status'], rows: PROVENANCE.map((r) => r.slice()),
-          note: 'Every tabulated constant of the chemistry engine was compared with the named database file or table. “Replaced” = the earlier value could not be found and was exchanged for a documented one; “analogue” = assigned by chemical similarity; “unconfirmed” = no source could be retrieved, and the entry is not used by the default (Pitzer) calculation path. The activity models are tested against the NIST activity-coefficient tables on the Verify tab.' },
+          note: 'Every tabulated constant of the chemistry engine was compared with the named database file or table. “Replaced” = the earlier value could not be found and was exchanged for a documented one; “fitted here” / “refitted here” = derived in this work from the named measurements, with the fit statistics given; “analogue” = assigned by chemical similarity; “unconfirmed” = no source could be retrieved, and the entry is not used by the default (Pitzer) calculation path. The activity models are tested against the NIST activity-coefficient tables on the Verify tab.' },
       ],
       balances: (() => {
         const iCa = mi('Ca'), iS = mi('SO4'), caS = sum(Object.entries(pr.solids).map(([id, x]) => x * (MINERALS[id].stoich.Ca || 0))), sS = sum(Object.entries(pr.solids).map(([id, x]) => x * (MINERALS[id].stoich.SO4 || 0)));
@@ -1879,7 +2121,7 @@ const suite = {
   mesh: [{ name: 'Recovery-sweep resolution', keys: ['nRec'], min: 6, note: 'Scaling-limited recoveries are interpolated between sweep points; the study refines the sweep and reports the numerical uncertainty of those limits.',
     metrics: [{ label: 'Max recovery with antiscalant', unit: '–', get: (r) => r.outputs.maxRecoveryAntiscalant }, { label: 'Max recovery without antiscalant', unit: '–', get: (r) => r.outputs.maxRecoveryNoAntiscalant }] },
   { name: 'Reactive-transport grid', keys: ['rtN'], min: 8, note: 'Cells along the channel of the advection–dispersion–reaction model (needs the reactive-transport case switched on).', metrics: [{ label: 'Mean wall deposit', unit: 'g/m²', get: (r) => r.outputs.rtDepositMean ?? 0 }, { label: 'Outlet saturation index', unit: '', get: (r) => r.outputs.rtOutletSI ?? 0 }] },
-  { name: 'Spacer-section grid (Navier–Stokes)', keys: ['cfdNxFil', 'cfdNyFull'], min: 8, note: 'Cells per filament spacing and across the channel of the Navier–Stokes model (needs the spacer-filled section switched on). The mean polarisation converges quickly; the hot-spot value at a filament contact line converges slowly.', metrics: [{ label: 'Mean polarisation factor', unit: '–', get: (r) => r.outputs.spacerBetaMean ?? 1 }, { label: '95th-percentile polarisation factor', unit: '–', get: (r) => r.outputs.spacerBeta95 ?? 1 }] },
+  { name: 'Spacer-section grid (Navier–Stokes)', keys: ['cfdNxFil', 'cfdNyFull'], min: 8, note: 'Cells per filament spacing and across the channel of the Navier–Stokes model (needs the spacer-filled section switched on). The mean polarisation converges quickly; the hot spot next to a filament is resolved by the separate three-grid convergence study of the results.', metrics: [{ label: 'Mean polarisation factor', unit: '–', get: (r) => r.outputs.spacerBetaMean ?? 1 }, { label: '95th-percentile polarisation factor', unit: '–', get: (r) => r.outputs.spacerBeta95 ?? 1 }] },
   { name: 'Flow-model grid across the channel', keys: ['cfdNy'], min: 8, note: 'Wall-normal cells of the two-dimensional channel model.', metrics: [{ label: 'Largest local polarisation factor', unit: '–', get: (r) => r.outputs.cfdBetaMax ?? 1 }, { label: 'Channel pressure drop', unit: 'bar', get: (r) => r.outputs.cfdPressureDropBar ?? 0 }] }],
 
   calibration: {
@@ -2011,13 +2253,62 @@ const suite = {
       const q = actDeviation(ref, model, mMax);
       add(`${salt} ${q.m0}${q.n > 1 ? `–${q.m1}` : ''} mol/kg, ${mLab[model]} model: γ± and φ against ${ref.src}`, 0, Math.max(q.dg, q.dp), tol, `Largest relative deviation over ${q.n} tabulated molalit${q.n > 1 ? 'ies' : 'y'}: γ± ${fmt(100 * q.dg, 2)} %, φ ${fmt(100 * q.dp, 2)} % (NIST critical evaluation, 25 °C)`);
     }
-    { // MgSO4: no critically evaluated table could be retrieved, so these are not independent of the suite's parameters
+    { // MgSO4: implementation checks first, then measurements that are independent of the suite's parameters
       const ps = [0.1, 1, 3].map((m) => { const q = saltActivity('Mg', 'SO4', m), h = pitzerSingle(2, 2, m, 0.221, 3.343, -37.23, 0.025); return Math.max(Math.abs(q.gamma / h.gamma - 1), Math.abs(q.phi / h.phi - 1)); });
-      add('MgSO₄ 0.1–3 mol/kg, Pitzer model: multi-ion sums against the closed-form single-salt equation', 0, Math.max(...ps), 2e-3, 'Implementation check, not an independent one: both sides use the Harvie–Møller–Weare parameters (β⁰ 0.221, β¹ 3.343, β² −37.23, Cφ 0.025); no tabulated MgSO₄ data could be retrieved');
+      add('MgSO₄ 0.1–3 mol/kg, Pitzer model: multi-ion sums against the closed-form single-salt equation', 0, Math.max(...ps), 2e-3, 'Implementation check, not an independent one: both sides use the Harvie–Møller–Weare parameters (β⁰ 0.221, β¹ 3.343, β² −37.23, Cφ 0.025, as held in EQ3/6 data0.hmw)');
       const p01 = saltActivity('Mg', 'SO4', 0.1);
       add('MgSO₄ 0.1 mol/kg: SIT, Davies and Bromley against the suite’s Pitzer model', 0, Math.max(...['sit', 'davies', 'bromley'].map((mod) => Math.abs(saltActivity('Mg', 'SO4', 0.1, { model: mod }).gamma / p01.gamma - 1))), 0.15, 'Consistency check, not an independent one: the reference is the suite’s own source-verified Pitzer model. 2:2 salts are outside the range of the Bromley correlation');
+      { // independent data: isopiestic osmotic coefficients, the Archer–Rard evaluation, epsomite solubility
+        const dv = (rows, f) => Math.max(...rows.map(f)), q = (m) => saltActivity('Mg', 'SO4', m);
+        const dIso = dv(MGSO4_REF.iso, ([m, ph]) => Math.abs(q(m).phi / ph - 1)), dG = dv(MGSO4_REF.ar, ([I, g]) => Math.abs(q(I / 4).gamma / g - 1)), dP = dv(MGSO4_REF.ar, ([I, , ph]) => Math.abs(q(I / 4).phi / ph - 1)), dPP = dv(MGSO4_REF.pp, ([m, ph]) => Math.abs(q(m).phi / ph - 1));
+        add('MgSO₄ 0.72–3.14 mol/kg, Pitzer model: osmotic coefficient against isopiestic measurements', 0, dIso, 0.012, `Largest relative deviation from six points measured against KCl reference solutions (Miladinović, Ninković, Todorović & Rard 2007, LLNL UCRL-JRNL-231697, Table 4): ${fmt(100 * dIso, 2)} %. Independent of the model parameters: the Harvie–Møller–Weare set dates from 1984`);
+        add('MgSO₄ 0.25–1.5 mol/kg, Pitzer model: γ± against the Archer & Rard (1998) evaluation', 0, dG, 0.006, `Largest relative deviation over 11 tabulated ionic strengths (values of the extended ion-interaction model of Archer & Rard as printed in Table 6 of the same report): γ± ${fmt(100 * dG, 2)} %, φ ${fmt(100 * dP, 2)} %. An independent evaluation with its own parameters, not a measurement`);
+        add('MgSO₄ 0.25–1.5 mol/kg, Pitzer model: φ against the Archer & Rard (1998) evaluation', 0, dP, 0.006, 'Same table');
+        add('MgSO₄ 0.1–3 mol/kg, Pitzer model: φ against Phutela & Pitzer (1986)', 0, dPP, 0.013, `Four values quoted in Table I-15 of the report ANL-EBS-MD-000045 REV 02 (2004): largest deviation ${fmt(100 * dPP, 2)} %. Secondary source; Phutela & Pitzer and Harvie–Møller–Weare evaluate partly the same measurements`);
+        const eps = solubility(pure, 'epsomite', { excess: 8 });
+        add('Epsomite (MgSO₄·7H₂O) solubility in water, 25 °C', 2.99, eps.molality, 0.05, `mol/kg water. Two retrieved values: 3.018 (data point of Pabalan & Pitzer 1987, fig. 7, as entered in the file MgSO4.csv of Appelo 2015) and 2.96 (26.3 mass %, CRC Handbook as converted in ANL-EBS-MD-000045, solid phase not named there). Tests the Pitzer activity product at saturation (log K −1.881 with γ± and the water activity at 3 mol/kg); water activity of the saturated solution in the model ${fmt(eps.sol.eq.aw, 4)}`);
+      }
       const nn = { c: 'Na', a: 'NO3', d: [[0.1, 0.76, 0.921], [0.5, 0.618, 0.876], [1, 0.549, 0.852], [2, 0.478, 0.826], [3, 0.437, 0.81], [4, 0.408, 0.798], [5, 0.386, 0.789], [6, 0.372, 0.789]] }, qn = actDeviation(nn, 'pitzer', 6);
       add('NaNO₃ 0.1–6 mol/kg, Pitzer model (replaced parameter set): γ± and φ against Hamer & Wu 1972', 0, Math.max(qn.dg, qn.dp), 0.03, `γ± ${fmt(100 * qn.dg, 2)} %, φ ${fmt(100 * qn.dp, 2)} %`);
+    }
+    { // barite and celestite solubility in water and in NaCl solutions (Pitzer model)
+      const nacl = (m) => { const n = new Float64Array(NM); n[mi('Na')] = m; n[mi('Cl')] = m; return equilibrate({ T: 25, model: 'pitzer', n, alk: 0, w: 1, pH: 7 }); };
+      const ba = BARITE_NACL.map(([c, x]) => [c, (solubility(nacl(c), 'barite', { excess: 0.01 }).m * 1000) / x - 1]), rms = (a) => Math.sqrt(sum(a.map((x) => Math.log10(1 + x) ** 2)) / a.length), pc = (x) => fmt(100 * x, 2);
+      add('Barite solubility in water, 25 °C', 0.0107, (ba[0][1] + 1) * BARITE_NACL[0][1], 0.0004, 'mmol/kg. Templeton (1960): 0.0108 (as entered by Appelo 2015); Blount (1977, Am. Mineral. 62, 942, Table 3): 0.0106. Tests log K = −9.97; no activity model parameter matters at this dilution');
+      const hi = ba.filter((r) => r[0] >= 1 && r[0] <= 4), lo = ba.filter((r) => r[0] > 0 && r[0] < 1);
+      add('Barite solubility in 1–4 mol/kg NaCl', 0, Math.max(...hi.map((r) => Math.abs(r[1]))), 0.08, `Largest relative deviation from the table of Templeton (1960) at ${hi.length} NaCl concentrations: ${hi.map((r) => `${r[0]}: ${pc(r[1])} %`).join(', ')}. Depends on the Ba–Cl and Na–SO₄ parameters only (no θ(Ba,Na) or ψ in the set); independent of the Ba–SO₄ analogue`);
+      add('Barite solubility in 0.05–5 mol/kg NaCl: root-mean-square deviation', 0, rms(ba.slice(1).map((r) => r[1])), 0.06, `In log₁₀ units over 15 concentrations. Below 1 mol/kg the model is lower than the table (${lo.map((r) => `${r[0]}: ${pc(r[1])} %`).join(', ')}): at 0.05 mol/kg the tabulated rise over pure water (factor 2.8) exceeds what the Debye–Hückel term allows (2.3), which no specific-interaction parameter can change`);
+      const ce = CELESTITE_NACL.map(([c, x]) => { const rho = density(25, (c * 58.443) / (1 + c * 0.058443)) / 1000, kgw = rho - c * 0.058443; return [c, (solubility(nacl(c / kgw), 'celestite', { excess: 0.2 }).m * 1000 * kgw) / x - 1]; }), cw = solubility(nacl(0), 'celestite', { excess: 0.2 }).m * 1000;
+      add('Celestite solubility in water, 25 °C', 0.652, cw, 0.04, 'mmol/kg. Brower & Renault (1971): 0.66 mmol/L; Culberson et al.: 0.644 mmol/kg (as quoted by Rogers 1981, LBL thesis). Tests log K = −6.55 with the Sr–SO₄ parameters of the THEREDA set');
+      add('Celestite solubility in 0.1 and 1 mol/L NaCl', 0, Math.max(Math.abs(ce[4][1]), Math.abs(ce[5][1])), 0.09, `Relative deviation from Brower & Renault (1971): ${pc(ce[4][1])} % and ${pc(ce[5][1])} % (measured 1.7 and 4.5 mmol/L, two significant figures)`);
+      add('Celestite solubility in 0–1 mol/L NaCl: root-mean-square deviation', 0, rms(ce.map((r) => r[1])), 0.05, `In log₁₀ units over six concentrations of Brower & Renault (1971): ${ce.map((r) => `${r[0]}: ${pc(r[1])} %`).join(', ')}. With the earlier Sr–SO₄ entry (numerically the Ca–SO₄ set) and log K −6.63 the value was 0.072`);
+    }
+    { // Bromley constants: published table against an independent refit from the NIST evaluations
+      const Zc = { Mg: 2, Ca: 2, Sr: 2, Ba: 2 }, rf = BR_REFIT.split('|').map((r) => r.split(' ')).map(([c, a, B, rm, n, Im, pub]) => ({ c, a, B: +B, rms: +rm, n: +n, Imax: +Im, pub: pub == null ? null : +pub }));
+      let dFit = 0, dPub = 0, worst = '';
+      for (const [k, txt] of Object.entries(BR_DATA)) {
+        const [c, a] = k.split(' '), v = txt.split(' ').map(Number), rows = []; for (let i = 0; i < v.length; i += 2) rows.push([v[i], v[i + 1]]);
+        const f = fitBromleyB(Zc[c] || 1, a === 'SO4' ? 2 : 1, rows), st = rf.find((r) => r.c === c && r.a === a), used = PAIRPAR.BR[si(c) * NS + si(a)];
+        dFit = Math.max(dFit, Math.abs(f.B - st.B));
+        if (Math.abs(used - f.B) > dPub) { dPub = Math.abs(used - f.B); worst = `${c}–${a}: ${fmt(used, 4)} published, ${fmt(f.B, 4)} refitted`; }
+      }
+      add('Bromley refit: the regression on the embedded NIST tables returns the stored constants', 0, dFit, 6e-5, `fitBromleyB on γ± of ${Object.keys(BR_DATA).length} salts (Hamer & Wu 1972; Goldberg & Nuttall 1978; Goldberg 1981), weighted least squares on log γ± to I = 6 mol/kg`);
+      add('Bromley constants in use (Bromley 1973) against the refit from NIST data', 0, dPub, 0.011, `Largest difference of B over the 16 salts of the suite with tabulated data — ${worst}; K₂SO₄ is tabulated only to 0.69 mol/kg`);
+      const cmp = rf.filter((r) => r.pub != null && !(r.c === 'Rb' && r.a === 'I')), dAll = cmp.map((r) => r.B - r.pub);
+      add('Bromley published salt constants against the refit: root-mean-square difference over all salts', 0, Math.sqrt(sum(dAll.map((x) => x * x)) / dAll.length), 0.004, `${cmp.length} salts with a value in Bromley’s Table 1 (as reproduced by Zemaitis et al. 1986); largest ${fmt(Math.max(...dAll.map(Math.abs)), 3)} kg/mol. RbI is left out: the printed −0.0108 has the opposite sign of the refit (+0.0102) and of Bromley’s own ion values (+0.0157)`);
+      let salts = rf.map((r) => [r.c, r.a, r.B]);
+      for (;;) { const cnt = {}; for (const q of salts) { cnt['c' + q[0]] = (cnt['c' + q[0]] || 0) + 1; cnt['a' + q[1]] = (cnt['a' + q[1]] || 0) + 1; } const keep = salts.filter((q) => cnt['c' + q[0]] >= 3 && cnt['a' + q[1]] >= 3); if (keep.length === salts.length) break; salts = keep; }
+      const ion = fitBromleyIons(salts), dIon = Math.max(...Object.entries(BR_ION_REFIT.c).map(([k, [B, d]]) => Math.max(Math.abs(ion.Bc[k] - B), Math.abs(ion.dc[k] - d))), ...Object.entries(BR_ION_REFIT.a).map(([k, [B, d]]) => Math.max(Math.abs(ion.Ba[k] - B), Math.abs(ion.da[k] - d))));
+      add('Bromley ion values: the global regression returns the stored refit', 0, dIon, 6e-4, `B = B₊ + B₋ + δ₊δ₋ over ${ion.n} salts, ${ion.nPar} free ion values (anchors B(Na⁺) = 0, δ(OH⁻) = −1, δ(Na⁺) = 0.028, δ(Cl⁻) = −0.067), ${ion.iterations} alternating least-squares sweeps`);
+      add('Bromley ion values: how well the refitted ion table reproduces the salt constants', 0.0081, ion.rms, 0.0004, `Root-mean-square residual in B, kg/mol (largest ${fmt(ion.max, 3)}). Bromley’s published ion table gives ${fmt(Math.sqrt(sum(salts.map(([c, a, B]) => ((BR_ION[c] || BR_PUB[c])[0] + (BR_ION[a] || BR_PUB[a])[0] + (BR_ION[c] || BR_PUB[c])[1] * (BR_ION[a] || BR_PUB[a])[1] - B) ** 2)) / salts.length), 4)} on the same salts: the additive ion scheme, not the data, limits the accuracy of salts without a fitted constant`);
+      const pubIon = Math.max(...['H', 'Na', 'K', 'NH4', 'Mg', 'Ca', 'Sr', 'Ba'].map((k) => Math.abs(BR_ION[k][0] - BR_ION_REFIT.c[k][0])), ...['Cl', 'NO3', 'OH', 'F', 'SO4'].map((k) => Math.abs(BR_ION[k][0] - BR_ION_REFIT.a[k][0])));
+      add('Bromley ion values in use against the refit: B₊ and B₋ of the suite’s ions', 0, pubIon, 0.017, 'Largest difference in kg/mol over H⁺, Na⁺, K⁺, NH₄⁺, Mg²⁺, Ca²⁺, Sr²⁺, Ba²⁺, Cl⁻, NO₃⁻, OH⁻, F⁻, SO₄²⁻ (the δ values are less well determined and differ by up to 0.09 for cations)');
+      { // SIT ε(Sr,Cl): fit to the same table up to I = 3 mol/kg
+        const v = BR_DATA['Sr Cl'].split(' ').map(Number), A = (3 * aphi(25)) / LN10; let sxx = 0, sxy = 0; const d = [];
+        for (let i = 0; i < v.length; i += 2) if (3 * v[i] <= 3 + 1e-9) d.push([v[i], v[i + 1]]);
+        d.forEach(([m, g], i) => { const sq = Math.sqrt(3 * m), w = 0.5 * (d[Math.min(i + 1, d.length - 1)][0] - d[Math.max(i - 1, 0)][0]), x = (4 / 3) * m, y = Math.log10(g) + (2 * A * sq) / (1 + 1.5 * sq); sxx += w * x * x; sxy += w * x * y; });
+        add('SIT ε(Sr²⁺, Cl⁻): least-squares fit to the SrCl₂ table of Goldberg & Nuttall (1978)', sxy / sxx, PAIRPAR.EPS[si('Sr') * NS + si('Cl')], 0.005, 'kg/mol; log γ± = −2A√I/(1 + 1.5√I) + (4/3)·ε·m up to I = 3 mol/kg. Replaces the Ca²⁺ analogue 0.14');
+      }
     }
     { // PHREEQC example 1: speciation of the Nordstrom et al. (1979) seawater with phreeqc.dat (ion-association model)
       const ppm = { Na: 10768, K: 399.1, Ca: 412.3, Mg: 1291.8, Cl: 19353, SO4: 2712, HCO3: 141.682, SiO2: 4.28 }, x1 = analyzeWater({ ions: Object.fromEntries(Object.entries(ppm).map(([k, x]) => [k, x * 1.023])), T: 25, pH: 8.22, model: 'tj' });
@@ -2063,6 +2354,22 @@ const suite = {
       const siG = (c) => saturationIndex(concentrateSolution(sw, 1.8 * c, { co2: 'closed' }).eq, 'gypsum');
       add('Navier–Stokes spacer channel: saturation index at the wall ≥ bulk', 1, Math.min(...open) >= 1 - 1e-9 && siG(wm) > siG(cbm) && siG(Math.max(...open)) > siG(wm) ? 1 : 0, 0, `Gypsum SI in 1.8-times concentrated seawater: bulk ${fmt(siG(cbm), 4)}, mean wall ${fmt(siG(wm), 4)}, hot spot ${fmt(siG(Math.max(...open)), 4)}; no wall point lies below the inlet concentration`);
       add('Navier–Stokes spacer channel: filaments create hot spots above the open-slit wall concentration', 1, Math.max(...open) > Math.max(...ns.cwB) ? 1 : 0, 0, `Peak c wall/c inlet ${fmt(Math.max(...open), 4)} with zigzag filaments, ${fmt(Math.max(...ns.cwB), 4)} without`);
+    }
+    { // hot spot next to a filament: footprint, osmotic ceiling and grid convergence
+      const piS = (c) => osmoticPressure(25, clamp(63.7 * c, 0, 260)), par = { h: 7.1e-4, u0: 0.0883, vw: 15 / 3.6e6, D: 1.48e-9, rej: 0.995, rho: 1045, mu: 1e-3, arr: 'zigzag', lm: 3e-3, df: 3.55e-4, contact: 0.15, dP: 60e5, pi: piS };
+      const gs = await spacerHotSpotStudy(par, { nFine: 50, Lp: 1e-4 }), pk = gs.grids.map((g) => g.peak), pa = gs.grids.map((g) => g.patch), F = gs.fine;
+      add('Spacer hot spot: osmotic ceiling is where the flux law gives zero flux', 60e5, piS(gs.cCap) - piS(0.005 * gs.cCap), 1, 'π(c cap) − π((1 − R)·c cap) = ΔP = 60 bar for 99.5 % rejection, Pa');
+      add('Spacer hot spot: no concentration on any of the three grids exceeds the osmotic ceiling', 1, gs.cMax <= gs.cCap * (1 + 1e-4) && gs.cMax > 1.05 ? 1 : 0, 0, `Largest value in the field and on the walls ${fmt(gs.cMax, 5)} against the ceiling ${fmt(gs.cCap, 5)} (c / c inlet); J = A·(ΔP − Δπ) ≥ 0`);
+      add('Spacer hot spot: membrane under the filament footprints does not permeate', 0, Math.max(0, gs.jFoot) * 3.6e6 + (gs.nFoot > 0 ? 0 : 1), 1e-9, `${gs.nFoot} wall cells touched by a footprint of ±${fmt(gs.contactHalfWidth * 1e6, 3)} µm: flux above the share of their open length, L/m²·h`);
+      { const fp = F.feet.find((q) => !q.top && q.x > F.L / 2) || F.feet[0], cov = F.x.reduce((a2, x, i) => a2 + (Math.abs(x - fp.x) < fp.a + F.dx ? (1 - (fp.top ? F.permT : F.permB)[i]) * F.dx : 0), 0);
+        add('Spacer hot spot: covered length of a footprint equals twice the contact half-width', 2 * fp.a * 1e6, cov * 1e6, 1e-6, 'Partly covered cells permeate in proportion to their open length, so the footprint has the same width on every grid, µm'); }
+      add('Spacer hot spot: patch-averaged value changes by less than 3 % between the two finest grids', 0, Math.abs(gs.patch.change21), 0.03, `Mean over the hottest 100 µm of membrane on grids of ${gs.grids.map((g) => `${g.nx}×${g.ny}`).join(', ')} cells: ${pa.map((x) => fmt(x, 5)).join(', ')}; Richardson estimate ${fmt(gs.patch.value, 5)}, grid-convergence index ${fmt(100 * gs.patch.gci, 2)} %, observed order ${fmt(gs.patch.pObs, 3)}`);
+      add('Spacer hot spot: peak sequence is monotone and stays below the ceiling', 1, gs.peak.monotone && pk[0] < pk[1] && pk[1] < pk[2] && pk[2] <= gs.cCap && gs.peak.value <= gs.cCap ? 1 : 0, 0, `Peak wall-cell value ${pk.map((x) => fmt(x, 5)).join(', ')}; estimate ${fmt(gs.peak.value, 5)}${gs.peak.capped ? ' (set to the ceiling)' : ''}, grid-convergence index ${fmt(100 * gs.peak.gci, 2)} %`);
+      add('Spacer hot spot: the grid-convergence index covers the change to the finest grid', 1, gs.patch.gci * gs.patch.value >= 0.5 * Math.abs(pa[2] - pa[1]) ? 1 : 0, 0, 'Error band of the estimate against the last refinement step');
+      const gq = gridConvergence([1, 1.5, 2.25], [1, 1.5, 2.25].map((hh) => 2 + 0.1 * hh * hh));
+      add('Grid convergence: Richardson extrapolation recovers a second-order limit', 2, gq.value, 1e-9, `f = 2 + 0.1·h² on three grids; observed order ${fmt(gq.pObs, 4)}`);
+      const hp = wallHotSpot({ dx: 1, nx: 10, L: 10, x: Array.from({ length: 10 }, (_, i) => i + 0.5), blockB: new Array(10).fill(false), feet: [{ x: 5, a: 1, top: false }], cwB: [1, 1, 1, 2, 9, 9, 4, 1, 1, 1] }, false, 1.5);
+      add('Hot-spot patch average: exact integral of the cell values outside the footprint', (4 * 1 + 1 * 0.5) / 1.5, hp.patch, 1e-12, 'Cells under the footprint (x = 4–6) are ignored; the hottest 1.5-long window on the open membrane starts at its edge');
     }
     add('Surrogate reproduces the engine at the design point', 0, Math.max(...sur.predict(0.45, 8.1, 25).map((x, i) => Math.abs(x - sur.engine(0.45, 8.1, 25)[i]))), 0.1, 'Kernel regression versus a fresh speciation run');
     return C;

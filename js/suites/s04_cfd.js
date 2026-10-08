@@ -563,6 +563,7 @@ export async function solveChannel(o, ctx) {
   // ---- scalar transport (salt concentration c in kg/m³, temperature in °C)
   const Sc = stencil(nx, ny), fixS = solid;
   const afB = new Float64Array(nx).fill(1), afT = new Float64Array(nx).fill(1); // membrane permeability factor 1/(1 + A μ R_f) of a fouling layer
+  if (o.species?.permB) afB.set(o.species.permB); if (o.species?.permT) afT.set(o.species.permT); // optional local permeability factor (0–1), e.g. membrane covered by a filament footprint
   const makeScalar = (sp, init) => {
     const phi = new Float64Array(n).fill(init), wB = new Float64Array(nx).fill(init), wT = new Float64Array(nx).fill(init), pB = new Float64Array(nx), pT = new Float64Array(nx), nB = new Float64Array(nx), nT = new Float64Array(nx), fB = new Float64Array(nx), fT = new Float64Array(nx);
     const cht = sp.solidD > 0; // conjugate transfer: the scalar is also solved inside the solids (conduction only)
@@ -610,17 +611,17 @@ export async function solveChannel(o, ctx) {
             if (S1 < 0) Sc.aP[P] -= S1; else Sc.b[P] += S1 * phi[P];
             Sc.b[P] += dx * b0; wall[i] = cw; (top ? nT : nB)[i] = Math.max(0, a * phi[P] - b0);
           } else if (w.type === 'membrane') {
-            // film solution across the wall half-cell: c_w = c_P e^Pe / (1 + (1 − R)(e^Pe − 1)), R = J/(J + B)
+            // film solution across the wall half-cell: c_w = c_P e^Pe / (1 + (1 − R)(e^Pe − 1)), R = J/(J + B) (or a constant intrinsic rejection sp.R when given)
             let dJ = 0;
             if (!freeze) {
-              const R0 = J[i] > 0 ? J[i] / (J[i] + sp.B) : 0, e0 = Math.exp(Math.min(6, (J[i] * dl) / D)), E0 = e0 / (1 + (1 - R0) * (e0 - 1)), cw = phi[P] * E0;
+              const R0 = sp.R ?? (J[i] > 0 ? J[i] / (J[i] + sp.B) : 0), e0 = Math.exp(Math.min(6, (J[i] * dl) / D)), E0 = e0 / (1 + (1 - R0) * (e0 - 1)), cw = phi[P] * E0;
               const dP = sp.dP + (p[P] - sp.pRef()), pw = sp.pi(cw), Jn = Math.max(0, Aw * (dP - (pw - sp.pi((1 - R0) * cw))));
               J[i] = 0.5 * J[i] + 0.5 * Jn;
               if (Jn > 0 && cw > 0) dJ = (-Aw * E0 * (sp.pi(1.01 * cw) - pw)) / (0.01 * cw); // ∂J/∂c_P
             }
             // water leaves through the wall at J, salt only at J(1 − R)c_w: the difference concentrates the wall cell.
             // Source S = Δx·J·β·c_P, linearised (Newton) only where that makes it a stabilising sink.
-            const R = J[i] > 0 ? J[i] / (J[i] + sp.B) : 0, e = Math.exp(Math.min(6, (J[i] * dl) / D)), Ew = e / (1 + (1 - R) * (e - 1));
+            const R = sp.R ?? (J[i] > 0 ? J[i] / (J[i] + sp.B) : 0), e = Math.exp(Math.min(6, (J[i] * dl) / D)), Ew = e / (1 + (1 - R) * (e - 1));
             const beta = 1 - (1 - R) * Ew, S0 = dx * J[i] * beta * phi[P], S1 = dx * beta * (J[i] + phi[P] * dJ);
             if (S1 < 0) { Sc.aP[P] -= S1; Sc.b[P] += S0 - S1 * phi[P]; } else Sc.b[P] += S0;
             wall[i] = phi[P] * Ew; perm[i] = (1 - R) * wall[i]; salt += J[i] * perm[i] * dx;
@@ -650,7 +651,7 @@ export async function solveChannel(o, ctx) {
   let pRefVal = 0;
   const spc = o.species ? makeScalar({ ...o.species, pRef: () => pRefVal, inVal: o.species.c0, bot: { type: o.species.bot || 'none', val: o.species.cwBot ?? o.species.cw }, top: { type: o.species.top || 'none', val: o.species.cwTop ?? o.species.cw } }, o.species.c0) : null;
   const eng = o.energy ? makeScalar({ D: o.energy.alpha, sct: 0.9, inVal: o.energy.Tin, bot: o.energy.bot, top: o.energy.top, solidD: o.energy.solidD || 0, S: o.energy.solidD > 0 && o.energy.qS ? Float64Array.from(solid, (b) => (b ? o.energy.qS : 0)) : null }, o.energy.Tin) : null;
-  if (spc) for (const top of [0, 1]) if ((top ? o.species.top : o.species.bot) === 'membrane') { const J = top ? Jt : Jb, J0 = Math.max(0, o.species.A * (o.species.dP - o.species.pi(o.species.c0))); for (let i = 0; i < nx; i++) J[i] = solid[(top ? ny - 1 : 0) * nx + i] ? 0 : J0; }
+  if (spc) for (const top of [0, 1]) if ((top ? o.species.top : o.species.bot) === 'membrane') { const J = top ? Jt : Jb, J0 = Math.max(0, o.species.A * (o.species.dP - o.species.pi(o.species.c0))); for (let i = 0; i < nx; i++) J[i] = solid[(top ? ny - 1 : 0) * nx + i] ? 0 : J0 * (top ? afT : afB)[i]; }
   setWallV();
 
   const hist = { it: [], mass: [], dU: [], scal: [] }, tick = async (f, msg) => { if (ctx?.progress) ctx.progress(f, msg); if (ctx?.tick) await ctx.tick(); };
@@ -767,7 +768,7 @@ export async function solveChannel(o, ctx) {
   if (pr) { await tick(0.92, 'Precipitation and crystal population'); await solvePrecip(nX); }
   if (o.foul && o.steady !== false && (memB || memT)) { // growing deposit: cake build-up minus shear back-transport plus wall scale → hydraulic resistance
     const fo = o.foul, sA = o.species.A * mu * fo.alpha, mB = new Float64Array(nx).fill(memB ? fo.m0 || 0 : 0), mT = new Float64Array(nx).fill(memT ? fo.m0 || 0 : 0);
-    const setAf = () => { for (let i = 0; i < nx; i++) { afB[i] = 1 / (1 + sA * mB[i]); afT[i] = 1 / (1 + sA * mT[i]); } };
+    const setAf = () => { for (let i = 0; i < nx; i++) { afB[i] = (o.species.permB ? o.species.permB[i] : 1) / (1 + sA * mB[i]); afT[i] = (o.species.permT ? o.species.permT[i] : 1) / (1 + sA * mT[i]); } };
     const Jm = () => { let a = 0, m = 0; for (let i = 0; i < nx; i++) { if (memB && !solid[i]) { a += Jb[i]; m++; } if (memT && !solid[(ny - 1) * nx + i]) { a += Jt[i]; m++; } } return m ? a / m : 0; };
     foul = { t: [0], J: [], mB, mT, J0: Jm() };
     if (fo.m0 > 0) { setAf(); await scalarSteady(spc, 80, false, o.species.c0, true); await flowSteady(15, 0.93, 0.93); }
