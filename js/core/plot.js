@@ -1,5 +1,6 @@
-// Dependency-free canvas plotting: line/scatter curves, bar charts and 2-D fields
-// (filled contours, iso-lines, streamlines, vectors). Every chart supports hover read-out and PNG/CSV export.
+// Dependency-free canvas plotting: line/scatter curves, bar charts, 2-D fields
+// (filled contours, iso-lines, streamlines, vectors) and shaded 3-D surfaces. Every chart supports PNG/CSV export;
+// a spec may carry several `frames` (e.g. depth slices), which the chart card switches between with a slider.
 import { fmt } from './num.js';
 
 const PALETTE = ['#0ea5e9', '#f97316', '#10b981', '#a855f7', '#ef4444', '#eab308', '#14b8a6', '#ec4899', '#6366f1', '#84cc16', '#f43f5e', '#06b6d4'];
@@ -13,6 +14,7 @@ const CMAPS = {
   land: ['#a8d08d', '#c9dd9a', '#e9e3a0', '#d9bf77', '#b98f55', '#96673f', '#7a5a4a', '#5a463f'],
   sea: ['#08306b', '#0a4a90', '#1565a8', '#2a7fbf', '#4a9bd0', '#72b7dc', '#9bd0e6', '#bfe6ee'],
   thermal: ['#042333', '#2c3395', '#744992', '#b15f82', '#eb7958', '#fbb43d', '#e8fa5b'],
+  heat: ['#fff3b0', '#fdd66b', '#fba23c', '#f0652a', '#d0301f', '#8f1414'],
 };
 const hex = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
 const LUT = {};
@@ -373,9 +375,128 @@ function drawField(canvas, spec) {
   };
 }
 
+/**
+ * Shaded three-dimensional view of a ground surface with optional bodies on it (painter's algorithm on the 2-D canvas).
+ * spec = { type: 'surface3d', x: [nx], y: [ny], z: [ny][nx] ground elevation at the grid nodes (NaN = hole), cmap, zmin, zmax, zmid,
+ *   layers: [{ name, z: [ny][nx] upper surface, base: [ny][nx] (default: the ground), c: [ny][nx] colour value + cmap, cmin, cmax,
+ *              clabel, cunit — or a flat `color` —, opacity, minThickness }]  — drawn where the surface stands above its base,
+ *   planes: [{ z, name, color }] horizontal reference levels (outline), markers: [{ x, y, z0, z1, label, color }] vertical poles,
+ *   azimuth (compass bearing of the viewpoint, °), elevation (° above the horizon), zscale (vertical exaggeration; automatic if absent),
+ *   xlabel, ylabel, zlabel }. The card rotates the view by dragging (azimuth; with a mouse also the elevation) and with its ◀ ▶ buttons.
+ */
+function drawSurface3D(canvas, spec) {
+  const xs = spec.x, ys = spec.y, zb = spec.z, nx = xs.length, ny = ys.length, layers = spec.layers || [];
+  const cw = Math.max(260, canvas.clientWidth || canvas.parentElement.clientWidth || 600);
+  const C = setup(canvas, spec.height || Math.round(Math.min(480, Math.max(240, 0.62 * cw)))), { ctx, w, h } = C;
+  const bar = layers.find((l) => l.c) || null, m = { l: 10, r: bar ? 70 : 10, t: 10, b: 30 }, pw = w - m.l - m.r, ph = h - m.t - m.b;
+  const az = ((spec.azimuth ?? 205) * Math.PI) / 180, el = (Math.max(8, Math.min(85, spec.elevation ?? 30)) * Math.PI) / 180;
+  const fin = Number.isFinite, cx = 0.5 * (xs[0] + xs[nx - 1]), cy = 0.5 * (ys[0] + ys[ny - 1]), Lx = Math.abs(xs[nx - 1] - xs[0]) || 1, Ly = Math.abs(ys[ny - 1] - ys[0]) || 1;
+  let zlo = Infinity, zhi = -Infinity;
+  const span = (a) => { for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { const v = a[j][i]; if (fin(v)) { if (v < zlo) zlo = v; if (v > zhi) zhi = v; } } };
+  span(zb); for (const l of layers) span(l.z); for (const q of spec.planes || []) { if (q.z < zlo) zlo = q.z; if (q.z > zhi) zhi = q.z; }
+  if (!(zhi > zlo)) { zlo = (fin(zlo) ? zlo : 0) - 0.5; zhi = zlo + 1; }
+  const zs = spec.zscale > 0 ? spec.zscale : (0.22 * Math.max(Lx, Ly)) / (zhi - zlo);
+  // camera at compass bearing az: right = (−cos az, sin az), away = (−sin az, −cos az)
+  const rx = -Math.cos(az), ry = Math.sin(az), dxv = -Math.sin(az), dyv = -Math.cos(az), se = Math.sin(el), ce = Math.cos(el);
+  const P3 = (x, y, z) => { const X0 = x - cx, Y0 = y - cy, a = X0 * rx + Y0 * ry, d = X0 * dxv + Y0 * dyv, zz = (z - zlo) * zs; return [a, d * se + zz * ce, d * ce - zz * se]; };
+  let a0 = Infinity, a1 = -Infinity, b0 = Infinity, b1 = -Infinity;
+  for (const x of [xs[0], xs[nx - 1]]) for (const y of [ys[0], ys[ny - 1]]) for (const z of [zlo, zhi]) { const q = P3(x, y, z); if (q[0] < a0) a0 = q[0]; if (q[0] > a1) a1 = q[0]; if (q[1] < b0) b0 = q[1]; if (q[1] > b1) b1 = q[1]; }
+  const sc = Math.min(pw / (a1 - a0 || 1), ph / (b1 - b0 || 1)), ox = m.l + 0.5 * (pw - sc * (a1 - a0)), oy = m.t + 0.5 * (ph - sc * (b1 - b0));
+  const SX = (q) => ox + (q[0] - a0) * sc, SY = (q) => oy + (b1 - q[1]) * sc;
+  // light from the upper left of the view
+  const lx = -0.45 * rx - 0.35 * dxv, ly = -0.45 * ry - 0.35 * dyv, lz = 0.82, ln = Math.hypot(lx, ly, lz);
+  const shadeOf = (x0, y0, z00, z10, z01, x1, y1) => { const gx = ((z10 - z00) * zs) / (x1 - x0 || 1), gy = ((z01 - z00) * zs) / (y1 - y0 || 1), n = Math.hypot(gx, gy, 1); return 0.5 + 0.62 * Math.max(0, (-gx * lx - gy * ly + lz) / (n * ln)); };
+  const Lb = lut(spec.cmap || 'topo'), glo = spec.zmin ?? zlo, ghi = spec.zmax ?? zhi, mid = spec.zmid !== undefined && spec.zmid > glo && spec.zmid < ghi ? spec.zmid : null, sA = (spec.cmap || 'topo') === 'topo' ? 7 / 15 : 0.5, sB = (spec.cmap || 'topo') === 'topo' ? 8 / 15 : 0.5;
+  const gnorm = (v) => (mid === null ? (v - glo) / (ghi - glo || 1) : v < mid ? (sA * (v - glo)) / (mid - glo) : sB + ((1 - sB) * (v - mid)) / (ghi - mid));
+  const rgb = (L, t, sh, al) => { const k = Math.max(0, Math.min(255, Math.round(t * 255))) * 3; return `rgba(${Math.min(255, Math.round(L[k] * sh))},${Math.min(255, Math.round(L[k + 1] * sh))},${Math.min(255, Math.round(L[k + 2] * sh))},${al})`; };
+  const st = Math.max(1, Math.ceil(Math.sqrt(((nx - 1) * (ny - 1)) / 9000))), polys = [];
+  const quad = (i, j, i2, j2, za, zb2, zc, zd, fill, bias, edge) => {
+    const p0 = P3(xs[i], ys[j], za), p1 = P3(xs[i2], ys[j], zb2), p2 = P3(xs[i2], ys[j2], zc), p3 = P3(xs[i], ys[j2], zd);
+    polys.push({ d: 0.25 * (p0[2] + p1[2] + p2[2] + p3[2]) - bias, f: fill, e: edge, p: [SX(p0), SY(p0), SX(p1), SY(p1), SX(p2), SY(p2), SX(p3), SY(p3)] });
+  };
+  for (let j = 0; j < ny - 1; j += st) for (let i = 0; i < nx - 1; i += st) {
+    const i2 = Math.min(nx - 1, i + st), j2 = Math.min(ny - 1, j + st), za = zb[j][i], zb2 = zb[j][i2], zc = zb[j2][i2], zd = zb[j2][i];
+    if (fin(za + zb2 + zc + zd)) quad(i, j, i2, j2, za, zb2, zc, zd, rgb(Lb, gnorm(0.25 * (za + zb2 + zc + zd)), shadeOf(xs[i], ys[j], za, zb2, zd, xs[i2], ys[j2]), 1), 0, null);
+  }
+  const eps = 1e-4 * Math.max(Lx, Ly), barRange = [0, 1];
+  layers.forEach((l, li) => {
+    const base = l.base || zb, minT = l.minThickness ?? 1e-9 * (zhi - zlo), Lc = l.c ? lut(l.cmap || 'heat') : null, col = l.color ? hex(l.color) : [234, 88, 12], al = l.opacity ?? 0.92;
+    let clo = l.cmin, chi = l.cmax;
+    if (Lc && (clo === undefined || chi === undefined)) { let a = Infinity, b = -Infinity; for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { const v = l.c[j][i]; if (fin(v) && fin(l.z[j][i]) && l.z[j][i] - (fin(base[j][i]) ? base[j][i] : l.z[j][i]) > minT) { if (v < a) a = v; if (v > b) b = v; } } if (clo === undefined) clo = fin(a) ? a : 0; if (chi === undefined) chi = fin(b) ? b : 1; }
+    if (Lc && !(chi > clo)) chi = clo + (Math.abs(clo) * 1e-6 || 1e-9);
+    if (l === bar) { barRange[0] = clo; barRange[1] = chi; }
+    for (let j = 0; j < ny - 1; j += st) for (let i = 0; i < nx - 1; i += st) {
+      const i2 = Math.min(nx - 1, i + st), j2 = Math.min(ny - 1, j + st);
+      const g = [base[j][i], base[j][i2], base[j2][i2], base[j2][i]], t = [l.z[j][i], l.z[j][i2], l.z[j2][i2], l.z[j2][i]];
+      if (!fin(g[0] + g[1] + g[2] + g[3] + t[0] + t[1] + t[2] + t[3])) continue;
+      for (let k = 0; k < 4; k++) if (t[k] < g[k]) t[k] = g[k];
+      if (Math.max(t[0] - g[0], t[1] - g[1], t[2] - g[2], t[3] - g[3]) <= minT) continue;
+      const sh = shadeOf(xs[i], ys[j], t[0], t[1], t[3], xs[i2], ys[j2]);
+      let fill;
+      if (Lc) { const cv = [l.c[j][i], l.c[j][i2], l.c[j2][i2], l.c[j2][i]].filter(fin), cm = cv.length ? cv.reduce((a, b) => a + b, 0) / cv.length : clo; fill = rgb(Lc, (cm - clo) / (chi - clo), sh, al); }
+      else fill = `rgba(${Math.min(255, Math.round(col[0] * sh))},${Math.min(255, Math.round(col[1] * sh))},${Math.min(255, Math.round(col[2] * sh))},${al})`;
+      quad(i, j, i2, j2, t[0], t[1], t[2], t[3], fill, eps * (li + 1), 'rgba(15,23,42,.22)');
+    }
+  });
+  polys.sort((a, b) => b.d - a.d);
+  ctx.save(); ctx.beginPath(); ctx.rect(0, 0, w, h - 2); ctx.clip();
+  ctx.lineJoin = 'round';
+  for (const q of polys) {
+    const p = q.p;
+    ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(p[2], p[3]); ctx.lineTo(p[4], p[5]); ctx.lineTo(p[6], p[7]); ctx.closePath();
+    ctx.fillStyle = q.f; ctx.fill(); ctx.strokeStyle = q.e || q.f; ctx.lineWidth = q.e ? 0.6 : 0.8; ctx.stroke(); // the same-colour stroke closes the hairline seams between neighbours
+  }
+  const path = (pts, close) => { ctx.beginPath(); pts.forEach((q, k) => (k ? ctx.lineTo(SX(q), SY(q)) : ctx.moveTo(SX(q), SY(q)))); if (close) ctx.closePath(); };
+  ctx.font = '11px system-ui, sans-serif';
+  for (const q of spec.planes || []) {
+    const cor = [P3(xs[0], ys[0], q.z), P3(xs[nx - 1], ys[0], q.z), P3(xs[nx - 1], ys[ny - 1], q.z), P3(xs[0], ys[ny - 1], q.z)];
+    ctx.strokeStyle = q.color || '#38bdf8'; ctx.lineWidth = 1.2; ctx.setLineDash([6, 4]); path(cor, true); ctx.stroke(); ctx.setLineDash([]);
+    if (q.fill) { ctx.fillStyle = q.fill; path(cor, true); ctx.fill(); }
+    if (q.name) { const top = cor.reduce((a, b) => (SY(b) < SY(a) ? b : a)); ctx.fillStyle = q.color || '#38bdf8'; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'; ctx.fillText(q.name, Math.max(m.l + 60, Math.min(w - m.r - 60, SX(top))), Math.max(m.t + 13, SY(top) - 3)); }
+  }
+  for (const q of spec.markers || []) {
+    const a = P3(q.x, q.y, q.z0 ?? zlo), b = P3(q.x, q.y, q.z1 ?? zhi);
+    ctx.strokeStyle = q.color || C.fg; ctx.lineWidth = 1.6; path([a, b]); ctx.stroke();
+    ctx.fillStyle = q.color || C.fg; ctx.beginPath(); ctx.arc(SX(b), SY(b), 3, 0, 6.2832); ctx.fill();
+    if (q.label) { ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.strokeStyle = C.bg; ctx.lineWidth = 3; ctx.strokeText(q.label, SX(b) + 6, SY(b)); ctx.fillStyle = C.fg; ctx.fillText(q.label, SX(b) + 6, SY(b)); }
+  }
+  ctx.restore();
+  // orientation: north arrow on the ground plane, horizontal scale and the view parameters
+  { const o = [m.l + 26, h - m.b - 22], nxs = ry, nys = dyv * se, nl = Math.hypot(nxs, nys) || 1, ax = (18 * nxs) / nl, ay = (-18 * nys) / nl;
+    ctx.strokeStyle = C.fg; ctx.fillStyle = C.fg; ctx.lineWidth = 1.4; ctx.beginPath(); ctx.moveTo(o[0] - 0.5 * ax, o[1] - 0.5 * ay); ctx.lineTo(o[0] + ax, o[1] + ay); ctx.stroke();
+    const an = Math.atan2(ay, ax); ctx.beginPath(); ctx.moveTo(o[0] + ax, o[1] + ay); ctx.lineTo(o[0] + ax - 6 * Math.cos(an - 0.5), o[1] + ay - 6 * Math.sin(an - 0.5)); ctx.lineTo(o[0] + ax - 6 * Math.cos(an + 0.5), o[1] + ay - 6 * Math.sin(an + 0.5)); ctx.fill();
+    ctx.font = '11px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('N', o[0] + 1.6 * ax, o[1] + 1.6 * ay); }
+  const azd = ((((spec.azimuth ?? 205) % 360) + 360) % 360), pts = ['north', 'north-east', 'east', 'south-east', 'south', 'south-west', 'west', 'north-west'][Math.round(azd / 45) % 8];
+  ctx.fillStyle = C.mute; ctx.textAlign = 'left'; ctx.textBaseline = 'bottom'; ctx.font = '11px system-ui, sans-serif';
+  { const parts = [`Seen from the ${pts}`, `${Math.round((el * 180) / Math.PI)}° above the horizon`, `vertical scale × ${zs >= 10 ? Math.round(zs) : +zs.toPrecision(2)}`, tickLabel(+Lx.toPrecision(3)) + ' × ' + tickLabel(+Ly.toPrecision(3)) + (spec.xunit ? ' ' + spec.xunit : '')];
+    while (parts.length > 1 && ctx.measureText(parts.join(' · ')).width > w - m.l - 6) parts.pop(); // drop the last items on narrow screens
+    ctx.fillText(parts.join(' · '), m.l, h - 5); }
+  if (bar) { // colour bar of the first layer coloured by a value
+    const Lc = lut(bar.cmap || 'heat'), bx = w - m.r + 12, bwid = 12, lo = barRange[0], hi = barRange[1];
+    for (let k = 0; k < ph; k++) { const t = Math.round((1 - k / ph) * 255); ctx.fillStyle = `rgb(${Lc[t * 3]},${Lc[t * 3 + 1]},${Lc[t * 3 + 2]})`; ctx.fillRect(bx, m.t + k, bwid, 1.5); }
+    ctx.strokeStyle = C.mute; ctx.lineWidth = 1; ctx.strokeRect(bx, m.t, bwid, ph);
+    ctx.fillStyle = C.mute; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+    for (const v of niceTicks(lo, hi, 5)) if (v >= lo && v <= hi) ctx.fillText(tickLabel(v), bx + bwid + 4, m.t + ph - ((v - lo) / (hi - lo)) * ph);
+    if (bar.clabel) { // the label shrinks, then loses its tail, so that it always fits beside the bar
+      let txt = bar.clabel + (bar.cunit ? ' (' + bar.cunit + ')' : ''), px = 11;
+      ctx.save(); ctx.translate(w - 5, m.t + ph / 2); ctx.rotate(-Math.PI / 2); ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'; ctx.fillStyle = C.fg;
+      while (px > 9 && ctx.measureText(txt).width > ph) { px -= 0.5; ctx.font = `${px}px system-ui, sans-serif`; }
+      while (txt.length > 8 && ctx.measureText(txt).width > ph) txt = txt.slice(0, -2).trimEnd() + '…';
+      ctx.fillText(txt, 0, 0); ctx.restore(); }
+  }
+  canvas._hover = null; canvas._pick = null; canvas._polys = polys.length;
+}
+
+/** The spec shown for frame k of a plot with `frames` (the frame's fields override those of the spec). */
+export function frameSpec(spec, k) {
+  const f = spec.frames && spec.frames[k];
+  return f ? { ...spec, ...f, frames: undefined, label: undefined } : spec;
+}
+
 export function draw(canvas, spec) {
   try {
     if (spec.type === 'bar') drawBar(canvas, spec);
+    else if (spec.type === 'surface3d') drawSurface3D(canvas, spec);
     else if (spec.type === 'field') drawField(canvas, spec);
     else drawLine(canvas, spec);
   } catch (e) {
@@ -394,6 +515,10 @@ export function plotToCSV(spec) {
   } else if (spec.type === 'field') {
     rows.push([`${spec.ylabel || 'y'} \\ ${spec.xlabel || 'x'}`, ...spec.x]);
     spec.y.forEach((yv, j) => rows.push([yv, ...Array.from(spec.z[j])]));
+  } else if (spec.type === 'surface3d') { // one block per surface: the ground, then the upper surface (and colour value) of every layer
+    const block = (name, a) => { if (rows.length) rows.push([]); rows.push([`${name} — ${spec.ylabel || 'y'} \\ ${spec.xlabel || 'x'}`, ...spec.x]); spec.y.forEach((yv, j) => rows.push([yv, ...Array.from(a[j], (v) => (Number.isFinite(v) ? v : ''))])); };
+    block(spec.zlabel || 'ground elevation', spec.z);
+    for (const l of spec.layers || []) { block(`${l.name || 'layer'}: upper surface`, l.z); if (l.c) block(`${l.name || 'layer'}: ${l.clabel || 'value'}${l.cunit ? ' (' + l.cunit + ')' : ''}`, l.c); }
   } else {
     const n = Math.max(...spec.series.map((s) => s.x.length));
     rows.push(spec.series.flatMap((s) => [`${s.name || 'series'} · ${spec.xlabel || 'x'}`, `${s.name || 'series'} · ${spec.ylabel || 'y'}`]));
@@ -414,13 +539,44 @@ export function plotCard(spec, { onDownload } = {}) {
   canvas.setAttribute('role', 'img'); canvas.setAttribute('aria-label', spec.title || 'chart');
   const tip = document.createElement('div'); tip.className = 'plot-tip'; tip.hidden = true;
   const safe = (spec.title || 'plot').replace(/[^\w-]+/g, '_').slice(0, 60);
-  mk('PNG', 'Download this chart as an image', () => canvas.toBlob((b) => onDownload && onDownload(b, safe + '.png')));
-  mk('CSV', 'Download the plotted data as a table', () => onDownload && onDownload(new Blob([plotToCSV(spec)], { type: 'text/csv' }), safe + '.csv'));
+  // frames: several versions of the chart (depth slices, section positions, iso-levels …) chosen with a slider; `cur` is the one shown
+  const frames = Array.isArray(spec.frames) && spec.frames.length > 1 ? spec.frames : null, is3d = spec.type === 'surface3d';
+  let fk = frames ? Math.max(0, Math.min(frames.length - 1, Math.round(spec.frame ?? 0))) : 0, cur = frames ? frameSpec(spec, fk) : spec;
+  const view = is3d ? { az: spec.azimuth ?? 205, el: spec.elevation ?? 30 } : null;
+  const shown = () => (is3d ? Object.assign(cur === spec ? { ...spec } : cur, { azimuth: view.az, elevation: view.el }) : cur);
+  const fileName = () => (frames ? safe + '_' + String(frames[fk].label ?? fk + 1).replace(/[^\w.-]+/g, '_').slice(0, 30) : safe);
+  if (is3d) { mk('◀', 'Rotate the view to the left', () => { view.az -= 30; render(); }); mk('▶', 'Rotate the view to the right', () => { view.az += 30; render(); }); }
+  mk('PNG', 'Download this chart as an image', () => canvas.toBlob((b) => onDownload && onDownload(b, fileName() + '.png')));
+  mk('CSV', 'Download the plotted data as a table', () => onDownload && onDownload(new Blob([plotToCSV(shown())], { type: 'text/csv' }), fileName() + '.csv'));
   head.append(title, tools);
   const wrap = document.createElement('div'); wrap.className = 'plot-wrap'; wrap.append(canvas, tip);
-  card.append(head, wrap);
+  card.append(head);
+  if (frames) {
+    const row = document.createElement('label'), cap = document.createElement('span'), rng = document.createElement('input'), val = document.createElement('output');
+    row.className = 'plot-frames'; Object.assign(row.style, { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', fontSize: '12.5px', margin: '2px 0 6px' });
+    cap.textContent = spec.frameLabel || 'Frame';
+    rng.type = 'range'; rng.min = '0'; rng.max = String(frames.length - 1); rng.step = '1'; rng.value = String(fk);
+    Object.assign(rng.style, { flex: '1 1 140px', minWidth: '120px', minHeight: '28px', margin: '0' });
+    val.style.fontWeight = '600';
+    const show = () => { const f = frames[fk]; val.textContent = String(f.label ?? `${fk + 1} of ${frames.length}`); rng.setAttribute('aria-valuetext', val.textContent); title.textContent = f.title || spec.title || ''; canvas.setAttribute('aria-label', title.textContent || 'chart'); };
+    rng.addEventListener('input', () => { fk = Math.max(0, Math.min(frames.length - 1, +rng.value || 0)); cur = frameSpec(spec, fk); show(); tip.hidden = true; render(); });
+    show(); row.append(cap, rng, val); card.append(row);
+    card._setFrame = (k) => { rng.value = String(k); rng.dispatchEvent(new Event('input')); };
+  }
+  card.append(wrap);
   if (spec.note) { const n = document.createElement('p'); n.className = 'note'; n.textContent = spec.note; card.append(n); }
-  const render = () => { if (canvas.isConnected && canvas.clientWidth) draw(canvas, spec); };
+  const render = () => { if (canvas.isConnected && canvas.clientWidth) draw(canvas, shown()); };
+  if (is3d) { // drag to rotate: horizontally the azimuth (touch as well: vertical swipes keep scrolling the page), vertically the elevation with a mouse or pen
+    let drag = null, pend = false;
+    canvas.style.cursor = 'grab'; canvas.tabIndex = 0;
+    const turn = () => { if (pend) return; pend = true; requestAnimationFrame(() => { pend = false; render(); }); };
+    canvas.addEventListener('pointerdown', (e) => { drag = { x: e.clientX, y: e.clientY, az: view.az, el: view.el }; canvas.style.cursor = 'grabbing'; try { canvas.setPointerCapture(e.pointerId); } catch (er) { /* not capturable */ } });
+    canvas.addEventListener('pointermove', (e) => { if (!drag) return; view.az = drag.az - 0.45 * (e.clientX - drag.x); if (e.pointerType !== 'touch') view.el = Math.max(8, Math.min(85, drag.el + 0.35 * (e.clientY - drag.y))); turn(); });
+    const end = () => { drag = null; canvas.style.cursor = 'grab'; };
+    canvas.addEventListener('pointerup', end); canvas.addEventListener('pointercancel', end);
+    canvas.addEventListener('keydown', (e) => { const d = { ArrowLeft: [-15, 0], ArrowRight: [15, 0], ArrowUp: [0, 5], ArrowDown: [0, -5] }[e.key]; if (!d) return; e.preventDefault(); view.az += d[0]; view.el = Math.max(8, Math.min(85, view.el + d[1])); render(); });
+    card._view = view;
+  }
   const ro = new ResizeObserver(() => render());
   ro.observe(wrap);
   canvas.addEventListener('pointermove', (e) => {

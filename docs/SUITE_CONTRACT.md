@@ -95,7 +95,14 @@ export default {
   cmap: 'viridis' | 'turbo' | 'coolwarm' | 'salinity' | 'thermal', contours: 8, equal: true,
   u: [ny][nx], v: [ny][nx], stream: true, vectors: true, mask: [ny][nx] /* true = solid */,
   shapes: [{ x: [], y: [], closed, color, dash, fill }], markers: [{ x, y, label }] }
+{ type: 'surface3d', title, x: [nx], y: [ny], z: [ny][nx] /* ground elevation */, cmap, zmin, zmax, zmid,
+  layers: [{ name, z: [ny][nx] /* upper surface */, base, c: [ny][nx] /* colour value */, cmap, cmin, cmax, clabel, cunit, opacity }],
+  planes: [{ z, name, color }], markers: [{ x, y, z0, z1, label }], azimuth, elevation, zscale }
 ```
+
+Any plot spec may carry `frames: [{ label, ...fields that differ }]` with `frameLabel` and a starting `frame`: the chart card then shows a
+slider that switches between the frames (depth slices, section positions, iso-levels) without re-running; title, PNG and CSV follow the frame.
+The `surface3d` view is rotated by dragging or with the buttons on its card.
 
 ## Fixed ids and the outputs each suite publishes
 
