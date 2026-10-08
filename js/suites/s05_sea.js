@@ -4,9 +4,12 @@
 // against the empirical dense-jet coefficients. Intermediate field: entraining bottom gravity current.
 // Far field: transient advection–dispersion of excess salinity over real or synthetic bathymetry, driven
 // by tidal-harmonic, residual and wind-drift currents whose spatial pattern follows a rigid-lid,
-// friction-dominated shallow-water balance. Regulatory mixing-zone, receptor and intake assessment.
+// friction-dominated shallow-water balance, or by a free-surface shallow-water solver (wetting–drying,
+// Flather/elevation/radiation boundaries, wind stress, Coriolis). Optional wave-action model, vertical
+// (x–z) hydrostatic/non-hydrostatic slice with turbulence closure, atmospheric heat exchange, ecological
+// dose–response and seasonal sweep. Regulatory mixing-zone, receptor and intake assessment.
 import { rk45, clamp, linspace, fmt, rng, interp1, mean } from '../core/num.js';
-import { density, G, salinityFromTDS } from '../core/props.js';
+import { density, G, salinityFromTDS, cp as cpSea } from '../core/props.js';
 import { pcg5 } from './s04_cfd.js';
 
 export const TIDES = { M2: 12.4206012, S2: 12.0, K1: 23.93447213, O1: 25.81933871 }; // constituent periods, h
@@ -213,12 +216,19 @@ export function flowBasis(g, closed = false) {
  * Far-field transport of excess salinity C (g/kg) in a bottom-attached layer occupying a fixed fraction φ of
  * the local depth (φ = 1: fully mixed): ∂(φHC)/∂t + ∇·(f_b φ q C) + ∇·(φ H u_g C) = ∇·(φ H K ∇C) + source.
  * Explicit finite volumes, upwind or van Leer TVD fluxes, CFL-limited step, open or closed boundaries.
+ * Options: dyn = swCoupler(...) co-steps a shallowWater() solver and uses its time-mean face transports and its
+ * moving depth, ∂D/∂t = −∇·(f_b q), so the scheme stays consistent with the moving free surface; extra = { rate, decay }
+ * carries a second tracer (excess temperature) with a first-order surface-exchange decay (1/s per cell);
+ * expThr = [thresholds] returns the share of the statistics window that each cell spends above each threshold.
  */
 export async function farField(c, ctx) {
-  const { g, flow, cur, K, phi = 1, bedF = 1, scheme = 'tvd', cfl = 0.5, tEnd, tStat = 0, src = [], rate = 0, probes = [], ring = [], drift = null, closed = false, thr = 0.1, particles = 0 } = c;
-  const { nx, ny, dx, dy, H } = g, n = nx * ny, A = dx * dy, [bA, bB] = flow.basis;
+  const { g, flow, cur, K, phi = 1, bedF = 1, scheme = 'tvd', cfl = 0.5, tEnd, tStat = 0, src = [], rate = 0, probes = [], ring = [], drift = null, closed = false, thr = 0.1, particles = 0, dyn = null, extra = null, expThr = null } = c;
+  const { nx, ny, dx, dy, H } = g, n = nx * ny, A = dx * dy, zero = () => ({ qx: new Float64Array((nx + 1) * ny), qy: new Float64Array(nx * (ny + 1)), rate: 0 });
+  const bA = dyn ? zero() : flow.basis[0], bB = dyn ? zero() : flow.basis[1];
   const C = c.C0 ? Float64Array.from(c.C0) : new Float64Array(n), dC = new Float64Array(n), Cmax = new Float64Array(n), Csum = new Float64Array(n), Csnap = new Float64Array(n);
-  let Kmax = 0;
+  const E = extra ? (extra.C0 ? Float64Array.from(extra.C0) : new Float64Array(n)) : null, dE = E ? new Float64Array(n) : null, Emax = E ? new Float64Array(n) : null, Esum = E ? new Float64Array(n) : null, lam = extra?.decay || null;
+  const expo = expThr ? expThr.map(() => new Float64Array(n)) : null;
+  let Kmax = 0, nExp = 0;
   for (let P = 0; P < n; P++) if (H[P] && K[P] > Kmax) Kmax = K[P];
   const dtDiff = Kmax > 0 ? 0.2 / (Kmax * (1 / (dx * dx) + 1 / (dy * dy))) : Infinity, tvd = scheme === 'tvd';
   // density-driven down-slope drift: u_g = √(g'·h_layer·|s| / 2C_d) directed down the bed gradient, g' = g β_S C
@@ -246,23 +256,27 @@ export async function farField(c, ctx) {
     if (j === 0) edge.push([P, i, 1, -1]); if (j === ny - 1) edge.push([P, ny * nx + i, 1, 1]);
   }
   const inv = Float64Array.from(H, (h) => (h > 0 ? 1 / (h * A) : 0));
-  const sample = (x, y) => { // bilinear over wet cells
+  // moving free surface (dyn): layer-equivalent depth D = H₀ + f_b (h − h₀) of the hydrodynamic cell, so that ∂D/∂t = −∇·(f_b q)
+  const sw = dyn || null, H0 = sw ? Float64Array.from(H, (h, P) => (h > 0 ? Math.max(h + (sw.depth(P) > 0 ? sw.eta(P) : sw.eta0 ?? 0), 0.05) : 0)) : null, Do = sw ? Float64Array.from(H0) : null, Dn = sw ? Float64Array.from(H0) : null, Da = sw ? new Float64Array(n) : null, Db = sw ? new Float64Array(n) : null;
+  const sampleOf = (F, x, y) => { // bilinear over wet cells
     const fi = (x - g.x0) / dx - 0.5, fj = (y - g.y0) / dy - 0.5, i = clamp(Math.floor(fi), 0, nx - 2), j = clamp(Math.floor(fj), 0, ny - 2), a = clamp(fi - i, 0, 1), b = clamp(fj - j, 0, 1);
     let s = 0, w = 0;
-    for (const [P, wt] of [[j * nx + i, (1 - a) * (1 - b)], [j * nx + i + 1, a * (1 - b)], [(j + 1) * nx + i, (1 - a) * b], [(j + 1) * nx + i + 1, a * b]]) if (H[P]) { s += wt * C[P]; w += wt; }
+    for (const [P, wt] of [[j * nx + i, (1 - a) * (1 - b)], [j * nx + i + 1, a * (1 - b)], [(j + 1) * nx + i, (1 - a) * b], [(j + 1) * nx + i + 1, a * b]]) if (H[P]) { s += wt * F[P]; w += wt; }
     return w > 0 ? s / w : 0;
+  };
+  const sample = (x, y) => sampleOf(C, x, y);
+  const cellVel = (P) => { // velocity of the transported layer in cell P (shallow-water coupling)
+        const i = P % nx, j = (P - i) / nx, hh = Math.max(H0[P] + (Dn[P] - H0[P]) / bedF, 0.2);
+    return [(bedF * 0.5 * (bA.qx[j * (nx + 1) + i] + bA.qx[j * (nx + 1) + i + 1])) / (hh * dy), (bedF * 0.5 * (bA.qy[P] + bA.qy[P + nx])) / (hh * dx)];
   };
   // particles (random walk): continuous release at the source
   const np = Math.round(particles), px = new Float64Array(np), py = new Float64Array(np), alive = new Uint8Array(np), rn = np ? rng(99) : null;
   let released = 0;
-  const ser = { t: [], u: [], v: [], probes: probes.map(() => []), ring: [] }, bal = { injected: 0, out: 0 };
-  let t = 0, step = 0, nStat = 0, tSnap = 0, areaSnap = -1, lastSample = -Infinity, ringMax = 0, tRingMax = 0;
-  const dtSample = tEnd / 360, maxSteps = c.maxSteps ?? 60000;
-  while (t < tEnd - 1e-9 && step < maxSteps) {
-    const [ux, uy] = currentAt(cur, t), adv = bedF * (Math.abs(ux) * bA.rate + Math.abs(uy) * bB.rate) + gRate;
-    const dt = Math.min(adv > 0 ? cfl / adv : Infinity, dtDiff, tEnd - t, tEnd / 40);
-    dC.fill(0);
-    const cA = bedF * ux, cB = bedF * uy;
+  const ser = { t: [], u: [], v: [], probes: probes.map(() => []), ring: [], extra: E ? probes.map(() => []) : null, eta: sw ? [] : null }, bal = { injected: 0, out: 0, injectedE: 0, outE: 0, lostE: 0 };
+  /** One explicit transport step of length dts with current coefficients cA, cB (and depths a → b when the surface moves). */
+  const advance = (dts, cA, cB, Da, Db) => {
+    const moving = !!Da;
+    dC.fill(0); if (E) dE.fill(0);
     for (const T of tab) {
       const { m, stride, L, U1, U2, Fq, Dc, Gc, Ga, qa, qb } = T;
       for (let k = 0; k < m; k++) {
@@ -270,18 +284,67 @@ export async function farField(c, ctx) {
         let cf;
         if (f >= 0) { cf = cl; if (tvd && U1[k] >= 0) { const d1 = cl - C[U1[k]], d2 = cr - cl; if (d1 * d2 > 0) cf = cl + (d1 * d2) / (d1 + d2); } } // van Leer limiter
         else { cf = cr; if (tvd && U2[k] >= 0) { const d1 = cr - C[U2[k]], d2 = cl - cr; if (d1 * d2 > 0) cf = cr + (d1 * d2) / (d1 + d2); } }
-        let flux = f * cf - Dc[k] * (cr - cl);
-        if (Gc[k] !== 0) { const cu = Gc[k] > 0 ? cl : cr; if (cu > 0) { const ug = Gc[k] * Math.sqrt(cu); flux += (ug > vmaxG ? vmaxG : ug < -vmaxG ? -vmaxG : ug) * Ga[k] * cu; } }
+        let flux = f * cf - Dc[k] * (cr - cl), ugA = 0;
+        if (Gc[k] !== 0) { const cu = Gc[k] > 0 ? cl : cr; if (cu > 0) { const ug = Gc[k] * Math.sqrt(cu); ugA = (ug > vmaxG ? vmaxG : ug < -vmaxG ? -vmaxG : ug) * Ga[k]; flux += ugA * cu; } }
         dC[P] -= flux; dC[R] += flux;
+        if (E) {
+          const el = E[P], er = E[R];
+          let ef;
+          if (f >= 0) { ef = el; if (tvd && U1[k] >= 0) { const d1 = el - E[U1[k]], d2 = er - el; if (d1 * d2 > 0) ef = el + (d1 * d2) / (d1 + d2); } }
+          else { ef = er; if (tvd && U2[k] >= 0) { const d1 = er - E[U2[k]], d2 = el - er; if (d1 * d2 > 0) ef = er + (d1 * d2) / (d1 + d2); } }
+          const fe = f * ef - Dc[k] * (er - el) + ugA * (ugA > 0 ? el : er);
+          dE[P] -= fe; dE[R] += fe;
+        }
       }
     }
     for (const [P, q, ax, sg] of edge) { // open edge: outflow leaves the domain, inflow brings clean water
       const fo = sg * (ax ? cA * bA.qy[q] + cB * bB.qy[q] : cA * bA.qx[q] + cB * bB.qx[q]);
-      if (fo > 0) { dC[P] -= fo * C[P]; bal.out += fo * C[P] * dt * phi; }
+      if (fo > 0) { dC[P] -= fo * C[P]; bal.out += fo * C[P] * dts * phi; if (E) { dE[P] -= fo * E[P]; bal.outE += fo * E[P] * dts * phi; } }
     }
-    for (let P = 0; P < n; P++) { const cn = C[P] + dt * dC[P] * inv[P]; C[P] = cn > 0 ? cn : 0; }
-    for (const s of src) C[s.P] += (dt * rate * s.w) / (phi * H[s.P] * A);
-    bal.injected += dt * rate * (src.length ? 1 : 0);
+    if (!moving) {
+      for (let P = 0; P < n; P++) { const cn = C[P] + dts * dC[P] * inv[P]; C[P] = cn > 0 ? cn : 0; }
+      for (const s of src) C[s.P] += (dts * rate * s.w) / (phi * H[s.P] * A);
+      if (E) {
+        for (let P = 0; P < n; P++) { let en = E[P] + dts * dE[P] * inv[P]; if (lam && lam[P] > 0) { const e2 = en / (1 + dts * lam[P]); bal.lostE += (en - e2) * phi * H[P] * A; en = e2; } E[P] = en; }
+        for (const s of src) E[s.P] += (dts * extra.rate * s.w) / (phi * H[s.P] * A);
+      }
+    } else {
+      for (let P = 0; P < n; P++) { if (!H[P] || !(Db[P] > 0.02)) continue; const cn = (Da[P] * C[P] + (dts * dC[P]) / A) / Db[P]; C[P] = cn > 0 ? cn : 0; }
+      for (const s of src) C[s.P] += (dts * rate * s.w) / (phi * Math.max(Db[s.P], 0.02) * A);
+      if (E) {
+        for (let P = 0; P < n; P++) { if (!H[P] || !(Db[P] > 0.02)) continue; let en = (Da[P] * E[P] + (dts * dE[P]) / A) / Db[P]; if (lam && lam[P] > 0) { const e2 = en / (1 + dts * lam[P]); bal.lostE += (en - e2) * phi * Db[P] * A; en = e2; } E[P] = en; }
+        for (const s of src) E[s.P] += (dts * extra.rate * s.w) / (phi * Math.max(Db[s.P], 0.02) * A);
+      }
+    }
+    bal.injected += dts * rate * (src.length ? 1 : 0); if (E) bal.injectedE += dts * extra.rate * (src.length ? 1 : 0);
+  };
+  let t = 0, step = 0, nStat = 0, tSnap = 0, areaSnap = -1, lastSample = -Infinity, ringMax = 0, tRingMax = 0, rateDyn = 0, rateBulk = 0, subSteps = 0;
+  const dtSample = tEnd / 360, maxSteps = c.maxSteps ?? 60000;
+  while (t < tEnd - 1e-9 && step < maxSteps) {
+    let ux = 1, uy = 0, dt;
+    if (!sw) {
+      [ux, uy] = currentAt(cur, t);
+      const adv = bedF * (Math.abs(ux) * bA.rate + Math.abs(uy) * bB.rate) + gRate;
+      dt = Math.min(adv > 0 ? cfl / adv : Infinity, dtDiff, tEnd - t, tEnd / 40);
+      advance(dt, bedF * ux, bedF * uy, null, null);
+    } else {
+      dt = Math.min(rateBulk + gRate > 0 ? cfl / (rateBulk + gRate) : 30, dtDiff, Math.max(tEnd - t, 1e-6), tEnd / 40); // step from the bulk cells; thin (drying) cells are sub-cycled
+      Do.set(Dn);
+      sw.advance(dt, bA.qx, bA.qy);
+      rateDyn = 0; rateBulk = 0;
+      const hc = sw.sw.h, hc0 = sw.h0, mp = sw.map, lc = sw.sw.land;
+      for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) {
+        if (!H[P]) continue;
+        const Q = mp[P];
+        if (!lc[Q]) { const d = H0[P] + bedF * (hc[Q] - hc0[Q]); Dn[P] = d > 0.02 ? d : 0.02; }
+        const dm = Do[P] < Dn[P] ? Do[P] : Dn[P];
+        if (dm > 0.02) { const r = (0.5 * bedF * (Math.abs(bA.qx[j * (nx + 1) + i]) + Math.abs(bA.qx[j * (nx + 1) + i + 1]) + Math.abs(bA.qy[P]) + Math.abs(bA.qy[P + nx]))) / (dm * A); if (r > rateDyn) rateDyn = r; if (dm > 0.3 && r > rateBulk) rateBulk = r; }
+      }
+      const ns = clamp(Math.ceil((dt * (rateDyn + gRate)) / Math.max(cfl, 0.05)), 1, 40);
+      if (ns === 1) advance(dt, bedF, 0, Do, Dn);
+      else for (let s = 0; s < ns; s++) { for (let P = 0; P < n; P++) { Da[P] = Do[P] + ((Dn[P] - Do[P]) * s) / ns; Db[P] = Do[P] + ((Dn[P] - Do[P]) * (s + 1)) / ns; } advance(dt / ns, bedF, 0, Da, Db); }
+      subSteps += ns;
+    }
     t += dt; step++;
     if (np) {
       const want = Math.min(np, Math.floor((t / tEnd) * np) + 1);
@@ -289,36 +352,41 @@ export async function farField(c, ctx) {
       for (let k = 0; k < released; k++) {
         if (!alive[k]) continue;
         const i = Math.floor((px[k] - g.x0) / dx), j = Math.floor((py[k] - g.y0) / dy), P = j * nx + i, sd = Math.sqrt(6 * K[P] * dt);
-        const xn = px[k] + bedF * (ux * bA.u[P] + uy * bB.u[P]) * dt + sd * (2 * rn.uniform() - 1), yn = py[k] + bedF * (ux * bA.v[P] + uy * bB.v[P]) * dt + sd * (2 * rn.uniform() - 1);
+        let xn, yn;
+        if (!sw) { xn = px[k] + bedF * (ux * bA.u[P] + uy * bB.u[P]) * dt + sd * (2 * rn.uniform() - 1); yn = py[k] + bedF * (ux * bA.v[P] + uy * bB.v[P]) * dt + sd * (2 * rn.uniform() - 1); }
+        else { const [vx, vy] = cellVel(P); xn = px[k] + vx * dt + sd * (2 * rn.uniform() - 1); yn = py[k] + vy * dt + sd * (2 * rn.uniform() - 1); }
         const i2 = Math.floor((xn - g.x0) / dx), j2 = Math.floor((yn - g.y0) / dy);
         if (i2 < 0 || i2 >= nx || j2 < 0 || j2 >= ny) { alive[k] = 0; continue; }
         if (H[j2 * nx + i2]) { px[k] = xn; py[k] = yn; }
       }
     }
     const inStat = t >= tStat;
-    if (inStat) { nStat++; for (let P = 0; P < n; P++) { const cv = C[P]; if (cv > Cmax[P]) Cmax[P] = cv; Csum[P] += cv; } }
+    if (inStat) { nStat++; for (let P = 0; P < n; P++) { const cv = C[P]; if (cv > Cmax[P]) Cmax[P] = cv; Csum[P] += cv; } if (E) for (let P = 0; P < n; P++) { const ev = E[P]; if (Math.abs(ev) > Math.abs(Emax[P])) Emax[P] = ev; Esum[P] += ev; } }
     if (t - lastSample >= dtSample || t >= tEnd - 1e-9) {
       lastSample = t;
       let rm = 0;
       for (const [x, y] of ring) rm = Math.max(rm, sample(x, y));
-      ser.t.push(t / 3600); ser.u.push(ux); ser.v.push(uy); ser.ring.push(rm); probes.forEach((p, k) => ser.probes[k].push(sample(p[0], p[1])));
+      if (sw) { const Po = g.jo * nx + g.io, [vx, vy] = cellVel(Po); ux = vx / bedF; uy = vy / bedF; ser.eta.push(sw.depth(Po) > 0 ? sw.eta(Po) : (sw.eta0 ?? 0) + (Dn[Po] - H0[Po]) / bedF); }
+      ser.t.push(t / 3600); ser.u.push(ux); ser.v.push(uy); ser.ring.push(rm); probes.forEach((p, k) => { ser.probes[k].push(sample(p[0], p[1])); if (E) ser.extra[k].push(sampleOf(E, p[0], p[1])); });
       if (inStat) {
         if (rm > ringMax) { ringMax = rm; tRingMax = t; }
         let area = 0;
         for (let P = 0; P < n; P++) if (C[P] > thr) area++;
         if (area > areaSnap) { areaSnap = area; tSnap = t; Csnap.set(C); }
+        if (expo) { nExp++; expThr.forEach((th, k) => { const a = expo[k]; for (let P = 0; P < n; P++) if (C[P] > th) a[P]++; }); }
       }
       if (ctx?.progress) ctx.progress(0.12 + (0.83 * t) / tEnd, `Far field: ${fmt(t / 3600, 3)} h of ${fmt(tEnd / 3600, 3)} h`);
       if (ctx?.tick) await ctx.tick();
     }
     if (!Number.isFinite(C[g.jo * nx + g.io])) throw new Error('The far-field solution became unstable — lower the CFL number.');
   }
-  let mass = 0;
-  for (let P = 0; P < n; P++) { mass += phi * H[P] * C[P] * A; Csum[P] = nStat ? Csum[P] / nStat : C[P]; if (!nStat) Cmax[P] = C[P]; }
+  let mass = 0, massE = 0;
+  for (let P = 0; P < n; P++) { const D = sw ? (H[P] ? Dn[P] : 0) : H[P]; mass += phi * D * C[P] * A; if (E) { massE += phi * D * E[P] * A; Esum[P] = nStat ? Esum[P] / nStat : E[P]; if (!nStat) Emax[P] = E[P]; } Csum[P] = nStat ? Csum[P] / nStat : C[P]; if (!nStat) Cmax[P] = C[P]; }
   if (areaSnap < 0) Csnap.set(C);
+  if (expo) for (const a of expo) for (let P = 0; P < n; P++) a[P] = nExp ? a[P] / nExp : 0;
   const part = np ? { x: [], y: [] } : null;
   if (part) for (let k = 0; k < released; k++) if (alive[k]) { part.x.push(px[k]); part.y.push(py[k]); }
-  return { C, Cmax, Cmean: Csum, Csnap, tSnap, ser, bal: { ...bal, mass }, steps: step, tEnd: t, ringMax, tRingMax, dtMean: step ? t / step : 0, part, complete: t >= tEnd - 1e-6 };
+  return { C, Cmax, Cmean: Csum, Csnap, tSnap, ser, bal: { ...bal, mass, massE }, steps: step, tEnd: t, ringMax, tRingMax, dtMean: step ? t / step : 0, part, complete: t >= tEnd - 1e-6, E, Emax, Emean: Esum, expo, subSteps };
 }
 
 /** Marching-squares iso-line of a row-major field (rows[j][i]), returned as plot shapes. */
@@ -349,6 +417,469 @@ function isolines(z, xs, ys, level, color, maxShapes = 60) {
     lines.push(line);
   }
   return lines.sort((a, b) => b.length - a.length).slice(0, maxShapes).map((l) => ({ x: l.map((p) => p[0]), y: l.map((p) => p[1]), closed: false, color, width: 1 }));
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Free-surface shallow-water solver
+// ---------------------------------------------------------------------------------------------------
+const OMEGA_E = 7.2921e-5, RHO_AIR = 1.22;
+/** Kinematic wind stress τ/ρ_w (m²/s², east and north) from the 10 m wind (blowing from the bearing dirFrom), Smith–Banke drag law. */
+export function windStress(W, dirFrom, rhoW = 1025) {
+  const cd = (0.63 + 0.066 * clamp(W, 0, 30)) * 1e-3, [ex, ey] = bearing(dirFrom + 180), t = (RHO_AIR * cd * W * W) / rhoW;
+  return [t * ex, t * ey, cd];
+}
+
+/**
+ * Depth-averaged (2-D) shallow-water equations with a moving free surface on an Arakawa C grid:
+ *   ∂η/∂t + ∇·(h u) = 0 (finite-volume, upwind face depth → exact volume conservation, non-negative depths),
+ *   ∂u/∂t + u·∇u − f v = −g ∂η/∂x − c_f |u| u / h + (τ_wind + F_wave)/(ρ h)   (and likewise for v),
+ * forward–backward time stepping, semi-implicit bed friction (constant drag coefficient, Manning or Chézy),
+ * wetting and drying with a minimum depth, Coriolis, wind stress and wave (radiation-stress) forcing.
+ * Open sides: 'flather' (u_n = u_ext ± √(g/h)(η − η_ext)), 'elev' (clamped tidal elevation), 'rad' (radiation of
+ * outgoing waves to a still exterior) or 'wall'. ext(t) → { e, gx, gy, U, V }: external elevation e + gx·x + gy·y and
+ * external current (U, V) multiplied by the optional spatial patterns pat = { au, av, bu, bv }.
+ */
+export function shallowWater(o) {
+  const { nx, ny, dx, dy, zb } = o, n = nx * ny, nu1 = nx + 1, A = dx * dy, hmin = o.hmin ?? 0.05, f = o.f || 0, land = o.land || new Uint8Array(n);
+  const fr = o.fric || { type: 'cd', Cd: 0.0025 }, bc = { W: 'wall', E: 'wall', S: 'wall', N: 'wall', ...(o.bc || {}) }, x0 = o.x0 ?? 0, y0 = o.y0 ?? 0, pat = o.pat || null, fx = o.force?.fx || null, fy = o.force?.fy || null, adv = o.advect !== false;
+  const eta = new Float64Array(n), h = new Float64Array(n), u = new Float64Array(nu1 * ny), v = new Float64Array(nx * (ny + 1));
+  let un = new Float64Array(u.length), vn = new Float64Array(v.length), uc = u, vc = v;
+  const Fx = new Float64Array(u.length), Fy = new Float64Array(v.length), aX = new Float64Array(u.length), aY = new Float64Array(v.length), mu = new Uint8Array(u.length), mv = new Uint8Array(v.length);
+  for (let j = 0; j < ny; j++) for (let i = 1; i < nx; i++) mu[j * nu1 + i] = land[j * nx + i - 1] || land[j * nx + i] ? 0 : 1;
+  for (let j = 1; j < ny; j++) for (let i = 0; i < nx; i++) mv[j * nx + i] = land[(j - 1) * nx + i] || land[j * nx + i] ? 0 : 1;
+  const e0 = o.eta0 ?? 0;
+  for (let P = 0; P < n; P++) { const e = typeof e0 === 'function' ? e0(P % nx, (P - (P % nx)) / nx) : e0; eta[P] = land[P] ? zb[P] : Math.max(e, zb[P]); h[P] = eta[P] - zb[P]; }
+  const cfOf = fr.type === 'manning' ? (hh) => (G * fr.n * fr.n) / Math.cbrt(hh) : fr.type === 'chezy' ? () => G / (fr.C * fr.C) : () => fr.Cd;
+  const S = { nx, ny, dx, dy, eta, h, land, t: 0, steps: 0, volIn: 0, volClamp: 0, capped: 0, get u() { return uc; }, get v() { return vc; } };
+  const etaExt = (E, i, j) => E.e + E.gx * (x0 + (i + 0.5) * dx) + E.gy * (y0 + (j + 0.5) * dy);
+  const still = { e: typeof e0 === 'number' ? e0 : 0, gx: 0, gy: 0, U: 0, V: 0 };
+  const open = (s) => bc[s] !== 'wall';
+  S.volume = () => { let s = 0; for (let P = 0; P < n; P++) s += h[P]; return s * A; };
+  S.dtStable = () => {
+    let m = 1e-12; const q = Math.sqrt(1 / (dx * dx) + 1 / (dy * dy));
+    for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { if (!(h[P] > hmin)) continue; const r = Math.sqrt(G * h[P]) * q + Math.max(Math.abs(uc[j * nu1 + i]), Math.abs(uc[j * nu1 + i + 1])) / dx + Math.max(Math.abs(vc[P]), Math.abs(vc[P + nx])) / dy; if (r > m) m = r; }
+    return (o.cfl ?? 0.9) / m; // forward–backward stability limit: c Δt √(1/Δx² + 1/Δy²) ≤ 1
+  };
+  const oW = open('W'), oE = open('E'), oS = open('S'), oN = open('N'), manning = fr.type === 'manning', cfC = manning ? 0 : cfOf(1), gn2 = manning ? G * fr.n * fr.n : 0, gdx = G / dx, gdy = G / dy, rdx = 1 / dx, rdy = 1 / dy;
+  /** One step of length dt. acc = true accumulates the face transports for the transport model. */
+  S.step = (dt, acc) => {
+    const u = uc, v = vc, tw = typeof o.tau === 'function' ? o.tau(S.t) : o.tau || [0, 0], E = o.ext ? o.ext(S.t + dt) : still, twx = tw[0], twy = tw[1];
+    // 1. face transports with the upwind surface level above the higher of the two beds
+    for (let j = 0; j < ny; j++) {
+      const r = j * nu1, c = j * nx;
+      Fx[r] = oW && h[c] > hmin ? h[c] * u[r] * dy : 0; Fx[r + nx] = oE && h[c + nx - 1] > hmin ? h[c + nx - 1] * u[r + nx] * dy : 0;
+      for (let i = 1; i < nx; i++) {
+        const q = r + i;
+        if (!mu[q]) continue;
+        const R = c + i, L = R - 1, uq = u[q], zf = zb[L] > zb[R] ? zb[L] : zb[R], e = uq > 0 ? eta[L] : uq < 0 ? eta[R] : eta[L] > eta[R] ? eta[L] : eta[R], hf = e - zf;
+        if (hf <= hmin) { Fx[q] = 0; u[q] = 0; } else Fx[q] = hf * uq * dy;
+      }
+    }
+    for (let i = 0; i < nx; i++) { Fy[i] = oS && h[i] > hmin ? h[i] * v[i] * dx : 0; const P = (ny - 1) * nx + i; Fy[P + nx] = oN && h[P] > hmin ? h[P] * v[P + nx] * dx : 0; }
+    for (let q = nx; q < ny * nx; q++) {
+      if (!mv[q]) continue;
+      const L = q - nx, vq = v[q], zf = zb[L] > zb[q] ? zb[L] : zb[q], e = vq > 0 ? eta[L] : vq < 0 ? eta[q] : eta[L] > eta[q] ? eta[L] : eta[q], hf = e - zf;
+      if (hf <= hmin) { Fy[q] = 0; v[q] = 0; } else Fy[q] = hf * vq * dx;
+    }
+    // 2. continuity (kinematic free-surface condition, depth-integrated)
+    const dA = dt / A;
+    for (let j = 0, P = 0; j < ny; j++) for (let i = 0, q = j * nu1; i < nx; i++, P++, q++) {
+      if (land[P]) continue;
+      let e = eta[P] - dA * (Fx[q + 1] - Fx[q] + Fy[P + nx] - Fy[P]);
+      if (e < zb[P]) { S.volClamp += (zb[P] - e) * A; e = zb[P]; }
+      eta[P] = e; h[P] = e - zb[P];
+    }
+    for (let j = 0; j < ny; j++) S.volIn += dt * (Fx[j * nu1] - Fx[j * nu1 + nx]);
+    for (let i = 0; i < nx; i++) S.volIn += dt * (Fy[i] - Fy[ny * nx + i]);
+    if (acc) { for (let q = 0; q < Fx.length; q++) aX[q] += Fx[q]; for (let q = 0; q < Fy.length; q++) aY[q] += Fy[q]; }
+    const clampCell = (P, i, j) => { if (land[P]) return; const e = Math.max(etaExt(E, i, j), zb[P]); S.volClamp += (e - eta[P]) * A; eta[P] = e; h[P] = e - zb[P]; };
+    if (bc.W === 'elev') for (let j = 0; j < ny; j++) clampCell(j * nx, 0, j);
+    if (bc.E === 'elev') for (let j = 0; j < ny; j++) clampCell(j * nx + nx - 1, nx - 1, j);
+    if (bc.S === 'elev') for (let i = 0; i < nx; i++) clampCell(i, i, 0);
+    if (bc.N === 'elev') for (let i = 0; i < nx; i++) clampCell((ny - 1) * nx + i, i, ny - 1);
+    // 3. momentum (dynamic free-surface condition: hydrostatic pressure gradient g∇η), u then v with the new u
+    for (let j = 0; j < ny; j++) for (let i = 1; i < nx; i++) {
+      const q = j * nu1 + i;
+      if (!mu[q]) continue;
+      const R = j * nx + i, L = R - 1, eL = eta[L], eR = eta[R], zf = zb[L] > zb[R] ? zb[L] : zb[R];
+      if ((eL > eR ? eL : eR) - zf <= hmin) { un[q] = 0; continue; }
+      const uq = u[q], vb = 0.25 * (v[L] + v[R] + v[L + nx] + v[R + nx]);
+      let hb = 0.5 * (h[L] + h[R]); if (hb < hmin) hb = hmin;
+      let a = -gdx * (eR - eL) + f * vb;
+      if (twx !== 0 || fx) a += (twx + (fx ? 0.5 * (fx[L] + fx[R]) : 0)) / (hb > 0.2 ? hb : 0.2);
+      if (adv) a -= uq * (uq > 0 ? uq - u[q - 1] : u[q + 1] - uq) * rdx + vb * (vb > 0 ? (j > 0 ? uq - u[q - nu1] : 0) : j < ny - 1 ? u[q + nu1] - uq : 0) * rdy;
+      const cf = manning ? gn2 / Math.cbrt(hb) : cfC;
+      let w = cf > 0 ? (uq + dt * a) / (1 + (dt * cf * Math.sqrt(uq * uq + vb * vb)) / hb) : uq + dt * a;
+      if (w > 2 || w < -2) { const cap = 3 * Math.sqrt(G * hb) + 0.5; if (w > cap) { w = cap; S.capped++; } else if (w < -cap) { w = -cap; S.capped++; } }
+      un[q] = w;
+    }
+    for (let j = 0; j < ny; j++) { un[j * nu1] = u[j * nu1]; un[j * nu1 + nx] = u[j * nu1 + nx]; }
+    for (let j = 1; j < ny; j++) for (let i = 0; i < nx; i++) {
+      const q = j * nx + i;
+      if (!mv[q]) continue;
+      const L = q - nx, eL = eta[L], eR = eta[q], zf = zb[L] > zb[q] ? zb[L] : zb[q];
+      if ((eL > eR ? eL : eR) - zf <= hmin) { vn[q] = 0; continue; }
+      const vq = v[q], r = j * nu1 + i, ub = 0.25 * (un[r] + un[r + 1] + un[r - nu1] + un[r - nu1 + 1]);
+      let hb = 0.5 * (h[L] + h[q]); if (hb < hmin) hb = hmin;
+      let a = -gdy * (eR - eL) - f * ub;
+      if (twy !== 0 || fy) a += (twy + (fy ? 0.5 * (fy[L] + fy[q]) : 0)) / (hb > 0.2 ? hb : 0.2);
+      if (adv) a -= ub * (ub > 0 ? (i > 0 ? vq - v[q - 1] : 0) : i < nx - 1 ? v[q + 1] - vq : 0) * rdx + vq * (vq > 0 ? vq - v[q - nx] : v[q + nx] - vq) * rdy;
+      const cf = manning ? gn2 / Math.cbrt(hb) : cfC;
+      let w = cf > 0 ? (vq + dt * a) / (1 + (dt * cf * Math.sqrt(vq * vq + ub * ub)) / hb) : vq + dt * a;
+      if (w > 2 || w < -2) { const cap = 3 * Math.sqrt(G * hb) + 0.5; if (w > cap) { w = cap; S.capped++; } else if (w < -cap) { w = -cap; S.capped++; } }
+      vn[q] = w;
+    }
+    for (let i = 0; i < nx; i++) { vn[i] = v[i]; vn[ny * nx + i] = v[ny * nx + i]; }
+    // 4. open boundaries
+    const side = (s, P, i, j, q, arr, sgn, inner, isU) => {
+      const t = bc[s];
+      if (t === 'wall' || land[P] || !(h[P] > hmin)) { arr[q] = 0; return; }
+      if (t === 'elev') { arr[q] = arr[inner]; return; }
+      const X = t === 'rad' ? still : E, ue = t === 'rad' ? 0 : isU ? X.U * (pat ? pat.au[P] : 1) + X.V * (pat ? pat.bu[P] : 0) : X.U * (pat ? pat.av[P] : 0) + X.V * (pat ? pat.bv[P] : 1);
+      arr[q] = ue + sgn * Math.sqrt(G / (h[P] > 0.3 ? h[P] : 0.3)) * (eta[P] - etaExt(X, i, j));
+    };
+    for (let j = 0; j < ny; j++) { side('W', j * nx, 0, j, j * nu1, un, -1, j * nu1 + 1, true); side('E', j * nx + nx - 1, nx - 1, j, j * nu1 + nx, un, 1, j * nu1 + nx - 1, true); }
+    for (let i = 0; i < nx; i++) { side('S', i, i, 0, i, vn, -1, nx + i, false); side('N', (ny - 1) * nx + i, i, ny - 1, ny * nx + i, vn, 1, (ny - 1) * nx + i, false); }
+    const tu = uc; uc = un; un = tu; const tv = vc; vc = vn; vn = tv;
+    S.t += dt; S.steps++;
+  };
+  /** Advance by exactly dtTot in stable sub-steps; qx, qy receive the time-mean face transports (m³/s). */
+  S.advance = (dtTot, qx, qy) => {
+    const ds = S.dtStable(), ns = Math.max(1, Math.ceil(dtTot / ds)), dt = dtTot / ns;
+    if (S.dt0 === undefined) S.dt0 = ds; else if (ds < 0.02 * S.dt0) throw new Error('The shallow-water solution became unstable (runaway velocities) — raise the minimum depth, coarsen the hydrodynamic grid or use Flather boundaries.');
+    if (qx) { aX.fill(0); aY.fill(0); }
+    for (let k = 0; k < ns; k++) S.step(dt, !!qx);
+    if (qx) { for (let q = 0; q < aX.length; q++) qx[q] = aX[q] / ns; for (let q = 0; q < aY.length; q++) qy[q] = aY[q] / ns; }
+    if (S.stat) { // envelope statistics once per call
+      let wetN = 0; const st = S.stat;
+      for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { if (land[P]) continue; if (h[P] > hmin) { wetN++; const a = 0.5 * (uc[j * nu1 + i] + uc[j * nu1 + i + 1]), b = 0.5 * (vc[P] + vc[P + nx]), sp = Math.sqrt(a * a + b * b); if (sp > st.spd[P]) st.spd[P] = sp; } if (eta[P] > st.hi[P]) st.hi[P] = eta[P]; if (eta[P] < st.lo[P]) st.lo[P] = eta[P]; }
+      if (wetN < st.wetMin) st.wetMin = wetN; if (wetN > st.wetMax) st.wetMax = wetN;
+    }
+    if (!Number.isFinite(eta[(ny >> 1) * nx + (nx >> 1)])) throw new Error('The shallow-water solution became unstable — coarsen the grid or raise the minimum depth.');
+    return dtTot;
+  };
+  S.track = () => { S.stat = { spd: new Float64Array(n), hi: Float64Array.from(eta), lo: Float64Array.from(eta), wetMin: Infinity, wetMax: 0 }; };
+  S.cellU = (P) => { const i = P % nx, j = (P - i) / nx; return [0.5 * (uc[j * nu1 + i] + uc[j * nu1 + i + 1]), 0.5 * (vc[P] + vc[P + nx])]; };
+  return S;
+}
+
+/**
+ * Couples a shallowWater() solver (cells m × the transport cells) to the far-field transport grid nx × ny: the
+ * coarse face transports are interpolated linearly to the fine faces, which keeps the fine-grid divergence
+ * equal to the coarse one (∂η/∂t uniform inside each hydrodynamic cell).
+ */
+export function swCoupler(sw, nx, ny, m = 1, eta0 = 0) {
+  const ncx = sw.nx, ncy = sw.ny, map = new Int32Array(nx * ny), cx = m > 1 ? new Float64Array((ncx + 1) * ncy) : null, cy = m > 1 ? new Float64Array(ncx * (ncy + 1)) : null;
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) map[j * nx + i] = Math.min(ncy - 1, Math.floor(j / m)) * ncx + Math.min(ncx - 1, Math.floor(i / m));
+  const h0 = Float64Array.from(sw.h);
+  return { sw, map, eta0, h0, depth: (P) => sw.h[map[P]], eta: (P) => sw.eta[map[P]], dh: (P) => (sw.land[map[P]] ? NaN : sw.h[map[P]] - h0[map[P]]),
+    advance(dt, qx, qy) {
+      if (m === 1) return sw.advance(dt, qx, qy);
+      sw.advance(dt, cx, cy);
+      for (let j = 0; j < ny; j++) { const J = Math.floor(j / m); for (let i = 0; i <= nx; i++) { const I = Math.floor(i / m), a = i - I * m, FW = cx[J * (ncx + 1) + I]; qx[j * (nx + 1) + i] = a === 0 ? FW / m : (FW * (m - a) + cx[J * (ncx + 1) + I + 1] * a) / (m * m); } }
+      for (let j = 0; j <= ny; j++) { const J = Math.floor(j / m), b = j - J * m; for (let i = 0; i < nx; i++) { const I = Math.floor(i / m), FS = cy[J * ncx + I]; qy[j * nx + i] = b === 0 ? FS / m : (FS * (m - b) + cy[(J + 1) * ncx + I] * b) / (m * m); } }
+      return dt;
+    } };
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Waves: steady wave-action balance (refraction, shoaling, depth-limited breaking, Doppler shift by currents)
+// ---------------------------------------------------------------------------------------------------
+/** Linear dispersion with a following/opposing current component Uk along the wave direction: (ω − k·Uk)² = g k tanh(kh). */
+export function waveNumber(om, h, Uk = 0) {
+  const k0 = (om * om) / G, x = k0 * h;
+  let k = k0 / Math.sqrt(Math.tanh(x)); // Eckart first guess, then Newton
+  for (let it = 0; it < 50; it++) {
+    const kh = Math.min(k * h, 30), th = Math.tanh(kh), s = Math.sqrt(G * k * th), F = om - k * Uk - s, dF = -Uk - (0.5 * G * (th + k * h * (1 - th * th))) / s, kn = k - F / dF;
+    if (!(kn > 0) || !Number.isFinite(kn)) break;
+    const d = Math.abs(kn - k); k = kn; if (d < 1e-13 * k) break;
+  }
+  const kh = Math.min(k * h, 30), sig = Math.sqrt(G * k * Math.tanh(kh)), nn = 0.5 * (1 + (2 * kh) / Math.sinh(2 * kh));
+  return { k, sig, c: sig / k, n: nn, cg: (nn * sig) / k };
+}
+
+/**
+ * Steady wave-action balance ∇·[(c_g e_θ + U) N] = −D_b/σ for a monochromatic wave, N = E/σ, with the ray
+ * (refraction) equation (c_g e_θ + U)·∇θ = −(c_g/c) ∂c/∂n − ∂(U·e_θ)/∂n, solved by upwind pseudo-time marching
+ * with local steps. Depth-limited breaking caps the height at γ h. Returns height, direction, orbital velocity,
+ * radiation-stress forces (per unit mass and area, m²/s²) and the wave-driven longshore current of Longuet-Higgins.
+ * o = { nx, ny, dx, dy, h (0 = land), H0, T, theta0 (propagation direction, rad from +x), gamma, U, V, Cf }.
+ */
+export function waveField(o) {
+  const { nx, ny, dx, dy, h, H0, T } = o, n = nx * ny, om = (2 * Math.PI) / T, gam = o.gamma ?? 0.78, U = o.U || null, V = o.V || null, Cf = o.Cf ?? 0.01, th0 = o.theta0;
+  const N = new Float64Array(n), th = new Float64Array(n).fill(th0), k = new Float64Array(n), sg = new Float64Array(n), cc = new Float64Array(n), cg = new Float64Array(n), nn = new Float64Array(n), Nn = new Float64Array(n), tn = new Float64Array(n), brk = new Uint8Array(n);
+  let href = 0;
+  for (let P = 0; P < n; P++) if (h[P] > href) href = h[P];
+  const disp = () => { for (let P = 0; P < n; P++) { if (!(h[P] > 0)) continue; const w = waveNumber(om, h[P], U ? U[P] * Math.cos(th[P]) + V[P] * Math.sin(th[P]) : 0); k[P] = w.k; sg[P] = w.sig; cc[P] = w.c; cg[P] = w.cg; nn[P] = w.n; } };
+  disp();
+  const w0 = waveNumber(om, href), E0 = (G * H0 * H0) / 8, N0 = E0 / om; // E/ρ; the incident wave is specified in still water of the largest depth
+  const capN = (P) => (G * (gam * h[P]) ** 2) / 8 / sg[P];
+  for (let P = 0; P < n; P++) N[P] = h[P] > 0 ? Math.min(o.init ? o.init.N[P] : N0 * (w0.cg / cg[P]), capN(P)) : 0;
+  if (o.init) th.set(o.init.theta);
+  const deep = (P) => h[P] >= 0.5 * href, iters = o.iters ?? 4 * (nx + ny), lim = (d1, d2) => (d1 * d2 > 0 ? (2 * d1 * d2) / (d1 + d2) : 0);
+  const vxA = new Float64Array(n), vyA = new Float64Array(n), wet = Uint8Array.from(h, (x) => (x > 0 ? 1 : 0));
+  // second-order (van Leer limited) upwind face values on the low (M|P) and high (P|Q) faces; g = value outside the grid
+  const lowF = (F, P, M, MM, Q, g, vv) => (vv > 0 ? (M < 0 ? g : wet[M] ? F[M] + 0.5 * (MM >= 0 ? lim(F[M] - F[MM], F[P] - F[M]) : 0) : F[P]) : F[P] - 0.5 * (M >= 0 && Q >= 0 && wet[M] && wet[Q] ? lim(F[Q] - F[P], F[P] - F[M]) : 0));
+  const highF = (F, P, M, Q, QQ, g, vv) => (vv > 0 ? F[P] + 0.5 * (M >= 0 && Q >= 0 && wet[M] && wet[Q] ? lim(F[P] - F[M], F[Q] - F[P]) : 0) : Q < 0 ? g : wet[Q] ? F[Q] - 0.5 * (QQ >= 0 ? lim(F[QQ] - F[Q], F[Q] - F[P]) : 0) : F[P]);
+  for (let it = 0; it < iters; it++) {
+    if (U && it % 25 === 24) disp();
+    for (let P = 0; P < n; P++) if (wet[P]) { vxA[P] = cg[P] * Math.cos(th[P]) + (U ? U[P] : 0); vyA[P] = cg[P] * Math.sin(th[P]) + (V ? V[P] : 0); }
+    for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) {
+      if (!wet[P]) { Nn[P] = 0; tn[P] = th0; continue; }
+      const ct = Math.cos(th[P]), st = Math.sin(th[P]), vx = vxA[P], vy = vyA[P], dp = deep(P);
+      // outside the grid: incident wave in deep water, zero gradient in shallow water; land sends nothing
+      const gN = dp ? N0 * (w0.cg / cg[P]) : N[P], gT = dp ? th0 : th[P];
+      let M = i > 0 ? P - 1 : -1, Q = i < nx - 1 ? P + 1 : -1, MM = i > 1 && wet[P - 1] && wet[P - 2] ? P - 2 : -1, QQ = i < nx - 2 && wet[P + 1] && wet[P + 2] ? P + 2 : -1;
+      let vm = M < 0 ? vx : wet[M] ? 0.5 * (vx + vxA[M]) : vx < 0 ? vx : 0, vq = Q < 0 ? vx : wet[Q] ? 0.5 * (vx + vxA[Q]) : vx > 0 ? vx : 0;
+      let div = (vq * highF(N, P, M, Q, QQ, gN, vq) - vm * lowF(N, P, M, MM, Q, gN, vm)) / dx, adv = (vx * (highF(th, P, M, Q, QQ, gT, vx) - lowF(th, P, M, MM, Q, gT, vx))) / dx;
+      M = j > 0 ? P - nx : -1; Q = j < ny - 1 ? P + nx : -1; MM = j > 1 && wet[P - nx] && wet[P - 2 * nx] ? P - 2 * nx : -1; QQ = j < ny - 2 && wet[P + nx] && wet[P + 2 * nx] ? P + 2 * nx : -1;
+      vm = M < 0 ? vy : wet[M] ? 0.5 * (vy + vyA[M]) : vy < 0 ? vy : 0; vq = Q < 0 ? vy : wet[Q] ? 0.5 * (vy + vyA[Q]) : vy > 0 ? vy : 0;
+      div += (vq * highF(N, P, M, Q, QQ, gN, vq) - vm * lowF(N, P, M, MM, Q, gN, vm)) / dy; adv += (vy * (highF(th, P, M, Q, QQ, gT, vy) - lowF(th, P, M, MM, Q, gT, vy))) / dy;
+      const cW = i > 0 && wet[P - 1] ? P - 1 : P, cE = i < nx - 1 && wet[P + 1] ? P + 1 : P, cS = j > 0 && wet[P - nx] ? P - nx : P, cN = j < ny - 1 && wet[P + nx] ? P + nx : P, ex = cE === cW ? 0 : 1 / ((cE - cW) * dx), ey = cN === cS ? 0 : 1 / (((cN - cS) / nx) * dy);
+      let rhs = (-cg[P] / cc[P]) * (-st * (cc[cE] - cc[cW]) * ex + ct * (cc[cN] - cc[cS]) * ey);
+      if (U) rhs -= -st * (ct * (U[cE] - U[cW]) * ex + st * (V[cE] - V[cW]) * ex) + ct * (ct * (U[cN] - U[cS]) * ey + st * (V[cN] - V[cS]) * ey);
+      const dtau = 0.45 / (Math.abs(vx) / dx + Math.abs(vy) / dy + 1e-12);
+      let Nv = N[P] - dtau * div; const cap = capN(P);
+      brk[P] = Nv > cap ? 1 : 0; if (Nv > cap) Nv = cap; if (Nv < 0) Nv = 0;
+      Nn[P] = Nv; tn[P] = th[P] + dtau * (rhs - adv);
+    }
+    N.set(Nn); th.set(tn);
+  }
+  if (U) disp();
+  const Hs = new Float64Array(n), uorb = new Float64Array(n), fx = new Float64Array(n), fy = new Float64Array(n), Vls = new Float64Array(n), Sxx = new Float64Array(n), Sxy = new Float64Array(n), Syy = new Float64Array(n);
+  for (let P = 0; P < n; P++) {
+    if (!(h[P] > 0)) continue;
+    const E = N[P] * sg[P], ct = Math.cos(th[P]), st = Math.sin(th[P]);
+    Hs[P] = Math.sqrt((8 * E) / G); uorb[P] = (0.5 * Hs[P] * sg[P]) / Math.sinh(Math.min(k[P] * h[P], 30));
+    Sxx[P] = E * (nn[P] * (ct * ct + 1) - 0.5); Syy[P] = E * (nn[P] * (st * st + 1) - 0.5); Sxy[P] = E * nn[P] * ct * st;
+  }
+  let surf = 0, HbMax = 0, VlsMax = 0;
+  for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) {
+    if (!(h[P] > 0)) continue;
+    const cW = i > 0 && h[P - 1] > 0 ? P - 1 : P, cE = i < nx - 1 && h[P + 1] > 0 ? P + 1 : P, cS = j > 0 && h[P - nx] > 0 ? P - nx : P, cN = j < ny - 1 && h[P + nx] > 0 ? P + nx : P;
+    const ddx = (F) => (cE === cW ? 0 : (F[cE] - F[cW]) / ((cE - cW) * dx)), ddy = (F) => (cN === cS ? 0 : (F[cN] - F[cS]) / (((cN - cS) / nx) * dy));
+    fx[P] = -(ddx(Sxx) + ddy(Sxy)); fy[P] = -(ddx(Sxy) + ddy(Syy));
+    if (brk[P]) {
+      surf++; if (Hs[P] > HbMax) HbMax = Hs[P];
+      // Longuet-Higgins: alongshore radiation-stress force balanced by the wave-averaged bed shear (2/π) C_f u_orb V
+      const hx = ddx(h), hy = ddy(h), hm = Math.hypot(hx, hy);
+      if (hm > 1e-6 && uorb[P] > 1e-3) { const tx = -hy / hm, ty = hx / hm, Ft = fx[P] * tx + fy[P] * ty; Vls[P] = clamp(Ft / ((2 / Math.PI) * Cf * uorb[P]), -3, 3); if (Math.abs(Vls[P]) > VlsMax) VlsMax = Math.abs(Vls[P]); }
+    }
+  }
+  return { N, theta: th, k, c: cc, cg, sig: sg, Hs, uorb, fx, fy, Vls, brk, surfCells: surf, HbMax, VlsMax, href };
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Vertical (x–z) slice: non-hydrostatic or hydrostatic Boussinesq equations with a turbulence closure
+// ---------------------------------------------------------------------------------------------------
+const KE = { cmu: 0.09, c1: 1.44, c2: 1.92, sk: 1.0, se: 1.3, st: 0.85 };
+/** Pacanowski & Philander (1981) Richardson-number mixing: ν = ν₀/(1 + 5Ri)² + ν_b, K = ν/(1 + 5Ri) + K_b. */
+export function ppMixing(Ri, nu0 = 1e-2, nub = 1e-4, Kb = 1e-5) { const r = 1 + 5 * Math.max(Ri, 0), nu = nu0 / (r * r) + nub; return { nu, K: nu / r + Kb }; }
+
+/**
+ * Two-dimensional vertical slice of the Boussinesq Navier–Stokes equations (x along the section, z up, rigid lid):
+ * 'nonhydro' — full vertical momentum equation with a pressure-projection step (Poisson equation for the
+ *   non-hydrostatic pressure, conjugate gradients); 'hydro' — hydrostatic primitive equations: baroclinic pressure
+ *   from the vertical integral of buoyancy, rigid-lid barotropic correction of the depth-integrated transport and
+ *   w from continuity. Scalar s = density excess expressed as equivalent salinity (g/kg), buoyancy b = −g β s.
+ * Turbulence: 'ke' (k–ε with shear and buoyancy production and wall values at the bed), 'pp' (Richardson-number
+ * mixing of Pacanowski–Philander) or 'const'. Staggered grid, upwind momentum, van Leer TVD scalar transport.
+ * o = { nx, nz, dx, dz, solid, s0 (cell array), beta, tEnd, turb, nu, Kh, Cd, k0, eps0, src: [{ P, rate }], model }.
+ */
+export async function verticalSlice(o, ctx) {
+  const { nx, nz, dx, dz } = o, n = nx * nz, nu1 = nx + 1, beta = o.beta ?? 7.6e-4, gb = G * beta, hydro = o.model === 'hydro', turb = o.turb || 'const', Cd = o.Cd ?? 0;
+  const solid = o.solid || new Uint8Array(n), nuB = o.nu ?? 1e-4, Kb = o.Kv ?? nuB, nuH = o.nuH ?? nuB, KH = o.Kh ?? nuH;
+  const s = Float64Array.from(o.s0), sn = new Float64Array(n), u = new Float64Array(nu1 * nz), w = new Float64Array(nx * (nz + 1)), us = new Float64Array(u.length), ws = new Float64Array(w.length), p = new Float64Array(n), ph = new Float64Array(n);
+  const ub = new Uint8Array(u.length), wb = new Uint8Array(w.length);
+  for (let k = 0; k < nz; k++) for (let i = 0; i <= nx; i++) ub[k * nu1 + i] = i === 0 || i === nx || solid[k * nx + i - 1] || solid[k * nx + i] ? 1 : 0;
+  for (let k = 0; k <= nz; k++) for (let i = 0; i < nx; i++) wb[k * nx + i] = k === 0 || k === nz || solid[(k - 1) * nx + i] || solid[k * nx + i] ? 1 : 0;
+  const nut = new Float64Array(n).fill(nuB), Kt = new Float64Array(n).fill(Kb), tk = new Float64Array(n).fill(o.k0 ?? 1e-6), te = new Float64Array(n), tkn = new Float64Array(n), ten = new Float64Array(n);
+  const Hd = nz * dz, eps0 = o.eps0 ?? (KE.cmu ** 0.75 * (o.k0 ?? 1e-6) ** 1.5) / (0.1 * Hd);
+  te.fill(eps0);
+  // Poisson operator (non-hydrostatic pressure)
+  const aE = new Float64Array(n), aN = new Float64Array(n), dg = new Float64Array(n), rhs = new Float64Array(n);
+  let pin = -1;
+  for (let k = 0, P = 0; k < nz; k++) for (let i = 0; i < nx; i++, P++) { if (solid[P]) continue; if (pin < 0) pin = P; if (!ub[k * nu1 + i + 1]) aE[P] = dz / dx; if (!wb[(k + 1) * nx + i]) aN[P] = dx / dz; }
+  for (let k = 0, P = 0; k < nz; k++) for (let i = 0; i < nx; i++, P++) dg[P] = solid[P] ? 0 : aE[P] + aN[P] + (i > 0 ? aE[P - 1] : 0) + (k > 0 ? aN[P - nx] : 0);
+  for (let P = 0; P < n; P++) if (!solid[P] && !(dg[P] > 0)) dg[P] = 1; // isolated cell
+  if (pin >= 0) dg[pin] *= 1.0001;
+  const Wcg = { r: new Float64Array(n), z: new Float64Array(n), s: new Float64Array(n), q: new Float64Array(n), pc: new Float64Array(n) };
+  const srcs = o.src || [], lim = (d1, d2) => (d1 * d2 > 0 ? (d1 * d2) / (d1 + d2) : 0);
+  /** Limited upwind value on the face between entries b and c of F (a and d are the next ones out, −1 if absent). */
+  const fv = (F, a, b, c, d, vel) => (vel > 0 ? F[b] + (a >= 0 ? lim(F[b] - F[a], F[c] - F[b]) : 0) : F[c] - (d >= 0 ? lim(F[d] - F[c], F[c] - F[b]) : 0));
+  let t = 0, steps = 0, salt0 = 0, injected = 0, pIter = 0;
+  for (let P = 0; P < n; P++) if (!solid[P]) salt0 += s[P];
+  const hist = { t: [], front: [], ke: [] }, tEnd = o.tEnd, sRange = () => { let a = Infinity, b = -Infinity; for (let P = 0; P < n; P++) if (!solid[P]) { if (s[P] < a) a = s[P]; if (s[P] > b) b = s[P]; } return b - a; };
+  const cInt0 = Math.sqrt(Math.max(gb * Math.max(sRange(), o.sScale ?? 0, 1e-9) * Hd, 1e-12));
+  const rx2 = 1 / (dx * dx), rz2 = 1 / (dz * dz);
+  const turbStep = (dt) => {
+    let numax = nuB;
+    for (let k = 0, P = 0; k < nz; k++) for (let i = 0; i < nx; i++, P++) {
+      if (solid[P]) { nut[P] = nuB; Kt[P] = Kb; tkn[P] = tk[P]; ten[P] = te[P]; continue; }
+      const q = k * nu1 + i, r = k * nx + i, uc = 0.5 * (u[q] + u[q + 1]), wc = 0.5 * (w[r] + w[r + nx]);
+      const up = k < nz - 1 && !solid[P + nx] ? 0.5 * (u[q + nu1] + u[q + nu1 + 1]) : uc, dn = k > 0 && !solid[P - nx] ? 0.5 * (u[q - nu1] + u[q - nu1 + 1]) : uc, dzz = ((k < nz - 1 && !solid[P + nx] ? 1 : 0) + (k > 0 && !solid[P - nx] ? 1 : 0)) * dz || dz;
+      const uz = (up - dn) / dzz, ux = (u[q + 1] - u[q]) / dx, wz = (w[r + nx] - w[r]) / dz;
+      const wE = i < nx - 1 && !solid[P + 1] ? 0.5 * (w[r + 1] + w[r + 1 + nx]) : wc, wW = i > 0 && !solid[P - 1] ? 0.5 * (w[r - 1] + w[r - 1 + nx]) : wc, wx = (wE - wW) / (2 * dx);
+      const S2 = 2 * (ux * ux + wz * wz) + (uz + wx) * (uz + wx);
+      const sU = k < nz - 1 && !solid[P + nx] ? s[P + nx] : s[P], sD = k > 0 && !solid[P - nx] ? s[P - nx] : s[P], N2 = (-gb * (sU - sD)) / dzz;
+      if (turb === 'pp') { const m = ppMixing(N2 / (uz * uz + 1e-10), o.nu0 ?? 1e-2, nuB, Kb); nut[P] = N2 < 0 ? (o.nu0 ?? 1e-2) + nuB : m.nu; Kt[P] = N2 < 0 ? (o.nu0 ?? 1e-2) + Kb : m.K; }
+      else if (turb === 'ke') {
+        // k–ε: Dk/Dt = ∇·(ν_t/σ_k ∇k) + P + B − ε, Dε/Dt = ∇·(ν_t/σ_ε ∇ε) + (ε/k)(c₁P + c₃B − c₂ε); explicit, sinks implicit
+        const nt = nut[P] - nuB, Pk = nt * S2, B = (-nt / KE.st) * N2, k0 = tk[P], e0 = te[P];
+        const W = i > 0 && !solid[P - 1] ? P - 1 : P, Ea = i < nx - 1 && !solid[P + 1] ? P + 1 : P, Dn = k > 0 && !solid[P - nx] ? P - nx : P, Up = k < nz - 1 && !solid[P + nx] ? P + nx : P;
+        const nE = 0.5 * (nut[P] + nut[Ea]) * rx2, nW = 0.5 * (nut[P] + nut[W]) * rx2, nU = 0.5 * (nut[P] + nut[Up]) * rz2, nD = 0.5 * (nut[P] + nut[Dn]) * rz2;
+        const advK = (uc > 0 ? uc * (k0 - tk[W]) : uc * (tk[Ea] - k0)) / dx + (wc > 0 ? wc * (k0 - tk[Dn]) : wc * (tk[Up] - k0)) / dz, advE = (uc > 0 ? uc * (e0 - te[W]) : uc * (te[Ea] - e0)) / dx + (wc > 0 ? wc * (e0 - te[Dn]) : wc * (te[Up] - e0)) / dz;
+        const difK = (nE * (tk[Ea] - k0) - nW * (k0 - tk[W]) + nU * (tk[Up] - k0) - nD * (k0 - tk[Dn])) / KE.sk, difE = (nE * (te[Ea] - e0) - nW * (e0 - te[W]) + nU * (te[Up] - e0) - nD * (e0 - te[Dn])) / KE.se;
+        const kNew = (k0 + dt * (-advK + difK + Pk + (B > 0 ? B : 0))) / (1 + (dt * (e0 + (B < 0 ? -B : 0))) / k0);
+        const eNew = (e0 + dt * (-advE + difE + (e0 / k0) * KE.c1 * (Pk + (B > 0 ? B : 0)))) / (1 + (dt * KE.c2 * e0) / k0);
+        tkn[P] = kNew > 1e-10 ? kNew : 1e-10; ten[P] = eNew > 1e-14 ? eNew : 1e-14;
+      }
+      if (nut[P] > numax) numax = nut[P];
+    }
+    if (turb === 'ke') {
+      tk.set(tkn); te.set(ten);
+      for (let k = 0, P = 0; k < nz; k++) for (let i = 0; i < nx; i++, P++) {
+        if (solid[P]) continue;
+        if (Cd > 0 && (k === 0 || solid[P - nx])) { const uc = 0.5 * (u[k * nu1 + i] + u[k * nu1 + i + 1]), ut2 = Cd * uc * uc; if (ut2 > 1e-12) { tk[P] = Math.max(tk[P], ut2 / Math.sqrt(KE.cmu)); te[P] = Math.max(te[P], ut2 ** 1.5 / (0.41 * 0.5 * dz)); } }
+        const sU = k < nz - 1 && !solid[P + nx] ? s[P + nx] : s[P], sD = k > 0 && !solid[P - nx] ? s[P - nx] : s[P], N2 = (-gb * (sU - sD)) / (2 * dz);
+        let e = te[P];
+        if (N2 > 0) { const eMin = (KE.cmu ** 0.75 * tk[P] * Math.sqrt(N2)) / (0.53 * Math.SQRT2); if (e < eMin) e = te[P] = eMin; } // Galperin length-scale limit in stable stratification
+        const nt = Math.min((KE.cmu * tk[P] * tk[P]) / e, o.nuMax ?? 0.05);
+        nut[P] = nuB + nt; Kt[P] = Kb + nt / KE.st;
+        if (nut[P] > numax) numax = nut[P];
+      }
+    }
+    return numax;
+  };
+  let numax = nuB;
+  const front = o.front || null; // { row, i0, dir, level }
+  while (t < tEnd - 1e-9 && steps < (o.maxSteps ?? 20000)) {
+    let um = 1e-9, wm = 1e-9;
+    for (let q = 0; q < u.length; q++) { const a = Math.abs(u[q]); if (a > um) um = a; }
+    for (let q = 0; q < w.length; q++) { const a = Math.abs(w[q]); if (a > wm) wm = a; }
+    const nuX = Math.max(numax, nuH, KH), cI = Math.max(cInt0, Math.sqrt(gb * Math.max(sRange(), 1e-9) * Hd));
+    const dt = Math.min((o.cfl ?? 0.35) / (um / dx + wm / dz), 0.2 / (numax / (dz * dz) + nuX / (dx * dx)), (0.8 * dx) / cI, tEnd - t, o.dtMax ?? Infinity);
+    if (turb !== 'const') numax = turbStep(dt);
+    // hydrostatic pressure (÷ρ₀) from the top down
+    if (hydro) for (let i = 0; i < nx; i++) { let acc = 0, prev = 0, first = true; for (let k = nz - 1; k >= 0; k--) { const P = k * nx + i; if (solid[P]) break; acc += first ? 0.5 * gb * s[P] * dz : 0.5 * gb * (s[P] + prev) * dz; ph[P] = acc; prev = s[P]; first = false; } }
+    // ---- momentum predictor
+    for (let k = 0; k < nz; k++) for (let i = 1; i < nx; i++) {
+      const q = k * nu1 + i;
+      if (ub[q]) { us[q] = 0; continue; }
+      const R = k * nx + i, L = R - 1, uq = u[q];
+      const upOk = k < nz - 1 && !ub[q + nu1], dnOk = k > 0 && !ub[q - nu1], nuC = 0.5 * (nut[L] + nut[R]);
+      // conservative (flux-form) advection with van Leer limited upwind face values
+      const Fe = 0.5 * (uq + u[q + 1]), Fw = 0.5 * (uq + u[q - 1]), Fn = k < nz - 1 ? 0.5 * (w[L + nx] + w[R + nx]) : 0, Fs = k > 0 ? 0.5 * (w[L] + w[R]) : 0;
+      let a = -(Fe * fv(u, q - 1, q, q + 1, i + 2 <= nx ? q + 2 : -1, Fe) - Fw * fv(u, i >= 2 ? q - 2 : -1, q - 1, q, q + 1, Fw)) / dx
+        - ((Fn !== 0 ? Fn * fv(u, dnOk ? q - nu1 : -1, q, q + nu1, k + 2 < nz ? q + 2 * nu1 : -1, Fn) : 0) - (Fs !== 0 ? Fs * fv(u, k >= 2 ? q - 2 * nu1 : -1, q - nu1, q, upOk ? q + nu1 : -1, Fs) : 0)) / dz;
+      a += (nuH * (u[q + 1] - 2 * uq + u[q - 1])) / (dx * dx) + (nuC * ((upOk ? u[q + nu1] - uq : 0) - (dnOk ? uq - u[q - nu1] : 0))) / (dz * dz);
+      a -= ((hydro ? ph[R] - ph[L] : p[R] - p[L])) / dx; // hydrostatic pressure, or the previous non-hydrostatic pressure (incremental projection)
+      const drag = Cd > 0 && !dnOk ? (Cd * Math.abs(uq)) / dz : 0;
+      us[q] = (uq + dt * a) / (1 + dt * drag);
+    }
+    if (!hydro) {
+      for (let k = 1; k < nz; k++) for (let i = 0; i < nx; i++) {
+        const q = k * nx + i;
+        if (wb[q]) { ws[q] = 0; continue; }
+        const D = q - nx, wq = w[q], r = k * nu1 + i;
+        const eOk = i < nx - 1 && !wb[q + 1], wOk = i > 0 && !wb[q - 1], nuC = 0.5 * (nut[D] + nut[q]);
+        const Fe = i < nx - 1 ? 0.5 * (u[r + 1] + u[r - nu1 + 1]) : 0, Fw = i > 0 ? 0.5 * (u[r] + u[r - nu1]) : 0, Fn = 0.5 * (wq + w[q + nx]), Fs = 0.5 * (wq + w[q - nx]);
+        let a = -((Fe !== 0 ? Fe * fv(w, wOk ? q - 1 : -1, q, q + 1, i + 2 < nx ? q + 2 : -1, Fe) : 0) - (Fw !== 0 ? Fw * fv(w, i >= 2 ? q - 2 : -1, q - 1, q, eOk ? q + 1 : -1, Fw) : 0)) / dx
+          - (Fn * fv(w, q - nx, q, q + nx, k + 2 <= nz ? q + 2 * nx : -1, Fn) - Fs * fv(w, k >= 2 ? q - 2 * nx : -1, q - nx, q, q + nx, Fs)) / dz;
+        a += (nuH * ((eOk ? w[q + 1] - wq : 0) - (wOk ? wq - w[q - 1] : 0))) / (dx * dx) + (nuC * (w[q + nx] - 2 * wq + w[q - nx])) / (dz * dz);
+        a -= 0.5 * gb * (s[D] + s[q]) + (p[q] - p[D]) / dz;
+        ws[q] = wq + dt * a;
+      }
+      // incremental projection: ∇²φ = ∇·u*/Δt, u = u* − Δt ∇φ, p ← p + φ
+      for (let k = 0, P = 0; k < nz; k++) for (let i = 0; i < nx; i++, P++) rhs[P] = solid[P] ? 0 : -((us[k * nu1 + i + 1] - us[k * nu1 + i]) * dz + (ws[P + nx] - ws[P]) * dx) / dt;
+      ph.fill(0); // pressure increment φ
+      pIter += pcg5(nx, nz, aE, aN, dg, rhs, ph, o.pTol ?? 2e-3, o.pIter ?? 60, Wcg).iters;
+      for (let k = 0; k < nz; k++) for (let i = 1; i < nx; i++) { const q = k * nu1 + i; u[q] = ub[q] ? 0 : us[q] - (dt * (ph[k * nx + i] - ph[k * nx + i - 1])) / dx; }
+      for (let k = 1; k < nz; k++) for (let i = 0; i < nx; i++) { const q = k * nx + i; w[q] = wb[q] ? 0 : ws[q] - (dt * (ph[q] - ph[q - nx])) / dz; }
+      for (let P = 0; P < n; P++) p[P] += ph[P];
+    } else {
+      // rigid lid: depth-integrated transport through every section equals the prescribed through-flow (zero), then w from continuity
+      for (let i = 1; i < nx; i++) { let Q = 0, m = 0; for (let k = 0; k < nz; k++) if (!ub[k * nu1 + i]) { Q += us[k * nu1 + i]; m++; } const c = m ? ((o.Q0 ?? 0) / dz - Q) / m : 0; for (let k = 0; k < nz; k++) { const q = k * nu1 + i; u[q] = ub[q] ? 0 : us[q] + c; } }
+      for (let i = 0; i < nx; i++) for (let k = 0; k < nz; k++) { const P = k * nx + i; w[P + nx] = solid[P] || wb[P + nx] ? 0 : w[P] - ((u[k * nu1 + i + 1] - u[k * nu1 + i]) * dz) / dx; }
+    }
+    // ---- scalar (van Leer TVD, conservative)
+    sn.set(s);
+    for (let k = 0; k < nz; k++) for (let i = 1; i < nx; i++) {
+      const q = k * nu1 + i;
+      if (ub[q]) continue;
+      const R = k * nx + i, L = R - 1, uq = u[q];
+      let sf;
+      if (uq >= 0) sf = s[L] + (i > 1 && !solid[L - 1] ? lim(s[L] - s[L - 1], s[R] - s[L]) : 0); else sf = s[R] + (i < nx - 1 && !solid[R + 1] ? lim(s[R] - s[R + 1], s[L] - s[R]) : 0);
+      const fl = (dt * (uq * sf - (KH * (s[R] - s[L])) / dx)) / dx;
+      sn[L] -= fl; sn[R] += fl;
+    }
+    for (let k = 1; k < nz; k++) for (let i = 0; i < nx; i++) {
+      const q = k * nx + i;
+      if (wb[q]) continue;
+      const D = q - nx, wq = w[q];
+      let sf;
+      if (wq >= 0) sf = s[D] + (k > 1 && !solid[D - nx] ? lim(s[D] - s[D - nx], s[q] - s[D]) : 0); else sf = s[q] + (k < nz - 1 && !solid[q + nx] ? lim(s[q] - s[q + nx], s[D] - s[q]) : 0);
+      const fl = (dt * (wq * sf - (0.5 * (Kt[D] + Kt[q]) * (s[q] - s[D])) / dz)) / dz;
+      sn[D] -= fl; sn[q] += fl;
+    }
+    for (const sc of srcs) { sn[sc.P] += dt * sc.rate; injected += dt * sc.rate; }
+    s.set(sn);
+    t += dt; steps++;
+    if (!Number.isFinite(s[pin >= 0 ? pin : 0]) || !Number.isFinite(um)) throw new Error('The vertical-slice solution became unstable — reduce the eddy viscosity limit or coarsen the slice grid.');
+    if (steps % 4 === 0 || t >= tEnd - 1e-9) {
+      let xf = null;
+      if (front) { const { row, level, dir, i0 } = front; let last = -1; for (let i = i0; i >= 0 && i < nx; i += dir) { let k = row; if (k < 0) { k = 0; while (k < nz - 1 && solid[k * nx + i]) k++; } const P = k * nx + i; if (solid[P]) break; if (s[P] - (o.sAmb ? o.sAmb[P] : 0) > level) last = i; } if (last >= 0) { // sub-cell position of the level crossing
+          let k = row; if (k < 0) { k = 0; while (k < nz - 1 && solid[k * nx + last]) k++; }
+          const P = k * nx + last, Q = P + dir, a = s[P] - (o.sAmb ? o.sAmb[P] : 0), b = last + dir >= 0 && last + dir < nx && !solid[Q] ? s[Q] - (o.sAmb ? o.sAmb[Q] : 0) : level;
+          xf = (last + 0.5 + (a > b ? clamp((a - level) / (a - b), 0, 1) : 0) * dir) * dx; } }
+      let ke = 0; for (let q = 0; q < u.length; q++) ke += u[q] * u[q];
+      hist.t.push(t); hist.front.push(xf); hist.ke.push(0.5 * ke * dx * dz);
+      if (steps % 40 === 0) { ctx?.progress?.(o.p0 !== undefined ? o.p0 + (o.p1 - o.p0) * (t / tEnd) : t / tEnd, `Vertical slice: ${fmt(t, 3)} s of ${fmt(tEnd, 3)} s`); if (ctx?.tick) await ctx.tick(); }
+    }
+  }
+  let salt = 0, divMax = 0;
+  for (let k = 0, P = 0; k < nz; k++) for (let i = 0; i < nx; i++, P++) { if (solid[P]) continue; salt += s[P]; const d = Math.abs((u[k * nu1 + i + 1] - u[k * nu1 + i]) / dx + (w[P + nx] - w[P]) / dz); if (d > divMax) divMax = d; }
+  return { nx, nz, dx, dz, solid, s, u, w, p, nut, Kt, k: tk, eps: te, t, steps, hist, salt0, salt, injected, divMax, pIter, nu1 };
+}
+
+/** Least-squares front speed (m/s) from a front-position history over the window [f0, f1] of the run time. */
+export function frontSpeed(hist, f0 = 0.3, f1 = 1) {
+  const T = hist.t.at(-1) || 1, xs = [], ts = [];
+  hist.t.forEach((t, k) => { if (hist.front[k] !== null && t >= f0 * T && t <= f1 * T) { ts.push(t); xs.push(hist.front[k]); } });
+  if (ts.length < 3) return 0;
+  const tm = mean(ts), xm = mean(xs); let a = 0, b = 0;
+  ts.forEach((t, k) => { a += (t - tm) * (xs[k] - xm); b += (t - tm) ** 2; });
+  return b > 0 ? a / b : 0;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Atmospheric heat exchange, ecological dose–response, three-dimensional reconstruction
+// ---------------------------------------------------------------------------------------------------
+/** Bulk air–sea heat budget (W/m², positive into the sea). Tw, Ta °C; rh %; W m/s; cloud 0–1; solar W/m² (incident). */
+export function surfaceHeatFlux({ Tw, Ta, rh = 70, W = 5, cloud = 0.3, solar = 200, P = 101325 }) {
+  const SB = 5.670374e-8, TK = 273.15, es = (T) => 611.2 * Math.exp((17.62 * T) / (243.12 + T)), q = (e) => (0.622 * e) / (P - 0.378 * e), We = Math.max(W, 1);
+  const sw = 0.94 * solar, lwDown = 0.97 * 0.937e-5 * SB * (Ta + TK) ** 6 * (1 + 0.17 * cloud * cloud), lwUp = 0.97 * SB * (Tw + TK) ** 4;
+  const latent = RHO_AIR * 2.45e6 * 1.3e-3 * We * (q(es(Tw)) - (rh / 100) * q(es(Ta))), sensible = RHO_AIR * 1005 * 1.1e-3 * We * (Tw - Ta);
+  return { sw, lwDown, lwUp, latent, sensible, net: sw + lwDown - lwUp - latent - sensible };
+}
+/** Linearised surface heat-exchange coefficient K = −∂Q_net/∂T_w (W/m²·K) and the equilibrium temperature. */
+export function heatExchange(a) {
+  const Q = (T) => surfaceHeatFlux({ ...a, Tw: T }).net, K = -(Q(a.Tw + 0.25) - Q(a.Tw - 0.25)) / 0.5;
+  let lo = -5, hi = 70;
+  for (let k = 0; k < 60; k++) { const m = 0.5 * (lo + hi); if (Q(m) > 0) lo = m; else hi = m; }
+  return { K, Te: 0.5 * (lo + hi), flux: surfaceHeatFlux(a) };
+}
+/** Log-logistic dose–response: fraction affected at an excess salinity dS, from the 10 % and 50 % effect levels. */
+export function doseResponse(dS, ec10, ec50) {
+  if (!(dS > 0) || !(ec50 > 0)) return 0;
+  const b = ec10 > 0 && ec10 < ec50 ? Math.log(9) / Math.log(ec50 / ec10) : 4;
+  return 1 / (1 + (ec50 / dS) ** b);
+}
+/** Vertical profile of a bottom-attached layer: half-Gaussian above the bed whose depth integral equals φ·H·C. */
+export function layerProfile(C, H, phi, zeta) {
+  if (phi >= 0.999) return C;
+  const sg = phi * H * Math.sqrt(2 / Math.PI), a = erf(H / (sg * Math.SQRT2));
+  return (C / Math.max(a, 1e-9)) * Math.exp((-zeta * zeta) / (2 * sg * sg));
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -416,24 +947,27 @@ function nearFieldEnd(j) {
 
 const F = (key, label, unit, value, min, max, help, extra = {}) => ({ key, label, unit, value, min, max, help, ...extra });
 const SEL = (key, label, value, options, help, extra = {}) => ({ key, label, type: 'select', value, options: options.map(([v, l]) => ({ value: v, label: l })), help, ...extra });
-const manual = (v) => v.design === 'manual';
+const manual = (v) => v.design === 'manual', isSW = (v) => v.hydro === 'sw', isWave = (v) => v.waveModel === 'action', isSlice = (v) => !!v.vslice, isHeat = (v) => !!v.heat;
 
 const suite = {
   id: 'sea', num: 5, title: 'Brine Discharge into the Sea', short: 'Sea discharge', icon: '🌊',
   tagline: 'Dense-jet near field, bottom density current and tidal far-field dispersion of brine, with mixing-zone, receptor and intake assessment.',
-  description: 'The near field is solved with an integral model of inclined negatively buoyant jets (volume, momentum, salt and heat conservation with an entrainment closure for jet, plume and cross-flow regimes) for single-port and multiport diffusers, and is cross-checked against the empirical dense-jet coefficients. The diluted brine then spreads as an entraining bottom density current and is carried by tidal, residual and wind-driven currents in a transient far-field advection–dispersion model over the site or a synthetic bathymetry. Results are tested against mixing-zone limits, sensitive receptors and recirculation to the intake.',
+  description: 'Optional modules add a free-surface shallow-water solver with Flather/tidal-elevation/radiation boundaries, a wave-action model, a vertical non-hydrostatic or hydrostatic slice with turbulence closure, atmospheric heat exchange, an ecological dose–response assessment and a seasonal sweep. The near field is solved with an integral model of inclined negatively buoyant jets (volume, momentum, salt and heat conservation with an entrainment closure for jet, plume and cross-flow regimes) for single-port and multiport diffusers, and is cross-checked against the empirical dense-jet coefficients. The diluted brine then spreads as an entraining bottom density current and is carried by tidal, residual and wind-driven currents in a transient far-field advection–dispersion model over the site or a synthetic bathymetry. Results are tested against mixing-zone limits, sensitive receptors and recirculation to the intake.',
   guide: [
     'Enter the brine flow, salinity and temperature (or pull the concentrate from the RO or ZLD suites) and the ambient seawater.',
     'Let the tool size the diffuser (ports, diameter, 60° angle) or enter your own design.',
     'Describe the currents with tidal constituents, a residual current and wind drift, or apply the Global Site Data (bathymetry, currents, tide, wind, waves).',
     'Place the intake and the sensitive receptors relative to the outfall and set the mixing-zone radius and limits.',
+    'Optionally switch on, under Model setup, the free-surface shallow-water solver, the wave-action model, the vertical slice of the bottom current, atmospheric heat exchange and the seasonal sweep.',
     'Run. Read the near-field dilution first, then the far-field maps, the receptor time series and the compliance table.',
   ],
   implemented: ['continuity equation', 'momentum equation', 'boussinesq', 'hydrostatic-pressure', 'salinity advection-diffusion', 'temperature transport', 'scalar transport', 'equation of state', 'buoyancy equation', 'jet-integral', 'buoyant-plume', 'entrainment', 'densimetric-froude', 'gaussian plume', 'tidal-harmonic',
     'near-field/far-field', 'integral-plume-hydrodynamic', 'salinity-temperature-density', 'hydrodynamic-water-quality', 'hydrodynamic-particle-tracking', 'eulerian-lagrangian',
     'initial currents field', 'salinity', 'temperature', 'density stratification', 'tracer concentration', 'prescribed current/velocity', 'discharge-flow', 'brine salinity/temperature source', 'seabed no-normal-flow and friction', 'zero-gradient/outflow',
-    'outfall and diffuser', 'near-field jet', 'buoyant-plume modelling', 'far-field hydrodynamics', 'salinity transport', 'temperature transport', 'density-driven', 'ocean-current', 'tidal modelling', 'wave effects', 'bathymetry', 'coastal-boundary', 'turbulent mixing', 'stratification', 'particle and contaminant transport', 'seabed interaction', 'plume dilution', 'recirculation towards desalination intakes', 'environmental-threshold', 'ecological exposure'],
-  equationsNote: 'Scope and limits. Near field: steady integral jet model with top-hat profiles in the Boussinesq approximation; the default entrainment coefficients (jet 0.07, plume 0.117, descending-limb enhancement 2.0) are calibrated to the 60° still-water experiments of Roberts, Ferrier & Daviero (1997) and the bottom-layer transition uses their empirical ratios, so angles far from 45–65°, strongly merged jets and shallow water where the jet reaches the surface carry more uncertainty. Intermediate field: one-dimensional Ellison–Turner gravity current. Far field: two-dimensional transport of excess salinity in a bottom-attached layer that occupies a fixed fraction of the local depth (or the fully mixed water column), with an optional density-driven down-slope drift. Hydrodynamics are not a free-surface solution: the current pattern is a quasi-steady rigid-lid, friction-dominated shallow-water balance ∇·(H^5/3 ∇η) = 0 scaled in time by tidal harmonics (M2, S2, K1, O1), a residual current and wind drift, so tidal propagation, eddies shed by headlands, Coriolis effects and wetting–drying are not resolved. Wave effects enter only as enhanced near-bed mixing; temperature is carried in the near field only. A full three-dimensional hydrostatic or non-hydrostatic ocean model with turbulence closure, wave-action modelling, Flather boundaries, atmospheric heat flux and seasonal simulations are listed for reference and are not solved here.',
+    'outfall and diffuser', 'near-field jet', 'buoyant-plume modelling', 'far-field hydrodynamics', 'salinity transport', 'temperature transport', 'density-driven', 'ocean-current', 'tidal modelling', 'wave effects', 'bathymetry', 'coastal-boundary', 'turbulent mixing', 'stratification', 'particle and contaminant transport', 'seabed interaction', 'plume dilution', 'recirculation towards desalination intakes', 'environmental-threshold', 'ecological exposure',
+    'shallow-water equation', 'three-dimensional hydrostatic navier-stokes', 'non-hydrostatic navier-stokes', 'turbulence-closure', 'wave-action', 'cfd-coastal-circulation', 'wave-current interaction', 'tide-wave-current', 'plume-ecological-response', 'nested ocean-outfall',
+    'initial sea level', 'turbulence', 'tidal-elevation', 'open-radiation', 'flather', 'free-surface kinematic', 'atmospheric heat-flux', 'wind-stress', 'atmospheric forcing', 'seasonal simulation', 'three-dimensional plume visualisation'],
+  equationsNote: 'Scope and limits. Near field: steady integral jet model with top-hat profiles in the Boussinesq approximation; the default entrainment coefficients (jet 0.07, plume 0.117, descending-limb enhancement 2.0) are calibrated to the 60° still-water experiments of Roberts, Ferrier & Daviero (1997) and the bottom-layer transition uses their empirical ratios, so angles far from 45–65°, strongly merged jets and shallow water where the jet reaches the surface carry more uncertainty. Intermediate field: one-dimensional Ellison–Turner gravity current. Far field: two-dimensional transport of excess salinity (and, optionally, excess temperature with a bulk atmospheric heat exchange) in a bottom-attached layer that occupies a fixed fraction of the local depth, or in the fully mixed water column, with an optional density-driven down-slope drift. Hydrodynamics: by default a quasi-steady rigid-lid, friction-dominated balance ∇·(H^5/3 ∇η) = 0 scaled in time by tidal harmonics (M2, S2, K1, O1), a residual current and wind drift. The optional shallow-water solver integrates the depth-averaged free-surface equations on the same grid (C grid, finite-volume continuity, forward–backward stepping, wetting–drying, Manning/Chézy/drag friction, Coriolis, wind stress, wave forces) with Flather, clamped-elevation or radiation open boundaries nested in the harmonic outer solution; it is a single-layer model, first-order in the advection terms, without horizontal eddy viscosity. Three-dimensional hydrostatic and non-hydrostatic equations are solved in reduced form only: a two-dimensional vertical (along-discharge × depth) rigid-lid Boussinesq slice with a k–ε or Pacanowski–Philander closure, which omits lateral spreading and the alongshore tidal current; the three-dimensional plume views are reconstructions from the layer model, not a 3-D solution. Waves: steady wave-action balance for one monochromatic component (refraction, shoaling, depth-limited breaking, Doppler shift and refraction by the peak tidal current) with the Longuet-Higgins longshore-current balance; no spectrum, diffraction or wind growth. The ecological response is a log-logistic dose–response on excess salinity with an exposure-duration test and indicative default thresholds. The seasonal simulation is a sweep of quasi-steady seasonal ambient states on a coarser far-field grid, not a continuous annual integration.',
 
   inputs: [
     { group: 'Brine discharge', help: 'What leaves the plant. Pull the concentrate of the RO suite or the liquid discharge of the ZLD suite.', fields: [
@@ -511,6 +1045,53 @@ const suite = {
       { key: 'particles', label: 'Lagrangian random-walk particle tracker', type: 'bool', value: false, help: 'Releases particles continuously at the near-field end to show the plume envelope.' },
       F('nPart', 'Number of particles', '', 1500, 100, 10000, '', { showIf: (v) => v.particles, step: 1 }),
     ] },
+    { group: 'Hydrodynamics: free-surface shallow-water solver', tab: 'setup', help: 'The default current field is a tidal-harmonic time signal on a rigid-lid friction pattern. The shallow-water option solves the depth-averaged free-surface equations on the far-field grid (finite volumes, wetting and drying) and drives the transport with the computed currents; the tidal harmonics then act as the outer model that supplies the open-boundary data.', fields: [
+      SEL('hydro', 'Current field for the far field', 'harmonic', [['harmonic', 'Tidal harmonics on a rigid-lid pattern (fast)'], ['sw', 'Shallow-water equations (free surface, wetting–drying)']], 'The shallow-water run takes about twice as long as the harmonic field at the default hydrodynamic resolution.'),
+      SEL('swBC', 'Open-boundary condition', 'flather', [['flather', 'Flather: tidal elevation and current, radiating'], ['elev', 'Clamped tidal elevation'], ['rad', 'Radiation only (no tide: wind-, wave- and Coriolis-driven flow)']], 'Flather boundaries let outgoing waves leave while imposing the outer tidal elevation and current; clamped boundaries prescribe the elevation only.', { showIf: isSW }),
+      F('eta0', 'Initial sea level above mean sea level', 'm', 0, -3, 5, 'Still-water level at the start (storm surge or datum offset); also the mean level of the boundary tide.', { showIf: isSW }),
+      F('etaLag', 'High water after peak flood current', '°', 0, -180, 180, '0° = progressive tidal wave (high water at peak flood); 90° = standing wave (high water at slack).', { showIf: isSW }),
+      F('lat', 'Latitude (Coriolis)', '°', 25, -80, 80, 'Sets the Coriolis parameter f = 2Ω sin(latitude); 0 switches rotation off.', { showIf: isSW }),
+      SEL('swFric', 'Bed-friction law', 'cd', [['cd', 'Constant drag coefficient (seabed drag above)'], ['manning', 'Manning roughness'], ['chezy', 'Chézy coefficient']], 'c_f = C_d, g n²/h^⅓ or g/C².', { showIf: isSW }),
+      F('manN', 'Manning roughness n', 's/m^⅓', 0.025, 0.01, 0.1, 'Sand 0.02–0.025, rock and reef 0.03–0.05.', { showIf: (v) => isSW(v) && v.swFric === 'manning' }),
+      F('chezy', 'Chézy coefficient C', 'm^½/s', 55, 20, 120, 'Typically 45–65 for sandy coasts.', { showIf: (v) => isSW(v) && v.swFric === 'chezy' }),
+      F('swRef', 'Hydrodynamic cell size ÷ transport cell size', '×', 2, 1, 4, 'The gravity-wave time-step limit makes the free-surface solver far more expensive than the transport: 2 runs it on cells twice as large (about eight times faster than 1); the transports are interpolated conservatively to the transport grid.', { showIf: isSW, step: 1 }),
+      F('hDry', 'Minimum (drying) depth', 'm', 0.05, 0.01, 0.5, 'Cell faces shallower than this are closed; cells re-flood when the surface rises.', { showIf: isSW }),
+      { key: 'windStress', label: 'Wind stress on the sea surface', type: 'bool', value: true, showIf: isSW, help: 'Surface stress ρ_air C_d W² from the wind inputs (replaces the empirical wind-drift factor).' },
+    ] },
+    { group: 'Waves: wave-action balance', tab: 'setup', help: 'Refraction, shoaling and depth-limited breaking of a monochromatic wave over the bathymetry, Doppler shift and refraction by the tidal current, wave-induced mixing and the radiation-stress-driven longshore current.', fields: [
+      SEL('waveModel', 'Wave model', 'orbital', [['orbital', 'Local orbital velocity from the wave height (no propagation)'], ['action', 'Wave-action balance over the bathymetry']], 'The wave-action solution feeds the dispersion coefficient and, with the shallow-water solver, the wave forces.'),
+      F('waveDir', 'Wave direction (coming from, bearing)', '°', 340, 0, 360, 'The synthetic beach faces north, so waves arrive from northerly bearings.', { showIf: isWave }),
+      F('gammaB', 'Breaker index γ = H/h', '–', 0.78, 0.4, 1.2, 'Depth-limited breaking caps the wave height at γ times the local depth.', { showIf: isWave }),
+      F('waveCf', 'Bed-friction coefficient under waves', '–', 0.01, 0.001, 0.1, 'Used in the Longuet-Higgins longshore-current balance.', { showIf: isWave }),
+      { key: 'waveCur', label: 'Wave–current interaction (waves on the peak tidal current)', type: 'bool', value: true, showIf: isWave, help: 'Solves the action balance with the Doppler-shifted dispersion relation and current refraction; the still-water solution is reported alongside.' },
+    ] },
+    { group: 'Vertical slice of the dense bottom current', tab: 'setup', help: 'Optional two-dimensional (along-discharge × vertical) Boussinesq simulation over the model bathymetry, fed by the near-field buoyancy flux. It resolves the layer thickness and front speed that the far-field layer model otherwise takes from the integral density-current model.', fields: [
+      { key: 'vslice', label: 'Resolve the bottom current in a vertical slice', type: 'bool', value: false, help: 'Adds a few seconds to the run.' },
+      SEL('vsModel', 'Pressure treatment', 'nonhydro', [['nonhydro', 'Non-hydrostatic (pressure projection)'], ['hydro', 'Hydrostatic (primitive equations)']], 'The hydrostatic option is the x–z section of the three-dimensional hydrostatic ocean equations; the non-hydrostatic option keeps the vertical acceleration.', { showIf: isSlice }),
+      SEL('vsTurb', 'Turbulence closure', 'ke', [['ke', 'k–ε with buoyancy production'], ['pp', 'Pacanowski–Philander (Richardson number)'], ['const', 'Constant eddy viscosity']], '', { showIf: isSlice }),
+      F('vsLen', 'Section length', 'm', 600, 100, 20000, 'One fifth of it lies behind the discharge point.', { showIf: isSlice }),
+      F('vsTime', 'Simulated time', 'min', 60, 5, 720, '', { showIf: isSlice }),
+      F('vsNx', 'Cells along the section', '', 100, 40, 200, '', { showIf: isSlice, step: 1 }),
+      F('vsNz', 'Cells over the depth', '', 24, 12, 64, '', { showIf: isSlice, step: 1 }),
+      F('vsK0', 'Initial turbulent kinetic energy', 'm²/s²', 1e-5, 1e-9, 1e-2, 'Initial condition of the k–ε closure; the dissipation rate follows from a length scale of one tenth of the depth.', { showIf: (v) => isSlice(v) && v.vsTurb === 'ke' }),
+      F('vsNu', 'Background vertical eddy viscosity', 'm²/s', 1e-4, 1e-6, 1e-1, 'Added to the closure value; the constant-viscosity option uses it alone.', { showIf: isSlice }),
+    ] },
+    { group: 'Atmosphere and heat exchange', tab: 'setup', help: 'Bulk air–sea heat budget and far-field transport of the thermal excess of the brine.', fields: [
+      { key: 'heat', label: 'Transport excess temperature with atmospheric heat exchange', type: 'bool', value: false, help: 'Carries a second tracer in the far field; adds about half of the far-field run time.' },
+      F('airTemp', 'Air temperature', '°C', 24, -10, 50, '', { showIf: isHeat }),
+      F('humidity', 'Relative humidity', '%', 70, 5, 100, '', { showIf: isHeat }),
+      F('cloud', 'Cloud cover', 'fraction', 0.3, 0, 1, '', { showIf: isHeat }),
+      F('solar', 'Mean incident solar radiation', 'W/m²', 220, 0, 450, 'Daily mean of the global horizontal irradiance.', { showIf: isHeat }),
+    ] },
+    { group: 'Ecological response', tab: 'setup', help: 'Dose–response of salinity-sensitive species: effect levels as excess salinity above ambient and the share of time the 10 % effect level may be exceeded.', fields: [
+      { key: 'species', label: 'Species and thresholds', type: 'table', columns: [{ key: 'name', label: 'Species / community', type: 'text' }, { key: 'ec10', label: 'EC10 ΔS', unit: 'g/kg' }, { key: 'ec50', label: 'EC50 ΔS', unit: 'g/kg' }, { key: 'tol', label: 'Tolerated time above EC10', unit: '%' }],
+        value: [{ name: 'Posidonia oceanica (seagrass)', ec10: 1, ec50: 2.5, tol: 25 }, { name: 'Cymodocea nodosa (seagrass)', ec10: 2, ec50: 5, tol: 25 }, { name: 'Reef-building corals', ec10: 1.5, ec50: 4, tol: 10 }, { name: 'Benthic infauna and echinoderms', ec10: 2, ec50: 6, tol: 25 }], help: 'Indicative literature values; replace them with site-specific toxicity data.' },
+    ] },
+    { group: 'Seasonal simulation', tab: 'setup', help: 'Repeats the near-field and far-field simulation for each season with the diffuser of the main run.', fields: [
+      { key: 'seasonal', label: 'Run the seasonal sweep', type: 'bool', value: false, help: 'Adds about one third of the far-field run time (coarser grid, two tidal cycles per season).' },
+      { key: 'seasons', label: 'Seasons', type: 'table', showIf: (v) => v.seasonal, columns: [{ key: 'name', label: 'Season', type: 'text' }, { key: 'Ta', label: 'Ambient temperature', unit: '°C' }, { key: 'Sa', label: 'Ambient salinity', unit: 'g/kg' }, { key: 'dT', label: 'Thermal stratification', unit: '°C' }, { key: 'uRes', label: 'Residual current', unit: 'm/s' }, { key: 'windSpeed', label: 'Wind speed', unit: 'm/s' }, { key: 'waveHeight', label: 'Wave height', unit: 'm' }],
+        value: [{ name: 'Winter', Ta: 16, Sa: 37.2, dT: 0, uRes: 0.05, windSpeed: 8, waveHeight: 1.4 }, { name: 'Spring', Ta: 19, Sa: 37, dT: 1.5, uRes: 0.03, windSpeed: 6, waveHeight: 0.9 }, { name: 'Summer', Ta: 26, Sa: 37.3, dT: 5, uRes: 0.02, windSpeed: 4, waveHeight: 0.5 }, { name: 'Autumn', Ta: 22, Sa: 37.1, dT: 2, uRes: 0.04, windSpeed: 6, waveHeight: 1 }], help: 'Ambient temperature, salinity, stratification, residual current, wind and waves of each season.' },
+    ] },
     { group: 'Environmental limits', tab: 'setup', help: 'Regulatory mixing zone and water-quality criteria.', fields: [
       F('mzR', 'Mixing-zone radius', 'm', 100, 10, 5000, 'Compliance is assessed at this distance from the diffuser.'),
       F('limAbs', 'Excess-salinity limit (absolute)', 'g/kg', 2, 0.05, 20, 'For example ΔS ≤ 2 g/kg at the mixing-zone edge.'),
@@ -538,6 +1119,7 @@ const suite = {
     { name: 'Large Gulf plant: 20,000 m³/h hypersaline brine, weak tide', values: { Qb: 20000, Sb: 68, Tb: 34, Sa: 42, Ta: 32, depth: 15, slope: 0.6, uM2: 0.12, uS2: 0.04, uRes: 0.04, Lx: 8000, Ly: 6000, inX: -2500, inY: -600, mzR: 300, receptors: [{ name: 'Seagrass meadow', x: 1500, y: -400, thr: 0.5 }, { name: 'Coral reef', x: -1200, y: 900, thr: 0.3 }] } },
     { name: 'Single-port outfall on a steep coast, strong tide', values: { design: 'manual', nPorts: 1, dPort: 280, theta: 45, Qb: 1200, depth: 18, slope: 4, uM2: 0.6, uS2: 0.2, bayAmp: 60, Lx: 5000, Ly: 2500, inX: 700, inY: -200, receptors: [{ name: 'Kelp bed', x: 500, y: -250, thr: 0.5 }, { name: 'Offshore reef', x: -600, y: 300, thr: 0.3 }] } },
     { name: 'Stratified summer case, fully mixed far field with particles', values: { dS: 0.6, dT: 4, layer: 'mixed', disp: 'okubo', particles: true, windSpeed: 9, windFactor: 1.2 } },
+    { name: 'Free-surface hydrodynamics, waves, heat exchange and a hydrostatic bottom-current slice', values: { hydro: 'sw', waveModel: 'action', heat: true, vslice: true, vsModel: 'hydro', vsTurb: 'pp', Tb: 30, nx: 60, ny: 44, nCycles: 2 } },
     { name: 'Thermal-plant brine in shallow water — jets reach the surface (problem case)', values: { design: 'manual', nPorts: 12, dPort: 200, spacing: 4, Qb: 6000, Sb: 52, Tb: 32, cCl: 0.1, depth: 9, disp: 'const', K0: 1.5 } },
   ],
 
@@ -559,7 +1141,7 @@ const suite = {
     add('depth', d.depth > 2 ? d.depth : undefined, 'Water depth at site'); add('Ta', d.sst, 'Sea-surface temperature at site'); add('Sa', d.salinity, 'Salinity at site');
     add('uM2', d.currentSpeed > 0 ? +(d.currentSpeed * Math.PI * 0.5).toFixed(3) : undefined, 'Mean current speed at site × π/2 (tidal amplitude)'); add('tideDir', d.currentDir, 'Current direction at site');
     const eta = Array.isArray(d.tide?.eta) ? d.tide.eta.filter(Number.isFinite) : [];
-    add('tideRange', Number.isFinite(d.tideRange) ? d.tideRange : eta.length > 3 ? +(Math.max(...eta) - Math.min(...eta)).toFixed(2) : undefined, Number.isFinite(d.tideRange) ? 'Tidal range at site' : 'Range of the site tide series'); add('waveHeight', d.waveHeight, 'Wave height at site'); add('wavePeriod', d.wavePeriod, 'Wave period at site'); add('windSpeed', d.windSpeed, 'Wind speed at site'); add('windDir', d.windDir, 'Wind direction at site');
+    add('tideRange', Number.isFinite(d.tideRange) ? d.tideRange : eta.length > 3 ? +(Math.max(...eta) - Math.min(...eta)).toFixed(2) : undefined, Number.isFinite(d.tideRange) ? 'Tidal range at site' : 'Range of the site tide series'); add('waveHeight', d.waveHeight, 'Wave height at site'); add('wavePeriod', d.wavePeriod, 'Wave period at site'); add('windSpeed', d.windSpeed, 'Wind speed at site'); add('windDir', d.windDir, 'Wind direction at site'); add('waveDir', d.waveDir, 'Wave direction at site'); add('airTemp', d.airTemp, 'Air temperature at site'); add('humidity', d.humidity, 'Relative humidity at site'); add('solar', d.solar ?? (Number.isFinite(d.ghiDaily) ? +((d.ghiDaily * 1000) / 24).toFixed(0) : undefined), 'Solar irradiance at site');
     if (d.bathy?.elev?.length) add('bathy', { ...d.bathy, name: d.bathy.name || 'Site bathymetry' }, 'Bathymetry grid at site');
     const c = d.currents;
     if (Array.isArray(c?.t) && c.t.length >= 3) { const k = Math.ceil(c.t.length / 60); add('curSeries', c.t.map((t, i) => ({ t, speed: c.speed?.[i], dir: c.dir?.[i] })).filter((r, i) => i % k === 0 && [r.t, r.speed, r.dir].every(Number.isFinite)), 'Current time series at site'); }
@@ -590,14 +1172,43 @@ const suite = {
       return gcEnd.S * brooks(x - gcEnd.x, gcEnd.W, uB, Kfun(gcEnd.W));
     };
     // ---- far field
-    const flow = flowBasis(g), n = nx * ny, hL = v.hLayer > 0 ? v.hLayer : gc ? interp1(gc.x, gc.h, Math.min(150, gcEnd.x)) : nf.yL;
+    const flow = flowBasis(g), n = nx * ny, betaR = (density(v.Ta, v.Sa + 1) - density(v.Ta, v.Sa)) / density(v.Ta, v.Sa), sEq = (P.rhoB - P.rhoA) / (P.rhoA * betaR); // density excess as equivalent salinity
+    // ---- waves: wave-action balance over the bathymetry (optional), with and without the tidal current
+    let wf = null;
+    if (v.waveModel === 'action' && v.waveHeight > 0) {
+      ctx?.progress?.(0.04, 'Waves: wave-action balance');
+      const [wx, wy] = bearing(v.waveDir + 180), pk = v.waveCur ? cur.peak : 0, a0x = cur.axis[0], a0y = cur.axis[1], wo = { nx, ny, dx: g.dx, dy: g.dy, h: g.H, H0: v.waveHeight, T: v.wavePeriod, theta0: Math.atan2(wy, wx), gamma: clamp(v.gammaB, 0.3, 1.5), Cf: clamp(v.waveCf, 1e-3, 0.1) };
+      const still = waveField(wo);
+      wf = pk > 0 ? waveField({ ...wo, init: still, iters: 2 * (nx + ny), U: Float64Array.from(g.H, (_, q) => pk * (a0x * flow.basis[0].u[q] + a0y * flow.basis[1].u[q])), V: Float64Array.from(g.H, (_, q) => pk * (a0x * flow.basis[0].v[q] + a0y * flow.basis[1].v[q])) }) : still;
+      for (const a of [wf.Hs, wf.uorb, wf.fx, wf.fy, wf.Vls, wf.theta]) for (let q = 0; q < n; q++) if (!Number.isFinite(a[q])) a[q] = 0;
+      wf.still = still; wf.pk = pk; if (ctx?.tick) await ctx.tick();
+    }
+    // ---- vertical slice along the discharge direction (optional): resolves the dense bottom current
+    let vs = null;
+    if (v.vslice && dense) {
+      const nxs = clamp(Math.round(v.vsNx), 40, 200), nzs = clamp(Math.round(v.vsNz), 12, 64), Ls = clamp(v.vsLen, 50, 20000), dxs = Ls / nxs, s00 = -0.2 * Ls, xsS = Array.from({ length: nxs }, (_, i) => s00 + (i + 0.5) * dxs);
+      const zbs = xsS.map((x) => g.fn(x * jx, x * jy)), Hmx = Math.max(2, ...zbs.map((z) => -z)), dzs = Hmx / nzs, zsS = Array.from({ length: nzs }, (_, k) => -Hmx + (k + 0.5) * dzs), solid = new Uint8Array(nxs * nzs), s0 = new Float64Array(nxs * nzs), sAmb = new Float64Array(nxs * nzs);
+      const rTop = density(P.amb(0)(depth).T, P.amb(0)(depth).S);
+      for (let i = 0; i < nxs; i++) { const dry = -zbs[i] < 0.5; for (let k = 0; k < nzs; k++) { const q = k * nxs + i; solid[q] = dry || (zsS[k] < zbs[i] && k < nzs - 2) ? 1 : 0; const a = P.amb(0)(clamp(zsS[k] + depth, 0, depth)); sAmb[q] = solid[q] ? 0 : (density(a.T, a.S) - rTop) / (P.rhoA * betaR); s0[q] = sAmb[q]; } }
+      const bedK = (i) => { let k = 0; while (k < nzs - 1 && solid[k * nxs + i]) k++; return k; }, is = clamp(Math.round((nf.xn - s00) / dxs - 0.5), 1, nxs - 2), kb = bedK(is), nc = clamp(Math.round(nf.yL / dzs), 1, Math.max(1, nzs - kb - 1));
+      const qs = (P.Q * sEq) / Math.max(W0, 1), src = [], sRef = sEq / nf.Sn;
+      if (!solid[kb * nxs + is]) for (let k = kb; k < kb + nc; k++) src.push({ P: k * nxs + is, rate: qs / (nc * dxs * dzs) });
+      const r = await verticalSlice({ nx: nxs, nz: nzs, dx: dxs, dz: dzs, solid, s0, sAmb, beta: betaR, tEnd: clamp(v.vsTime, 1, 1440) * 60, model: v.vsModel, turb: v.vsTurb, nu: clamp(v.vsNu, 1e-6, 1e-1), nu0: 1e-2, nuH: 2e-3 * dxs, Kh: 2e-3 * dxs, Cd: v.Cd, k0: clamp(v.vsK0, 1e-9, 1), src, sScale: sRef, front: { row: -1, i0: is, dir: 1, level: 0.1 * sRef }, p0: 0.05, p1: 0.12 }, ctx);
+      // layer thickness h = ∫ s′ dz / s′_bed and bed excess along the section
+      const hS = [], sB = [];
+      for (let i = 0; i < nxs; i++) { const k0 = bedK(i); let m = 0, I = 0; for (let k = k0; k < nzs; k++) { const q = k * nxs + i; if (solid[q]) continue; const e = Math.max(r.s[q] - sAmb[q], 0); I += e * dzs; if (e > m) m = e; } hS.push(m > 0.02 * sRef ? I / m : 0); sB.push(solid[k0 * nxs + i] ? 0 : Math.max(r.s[k0 * nxs + i] - sAmb[k0 * nxs + i], 0)); }
+      const xf = r.hist.front.filter((x) => x !== null).at(-1) ?? null, frontX = xf === null ? xsS[is] : s00 + xf, im = clamp(Math.round((Math.min(xsS[is] + 100, 0.5 * (xsS[is] + frontX)) - s00) / dxs - 0.5), 0, nxs - 1);
+      let nuMax = 0; for (let q = 0; q < r.nut.length; q++) if (!solid[q] && r.nut[q] > nuMax) nuMax = r.nut[q];
+      vs = { r, nxs, nzs, dxs, dzs, xsS, zsS, solid, sAmb, hS, sB, is, im, sRef, qs, frontX, uf: frontSpeed(r.hist, 0.3, 1), hLayer: hS[im] > 0 ? hS[im] : 0, nuMax, bScale: Math.cbrt(Math.max(G * betaR * qs, 0)) };
+    }
+    const hL = v.hLayer > 0 ? v.hLayer : vs?.hLayer > 0 ? vs.hLayer : gc ? interp1(gc.x, gc.h, Math.min(150, gcEnd.x)) : nf.yL;
     const phi = v.layer === 'layer' ? clamp(hL / depth, 0.04, 1) : 1, bedF = v.layer === 'layer' ? clamp(v.bedF, 0.1, 1) : 1, uw = waveOrbital(v.waveHeight, v.wavePeriod, depth);
     const K = new Float64Array(n), spd = new Float64Array(n), [ax, ay] = cur.axis;
     for (let j = 0, q = 0; j < ny; j++) for (let i = 0; i < nx; i++, q++) {
       if (!g.H[q]) continue;
       spd[q] = cur.rms * Math.hypot(ax * flow.basis[0].u[q] + ay * flow.basis[1].u[q], ax * flow.basis[0].v[q] + ay * flow.basis[1].v[q]);
-      const uwq = uw * Math.min(3, (Math.sinh(Math.min((2 * Math.PI * depth) / (v.wavePeriod * Math.sqrt(G * depth)), 20)) / Math.sinh(Math.min((2 * Math.PI * g.H[q]) / (v.wavePeriod * Math.sqrt(G * g.H[q])), 20))) || 1);
-      K[q] = v.Kmult * (v.disp === 'const' ? v.K0 : v.disp === 'okubo' ? Math.min(okubo(Math.max(g.dx, Math.hypot(g.xs[i], g.ys[j]))), okubo(5000)) : v.K0 + 0.6 * Math.sqrt(v.Cd) * Math.hypot(spd[q], 0.7 * uwq) * phi * g.H[q]);
+      const uwq = wf ? wf.uorb[q] : uw * Math.min(3, (Math.sinh(Math.min((2 * Math.PI * depth) / (v.wavePeriod * Math.sqrt(G * depth)), 20)) / Math.sinh(Math.min((2 * Math.PI * g.H[q]) / (v.wavePeriod * Math.sqrt(G * g.H[q])), 20))) || 1);
+      K[q] = v.Kmult * (v.disp === 'const' ? v.K0 : v.disp === 'okubo' ? Math.min(okubo(Math.max(g.dx, Math.hypot(g.xs[i], g.ys[j]))), okubo(5000)) : v.K0 + 0.6 * Math.sqrt(v.Cd) * (wf ? Math.hypot(spd[q], 0.7 * uwq, wf.Vls[q]) : Math.hypot(spd[q], 0.7 * uwq)) * phi * g.H[q]);
     }
     const sx = clamp(jx * nf.xn, g.x0 + g.dx, g.x0 + v.Lx - g.dx), sy = clamp(jy * nf.xn, g.y0 + g.dy, g.y0 + v.Ly - g.dy), sg = Math.max(0.7 * Math.min(g.dx, g.dy), 0.4 * W0);
     let src = [], sw = 0;
@@ -609,7 +1220,35 @@ const suite = {
     const probes = [inDom(v.inX, v.inY), ...recs.map((r) => inDom(r.x, r.y))], ring = linspace(0, 2 * Math.PI, 49).slice(0, 48).map((a) => [v.mzR * Math.cos(a), v.mzR * Math.sin(a)]).filter(([x, y]) => x > g.x0 && x < g.x0 + v.Lx && y > g.y0 && y < g.y0 + v.Ly);
     const TM2 = TIDES.M2 * 3600, nCyc = clamp(Math.round(v.nCycles), 1, 40), tEnd = nCyc * TM2, tStat = nCyc >= 3 ? tEnd - 2 * TM2 : nCyc === 2 ? TM2 : 0;
     const betaS = (density(v.Ta, v.Sa + 1) - density(v.Ta, v.Sa)) / density(v.Ta, v.Sa);
-    const ff = await farField({ g, flow, cur, K, phi, bedF, scheme: v.scheme, cfl: clamp(v.cfl, 0.05, 0.9), tEnd, tStat, src, rate: P.Q * dS0, probes, ring, drift: v.layer === 'layer' && v.drift && dense ? { betaS, Cd: v.Cd, vmax: 0.4 } : null, thr: 0.1 * P.limit, particles: v.particles ? clamp(v.nPart, 100, 10000) : 0, srcXY: [sx, sy], srcR: Math.max(sg, g.dx) }, ctx);
+    // ---- free-surface hydrodynamics (optional): shallow-water solver nested in the tidal-harmonic outer solution
+    let swm = null, swI = null;
+    const curT = { ...cur, wind: [0, 0] };
+    if (v.hydro === 'sw') {
+      const mc = clamp(Math.round(v.swRef), 1, 4), ncx = Math.ceil(nx / mc), ncy = Math.ceil(ny / mc), nc = ncx * ncy, zbc = new Float64Array(nc), land = new Uint8Array(nc), cnt = new Float64Array(nc), wetc = new Float64Array(nc);
+      const coarse = (a) => { const o = new Float64Array(nc); for (let j = 0, q = 0; j < ny; j++) for (let i = 0; i < nx; i++, q++) o[Math.floor(j / mc) * ncx + Math.floor(i / mc)] += a[q]; for (let q = 0; q < nc; q++) o[q] /= cnt[q] || 1; return o; };
+      for (let j = 0, q = 0; j < ny; j++) for (let i = 0; i < nx; i++, q++) { const Q = Math.floor(j / mc) * ncx + Math.floor(i / mc); cnt[Q]++; if (g.H[q]) wetc[Q]++; }
+      zbc.set(coarse(g.zb)); for (let q = 0; q < nc; q++) land[q] = 2 * wetc[q] < cnt[q] || zbc[q] > -HMIN ? 1 : 0;
+      const fC = 2 * OMEGA_E * Math.sin(clamp(v.lat, -85, 85) * D2R), lagT = (v.etaLag / 360) * TM2, ampS = cur.cons.reduce((a, c) => a + c.amp, 0);
+      const fric = v.swFric === 'manning' ? { type: 'manning', n: clamp(v.manN, 0.005, 0.2) } : v.swFric === 'chezy' ? { type: 'chezy', C: clamp(v.chezy, 10, 150) } : { type: 'cd', Cd: v.Cd };
+      const cf0 = fric.type === 'manning' ? (G * fric.n ** 2) / Math.cbrt(depth) : fric.type === 'chezy' ? G / fric.C ** 2 : v.Cd, tide = v.swBC !== 'rad';
+      const along = (t) => { if (cur.series) { const [a, b] = currentAt(curT, t); return (a * cur.axis[0] + b * cur.axis[1]) / Math.max(cur.peak, 1e-6); } let a = 0; for (const k of cur.cons) a += k.amp * Math.cos((2 * Math.PI * t) / (k.T * 3600) - k.ph); return ampS > 0 ? a / ampS : 0; };
+      // external (outer-model) data: harmonic current, tidal elevation and the surface tilt that balances it
+      const ext = (t) => { const m = Math.min(1, t / 3600), [U, V] = currentAt(curT, t), [U1, V1] = currentAt(curT, t + 60), [U0, V0] = currentAt(curT, t - 60), dU = (U1 - U0) / 120, dV = (V1 - V0) / 120, r = (cf0 * Math.hypot(U, V)) / depth;
+        return { e: v.eta0 + m * 0.5 * v.tideRange * along(t - lagT), gx: (-m * (dU - fC * V + r * U)) / G, gy: (-m * (dV + fC * U + r * V)) / G, U: m * U, V: m * V }; };
+      const tw = v.windStress ? windStress(v.windSpeed, v.windDir, P.rhoA) : [0, 0, 0];
+      swm = shallowWater({ nx: ncx, ny: ncy, dx: mc * g.dx, dy: mc * g.dy, zb: zbc, land, eta0: v.eta0, hmin: clamp(v.hDry, 0.01, 0.5), f: fC, x0: g.x0, y0: g.y0, fric, tau: [tw[0], tw[1]], force: wf ? { fx: coarse(wf.fx), fy: coarse(wf.fy) } : null, bc: { W: v.swBC, E: v.swBC, S: v.swBC, N: v.swBC }, ext: tide ? ext : null, pat: { au: coarse(flow.basis[0].u), av: coarse(flow.basis[0].v), bu: coarse(flow.basis[1].u), bv: coarse(flow.basis[1].v) } });
+      swm.track();
+      swI = { V0: swm.volume(), tw, fC, cf0, fric, dt0: swm.dtStable(), tide, mc, ncx, ncy, land, xs: Array.from({ length: ncx }, (_, i) => g.x0 + (i + 0.5) * mc * g.dx), ys: Array.from({ length: ncy }, (_, j) => g.y0 + (j + 0.5) * mc * g.dy), drv: swCoupler(swm, nx, ny, mc, v.eta0) };
+    }
+    // ---- atmospheric heat exchange (optional): bulk heat budget and surface-exchange decay of the thermal excess
+    let heat = null;
+    if (v.heat) {
+      const hx = heatExchange({ Tw: v.Ta, Ta: v.airTemp, rh: clamp(v.humidity, 0, 100), W: v.windSpeed, cloud: clamp(v.cloud, 0, 1), solar: Math.max(v.solar, 0) }), rc = P.rhoA * cpSea(v.Ta, v.Sa), dT0 = v.Tb - P.amb(0)(P.z0).T, decay = new Float64Array(n), act = phi >= 0.999;
+      if (act) for (let q = 0; q < n; q++) if (g.H[q]) decay[q] = Math.max(hx.K, 0) / (rc * g.H[q]);
+      heat = { hx, rc, dT0, decay, act };
+    }
+    const specs = (Array.isArray(v.species) ? v.species : []).filter((r) => +r.ec50 > 0 && +r.ec10 > 0).slice(0, 6).map((r, k) => ({ name: String(r.name || `Species ${k + 1}`).slice(0, 48), ec10: Math.min(+r.ec10, 0.999 * +r.ec50), ec50: +r.ec50, tol: clamp(Number.isFinite(+r.tol) ? +r.tol : 25, 0, 100) }));
+    const ff = await farField({ g, flow, cur, K, phi, bedF, scheme: v.scheme, cfl: clamp(v.cfl, 0.05, 0.9), tEnd, tStat, src, rate: P.Q * dS0, probes, ring, drift: v.layer === 'layer' && v.drift && dense ? { betaS, Cd: v.Cd, vmax: 0.4 } : null, thr: 0.1 * P.limit, particles: v.particles ? clamp(v.nPart, 100, 10000) : 0, srcXY: [sx, sy], srcR: Math.max(sg, g.dx), dyn: swm ? swI.drv : null, extra: heat ? { rate: P.Q * heat.dT0, decay: heat.act ? heat.decay : null } : null, expThr: specs.length ? specs.map((q) => q.ec10) : null }, ctx);
     ctx?.progress?.(0.96, 'Environmental assessment');
     if (!ff.complete) W.push({ level: 'warn', msg: `The far-field run stopped after ${ff.steps} steps at ${fmt(ff.tEnd / 3600, 3)} h — coarsen the grid or raise the CFL number.` });
     // ---- assessment
@@ -692,6 +1331,131 @@ const suite = {
     if (v.dS === 0 && v.dT === 0) balances.push({ name: 'Jet salt-excess flux (g/kg·m³/s per port)', in: mJetIn, out: pth.S[L] * jet.Q0 * (pth.sal[L] - v.Sa) });
     const outputs = { nearFieldDilution: nf.Sn, impactSalinity: impS, excessAtMixingZone: mzEx, complianceDistance: compliance, outfallLength, nPorts: P.n, portDiameter: P.d, impactDilution: jet.Si, froude: jet.F, exitVelocity: P.U0, riseHeight: jet.zt, mzFarField: mzFar, areaAboveThreshold: eThr.area, intakeExcessMax: intake.max, intakeExcessMean: intake.mean, limit: P.limit };
     for (const k of Object.keys(outputs)) if (!Number.isFinite(outputs[k])) delete outputs[k];
+    // ---- results of the additional physics: three-dimensional view, ecology, hydrodynamics, waves, slice, heat, seasons
+    const xK = [], xO = {}, Po = g.jo * nx + g.io, fin = (x) => (Number.isFinite(x) ? x : 0);
+    { // quasi-three-dimensional reconstruction: vertical sections through the plume source (plan view = far-field maps)
+      const nzv = 24, isx = clamp(Math.floor((sx - g.x0) / g.dx), 0, nx - 1), jsy = clamp(Math.floor((sy - g.y0) / g.dy), 0, ny - 1);
+      const sec = (alongX) => {
+        const m = alongX ? nx : ny, idx = (k) => (alongX ? jsy * nx + k : k * nx + isx);
+        let Hm = 1; for (let k = 0; k < m; k++) Hm = Math.max(Hm, g.H[idx(k)]);
+        const zs = Array.from({ length: nzv }, (_, k) => -Hm + ((k + 0.5) * Hm) / nzv), z = zs.map((zz) => Array.from({ length: m }, (_, k) => { const q = idx(k), Hq = g.H[q]; return !Hq || zz < -Hq ? NaN : fin(layerProfile(ff.Csnap[q], Hq, phi, zz + Hq)); }));
+        return { zs, z, mask: z.map((r) => r.map((x) => !Number.isFinite(x))) };
+      };
+      const sA = sec(true), sC = sec(false), z3 = Math.max(1e-6, ...sA.z.flat().filter(Number.isFinite), ...sC.z.flat().filter(Number.isFinite)), b3 = { type: 'field', ylabel: 'Elevation (m)', zlabel: 'Excess salinity', zunit: 'g/kg', cmap: 'salinity', zmin: 0, zmax: z3 };
+      plots.push({ ...b3, title: `3-D plume view: west–east section through the plume source (y = ${fmt(g.ys[jsy], 3)} m)`, xlabel: 'East of outfall (m)', x: g.xs, y: sA.zs, z: sA.z, mask: sA.mask, note: 'Together with the plan maps these sections give the three-dimensional plume: the layer excess of the far-field model is distributed above the bed as a half-Gaussian whose depth integral equals the transported layer content (uniform when the fully mixed option is chosen).' },
+        { ...b3, title: `3-D plume view: south–north (cross-shore) section through the plume source (x = ${fmt(g.xs[isx], 3)} m)`, xlabel: 'North of outfall (m)', x: g.ys, y: sC.zs, z: sC.z, mask: sC.mask });
+    }
+    if (specs.length) { // plume–ecological response: log-logistic dose–response with exposure duration
+      const sens = specs.reduce((a, b) => (b.ec10 < a.ec10 ? b : a)), eff = (c, sp) => 100 * doseResponse(c, sp.ec10, sp.ec50);
+      const rowsE = specs.map((sp, k) => {
+        let a10 = 0, a50 = 0, aT = 0;
+        for (let q = 0; q < n; q++) if (g.H[q]) { if (ff.Cmean[q] >= sp.ec10) a10 += cellA; if (ff.Cmean[q] >= sp.ec50) a50 += cellA; if (ff.expo && ff.expo[k][q] > sp.tol / 100) aT += cellA; }
+        const worst = recStats.length ? Math.max(...recStats.map((r) => eff(r.mean, sp))) : 0, e = eff(mzEx, sp);
+        return [sp.name, sp.ec10, sp.ec50, e, a10 / 1e4, a50 / 1e4, sp.tol, aT / 1e4, worst, aT > 0 || e > 10 ? 'RISK' : 'acceptable'];
+      });
+      const effMap = g.ys.map((_, j) => g.xs.map((__, i) => (g.H[j * nx + i] ? eff(ff.Cmean[j * nx + i], sens) : NaN))), eMax = Math.max(1, ...effMap.flat().filter(Number.isFinite)), cs = Array.from({ length: 60 }, (_, k) => 0.05 * 10 ** ((k / 59) * 2.6));
+      plots.push({ ...fbase, title: `Ecological response: predicted effect on ${sens.name} (tidal-mean exposure)`, z: effMap, zlabel: 'Affected fraction', zunit: '%', cmap: 'turbo', zmin: 0, zmax: eMax, contours: 5 });
+      plots.push({ type: 'line', title: 'Dose–response curves and predicted exposure', xlabel: 'Excess salinity (g/kg)', ylabel: 'Affected fraction (%)', logx: true, series: specs.map((sp) => ({ name: sp.name, x: cs, y: cs.map((c) => eff(c, sp)) })), vlines: mzEx > 0.05 ? [{ x: mzEx, label: 'mixing-zone edge' }] : [], hlines: [{ y: 10, label: '10 % effect' }] });
+      tables.push({ title: 'Ecological response (dose–response with exposure duration)', columns: ['Species / community', 'EC10 ΔS (g/kg)', 'EC50 ΔS (g/kg)', 'Effect at the mixing-zone edge (%)', 'Area ≥ 10 % effect, tidal mean (ha)', 'Area ≥ 50 % effect, tidal mean (ha)', 'Tolerated time above EC10 (%)', 'Area above EC10 longer than tolerated (ha)', 'Worst receptor effect (%)', 'Status'], rows: rowsE,
+        note: 'Log-logistic dose–response fitted through the 10 % and 50 % effect levels of each species, applied to the tidal-mean excess salinity; the exposure-duration test counts the share of the statistics window in which each cell exceeds the EC10. The default thresholds are indicative literature values — replace them with site-specific toxicity data.' });
+      const eS = eff(mzEx, sens), aRisk = Math.max(...rowsE.map((r) => r[7]));
+      xK.push({ label: 'Ecological effect at mixing-zone edge', value: eS, unit: '%', status: eS > 10 ? 'warn' : 'ok', help: `Dose–response of the most sensitive species (${sens.name})` }, { label: 'Area exceeding tolerated exposure', value: aRisk, unit: 'ha', status: aRisk > 0 ? 'warn' : 'ok', help: 'Largest area, over all species, where the EC10 is exceeded for longer than the tolerated share of time' });
+      Object.assign(xO, { ecoEffectMz: eS, ecoAreaAtRisk: aRisk * 1e4 });
+      if (aRisk > 0) W.push({ level: 'warn', msg: `Ecological exposure: ${fmt(aRisk, 3)} ha of seabed exceeds a species EC10 for longer than its tolerated share of time (see the ecological-response table).` });
+    }
+    if (swm) {
+      const st = swm.stat, hmin = clamp(v.hDry, 0.01, 0.5), k0 = Math.max(iStat, 0), spS = ff.ser.u.map((u, k) => Math.hypot(u, ff.ser.v[k])), spH = ff.ser.t.map((t) => Math.hypot(...currentAt(curT, t * 3600)));
+      const pkS = Math.max(0, ...spS.slice(k0)), pkH = Math.max(0, ...spH.slice(k0)), eS = ff.ser.eta.slice(k0), rngS = eS.length ? Math.max(...eS) - Math.min(...eS) : 0;
+      const { ncx, ncy, mc } = swI, rowsC = (fn) => swI.ys.map((_, j) => swI.xs.map((__, i) => fn(j * ncx + i)));
+      let spMax = 0; for (let q = 0; q < ncx * ncy; q++) if (st.spd[q] > spMax) spMax = st.spd[q];
+      const inter = Number.isFinite(st.wetMin) ? (st.wetMax - st.wetMin) * cellA * mc * mc : 0, Vend = swm.volume(), vIn = swI.V0 + swm.volIn + swm.volClamp, dryM = rowsC((q) => !!swI.land[q] || !(swm.h[q] > hmin));
+      const cu = (k) => rowsC((q) => (swI.land[q] || !(swm.h[q] > hmin) ? 0 : fin(swm.cellU(q)[k])));
+      plots.push({ type: 'field', title: `Shallow-water solution: free-surface elevation and depth-mean current (t = ${fmt(ff.tEnd / 3600, 3)} h)`, xlabel: 'East of outfall (m)', ylabel: 'North of outfall (m)', x: swI.xs, y: swI.ys, z: rowsC((q) => (swI.land[q] || !(swm.h[q] > hmin) ? NaN : swm.eta[q])), mask: dryM, equal: true, zlabel: 'Surface elevation', zunit: 'm', cmap: 'coolwarm', contours: 8, vectors: true, u: cu(0), v: cu(1), markers,
+        note: `Free-surface finite-volume solution with ${v.swBC === 'flather' ? 'Flather' : v.swBC === 'elev' ? 'clamped tidal-elevation' : 'radiation'} open boundaries; land and cells shallower than ${fmt(hmin, 2)} m (dried) are masked.` });
+      plots.push({ ...fbase, x: swI.xs, y: swI.ys, mask: rowsC((q) => !!swI.land[q]), title: 'Shallow-water solution: maximum current speed over the run', z: rowsC((q) => (swI.land[q] ? NaN : st.spd[q])), zlabel: 'Speed', zunit: 'm/s', cmap: 'viridis', zmin: 0, zmax: Math.max(spMax, 1e-6), contours: 6 });
+      plots.push({ type: 'line', title: 'Outfall: shallow-water solution against the tidal-harmonic outer solution', xlabel: 'Time (h)', ylabel: 'Speed (m/s) · elevation (m)', series: [{ name: 'Current speed, shallow-water solver', x: ff.ser.t, y: spS }, { name: 'Current speed, harmonic input (boundary data)', x: ff.ser.t, y: spH, dash: true }, { name: 'Free-surface elevation η (m)', x: ff.ser.t, y: ff.ser.eta }], vlines: [{ x: tStat / 3600, label: 'statistics from here' }] });
+      tables.push({ title: 'Shallow-water hydrodynamics', columns: ['Item', 'Value'], rows: [
+        ['Open-boundary condition', v.swBC === 'flather' ? 'Flather (elevation + current, radiating)' : v.swBC === 'elev' ? 'Clamped tidal elevation' : 'Radiation (no tidal forcing)'], ['Hydrodynamic grid (cells) and cell size (m)', `${ncx} × ${ncy}, ${fmt(mc * g.dx, 3)} × ${fmt(mc * g.dy, 3)}`], ['Stable time step at the start (s)', swI.dt0], ['Hydrodynamic sub-steps', swm.steps],
+        ['Bed friction', swI.fric.type === 'manning' ? `Manning n = ${fmt(swI.fric.n, 3)}` : swI.fric.type === 'chezy' ? `Chézy C = ${fmt(swI.fric.C, 3)}` : `drag coefficient ${fmt(v.Cd, 3)}`], ['Friction coefficient c_f at the outfall depth', swI.cf0], ['Coriolis parameter f (1/s)', swI.fC],
+        ['Wind stress (N/m²)', Math.hypot(swI.tw[0], swI.tw[1]) * P.rhoA], ['Initial sea level (m)', v.eta0], ['Peak current at the outfall, shallow-water (m/s)', pkS], ['Peak current at the outfall, harmonic input (m/s)', pkH], ['Tidal range at the outfall, computed (m)', rngS], ['Tidal range, input (m)', swI.tide ? v.tideRange : 0],
+        ['Maximum current speed in the domain (m/s)', spMax], ['Intertidal (wetting–drying) area (ha)', inter / 1e4], ['Volume-balance error (relative)', (Vend - vIn) / Math.max(swI.V0, 1)], ['Velocity-limiter events', swm.capped]],
+        note: 'The far-field transport is co-stepped with this solver: it uses the time-mean face transports of every transport step (interpolated linearly from the hydrodynamic cells) and a depth that follows their divergence, so a uniform concentration stays uniform while the tide rises and falls.' });
+      balances.push({ name: 'Shallow-water volume (m³): initial + boundary inflow vs final', in: vIn, out: Vend });
+      xK.push({ label: 'Peak current at outfall (shallow-water)', value: pkS, unit: 'm/s', help: `Harmonic input: ${fmt(pkH, 3)} m/s` }, { label: 'Computed tidal range at outfall', value: rngS, unit: 'm' }, { label: 'Intertidal (wetting–drying) area', value: inter / 1e4, unit: 'ha' });
+      Object.assign(xO, { swPeakCurrent: pkS, swTidalRange: rngS, swMaxSpeed: spMax });
+      W.push({ level: 'info', msg: `Free-surface shallow-water solution: peak current at the outfall ${fmt(pkS, 3)} m/s (harmonic input ${fmt(pkH, 3)} m/s), computed tidal range ${fmt(rngS, 3)} m, ${swm.steps} hydrodynamic sub-steps.${swI.tide ? '' : ' Radiation boundaries carry no tide: the flow is driven by wind, waves and Coriolis only.'}` });
+      if (swm.capped > 50) W.push({ level: 'warn', msg: `The shallow-water velocity limiter acted ${swm.capped} times (very shallow or steep cells) — raise the minimum depth or smooth the bathymetry.` });
+    }
+    if (wf) {
+      const HsO = wf.Hs[Po], Hs0 = wf.still.Hs[Po], th = wf.theta[Po], turn = (((th - Math.atan2(bearing(v.waveDir + 180)[1], bearing(v.waveDir + 180)[0])) / D2R + 540) % 360) - 180, surfA = wf.surfCells * cellA, isx = g.io;
+      const dir = (fn) => g.ys.map((_, j) => g.xs.map((__, i) => (g.H[j * nx + i] ? fn(wf.theta[j * nx + i]) : 0)));
+      plots.push({ ...fbase, title: 'Waves: significant wave height and direction (wave-action balance)', z: rows2d(wf.Hs), zlabel: 'Wave height', zunit: 'm', cmap: 'viridis', zmin: 0, zmax: Math.max(1e-6, ...Array.from(wf.Hs)), contours: 6, vectors: true, u: dir(Math.cos), v: dir(Math.sin), note: `Refraction, shoaling and depth-limited breaking (H ≤ ${fmt(v.gammaB, 3)} h) of a ${fmt(v.wavePeriod, 3)} s wave${wf.pk > 0 ? `, on the peak tidal current of ${fmt(wf.pk, 2)} m/s` : ''}. Arrows: direction of propagation.` });
+      plots.push({ ...fbase, title: 'Waves: radiation-stress-driven longshore current (Longuet-Higgins)', z: rows2d(Float64Array.from(wf.Vls, Math.abs)), zlabel: 'Longshore current', zunit: 'm/s', cmap: 'turbo', zmin: 0, zmax: Math.max(wf.VlsMax, 1e-6), contours: 5, note: 'Non-zero inside the surf zone only: alongshore radiation-stress force balanced by the wave-averaged bed shear stress.' });
+      const col = (a) => g.ys.map((_, j) => (g.H[j * nx + isx] ? fin(a[j * nx + isx]) : null));
+      plots.push({ type: 'line', title: 'Waves: cross-shore transect through the outfall', xlabel: 'North of outfall (m)', ylabel: 'm · m/s', series: [{ name: 'Wave height', x: g.ys, y: col(wf.Hs) }, { name: 'Wave height without current', x: g.ys, y: col(wf.still.Hs), dash: true }, { name: 'Breaking limit γ·h', x: g.ys, y: g.ys.map((_, j) => (g.H[j * nx + isx] ? Math.min(v.gammaB * g.H[j * nx + isx], 3 * v.waveHeight) : null)), dash: true }, { name: 'Near-bed orbital velocity (m/s)', x: g.ys, y: col(wf.uorb) }, { name: 'Longshore current (m/s)', x: g.ys, y: col(Float64Array.from(wf.Vls, Math.abs)) }] });
+      tables.push({ title: 'Wave transformation (wave-action balance)', columns: ['Item', 'Value'], rows: [
+        ['Incident wave height at the deepest boundary (m)', v.waveHeight], ['Period (s)', v.wavePeriod], ['Direction, coming from (°)', v.waveDir], ['Wavelength at the outfall (m)', wf.k[Po] > 0 ? (2 * Math.PI) / wf.k[Po] : 0], ['Wave height at the outfall (m)', HsO], ['… without the tidal current (m)', Hs0], ['Change by wave–current interaction (%)', Hs0 > 0 ? 100 * (HsO / Hs0 - 1) : 0],
+        ['Refraction turning at the outfall (°)', turn], ['Near-bed orbital velocity at the outfall (m/s)', wf.uorb[Po]], ['… local estimate without refraction/shoaling (m/s)', uw], ['Breaker height (m)', wf.HbMax], ['Surf-zone area (ha)', surfA / 1e4], ['Maximum longshore current (m/s)', wf.VlsMax]],
+        note: 'The orbital velocity and the longshore current of this solution replace the local estimate in the Elder dispersion coefficient; with the shallow-water solver the radiation-stress forces also drive the computed currents (wave set-up and longshore flow).' });
+      xK.push({ label: 'Wave height at the outfall', value: HsO, unit: 'm', help: `Incident ${fmt(v.waveHeight, 3)} m; ${fmt(Hs0, 3)} m without the tidal current` }, { label: 'Breaker height', value: wf.HbMax, unit: 'm' }, { label: 'Maximum longshore current', value: wf.VlsMax, unit: 'm/s' });
+      Object.assign(xO, { waveHeightOutfall: HsO, breakerHeight: wf.HbMax, longshoreCurrent: wf.VlsMax });
+    }
+    if (vs) {
+      const { r, xsS, zsS, nxs, nzs, solid, sAmb } = vs, cell = (fn) => zsS.map((_, k) => xsS.map((__, i) => fn(k * nxs + i, i, k))), maskS = cell((q) => !!solid[q]);
+      const exc = cell((q) => (solid[q] ? NaN : fin(r.s[q] - sAmb[q]))), eM = Math.max(1e-6, ...exc.flat().filter(Number.isFinite)), hyd = v.vsModel === 'hydro';
+      const xr = xsS.map((x) => x - xsS[vs.is]), tMin = r.hist.t.map((t) => t / 60), fr = r.hist.front.map((x) => (x === null ? null : x - (xsS[vs.is] - xsS[0] + 0.5 * vs.dxs)));
+      plots.push({ type: 'field', title: `Vertical slice (${hyd ? 'hydrostatic' : 'non-hydrostatic'}): density excess and flow after ${fmt(r.t / 60, 3)} min`, xlabel: 'Distance along the discharge direction (m)', ylabel: 'Elevation (m)', x: xsS, y: zsS, z: exc, mask: maskS, zlabel: 'Density excess (equivalent salinity)', zunit: 'g/kg', cmap: 'salinity', zmin: 0, zmax: eM, vectors: true,
+        u: cell((q, i, k) => (solid[q] ? 0 : fin(0.5 * (r.u[k * r.nu1 + i] + r.u[k * r.nu1 + i + 1])))), v: cell((q) => (solid[q] ? 0 : fin(0.5 * (r.w[q] + r.w[q + nxs])))), markers: [{ x: xsS[vs.is], y: zsS[0], label: 'Near-field end (source)' }],
+        note: 'Two-dimensional section: lateral spreading is not represented, so concentrations far from the source are upper bounds. The section follows the discharge bearing over the model bathymetry.' });
+      if (v.vsTurb !== 'const') plots.push({ type: 'field', title: `Vertical slice: eddy viscosity (${v.vsTurb === 'ke' ? 'k–ε closure' : 'Pacanowski–Philander closure'})`, xlabel: 'Distance along the discharge direction (m)', ylabel: 'Elevation (m)', x: xsS, y: zsS, z: cell((q) => (solid[q] ? NaN : fin(r.nut[q] * 1e4))), mask: maskS, zlabel: 'Eddy viscosity', zunit: 'cm²/s', cmap: 'turbo' });
+      plots.push({ type: 'line', title: 'Vertical slice: front of the dense bottom current', xlabel: 'Time (min)', ylabel: 'Front distance beyond the near-field end (m)', series: [{ name: 'Front position', x: tMin, y: fr }], note: `Front speed ${fmt(vs.uf, 3)} m/s (least-squares over the last 70 % of the run); buoyancy-flux scale (g′q)^⅓ = ${fmt(vs.bScale, 3)} m/s.` });
+      plots.push({ type: 'line', title: 'Vertical slice: layer thickness and bed excess along the section', xlabel: 'Distance beyond the near-field end (m)', ylabel: 'Thickness (m) · excess (g/kg)', series: [{ name: 'Layer thickness, slice', x: xr, y: vs.hS }, { name: 'Bed density excess, slice (g/kg)', x: xr, y: vs.sB }, ...(gc ? [{ name: 'Layer thickness, integral density-current model', x: gc.x, y: gc.h, dash: true }] : [])] });
+      const xm = xr[vs.im], hI = gc ? interp1(gc.x, gc.h, clamp(xm, 0, gcEnd.x)) : null, uI = gc ? interp1(gc.x, gc.U, clamp(xm, 0, gcEnd.x)) : null;
+      tables.push({ title: 'Vertical slice: resolved dense bottom current', columns: ['Item', 'Value'], rows: [
+        ['Equations', hyd ? 'Hydrostatic Boussinesq (baroclinic pressure, rigid lid)' : 'Non-hydrostatic Boussinesq (pressure projection)'], ['Turbulence closure', v.vsTurb === 'ke' ? 'k–ε with buoyancy production' : v.vsTurb === 'pp' ? 'Pacanowski–Philander Ri-dependent mixing' : 'constant eddy viscosity'], ['Grid (cells along × vertical)', `${nxs} × ${nzs}`], ['Cell size Δx × Δz (m)', `${fmt(vs.dxs, 3)} × ${fmt(vs.dzs, 3)}`], ['Time steps', r.steps],
+        ['Buoyancy source per metre width, g′q (m³/s³)', G * betaR * vs.qs], ['Front speed, slice (m/s)', vs.uf], ['Buoyancy-flux velocity scale (g′q)^⅓ (m/s)', vs.bScale], ['Front speed ÷ (g′q)^⅓', vs.bScale > 0 ? vs.uf / vs.bScale : 0], ['Layer velocity, integral model (m/s)', uI], [`Layer thickness ${fmt(xm, 3)} m beyond the near field, slice (m)`, vs.hS[vs.im]], ['… integral density-current model (m)', hI],
+        ['Maximum eddy viscosity (m²/s)', vs.nuMax], ['Initial turbulent kinetic energy (m²/s²)', v.vsTurb === 'ke' ? v.vsK0 : null], ['Density-excess conservation error (relative)', (r.salt - r.salt0 - r.injected) / Math.max(Math.abs(r.injected), 1e-12)], ['Largest velocity divergence (1/s)', r.divMax], ['Pressure iterations per step', hyd ? 0 : r.pIter / Math.max(r.steps, 1)]],
+        note: v.hLayer > 0 ? 'The far-field layer thickness was entered by hand; the slice result is shown for comparison.' : 'The layer thickness resolved by the slice sets the thickness of the far-field layer (two-way nesting of the section in the coastal model).' });
+      balances.push({ name: 'Vertical slice: density excess (g/kg·m²), initial + injected vs final', in: (r.salt0 + r.injected) * vs.dxs * vs.dzs, out: r.salt * vs.dxs * vs.dzs });
+      xK.push({ label: 'Bottom-current front speed (slice)', value: vs.uf, unit: 'm/s', help: `${hyd ? 'Hydrostatic' : 'Non-hydrostatic'} vertical slice` }, { label: 'Layer thickness (slice)', value: vs.hS[vs.im], unit: 'm', help: `${fmt(xm, 3)} m beyond the near-field end` }, { label: 'Maximum eddy viscosity (slice)', value: vs.nuMax * 1e4, unit: 'cm²/s' });
+      Object.assign(xO, { sliceFrontSpeed: vs.uf, sliceLayerThickness: vs.hS[vs.im] });
+    } else if (v.vslice) W.push({ level: 'info', msg: 'The vertical slice was skipped: the discharge does not form a dense bottom current.' });
+    if (heat) {
+      const { hx, rc } = heat, fx = hx.flux, eM = Array.from(ff.Emax).filter((_, q) => g.H[q]), lo = Math.min(0, ...eM), hi = Math.max(lo + 1e-6, ...eM), tau = hx.K > 0 ? (rc * depth) / hx.K / 86400 : 0;
+      let mzT = 0; for (const [x, y] of ring) { const q = clamp(Math.floor((y - g.y0) / g.dy), 0, ny - 1) * nx + clamp(Math.floor((x - g.x0) / g.dx), 0, nx - 1); if (g.H[q] && Math.abs(ff.Emax[q]) > Math.abs(mzT)) mzT = ff.Emax[q]; }
+      const inT = ff.ser.extra[0].slice(Math.max(iStat, 0)), inMax = inT.reduce((a, b) => (Math.abs(b) > Math.abs(a) ? b : a), 0);
+      plots.push({ ...fbase, title: 'Far field: excess temperature, tidal extreme', z: rows2d(ff.Emax), zlabel: 'Excess temperature', zunit: '°C', cmap: 'thermal', zmin: lo, zmax: hi, contours: 6, note: heat.act ? `Surface heat exchange removes the excess with an e-folding time of ${fmt(tau, 3)} d at the outfall depth.` : 'Bottom-attached layer: the thermal excess is not in contact with the atmosphere, so no surface exchange is applied (choose the fully mixed option to include it).' });
+      plots.push({ type: 'line', title: 'Excess temperature at the intake and receptors', xlabel: 'Time (h)', ylabel: 'Excess temperature (°C)', series: [{ name: 'Intake', x: ff.ser.t, y: ff.ser.extra[0] }, ...recs.map((r, k) => ({ name: r.name, x: ff.ser.t, y: ff.ser.extra[k + 1] }))] });
+      tables.push({ title: 'Atmospheric heat budget and thermal plume', columns: ['Item', 'Value'], rows: [
+        ['Absorbed solar radiation (W/m²)', fx.sw], ['Atmospheric long-wave radiation (W/m²)', fx.lwDown], ['Back radiation of the sea surface (W/m²)', -fx.lwUp], ['Evaporative (latent) heat flux (W/m²)', -fx.latent], ['Sensible heat flux (W/m²)', -fx.sensible], ['Net surface heat flux into the sea (W/m²)', fx.net],
+        ['Surface heat-exchange coefficient K (W/m²·K)', hx.K], ['Equilibrium temperature (°C)', hx.Te], ['Ambient temperature drift (°C/day)', (fx.net * 86400) / (rc * depth)], ['e-folding time of a thermal excess at the outfall depth (d)', tau],
+        ['Brine temperature excess at the port (°C)', heat.dT0], ['Thermal excess at the mixing-zone edge, tidal extreme (°C)', mzT], ['Thermal excess at the intake, extreme (°C)', inMax], ['Share of the discharged excess heat released to the atmosphere (%)', Math.abs(ff.bal.injectedE) > 0 ? (100 * ff.bal.lostE) / ff.bal.injectedE : 0]],
+        note: 'Bulk formulae: absorbed short-wave radiation, Swinbank clear-sky long-wave radiation with a cloud correction, grey-body back radiation, and Dalton/Stanton-type latent and sensible fluxes with the 10 m wind. The excess temperature is transported with the same fluxes as the salinity excess.' });
+      balances.push({ name: 'Far-field excess heat (°C·m³): injected vs stored + exported + released to the air', in: ff.bal.injectedE, out: ff.bal.massE + ff.bal.outE + ff.bal.lostE });
+      xK.push({ label: 'Net surface heat flux', value: fx.net, unit: 'W/m²', help: 'Positive into the sea' }, { label: 'Equilibrium temperature', value: hx.Te, unit: '°C' }, { label: 'Thermal excess at mixing-zone edge', value: mzT, unit: '°C' });
+      Object.assign(xO, { netHeatFlux: fx.net, thermalExcessMz: mzT, equilibriumTemperature: hx.Te });
+    }
+    if (v.seasonal) { // seasonal sweep: the same diffuser under each season's ambient conditions (coarser far-field grid)
+      const num = (x, d) => (Number.isFinite(+x) && x !== null && x !== '' ? +x : d), seas = (Array.isArray(v.seasons) ? v.seasons : []).slice(0, 6), outS = [];
+      for (const [k, sn] of seas.entries()) {
+        const sv = { Ta: num(sn.Ta, v.Ta), Sa: num(sn.Sa, v.Sa), dT: num(sn.dT, v.dT), uRes: Math.max(0, num(sn.uRes, v.uRes)), windSpeed: Math.max(0, num(sn.windSpeed, v.windSpeed)), waveHeight: Math.max(0, num(sn.waveHeight, v.waveHeight)) }, name = String(sn.name || `Season ${k + 1}`).slice(0, 24);
+        ctx?.progress?.(0.97, `Seasonal sweep: ${name}`);
+        const sub = await suite.run({ ...v, ...sv, seasonal: false, vslice: false, heat: false, hydro: 'harmonic', waveModel: 'orbital', particles: false, design: 'manual', nPorts: P.n, dPort: P.d * 1000, spacing: Number.isFinite(P.spacing) ? P.spacing : v.spacing, theta: P.theta / D2R, nx: Math.max(24, Math.round(nx / 2)), ny: Math.max(16, Math.round(ny / 2)), nCycles: Math.min(nCyc, 2) }, { ...(ctx || {}), progress() {} });
+        outS.push({ name, ...sv, rho: density(sv.Ta, sv.Sa), o: sub.outputs });
+      }
+      if (outS.length) {
+        const gv = (s, k) => fin(s.o[k] ?? 0), worst = outS.reduce((a, b) => (gv(b, 'excessAtMixingZone') > gv(a, 'excessAtMixingZone') ? b : a));
+        tables.push({ title: 'Seasonal simulation', columns: ['Season', 'Ambient T (°C)', 'Ambient S (g/kg)', 'Thermal stratification (°C)', 'Residual current (m/s)', 'Wind (m/s)', 'Waves (m)', 'Ambient density (kg/m³)', 'Froude number', 'Rise height (m)', 'Impact dilution', 'Near-field dilution', 'Excess at mixing-zone edge (g/kg)', 'Maximum excess at intake (g/kg)', 'Area above reporting threshold (ha)', 'Limit met'],
+          rows: outS.map((s) => [s.name, s.Ta, s.Sa, s.dT, s.uRes, s.windSpeed, s.waveHeight, s.rho, gv(s, 'froude'), gv(s, 'riseHeight'), gv(s, 'impactDilution'), gv(s, 'nearFieldDilution'), gv(s, 'excessAtMixingZone'), gv(s, 'intakeExcessMax'), gv(s, 'areaAboveThreshold') / 1e4, gv(s, 'excessAtMixingZone') <= gv(s, 'limit') ? 'yes' : 'NO']),
+          note: `Each season re-runs the near-field model and a far-field simulation (${Math.max(24, Math.round(nx / 2))} × ${Math.max(16, Math.round(ny / 2))} cells, ${Math.min(nCyc, 2)} tidal cycle${Math.min(nCyc, 2) > 1 ? 's' : ''}) with the diffuser of the main run held fixed.` });
+        plots.push({ type: 'bar', title: 'Seasonal simulation: excess salinity at the mixing-zone edge and at the intake', ylabel: 'Excess salinity (g/kg)', categories: outS.map((s) => s.name), series: [{ name: 'Mixing-zone edge', values: outS.map((s) => gv(s, 'excessAtMixingZone')) }, { name: 'Intake (maximum)', values: outS.map((s) => gv(s, 'intakeExcessMax')) }] });
+        plots.push({ type: 'bar', title: 'Seasonal simulation: near-field dilution', ylabel: 'Dilution (–)', categories: outS.map((s) => s.name), series: [{ name: 'Impact dilution', values: outS.map((s) => gv(s, 'impactDilution')) }, { name: 'Near-field dilution', values: outS.map((s) => gv(s, 'nearFieldDilution')) }] });
+        xK.push({ label: 'Worst season at mixing-zone edge', value: `${worst.name}: ${fmt(gv(worst, 'excessAtMixingZone'), 3)} g/kg`, status: gv(worst, 'excessAtMixingZone') > gv(worst, 'limit') ? 'bad' : 'ok' });
+        Object.assign(xO, { seasonalWorstExcess: gv(worst, 'excessAtMixingZone') });
+        if (gv(worst, 'excessAtMixingZone') > gv(worst, 'limit')) W.push({ level: 'bad', msg: `Seasonal simulation: in ${worst.name} the excess salinity at the mixing-zone edge reaches ${fmt(gv(worst, 'excessAtMixingZone'), 3)} g/kg and exceeds the limit.` });
+      }
+    }
+    for (const k of Object.keys(xO)) if (Number.isFinite(xO[k])) outputs[k] = xO[k];
     return {
       summary: `${P.n} port${P.n > 1 ? 's' : ''} of ${fmt(P.d * 1000, 3)} mm at ${fmt(P.U0, 3)} m/s (F = ${fmt(jet.F, 3)}): impact dilution ${fmt(jet.Si, 3)}, near-field dilution ${fmt(nf.Sn, 3)}; excess salinity ${fmt(mzEx, 2)} g/kg at the ${v.mzR} m mixing-zone edge (limit ${fmt(P.limit, 3)}), up to ${fmt(intake.max, 2)} g/kg at the intake.`,
       kpis: [
@@ -707,6 +1471,7 @@ const suite = {
         { label: 'Maximum excess at intake', value: intake.max, unit: 'g/kg', status: intake.max > 0.02 * v.Sa ? 'bad' : intake.max > 0.005 * v.Sa ? 'warn' : 'ok' }, { label: 'Mean excess at intake', value: intake.mean, unit: 'g/kg' },
         { label: 'Worst receptor exceedance', value: recStats.length ? 100 * Math.max(...recStats.map((r) => r.frac)) : 0, unit: '% of time', status: recStats.some((r) => r.frac > 0) ? 'warn' : 'ok' },
         { label: 'Antiscalant at mixing-zone edge', value: chem[0].mz, unit: 'mg/L', status: chem[0].mz > chem[0].lim ? 'warn' : 'ok' }, { label: 'Outfall length', value: outfallLength, unit: 'm', help: 'Distance from the shoreline to the diffuser plus the diffuser length' },
+        ...xK,
       ],
       warnings: W,
       recommendations: [
@@ -785,6 +1550,84 @@ const suite = {
     add('Brooks far-field dilution tends to 1 at the source', 1, brooks(1e-6, 50, 0.2, 0.05), 1e-6, 'Limit x → 0 of the line-source solution');
     const dg = designDiffuser({ Q: 2000 / 3600, gp: 0.21, depth: 12, z0: 1, dS0: 28, limit: 1.85 }).best;
     add('Auto-designed diffuser meets its criteria', 1, dg.ok && dg.V >= 4 && dg.V <= 6 && dg.F >= 20 ? 1 : 0, 0, `${dg.n} ports of ${fmt(dg.d * 1000, 3)} mm: velocity 4–6 m/s, F ≥ 20, jet below the surface`);
+    // ---- free-surface shallow-water solver
+    {
+      const flatB = (m, h0) => new Float64Array(m).fill(-h0), nf0 = { type: 'cd', Cd: 0 };
+      const s1 = shallowWater({ nx: 50, ny: 3, dx: 200, dy: 200, zb: flatB(150, 10), eta0: (i) => 0.05 * Math.cos((Math.PI * (i + 0.5)) / 50), fric: nf0 }), Tm = (2 * 50 * 200) / Math.sqrt(G * 10), dt1 = s1.dtStable(), cr = [], v0 = s1.volume();
+      for (let prev = s1.eta[50]; s1.t < 1.6 * Tm;) { s1.step(dt1); const e = s1.eta[50]; if (prev * e < 0) cr.push(s1.t - dt1 * (e / (e - prev))); prev = e; }
+      add('Shallow water: seiche period equals Merian’s formula', 1, (cr[2] - cr[0]) / Tm, 0.005, 'T = 2L/√(gh) for the fundamental mode of a closed basin (ratio)');
+      add('Shallow water: volume conservation (closed basin)', 0, s1.volume() / v0 - 1, 1e-12, 'Relative change of the stored volume after 1.6 seiche periods');
+      const zl = new Float64Array(600); for (let q = 0; q < 600; q++) { const i = q % 30, k = (q - i) / 30; zl[q] = -5 + 6.5 * Math.exp(-((i - 15) ** 2 + (k - 10) ** 2) / 20) + 0.3 * Math.sin(i) + 0.05 * i; }
+      const s2 = shallowWater({ nx: 30, ny: 20, dx: 100, dy: 100, zb: zl, eta0: 0 }); for (let k = 0; k < 200; k++) s2.step(s2.dtStable());
+      add('Shallow water: lake at rest over an uneven bed with a dry island', 0, Math.max(...Array.from(s2.u, Math.abs), ...Array.from(s2.v, Math.abs)), 1e-12, 'Well-balanced scheme: no spurious current (m/s) with wet and dry cells');
+      const zs = new Float64Array(240); for (let q = 0; q < 240; q++) zs[q] = -4 + 0.1 * (q % 60) + 0.2 * (((q - (q % 60)) / 60) % 2);
+      const s3 = shallowWater({ nx: 60, ny: 4, dx: 50, dy: 50, zb: zs, eta0: (i) => 0.5 - 0.02 * i, fric: { type: 'manning', n: 0.02 } }), v3 = s3.volume(); let wmin = 240, wmax = 0;
+      for (let k = 0; k < 1500; k++) { s3.step(s3.dtStable()); if (k % 10 === 0) { let wn = 0; for (const hh of s3.h) if (hh > 0.05) wn++; wmin = Math.min(wmin, wn); wmax = Math.max(wmax, wn); } }
+      add('Shallow water: volume conservation with wetting and drying', 0, s3.volume() / v3 - 1, 1e-10, `Run-up and run-down on a beach with Manning friction; between ${wmin} and ${wmax} cells wet`);
+      const tau = 1e-4, Ts = (2 * 20 * 250) / Math.sqrt(G * 5), s4 = shallowWater({ nx: 20, ny: 3, dx: 250, dy: 250, zb: flatB(60, 5), eta0: 0, fric: { type: 'cd', Cd: 0.003 }, tau: (t) => [tau * Math.min(1, t / (4 * Ts)), 0] }), dt4 = 0.9 * s4.dtStable(); let sl = 0, m4 = 0;
+      while (s4.t < 8 * Ts) { s4.step(dt4); if (s4.t > 7 * Ts) { sl += (s4.eta[39] - s4.eta[20]) / (19 * 250); m4++; } }
+      add('Shallow water: wind set-up balances the surface stress', 1, sl / m4 / (tau / (G * 5)), 0.01, '∂η/∂x = τ_wind/(ρ g h) in a closed basin (ratio)');
+      const s5 = shallowWater({ nx: 120, ny: 3, dx: 100, dy: 100, zb: flatB(360, 10), eta0: (i) => 0.1 * Math.exp(-((i - 60) ** 2) / 50), fric: nf0, bc: { W: 'rad', E: 'rad' } }), dt5 = s5.dtStable();
+      while (s5.t < (1.6 * 6000) / Math.sqrt(G * 10)) s5.step(dt5);
+      add('Shallow water: radiation boundary lets a wave leave', 0, Math.max(...Array.from(s5.eta, Math.abs)) / 0.1, 0.02, 'Residual elevation ÷ initial hump after both pulses crossed the open ends');
+      const T6 = 3600, om6 = (2 * Math.PI) / T6, s6 = shallowWater({ nx: 25, ny: 3, dx: 200, dy: 200, zb: flatB(75, 10), eta0: 0, fric: nf0, bc: { W: 'elev' }, ext: (t) => ({ e: 0.01 * Math.min(1, t / (5 * T6)) * Math.sin(om6 * t), gx: 0, gy: 0, U: 0, V: 0 }) }), dt6 = s6.dtStable(); let hi6 = -1, lo6 = 1;
+      while (s6.t < 8 * T6) { s6.step(dt6); if (s6.t > 7 * T6) { hi6 = Math.max(hi6, s6.eta[49]); lo6 = Math.min(lo6, s6.eta[49]); } }
+      add('Shallow water: tidal-elevation boundary, co-oscillating tide', 1 / Math.cos((om6 * (5000 - 100)) / Math.sqrt(G * 10)), (hi6 - lo6) / 0.02, 0.02, 'Amplification 1/cos(ωL/√(gh)) at the closed end of a frictionless channel');
+      const U7 = 0.4, f7 = 1e-4, r7 = (0.0025 * U7) / 10, s7 = shallowWater({ nx: 24, ny: 8, dx: 250, dy: 250, zb: flatB(192, 10), eta0: 0, f: f7, fric: { type: 'cd', Cd: 0.0025 }, bc: { W: 'flather', E: 'flather' }, ext: (t) => { const m = Math.min(1, t / 3000); return { e: 0, gx: (-r7 * U7 * m) / G, gy: (-f7 * U7 * m) / G, U: U7 * m, V: 0 }; } }), dt7 = s7.dtStable();
+      while (s7.t < 30000) s7.step(dt7);
+      add('Shallow water: Flather boundaries carry the outer current', 1, s7.cellU(4 * 24 + 12)[0] / U7, 0.01, 'Interior velocity ÷ external current for a steady friction-balanced stream (ratio)');
+      add('Shallow water: geostrophic cross-stream surface slope', 1, (s7.eta[6 * 24 + 12] - s7.eta[24 + 12]) / (5 * 250) / ((-f7 * U7) / G), 0.01, '∂η/∂y = −f U/g with Coriolis (ratio)');
+      // transport on the moving free surface: a uniform concentration must stay uniform while the basin sloshes
+      const gq = flatGrid(30, 6, 100, 8, false), s8 = shallowWater({ nx: 30, ny: 6, dx: 100, dy: 100, zb: gq.zb, eta0: (i) => 0.3 * Math.cos((Math.PI * (i + 0.5)) / 30), fric: nf0 });
+      const r8 = await farField({ g: gq, flow: null, cur: still, K: new Float64Array(180).fill(1), tEnd: 900, C0: new Float64Array(180).fill(1), closed: true, dyn: swCoupler(s8, 30, 6, 1) }); let dev8 = 0; for (let q = 0; q < 180; q++) dev8 = Math.max(dev8, Math.abs(r8.C[q] - 1));
+      const s9 = shallowWater({ nx: 15, ny: 3, dx: 200, dy: 200, zb: new Float64Array(45).fill(-8), eta0: (i) => 0.3 * Math.cos((Math.PI * (i + 0.5)) / 15), fric: nf0 }), r9 = await farField({ g: gq, flow: null, cur: still, K: new Float64Array(180).fill(1), tEnd: 900, C0: new Float64Array(180).fill(1), closed: true, dyn: swCoupler(s9, 30, 6, 2) }); let dev9 = 0; for (let q = 0; q < 180; q++) dev9 = Math.max(dev9, Math.abs(r9.C[q] - 1));
+      add('Coarse hydrodynamic grid: interpolated transports stay consistent', 0, dev9, 1e-9, 'Solver cells twice the transport cells: max |C − 1| for a uniform concentration during the seiche');
+      add('Shallow-water-driven transport preserves a uniform concentration', 0, dev8, 1e-9, 'Free-surface (η-consistent) far-field transport during a 0.3 m seiche: max |C − 1|');
+      add('Shallow-water-driven transport conserves mass', 1, r8.bal.mass / (180 * 8 * 1e4), 1e-9, 'Σ D·C·A after the run ÷ initial content');
+      add('Wind stress: Smith–Banke drag law', 1.22 * 1.29e-3 * 100, windStress(10, 270, 1025)[0] * 1025, 1e-6, 'τ = ρ_air C_d W² with C_d = (0.63 + 0.066 W)·10⁻³ at W = 10 m/s (N/m²)');
+    }
+    // ---- wave-action balance
+    {
+      const wn = 30, wm = 50, sl = 0.02, hw = new Float64Array(wn * wm); for (let q = 0; q < wn * wm; q++) hw[q] = Math.max(0, sl * ((((q - (q % wn)) / wn) + 0.5) * 5 - 10));
+      const a0 = 20 * D2R, wv = waveField({ nx: wn, ny: wm, dx: 10, dy: 5, h: hw, H0: 1, T: 10, theta0: -Math.PI / 2 - a0, Cf: 0.01 }), ref = waveNumber((2 * Math.PI) / 10, wv.href), Pa = 30 * wn + 9, anA = -Math.PI / 2 - wv.theta[Pa];
+      add('Waves: Snell’s law of refraction on a plane beach', Math.sin(a0) / ref.c, Math.sin(anA) / wv.c[Pa], (0.01 * Math.sin(a0)) / ref.c, `sin θ / c is invariant: the wave turns from 20° to ${fmt(anA / D2R, 3)}° at ${fmt(hw[Pa], 3)} m depth`);
+      add('Waves: shoaling and refraction coefficient', Math.sqrt((ref.cg * Math.cos(a0)) / (wv.cg[Pa] * Math.cos(anA))), wv.Hs[Pa] / 1, 0.01, 'H/H₀ = √(c_g0 cos θ₀ / (c_g cos θ)) from conservation of wave action');
+      const Pb = 9 * wn + 9, anB = -Math.PI / 2 - wv.theta[Pb];
+      add('Waves: depth-limited breaking H = γ h in the surf zone', 0.78 * hw[Pb], wv.Hs[Pb], 1e-6, 'Saturated surf zone');
+      add('Waves: longshore current of Longuet-Higgins', ((5 * Math.PI) / 16) * (0.78 / 0.01) * G * hw[Pb] * (Math.sin(anB) / wv.c[Pb]) * sl, Math.abs(wv.Vls[Pb]), 0.08 * ((5 * Math.PI) / 16) * (0.78 / 0.01) * G * hw[Pb] * (Math.sin(anB) / wv.c[Pb]) * sl, 'V = (5π/16)(γ/C_f) g h (sin θ/c) tan β from the radiation-stress gradient, within 8 %');
+      const hd = new Float64Array(240).fill(50), Uo = Float64Array.from({ length: 240 }, (_, q) => -0.5 * (1 + Math.tanh(((q % 80) - 40) / 6))), wc = waveField({ nx: 80, ny: 3, dx: 20, dy: 20, h: hd, H0: 1, T: 6, theta0: 0, U: Uo, V: new Float64Array(240), iters: 420 }), c0 = wc.c[82], c1 = wc.c[80 + 75];
+      add('Wave–current interaction: Doppler-shifted phase speed on an opposing current', 0.5 * (1 + Math.sqrt(1 - 4 / c0)), c1 / c0, 1e-3, 'c/c₀ = ½[1 + √(1 + 4U/c₀)], U = −1 m/s, deep water');
+      add('Wave–current interaction: wave-action conservation (steepening)', c0 / Math.sqrt(c1 * (c1 - 2)), wc.Hs[80 + 75] / wc.Hs[82], 5e-3, 'H/H₀ = c₀/√(c(c + 2U)) (Longuet-Higgins & Stewart 1961)');
+    }
+    // ---- vertical slice: lock exchange, turbulence closures
+    {
+      const ln = 96, lz = 20, Hl = 4, Ll = 32, bl = 0.1 / G, sl0 = Float64Array.from({ length: ln * lz }, (_, q) => (q % ln < ln / 2 ? 1 : 0)), Ub = 0.5 * Math.sqrt(0.1 * Hl);
+      for (const model of ['nonhydro', 'hydro']) {
+        const r = await verticalSlice({ nx: ln, nz: lz, dx: Ll / ln, dz: Hl / lz, s0: sl0, beta: bl, tEnd: 26, model, turb: 'const', nu: 1e-4, nuH: 1e-4, front: { row: 0, i0: 0, dir: 1, level: 0.5 } });
+        add(`Vertical slice (${model === 'hydro' ? 'hydrostatic' : 'non-hydrostatic'}): lock-exchange front speed`, Ub, frontSpeed(r.hist, 0.3, 1), 0.12 * Ub, 'Benjamin (1968): u_f = ½√(g′H) for a full-depth lock exchange, within 12 %');
+        if (model === 'nonhydro') { add('Vertical slice: salt conservation', 0, r.salt / r.salt0 - 1, 1e-10, 'Relative change of the total density excess'); add('Vertical slice: projected velocity is divergence-free', 0, r.divMax / (Ub / (Hl / lz)), 1e-4, 'max |∇·u| ÷ (u_f/Δz) after the pressure projection'); }
+      }
+      const kd = await verticalSlice({ nx: 6, nz: 6, dx: 1, dz: 1, s0: new Float64Array(36), tEnd: 50, turb: 'ke', k0: 1e-3, eps0: 1e-4, dtMax: 0.25, nuMax: 1e-9 });
+      add('k–ε closure: decay of homogeneous turbulence', 1e-3 * (1 + (0.92 * 1e-4 * 50) / 1e-3) ** (-1 / 0.92), kd.k[14], 0.02 * 1e-3, 'k(t) = k₀[1 + (c₂ − 1) ε₀ t / k₀]^(−1/(c₂−1)) with c₂ = 1.92');
+      add('Pacanowski–Philander mixing at Ri = 0.2', 1e-2 / 4 + 1e-4, ppMixing(0.2).nu, 1e-12, 'ν = ν₀/(1 + 5Ri)² + ν_b');
+    }
+    // ---- atmospheric heat exchange, ecology, three-dimensional reconstruction, seasons
+    {
+      add('Heat budget: back radiation of the sea surface at 20 °C', 0.97 * 5.670374e-8 * 293.15 ** 4, surfaceHeatFlux({ Tw: 20, Ta: 20 }).lwUp, 1e-9, 'Grey-body emission εσT⁴ (W/m²)');
+      const hx = heatExchange({ Tw: 22, Ta: 24, rh: 65, W: 5, cloud: 0.3, solar: 220 });
+      add('Heat budget: zero net flux at the equilibrium temperature', 0, surfaceHeatFlux({ Tw: hx.Te, Ta: 24, rh: 65, W: 5, cloud: 0.3, solar: 220 }).net, 1e-6, `Equilibrium temperature ${fmt(hx.Te, 4)} °C, exchange coefficient ${fmt(hx.K, 3)} W/m²·K`);
+      const gh = flatGrid(12, 12, 50, 10, false), lamH = hx.K / (1025 * 4000 * 10), rh = await farField({ g: gh, flow: flowBasis(gh, true), cur: still, K: new Float64Array(144), tEnd: 86400, closed: true, extra: { rate: 0, decay: new Float64Array(144).fill(lamH), C0: new Float64Array(144).fill(1) }, expThr: [0.5, 2], C0: new Float64Array(144).fill(1) });
+      add('Far-field temperature: surface-exchange decay', Math.exp(-lamH * 86400), rh.E[70], 2e-4, 'ΔT(t) = ΔT₀ exp(−K t / ρ c_p h) for a uniform excess in still water');
+      add('Far-field heat balance closes', 1, (rh.bal.massE + rh.bal.lostE) / (144 * 2500 * 10), 1e-9, 'Stored + released to the atmosphere ÷ initial excess heat');
+      add('Exposure-duration statistics', 1, rh.expo[0][70] - rh.expo[1][70], 1e-12, 'A uniform excess of 1 g/kg is above 0.5 g/kg all the time and never above 2 g/kg');
+      add('Dose–response passes through EC10 and EC50', 0.6, doseResponse(1, 1, 3) + doseResponse(3, 1, 3), 1e-9, 'Log-logistic curve: 10 % effect at EC10 and 50 % at EC50');
+      let pi3 = 0; for (let k = 0; k < 400; k++) pi3 += (layerProfile(1, 12, 0.2, ((k + 0.5) * 12) / 400) * 12) / 400;
+      add('3-D reconstruction conserves the layer content', 0.2 * 12, pi3, 1e-3, 'Depth integral of the half-Gaussian profile equals φ·H·C');
+      const dv = Object.fromEntries(suite.inputs.flatMap((q) => q.fields).map((q) => [q.key, q.type === 'table' ? JSON.parse(JSON.stringify(q.value)) : q.value])), sm = { ...dv, design: 'manual', nx: 24, ny: 16, nCycles: 1, seasonal: true, seasons: [{ name: 'Same as base', Ta: dv.Ta, Sa: dv.Sa, dT: dv.dT, uRes: dv.uRes, windSpeed: dv.windSpeed, waveHeight: dv.waveHeight }, { name: 'Cold', Ta: 12, Sa: dv.Sa, dT: 0, uRes: dv.uRes, windSpeed: dv.windSpeed, waveHeight: dv.waveHeight }] };
+      const rs = await suite.run(sm), ts = rs.tables.find((t) => t.title === 'Seasonal simulation');
+      add('Seasonal simulation: a season equal to the base case reproduces it', rs.outputs.nearFieldDilution, ts.rows[0][11], 1e-9 * rs.outputs.nearFieldDilution, 'Near-field dilution of the sweep row against the main run');
+      add('Seasonal simulation: colder (denser) ambient lowers the density contrast', 1, ts.rows[1][8] > ts.rows[0][8] ? 1 : 0, 0, `Densimetric Froude number ${fmt(ts.rows[0][8], 4)} → ${fmt(ts.rows[1][8], 4)} at 12 °C`);
+    }
     return C;
   },
 };
@@ -796,6 +1639,8 @@ const HELP = {
   hLayer: 'Leave at 0 to use the density-current thickness computed 150 m beyond the near field.', disp: 'Elder scales with friction velocity and layer thickness; Okubo grows with distance from the outfall.', nPart: 'More particles give a smoother envelope.',
   vMin: 'Below about 4 m/s mixing weakens and ports foul.', vMax: 'Above about 6 m/s head loss and fish-entrainment risk rise.', Fmin: 'F = U/√(g′d); 20 or more keeps the jets fully turbulent and well mixed.', clear: 'Keeps the plume submerged and invisible at low tide.',
   nx: 'Aim for cells no larger than half the mixing-zone radius.', ny: 'Use a similar cell size in both directions.', Lx: 'Should contain the tidal excursion (current amplitude × 12.42 h ÷ π) on both sides of the outfall.', Ly: 'Should reach from the shoreline to well offshore of the plume.',
+  vsTurb: 'k–ε solves transport equations for the turbulent kinetic energy and its dissipation; the Richardson-number closure is algebraic.', vsTime: 'Long enough for the front to travel a few hundred metres (about 0.05–0.15 m/s).', vsNx: 'Cell length = section length ÷ cells.', vsNz: 'Cell height = largest depth on the section ÷ cells; the layer should span at least three cells.',
+  airTemp: 'Air temperature at 2–10 m height.', humidity: 'Relative humidity of the air.', cloud: '0 = clear sky, 1 = overcast; raises the atmospheric long-wave radiation.',
   fx: '50 % centres the outfall east–west.', fy: 'Leave room offshore: dense plumes drift down-slope.',
 };
 for (const f of suite.inputs.flatMap((g) => g.fields)) if (!f.help && HELP[f.key]) f.help = HELP[f.key];
