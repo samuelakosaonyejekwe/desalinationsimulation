@@ -97,7 +97,6 @@ function drawLine(canvas, spec) {
   }
   for (const q of spec.vlines || []) {
     ctx.strokeStyle = q.color || '#ef4444'; ctx.setLineDash([6, 4]); ctx.beginPath(); ctx.moveTo(X(q.x), m.t); ctx.lineTo(X(q.x), h - m.b); ctx.stroke(); ctx.setLineDash([]);
-    if (q.label) { ctx.fillStyle = q.color || '#ef4444'; ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.fillText(q.label, X(q.x) + 4, m.t + 3); }
   }
   series.forEach((s, i) => {
     const col = s.color || PALETTE[i % PALETTE.length], mode = s.mode || 'line';
@@ -122,6 +121,12 @@ function drawLine(canvas, spec) {
       }
     }
   });
+  for (const q of spec.vlines || []) { // labels last, written upwards along the line from the axis on a backing, clear of the legend and legible over the curves
+    if (!q.label) continue;
+    ctx.save(); ctx.textAlign = 'left'; ctx.textBaseline = 'top'; ctx.translate(X(q.x) + 3, h - m.b - 5); ctx.rotate(-Math.PI / 2);
+    ctx.globalAlpha = 0.8; ctx.fillStyle = C.bg || '#fff'; ctx.fillRect(-2, -1, ctx.measureText(q.label).width + 4, 14); ctx.globalAlpha = 1;
+    ctx.fillStyle = q.color || '#ef4444'; ctx.fillText(q.label, 0, 0); ctx.restore();
+  }
   ctx.restore();
   legend(C, series.map((s, i) => ({ name: s.name, color: s.color || PALETTE[i % PALETTE.length] })), m);
   canvas._hover = (px, py) => {

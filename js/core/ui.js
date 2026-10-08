@@ -75,7 +75,8 @@ export function tabs(defs, initial, onChange) {
 
 // ---- field editors ---------------------------------------------------------------------------------
 function numberField(f, value, set) {
-  const input = h('input', { type: 'number', id: 'f_' + f.key, value: value ?? '', step: f.step ?? 'any', min: f.min ?? null, max: f.max ?? null, inputmode: 'decimal' });
+  // shown to seven significant figures (linked values arrive with full machine precision); the stored value is untouched until the user edits it
+  const input = h('input', { type: 'number', id: 'f_' + f.key, value: typeof value === 'number' && Number.isFinite(value) ? +value.toPrecision(7) : value ?? '', step: f.step ?? 'any', min: f.min ?? null, max: f.max ?? null, inputmode: 'decimal' });
   const msg = h('span', { class: 'field-msg' });
   const check = () => {
     const v = input.value === '' ? NaN : +input.value;
@@ -148,12 +149,14 @@ function tableField(f, value, set) {
   const wrap = h('div', { class: 'tbl-scroll edit', tabindex: '0' });
   const count = h('span', { class: 'note' });
   const commit = () => { set(rows.map((r) => ({ ...r }))); count.textContent = `${rows.length} row${rows.length === 1 ? '' : 's'}`; };
+  // a column is a text column when it says so or when the rows hold words in it (names of fittings, streams, units)
+  const isText = (c) => c.type === 'text' || (c.type === undefined && rows.some((r) => typeof r[c.key] === 'string' && r[c.key] !== '' && !Number.isFinite(+r[c.key])));
   const build = () => {
-    const shown = rows.slice(0, 250);
+    const shown = rows.slice(0, 250), text = Object.fromEntries(f.columns.map((c) => [c.key, isText(c)]));
     const body = h('tbody', null, shown.map((r, i) => h('tr', null,
       f.columns.map((c) => {
-        const inp = h('input', { type: c.type === 'text' ? 'text' : 'number', step: 'any', value: r[c.key] ?? '', 'aria-label': `${c.label} row ${i + 1}` });
-        inp.addEventListener('input', () => { r[c.key] = c.type === 'text' ? inp.value.slice(0, 200) : inp.value === '' ? null : +inp.value; commit(); });
+        const inp = h('input', text[c.key] ? { type: 'text', value: r[c.key] ?? '', 'aria-label': `${c.label} row ${i + 1}` } : { type: 'number', step: 'any', value: r[c.key] ?? '', 'aria-label': `${c.label} row ${i + 1}` });
+        inp.addEventListener('input', () => { r[c.key] = text[c.key] ? inp.value.slice(0, 200) : inp.value === '' ? null : +inp.value; commit(); });
         return h('td', null, inp);
       }),
       h('td', null, h('button', { type: 'button', class: 'mini ghost', title: 'Delete row', 'aria-label': 'Delete row', onclick: () => { rows.splice(i, 1); build(); commit(); } }, '✕')))));
@@ -162,7 +165,7 @@ function tableField(f, value, set) {
     count.textContent = `${rows.length} row${rows.length === 1 ? '' : 's'}`;
   };
   const tools = h('div', { class: 'row-tools' },
-    btn('+ Row', () => { rows.push(Object.fromEntries(f.columns.map((c) => [c.key, c.type === 'text' ? '' : 0]))); build(); commit(); }, 'mini'),
+    btn('+ Row', () => { rows.push(Object.fromEntries(f.columns.map((c) => [c.key, isText(c) ? '' : 0]))); build(); commit(); }, 'mini'),
     importBtn('Import CSV / Excel', async (file) => {
       const t = await readTable(file), norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
       const map = f.columns.map((c, i) => t.headers.find((hd) => norm(hd) === norm(c.key) || norm(hd) === norm(c.label)) ?? t.headers[i]);
