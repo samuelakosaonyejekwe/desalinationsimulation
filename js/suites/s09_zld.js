@@ -5,11 +5,36 @@
 // The evaporation path is followed stepwise with Pitzer-based mineral equilibria (suite 2 engine), so the
 // order, onset and mass of every salt are predicted; the crystallizer is an MSMPR population balance
 // solved by the method of moments and by a finite-volume discretisation of the size coordinate.
-import { brent, clamp, linspace, sum, rng, fmt, rk45, interp1 } from '../core/num.js';
+import { brent, clamp, linspace, sum, rng, rk45, interp1, gci } from '../core/num.js';
 import { psat, tsat, latentHeat, cp, viscosity, R, KELVIN } from '../core/props.js';
 import { IONS, ION_IDS, WATERS, scaleIons } from '../core/water.js';
 import { MINERALS, EVAPORITE_MINERALS, REAGENTS, ACTIVITY_MODELS, makeSolution, equilibrate, precipitateSolution, doseSolution, solutionToIons, saturationIndex, componentIndex } from './s02_chem.js';
+import { solveChannel, buildMask, pcg5, yGrid } from './s04_cfd.js';
 
+/** Number formatting of the shared toolbox (fmt of num.js: significant digits, thousands separators), without the locale machinery. */
+function fmt(x, sig = 4) {
+  if (x === null || x === undefined || x === '') return '–';
+  if (typeof x !== 'number') return String(x);
+  if (!Number.isFinite(x)) return Number.isNaN(x) ? '–' : x > 0 ? '∞' : '−∞';
+  if (x === 0) return '0';
+  const ax = Math.abs(x);
+  if (ax >= 1e7 || ax < 1e-4) return x.toExponential(Math.max(1, sig - 1)).replace('e+', 'e');
+  const digits = Math.min(8, Math.max(0, sig - 1 - Math.floor(Math.log10(ax))));
+  // round half up on the shortest decimal representation, as the locale formatter does
+  let t = String(ax);
+  const d0 = t.indexOf('.');
+  if (d0 >= 0 && t.length - d0 - 1 > digits) {
+    let k = Number(t.slice(0, d0) + t.slice(d0 + 1, d0 + 1 + digits));
+    if (t.charCodeAt(d0 + 1 + digits) >= 53) k += 1;
+    t = String(k);
+    if (digits > 0) { t = t.padStart(digits + 1, '0'); t = t.slice(0, t.length - digits) + '.' + t.slice(t.length - digits); }
+  }
+  if (t.indexOf('.') >= 0) t = t.replace(/\.?0+$/, '');
+  const dot = t.indexOf('.'), ip = dot < 0 ? t : t.slice(0, dot), fp = dot < 0 ? '' : t.slice(dot);
+  const grouped = ip.length > 3 ? ip.replace(/\B(?=(\d{3})+(?!\d))/g, ',') : ip, body = grouped + fp;
+  return x < 0 ? '-' + body : body;
+}
+const tcfM = (T) => tcf(T, T >= 25 ? 2640 : 3020);
 const MW_W = 0.0180153, RHO_W = 997, KB = 1.380649e-23, NA = 6.02214076e23, LN10 = Math.LN10;
 const iOf = Object.fromEntries(['Na', 'K', 'Ca', 'Mg', 'Cl', 'SO4', 'C'].map((k) => [k, componentIndex(k)]));
 const TRACK = ['calcite', 'gypsum', 'anhydrite', 'halite', 'glauberite', 'epsomite', 'sylvite', 'carnallite', 'bischofite'];
@@ -314,6 +339,188 @@ export function zoneCrystallizer(K, tau, MT, seed, o = {}) {
     wallRate: kw * (phi[0] * st[0].mt + phi[1] * st[1].mt), balance: { in: m0 + acc.made, out: mEnd + acc.product + acc.dissolvedOut + acc.wall + acc.top }, acc };
 }
 
+// ---- crystallizer flow field coupled to the population balance (finite volumes on the flow grid) ------------
+/** Banded LU factorisation without pivoting (diagonally dominant M-matrix). a is n rows of 2·bw + 1 entries, diagonal at column bw. */
+function bandLU(a, n, bw) {
+  const w = 2 * bw + 1;
+  for (let k = 0; k < n; k++) {
+    const rk = k * w + bw - k, pk = a[rk + k], iMax = Math.min(n - 1, k + bw), tiny = 1e-25 * Math.abs(pk);
+    let cMax = k; // last non-zero entry of the pivot row
+    for (let c = iMax; c > k; c--) if (a[rk + c] !== 0) { cMax = c; break; }
+    for (let i = k + 1; i <= iMax; i++) {
+      const ri = i * w + bw - i;
+      let l = a[ri + k];
+      if (l === 0) continue;
+      if (Math.abs(l) < tiny) { a[ri + k] = 0; continue; } // fill-in decays geometrically inside the band: dropped before it becomes subnormal
+      l /= pk; a[ri + k] = l;
+      for (let c = k + 1; c <= cMax; c++) a[ri + c] -= l * a[rk + c];
+    }
+  }
+  return a;
+}
+/** Solves L·U·x = b in place for a matrix factorised by bandLU. */
+function bandSolve(a, n, bw, b) {
+  const w = 2 * bw + 1;
+  for (let i = 1; i < n; i++) { const r = i * w + bw - i; let t = b[i]; for (let c = Math.max(0, i - bw); c < i; c++) { const l = a[r + c]; if (l !== 0) t -= l * b[c]; } b[i] = t; }
+  for (let i = n - 1; i >= 0; i--) { const r = i * w + bw - i, cMax = Math.min(n - 1, i + bw); let t = b[i]; for (let c = i + 1; c <= cMax; c++) { const u = a[r + c]; if (u !== 0) t -= u * b[c]; } b[i] = t / a[r + i]; }
+  return b;
+}
+/** Steady state of the ideal mixed crystallizer including the dissolved excess: ρ·kv·6·B·G³·τ⁴ = M_T − σ·c*. */
+export function msmprExact(K, tau, MT) {
+  const rk = K.rhoc * K.kv, f = (sg) => { const r = kinetics(K, sg, Math.max(MT - sg * K.cstar, 0)); return 6 * rk * r.B * r.G ** 3 * tau ** 4 + sg * K.cstar - MT; }, top = Math.min(3, (0.999999 * MT) / K.cstar);
+  const sigma = f(top) > 0 ? brent(f, 1e-12, top, 1e-15) : top, r = kinetics(K, sigma, Math.max(MT - sigma * K.cstar, 0)), Gt = r.G * tau;
+  return { sigma, G: r.G, B: r.B, mt: MT - sigma * K.cstar, m: [0, 1, 2, 3, 4, 5].map((k) => [1, 1, 2, 6, 24, 120][k] * r.B * tau * Gt ** k), L43: 4 * Gt, L32: 3 * Gt, L10: Gt, cv: 0.5 };
+}
+/**
+ * Steady two-dimensional flow in a vertical section of the crystallizer body from the finite-volume Navier–Stokes
+ * solver of suite 4: return nozzle of the circulation loop in the left wall below the free surface (symmetry plane),
+ * suction nozzle in the right wall near the bottom, an optional bottom baffle between them. Turbulence is a constant
+ * eddy viscosity ν_t = U_in·h_in / Re_t (free-shear value Re_t ≈ 35). The inlet velocity is set so that the fluid volume
+ * turns over in o.theta seconds. The face fluxes are then projected onto a discretely divergence-free field (one
+ * conjugate-gradient Poisson solve), which the scalar transport needs to stay bounded and conservative.
+ */
+export async function crystallizerFlow(o, ctx) {
+  const nx = clamp(Math.round(o.nx ?? 32), 8, 160), ny = clamp(Math.round(o.ny ?? 64), 8, 240), L = o.L, H = o.H, dx = L / nx, g = yGrid(H, ny, 1), dy = H / ny, n = nx * ny, nu1 = nx + 1;
+  const mk = buildMask({ type: 'baffle', L, H, nBaffle: 1, baffleH: clamp(o.baffleH ?? 0.55, 0, 0.9) }, nx, ny, g.yc), solid = mk.solid, [i0, i1] = o.inlet ?? [0.7, 0.86], [o0, o1] = o.outlet ?? [0.04, 0.2];
+  const open = (a, b) => { const js = []; for (let j = 0; j < ny; j++) { const y = g.yc[j] / H; if (y > a && y < b) js.push(j); } return js.length ? js : [clamp(Math.floor(0.5 * (a + b) * ny), 0, ny - 1)]; }, jIn = open(i0, i1), jOut = open(o0, o1);
+  for (let j = 0; j < ny; j++) { if (!jIn.includes(j)) solid[j * nx] = 1; if (!jOut.includes(j)) solid[j * nx + nx - 1] = 1; }
+  for (const j of jIn) solid[j * nx] = 0;
+  for (const j of jOut) solid[j * nx + nx - 1] = 0;
+  let nFluid = 0;
+  for (let P = 0; P < n; P++) if (!solid[P]) nFluid++;
+  const area = nFluid * dx * dy, hIn = jIn.length * dy, q = area / Math.max(o.theta, 1e-9), Uin = q / hIn, nuT = (Uin * hIn) / Math.max(o.ReT ?? 35, 1), rho = o.rho ?? 1200;
+  const r = await solveChannel({ L, H, nx, ny, solid, rho, mu: rho * nuT, Uin, inlet: 'uniform', scheme: 'hybrid', maxIter: Math.round(o.flowIter ?? 500), tol: o.flowTol ?? 1e-4, wallT: 'sym' }, ctx);
+  // face fluxes per unit depth (m²/s), zero on blocked faces
+  const Fx = new Float64Array(nu1 * ny), Fy = new Float64Array(nx * (ny + 1)), fl = (i, j) => i >= 0 && i < nx && j >= 0 && j < ny && !solid[j * nx + i];
+  for (let j = 0; j < ny; j++) for (let k = 0; k <= nx; k++) Fx[j * nu1 + k] = (k === 0 ? fl(0, j) : k === nx ? fl(nx - 1, j) : fl(k - 1, j) && fl(k, j)) ? r.u[j * nu1 + k] * dy : 0;
+  for (let jf = 1; jf < ny; jf++) for (let i = 0; i < nx; i++) Fy[jf * nx + i] = fl(i, jf - 1) && fl(i, jf) ? r.v[jf * nx + i] * dx : 0;
+  // projection: F' = F + a·(ψ_P − ψ_nb), ψ = 0 behind the outlet faces
+  const aE = new Float64Array(n), aN = new Float64Array(n), dg = new Float64Array(n), rhs = new Float64Array(n), psi = new Float64Array(n), ax = dy / dx, ay = dx / dy;
+  const div = () => { let m = 0; for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) { const P = j * nx + i; if (solid[P]) continue; const d = Fx[j * nu1 + i + 1] - Fx[j * nu1 + i] + Fy[P + nx] - Fy[P]; rhs[P] = -d; if (Math.abs(d) > m) m = Math.abs(d); } return m / q; };
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const P = j * nx + i;
+    if (solid[P]) continue;
+    if (fl(i + 1, j)) { aE[P] = ax; dg[P] += ax; dg[P + 1] += ax; }
+    if (fl(i, j + 1)) { aN[P] = ay; dg[P] += ay; dg[P + nx] += ay; }
+    if (i === nx - 1) dg[P] += 2 * ax;
+  }
+  const divRaw = div();
+  pcg5(nx, ny, aE, aN, dg, rhs, psi, 1e-13, 4000);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const P = j * nx + i;
+    if (solid[P]) continue;
+    if (aE[P]) Fx[j * nu1 + i + 1] += ax * (psi[P] - psi[P + 1]);
+    if (aN[P]) Fy[P + nx] += ay * (psi[P] - psi[P + nx]);
+    if (i === nx - 1) Fx[j * nu1 + nx] += 2 * ax * psi[P];
+  }
+  return { nx, ny, L, H, dx, dy, yc: Array.from(g.yc), solid, Fx, Fy, q, area, theta: area / q, Uin, hIn, nuT, D: nuT / (o.sct ?? 0.85), shapes: mk.shapes, iters: r.iters, converged: r.converged, massRes: r.hist.mass[r.hist.mass.length - 1], divRaw, div: div(), reEff: (Uin * H) / nuT };
+}
+/**
+ * Supersaturation and the moments m0…m5 of the crystal population transported on a given flow field:
+ *   ∇·(u φ) − ∇·(D_t ∇φ) = S,  S(m0) = B(σ, M_T),  S(m_k) = k·G(σ)·m_(k−1),  S(x) = −3·ρc·kv·G(σ)·m2,
+ * with x = σ·c* the dissolved excess (kg/m³), kinetics from the suite (kinetics()), first-order upwind fluxes with an
+ * optional van Leer (TVD) deferred correction, and a banded direct solve of every scalar. The circulation loop closes
+ * the domain: the inlet carries the flux-averaged outlet composition less the product draw-off (fraction ε = θ/τ per
+ * pass, replaced by saturated crystal-free feed) plus the salt set free by the flash, Δx = M_T·θ/τ. For fixed
+ * supersaturation every equation is linear, so the recycle is eliminated exactly by superposition; the supersaturation
+ * is iterated with full updates of its shape and a damped update of its level (the ideal-crystallizer feedback).
+ * o.plug = { x0, m: [..] } instead solves a once-through passage with prescribed inlet values (no recycle).
+ */
+export function pbeOnFlow(K, f, o = {}) {
+  const { nx, ny, dx, dy, solid, Fx, Fy } = f, n = nx * ny, nu1 = nx + 1, bw = nx, w = 2 * bw + 1, rk = K.rhoc * K.kv, cs = K.cstar, V = dx * dy, D = (f.D ?? 0) * (o.Dmult ?? 1), tvd = (o.scheme ?? 'tvd') === 'tvd', nuc = o.nuc !== false, plug = o.plug || null;
+  const tau = o.tau, MT = o.MT, eps = plug ? 1 : clamp(f.theta / tau, 1e-9, 1), q = f.q, fluid = (P) => !solid[P];
+  // transport matrix (upwind + diffusion), fixed for all scalars
+  const A = new Float64Array(n * w), bIn = new Float64Array(n), cx = D * (dy / dx), cy = D * (dx / dy);
+  let qOut = 0;
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    const P = j * nx + i, r = P * w + bw - P;
+    if (solid[P]) { A[r + P] = 1; continue; }
+    let d = 0;
+    const nb = (Q, F, c) => { A[r + Q] -= Math.max(-F, 0) + c; d += Math.max(F, 0) + c; }; // F = flux leaving P through the face
+    if (i > 0 && fluid(P - 1)) nb(P - 1, -Fx[j * nu1 + i], cx); else if (i === 0) bIn[P] = Math.max(Fx[j * nu1], 0);
+    if (i < nx - 1 && fluid(P + 1)) nb(P + 1, Fx[j * nu1 + i + 1], cx); else if (i === nx - 1) { d += Fx[j * nu1 + nx]; qOut += Fx[j * nu1 + nx]; }
+    if (j > 0 && fluid(P - nx)) nb(P - nx, -Fy[P], cy);
+    if (j < ny - 1 && fluid(P + nx)) nb(P + nx, Fy[P + nx], cy);
+    A[r + P] = d > 1e-300 ? d : 1e-300;
+  }
+  const LU = bandLU(A.slice(), n, bw), outAvg = (phi) => { let t = 0; for (let j = 0; j < ny; j++) t += Fx[j * nu1 + nx] * phi[j * nx + nx - 1]; return t / qOut; };
+  // van Leer correction of the convective face values, added to the right-hand side (deferred correction)
+  const defer = (phi, b) => {
+    if (!tvd) return;
+    const face = (F, C, Dn, U) => { if (solid[C] || solid[Dn] || solid[U]) return; const dm = phi[C] - phi[U], dp = phi[Dn] - phi[C], pr = dm * dp; if (pr > 0) { const c = (F * pr) / (dm + dp); b[C] -= c; b[Dn] += c; } };
+    for (let j = 0; j < ny; j++) for (let k = 1; k < nx; k++) { const F = Fx[j * nu1 + k], E = j * nx + k; if (F > 0) { if (k >= 2) face(F, E - 1, E, E - 2); } else if (F < 0 && k + 1 < nx) face(-F, E, E - 1, E + 1); }
+    for (let jf = 1; jf < ny; jf++) for (let i = 0; i < nx; i++) { const F = Fy[jf * nx + i], N = jf * nx + i; if (F > 0) { if (jf >= 2) face(F, N - nx, N, N - 2 * nx); } else if (F < 0 && jf + 1 < ny) face(-F, N, N - nx, N + nx); }
+  };
+  // start from the ideal mixed crystallizer
+  const id = msmprExact(K, tau, MT), x = new Float64Array(n), m = [0, 1, 2, 3, 4, 5].map(() => new Float64Array(n)), c2 = new Float64Array(n), G = new Float64Array(n), B = new Float64Array(n), b = new Float64Array(n), xb = new Float64Array(n), M = new Float64Array(n * w), mIn = new Array(6).fill(0);
+  let nf = 0;
+  for (let P = 0; P < n; P++) if (!solid[P]) { nf++; x[P] = plug ? plug.x0 : Math.max(id.sigma * cs, 1e-12 * MT); for (let k = 0; k < 6; k++) m[k][P] = plug ? plug.m[k] : id.m[k]; c2[P] = m[2][P]; }
+  const maxIter = Math.round(o.maxIter ?? 60), tol = o.tol ?? 1e-10, gN = K.g, inner = gN === 1 ? 1 : 4, m3b = new Float64Array(n), kapF = new Float64Array(n), slope0 = -(K.b + 3 * K.g) / K.g;
+  let err = Infinity, it = 0, xIn = plug ? plug.x0 : 0, aPrev = null, rPrev = 0, slope = slope0, nLU = 0, mean2 = id.m[2], lev = Math.log(Math.max(id.m[2], 1e-300));
+  for (it = 1; it <= maxIter; it++) {
+    // 1 — dissolved excess for the crystal surface c2: sink 3·ρc·kv·G·c2 written as κ·x (exact for first-order growth)
+    for (let q = 0; q < inner; q++) {
+      // once the level has settled the factorisation is kept and the small change of the sink coefficient is carried on
+      // the right-hand side (the fixed point is unchanged); first-order growth only
+      const keep = gN === 1 && nLU > 0 && err < 2e-3 && o.reuseLU !== false;
+      if (!keep) M.set(A);
+      b.fill(0);
+      for (let P = 0; P < n; P++) { // Newton linearisation of the sink for growth orders above one: S = −κ'·x + (g − 1)·S₀
+        if (solid[P]) continue;
+        const sg = x[P] / cs, up = sg > 1e-300 ? V * 3 * rk * c2[P] * kinetics(K, sg, 0).G : 0, nl = gN > 1 && sg < 3 ? gN : 1, kap = (nl * up) / x[P];
+        if (keep) b[P] = (kapF[P] - kap) * x[P]; else { kapF[P] = kap; M[P * w + bw] += kap; b[P] = (nl - 1) * up; }
+      }
+      if (!keep) { bandLU(M, n, bw); nLU++; }
+      defer(x, b); bandSolve(M, n, bw, b);
+      xb.set(bIn); bandSolve(M, n, bw, xb);
+      xIn = plug ? plug.x0 : ((1 - eps) * outAvg(b) + MT * eps) / Math.max(1 - (1 - eps) * outAvg(xb), 1e-300);
+      for (let P = 0; P < n; P++) if (!solid[P]) x[P] = Math.max(b[P] + xIn * xb[P], 1e-14 * MT);
+    }
+    // 2 — crystal mass from the salt balance (salt made = crystals + dissolved excess leaving), nucleation and growth,
+    //     then the moments in sequence (linear for a given supersaturation; the recycle is eliminated by superposition)
+    const m3o = outAvg(m[3]), scale3 = plug || !(m3o > 0) ? 1 : Math.max(MT - outAvg(x), 1e-12 * MT) / (rk * m3o);
+    for (let P = 0; P < n; P++) { if (solid[P]) continue; m3b[P] = m[3][P] * scale3; const r = kinetics(K, x[P] / cs, rk * m3b[P]); G[P] = r.G; B[P] = nuc ? r.B : 0; }
+    for (let k = 0; k < 6; k++) {
+      const mk = m[k], lo = k > 0 ? m[k - 1] : null;
+      for (let P = 0; P < n; P++) b[P] = solid[P] ? 0 : V * (k === 0 ? B[P] : k * G[P] * lo[P]) + (plug ? bIn[P] * plug.m[k] : 0);
+      defer(mk, b);
+      bandSolve(LU, n, bw, b);
+      mIn[k] = plug ? plug.m[k] : ((1 - eps) * outAvg(b)) / eps;
+      for (let P = 0; P < n; P++) mk[P] = solid[P] ? 0 : Math.max(b[P] + (plug ? 0 : mIn[k]), 1e-300);
+    }
+    // 3 — the crystal surface must reproduce itself: secant iteration on its level (the feedback loop of the mixed
+    //     crystallizer), its shape is taken over from the moment solution
+    let r = 0;
+    err = 0; mean2 = 0;
+    for (let P = 0; P < n; P++) { if (solid[P]) continue; const l = Math.log(m[2][P] / c2[P]); r += l; mean2 += m[2][P]; if (Math.abs(l) > err) err = Math.abs(l); }
+    r /= nf; mean2 /= nf;
+    if (!plug) err = Math.max(err, Math.abs(Math.log(scale3)));
+    if (err < tol) break;
+    if (plug) { c2.set(m[2]); continue; }
+    if (aPrev != null && Math.abs(lev - aPrev) > 1e-13) { const sl = (r - rPrev) / (lev - aPrev); if (sl < -0.2 && Number.isFinite(sl)) slope = sl; }
+    aPrev = lev; rPrev = r;
+    lev += clamp(-r / slope, -0.7, 0.7);
+    const f2 = Math.exp(lev) / mean2;
+    for (let P = 0; P < n; P++) if (!solid[P]) c2[P] = m[2][P] * f2;
+  }
+  // statistics
+  const mo = m.map(outAvg), xo = outAvg(x), stat = (mm) => ({ L10: mm[0] > 0 ? mm[1] / mm[0] : 0, L32: mm[2] > 0 ? mm[3] / mm[2] : 0, L43: mm[3] > 0 ? mm[4] / mm[3] : 0, cv: mm[4] > 0 ? Math.sqrt(Math.max(0, (mm[5] * mm[3]) / (mm[4] * mm[4]) - 1)) : 0, mt: rk * mm[3] });
+  let sAvg = 0, sMax = 0, bAvg = 0, gAvg = 0, bTop = 0, vTop = 0;
+  for (let P = 0; P < n; P++) { if (solid[P]) continue; const sg = x[P] / cs; sAvg += sg; if (sg > sMax) sMax = sg; bAvg += B[P]; gAvg += G[P]; }
+  sAvg /= Math.max(nf, 1); bAvg /= Math.max(nf, 1); gAvg /= Math.max(nf, 1);
+  for (let P = 0; P < n; P++) if (!solid[P] && x[P] / cs > 1.5 * sAvg) { bTop += B[P]; vTop++; }
+  const out = { sigma: xo / cs, x: xo, m: mo, ...stat(mo) }, inl = { sigma: xIn / cs, x: xIn, m: mIn.slice() };
+  const made = plug ? q * (plug.x0 + rk * plug.m[3]) : q * eps * MT, left = plug ? q * (xo + rk * mo[3]) : q * eps * (xo + rk * mo[3]);
+  return { nx, ny, x, m, G, B, out, inlet: inl, ideal: id, eps, iters: Math.min(it, maxIter), converged: err < Math.max(tol, 1e-8), err, nLU, sigmaAvg: sAvg, sigmaMax: sMax, Bavg: bAvg, Gavg: gAvg, Bideal: id.B, hotVolume: vTop / Math.max(nf, 1), hotNucleation: bAvg > 0 ? bTop / (bAvg * nf) : 0,
+    balance: { in: made, out: left }, pass: { in: q * (xIn + rk * mIn[3]), out: q * (xo + rk * mo[3]) }, stat };
+}
+/** Flow field and population balance of the crystallizer section in one call (see crystallizerFlow and pbeOnFlow). */
+export async function crystallizerCFD(K, o, ctx) {
+  const flow = o.flow || (await crystallizerFlow(o, ctx));
+  if (ctx?.tick) await ctx.tick();
+  return { flow, pbe: pbeOnFlow(K, flow, o) };
+}
+
 // ---- membrane distillation and electrodialysis as concentration steps ---------------------------------------
 /**
  * Direct-contact membrane distillation over a sequence of liquor states. Flux J = B·(aw·psat(T_fm) − psat(T_pm)) with
@@ -455,6 +662,39 @@ export function zldEconomics(v, r, day) {
   const opexY = sum(opex.map((q) => q[1])), annual = f * capex + opexY, brineY = v.Q * 24 * daysY, waterY = r.recovered * 24 * daysY;
   return { items, direct, capex, crf: f, opex, opexY, annual, capexY: f * capex, perBrine: annual / Math.max(brineY, 1e-9), perWater: waterY > 0 ? annual / waterY : 0, brineY, waterY };
 }
+
+/** Results of the crystallizer flow study for run(): fields, comparison with the two-zone and the ideal model, balances. */
+async function crystallizerFlowStudy(v, r, ph, ctx) {
+  const c = r.csd, um = 1e6, o = { nx: v.cfdNx ?? 32, ny: v.cfdNy ?? 64, L: ph.Dv, H: 2 * ph.Dv, theta: ph.theta, tau: c.tau, MT: c.MT, baffleH: (v.cfdBaffle ?? 55) / 100, ReT: v.cfdReT ?? 35, rho: ph.rhoSl, scheme: v.cfdScheme ?? 'tvd' };
+  ctx?.progress?.(0.9, 'Crystallizer flow field…');
+  const sub = ctx ? { progress: (f, msg) => ctx.progress?.(0.9 + 0.07 * f, msg), tick: ctx.tick } : undefined, f = await crystallizerFlow(o, sub);
+  ctx?.progress?.(0.97, 'Supersaturation and crystal moments on the flow field…');
+  if (ctx?.tick) await ctx.tick();
+  const p = pbeOnFlow(c.K, f, o), { nx, ny } = f, cs = c.K.cstar, id = p.ideal, z = ph.zone && ph.zone.ok ? ph.zone : null, zs = z ? z.product : null;
+  const xs = Array.from({ length: nx }, (_, i) => (i + 0.5) * f.dx), ys = f.yc, grid = (fn) => ys.map((_, j) => xs.map((_, i) => { const P = j * nx + i; return f.solid[P] ? 0 : fn(P, i, j); })), mask = ys.map((_, j) => xs.map((_, i) => !!f.solid[j * nx + i]));
+  const uc = grid((P, i, j) => (0.5 * (f.Fx[j * (nx + 1) + i] + f.Fx[j * (nx + 1) + i + 1])) / f.dy), vc = grid((P) => (0.5 * (f.Fy[P] + f.Fy[P + nx])) / f.dx), base = { type: 'field', xlabel: 'Width (m)', ylabel: 'Height above the bottom (m)', x: xs, y: ys, mask, equal: true, shapes: f.shapes };
+  const zRel = zs && z.reference.L43 > 0 ? zs.L43 / z.reference.L43 : 1, errBal = (p.balance.in - p.balance.out) / p.balance.in, dL = p.out.L43 / id.L43 - 1, ratio = p.out.sigma > 0 ? p.sigmaMax / p.out.sigma : 1, W = [];
+  const PL = [
+    { ...base, title: 'Crystallizer body: velocity and streamlines', zlabel: 'Speed', zunit: 'm/s', z: uc.map((row, j) => row.map((u, i) => Math.hypot(u, vc[j][i]))), u: uc, v: vc, stream: true, cmap: 'viridis', zmin: 0, note: `Return nozzle of the circulation loop top left (${fq(f.Uin, 3)} m/s), suction bottom right, free surface on top. ${nx} × ${ny} cells; constant eddy viscosity ${fq(f.nuT, 3)} m²/s.` },
+    { ...base, title: 'Crystallizer body: relative supersaturation', zlabel: 'σ', zunit: '× 10⁻³', z: grid((P) => (1000 * p.x[P]) / cs), cmap: 'turbo', contours: 8, zmin: 0, note: `The flashed liquor enters at σ = ${fq(p.inlet.sigma, 3)} and is desupersaturated by growth on the circulating crystals; the ideal mixed crystallizer has σ = ${fq(id.sigma, 3)} everywhere.` },
+    { ...base, title: 'Crystallizer body: nucleation rate relative to the ideal mixed crystallizer', zlabel: 'B / B_ideal', zunit: '–', z: grid((P) => p.B[P] / Math.max(id.B, 1e-300)), cmap: 'thermal', contours: 8, zmin: 0, note: `${fq(100 * p.hotNucleation, 3)} % of all nuclei form in the ${fq(100 * p.hotVolume, 3)} % of the volume where σ exceeds 1.5 times its mean.` },
+    { ...base, title: 'Crystallizer body: local mass-mean crystal size L₄₃', zlabel: 'L₄₃', zunit: 'µm', z: grid((P) => (p.m[3][P] > 0 ? (um * p.m[4][P]) / p.m[3][P] : 0)), cmap: 'viridis', contours: 6, note: `The slurry passes the body about ${fq(1 / p.eps, 3)} times before it is drawn off, so the crystal population is almost uniform while the supersaturation is not.` },
+    { type: 'bar', title: 'Product mass-mean size: ideal, two-zone and flow-field model', ylabel: 'L₄₃ (µm)', categories: ['Ideal mixed (MSMPR)', ...(zs ? ['Two-zone model'] : []), 'Flow field'], series: [{ name: 'L₄₃ (µm)', values: [id.L43 * um, ...(zs ? [zRel * id.L43 * um] : []), p.out.L43 * um] }] },
+  ];
+  const zv = (x) => (zs ? x : null), TB = [{ title: 'Crystallizer flow field coupled to the population balance', columns: ['Quantity', 'Flow-field model', 'Two-zone model', 'Ideal mixed (MSMPR)', 'Unit'], rows: [
+    ['Mass-mean size L₄₃ of the product', p.out.L43 * um, zv(zRel * id.L43 * um), id.L43 * um, 'µm'], ['L₄₃ relative to the ideal mixed crystallizer', p.out.L43 / id.L43, zv(zRel), 1, '–'], ['Sauter mean size L₃₂', p.out.L32 * um, null, id.L32 * um, 'µm'], ['Coefficient of variation (mass basis)', p.out.cv, zv(zs?.cv), id.cv, '–'],
+    ['Supersaturation at the product draw-off', p.out.sigma * 1000, zv(z?.sigma[1] * 1000), id.sigma * 1000, '× 10⁻³'], ['Highest supersaturation (return nozzle / boiling zone)', p.sigmaMax * 1000, zv(z?.sigma[0] * 1000), id.sigma * 1000, '× 10⁻³'], ['Ratio highest / draw-off supersaturation', ratio, zv(z && z.sigma[1] > 0 ? z.sigma[0] / z.sigma[1] : 1), 1, '–'],
+    ['Volume-mean supersaturation', p.sigmaAvg * 1000, zv(z ? (z.phi[0] * z.sigma[0] + z.phi[1] * z.sigma[1]) * 1000 : 0), id.sigma * 1000, '× 10⁻³'], ['Volume-mean nucleation rate', p.Bavg, null, id.B, '#/m³·s'], ['Magma density of the product', p.out.mt, zv(zs?.mt), id.mt, 'kg/m³'],
+    ['Turnover time / residence time', `${fq(f.theta, 3)} s / ${fq(c.tau / 3600, 3)} h`, zv(`${fq(ph.theta, 3)} s`), 'instant mixing', ''], ['Grid, flow iterations, coupling iterations', `${nx} × ${ny}, ${f.iters}, ${p.iters}`, null, null, ''], ['Flow: continuity residual / divergence after projection', `${fq(f.massRes, 2)} / ${fq(f.div, 2)}`, null, null, 'of the inlet flow']],
+    note: `Two-dimensional vertical section (${fq(f.L, 3)} m wide, ${fq(f.H, 3)} m of liquid) solved with the finite-volume Navier–Stokes solver of suite 4 (inlet ${fq(f.Uin, 3)} m/s, effective Reynolds number ${fq(f.reEff, 3)} with ν_t = U·h/${o.ReT}); the dissolved excess and the moments m₀…m₅ are then transported on that field (${o.scheme === 'tvd' ? 'van Leer TVD' : 'first-order upwind'} fluxes, turbulent Schmidt number 0.85) with the nucleation and growth laws of this suite, and the circulation loop returns the outlet composition to the inlet less the product draw-off. Salt balance error ${fq(Math.abs(errBal), 2)}. The two-zone sizes are scaled with the ratio to that model's own ideal reference (its size grid is first-order), and that column also contains the Gibbs–Thomson and wall effects when they are switched on.` }];
+  if (!f.converged) W.push({ level: 'warn', msg: `The crystallizer flow field stopped at a continuity residual of ${fq(f.massRes, 2)} after ${f.iters} iterations — treat the flow-field results as approximate or coarsen the grid.` });
+  if (!p.converged) W.push({ level: 'warn', msg: `The population balance on the flow field did not converge (change ${fq(p.err, 2)} after ${p.iters} iterations).` });
+  if (ratio > 4) W.push({ level: 'info', msg: `In the flow field the liquor at the return nozzle is ${fq(ratio, 3)} times more supersaturated than at the draw-off${Math.abs(dL) > 0.005 ? `; nucleation there makes the product ${fq(Math.abs(100 * dL), 3)} % ${dL < 0 ? 'finer' : 'coarser'} than the ideal mixed crystallizer predicts` : ''}.` });
+  return { W, PL, TB, K: [{ label: 'Product L₄₃, flow-field model', value: p.out.L43 * um, unit: 'µm', help: `Ideal mixed crystallizer ${fq(id.L43 * um, 4)} µm${zs ? `, two-zone model ${fq(zRel * id.L43 * um, 4)} µm` : ''}` }, { label: 'Supersaturation, return nozzle / draw-off (flow field)', value: ratio, unit: '–', status: ratio > 4 ? 'warn' : 'ok', help: 'Highest local supersaturation divided by the value at the suction nozzle' }],
+    BAL: [{ name: 'Crystallizer flow field: salt set free = crystals + dissolved excess drawn off (kg/s per m depth)', in: p.balance.in, out: p.balance.out }, { name: 'Crystallizer flow field: salt entering = salt leaving the section (kg/s per m depth)', in: p.pass.in, out: p.pass.out }],
+    out: { cfdL43um: p.out.L43 * um, cfdL32um: p.out.L32 * um, cfdCv: p.out.cv, cfdSigmaOut: p.out.sigma, cfdSigmaMax: p.sigmaMax, cfdSigmaRatio: ratio, cfdNucleationRatio: id.B > 0 ? p.Bavg / id.B : 1, cfdBalanceError: Math.abs(errBal), cfdL43Ratio: p.out.L43 / id.L43, cfdZoneL43Ratio: zRel, cfdCells: nx * ny, cfdConverged: f.converged && p.converged } };
+}
+const needCfd = (x) => { if (x == null) throw new Error('select the task “Solve the flow field of the crystallizer body” on the Setup tab before running this study'); return x; };
 
 const D = () => Object.fromEntries(suite.inputs.flatMap((g) => g.fields).map((f) => [f.key, f.value]));
 
@@ -603,20 +843,19 @@ export function simulateZLD(v) {
 const suite = {
   id: 'zld', num: 9, title: 'Brine Concentration, Crystallization & ZLD', short: 'ZLD & salts', icon: '🧂',
   tagline: 'From brine to distilled water and dry salts: evaporation path, salt sequence, crystallizer and the final water/solids balance.',
-  description: 'Follows a brine through softening, membrane pre-concentration, a falling-film brine concentrator and a forced-circulation crystallizer. At every evaporation step the Pitzer-based mineral equilibria decide which salts crystallise, so the precipitation sequence, salt yields and purity, boiling-point elevation, compressor work, steam demand and heat-transfer areas follow from the actual brine chemistry. The crystallizer size distribution is solved as an MSMPR population balance with primary and secondary nucleation and power-law growth, both by moments and on a discretised size grid, and again as a two-zone model with size-dependent growth, dissolution of fines, Ostwald ripening and a wall boundary condition. Electrodialysis and membrane distillation can replace the pressure- and steam-driven steps; filter sizing and a levelised-cost estimate complete the train. The final balance states how much water is recovered, which solids leave, and whether any liquid discharge remains.',
+  description: 'Follows a brine through softening, membrane pre-concentration, a falling-film brine concentrator and a forced-circulation crystallizer. At every evaporation step the Pitzer-based mineral equilibria decide which salts crystallise, so the precipitation sequence, salt yields and purity, boiling-point elevation, compressor work, steam demand and heat-transfer areas follow from the actual brine chemistry. The crystallizer size distribution is solved as an MSMPR population balance with primary and secondary nucleation and power-law growth, both by moments and on a discretised size grid, and again as a two-zone model with size-dependent growth, dissolution of fines, Ostwald ripening and a wall boundary condition; an optional study couples the population balance to the computed flow field of the crystallizer body. Electrodialysis and membrane distillation can replace the pressure- and steam-driven steps; filter sizing and a levelised-cost estimate complete the train. The final balance states how much water is recovered, which solids leave, and whether any liquid discharge remains.',
   guide: [
     'Pull the RO concentrate (or the brine from suite 2) or enter a brine analysis and flow.',
     'Choose the pretreatment, the membrane pre-concentration step and the type of evaporator and crystallizer drive.',
     'Set the brine-concentrator outlet salinity just below sodium-chloride saturation and choose the mother-liquor purge and where it goes.',
     'Run. Read the precipitation-sequence plot and the salt table, then the unit table for energy and area, and the ZLD balance for the remaining liquid.',
   ],
-  referenceOnly: ['cfd-population-balance', 'cfd-crystallization'],
   implemented: ['total and component mass balance', 'energy balance', 'phase-equilibrium', 'solubility-product', 'saturation-index', 'supersaturation equation', 'classical nucleation equation', 'primary-nucleation', 'secondary-nucleation', 'crystal-growth', 'population-balance equation', 'moment equation', 'crystal-size-distribution', 'evaporation equation', 'vapour–liquid equilibrium', 'solid–liquid equilibrium', 'heat-transfer equation',
     'electrolyte-equilibrium–crystallization', 'evaporation–precipitation', 'nucleation–growth–population-balance', 'ro–crystallization', 'zld process-integration', 'resource-recovery–selective-precipitation', 'thermodynamic–kinetic crystallization',
     'dissolution equations', 'ostwald-ripening', 'cfd–population-balance', 'cfd–crystallization', 'membrane-distillation–crystallization', 'electrodialysis–crystallization', 'crystallizer wall no-flux', 'crystal-wall deposition', 'dissolution', 'filtration', 'process economics',
     'brine composition', 'supersaturation', 'temperature', 'pressure', 'initial crystal population', 'seed size distribution', 'initial solid fraction', 'brine-feed concentration/flow', 'heat-flux or temperature', 'evaporation/vapour-flux', 'outlet population-flux', 'solid–liquid equilibrium/interface',
     'concentrated-electrolyte thermodynamics', 'brine concentration', 'evaporation', 'mechanical and thermal vapour compression', 'mineral saturation', 'nucleation', 'crystal growth', 'precipitation', 'solid-liquid equilibrium', 'crystalliser modelling', 'solids separation', 'centrifugation', 'drying', 'mother-liquor recycling', 'salt-purity', 'selective mineral recovery', 'chemical dosing', 'scale management', 'heat integration', 'water-recovery calculation', 'waste minimisation', 'zero-liquid-discharge assessment', 'resource recovery', 'energy analysis'],
-  equationsNote: 'Mineral equilibria use the Harvie–Møller–Weare Pitzer set (25 °C interaction parameters; solubility products and the Debye–Hückel slope follow temperature), which reproduces the seawater evaporation sequence at 25 °C; at evaporator temperatures the onset points are indicative (± 10–15 % in concentration factor) and double salts of the hot Mg–K–SO₄ system are approximate. The path stops at a water activity of 0.33 or an ionic strength of 22 mol/kg; CaCl₂ hydrates are not included, so calcium-chloride bitterns always leave with the purge. Crystallisation is fractional (solids leave the liquor as they form). The reference MSMPR model assumes a well-mixed crystallizer with size-independent growth. The two-zone model adds what a flow simulation coupled to a population balance would resolve, in reduced (compartment) form: a boiling zone and a body/heater-loop zone with separate supersaturation and size distribution, exchanging slurry with the circulation flow that follows from the heat duty and the temperature rise per pass; it is not a three-dimensional flow field, so dead zones, classification and local short-circuiting are not predicted. Its size grid is first-order upwind (about 5 % in median size), which is why it is always compared with the ideal case on the same grid. Growth below the Gibbs–Thomson critical size turns into diffusion-limited dissolution (Noyes–Whitney with Sh = 2); ripening in the hold tank is diffusion-controlled Lifshitz–Slyozov–Wagner coarsening at constant crystal volume. Wall deposition uses a single first-order capture velocity. Agglomeration and breakage are not modelled. Membrane distillation is a lumped direct-contact model (vapour-pressure driving force with a temperature-polarisation coefficient, no wetting or module pressure drop); electrodialysis uses the Faraday law with a cell-pair voltage from ohmic and membrane potentials and a water-transport ceiling, with the diluate polished by RO. Filter sizing uses the incompressible-cake Ruth equation. Costs are order-of-magnitude correlations (± 40 %) for comparing options, not a budget estimate. Evaporator energy is a lumped single-stage balance (MVC) or a steam-economy correlation (MEE/TVC); use suite 6 for effect-by-effect thermal design.',
+  equationsNote: 'Mineral equilibria use the Harvie–Møller–Weare Pitzer set (25 °C interaction parameters; solubility products and the Debye–Hückel slope follow temperature), which reproduces the seawater evaporation sequence at 25 °C; at evaporator temperatures the onset points are indicative (± 10–15 % in concentration factor) and double salts of the hot Mg–K–SO₄ system are approximate. The path stops at a water activity of 0.33 or an ionic strength of 22 mol/kg; CaCl₂ hydrates are not included, so calcium-chloride bitterns always leave with the purge. Crystallisation is fractional (solids leave the liquor as they form). The reference MSMPR model assumes a well-mixed crystallizer with size-independent growth. The two-zone model is the reduced (compartment) form of a coupled flow / population-balance model: a boiling zone and a body/heater-loop zone with separate supersaturation and size distribution, exchanging slurry with the circulation flow that follows from the heat duty and the temperature rise per pass. The optional flow study resolves this coupling: the steady flow in a two-dimensional vertical section of the crystallizer body is solved with the finite-volume Navier–Stokes solver of suite 4 (constant eddy viscosity, free surface as a symmetry plane), and the dissolved excess and the moments m₀…m₅ of the population are transported on that field by finite volumes with the nucleation and growth laws of this suite, the circulation loop closing the domain. It is a planar section with a moment closure: swirl, three-dimensional short-circuiting, particle settling and classification, and the size-dependent (Gibbs–Thomson) terms of the two-zone model are not included, and the eddy viscosity is a prescribed constant rather than a transported turbulence quantity. Its size grid is first-order upwind (about 5 % in median size), which is why it is always compared with the ideal case on the same grid. Growth below the Gibbs–Thomson critical size turns into diffusion-limited dissolution (Noyes–Whitney with Sh = 2); ripening in the hold tank is diffusion-controlled Lifshitz–Slyozov–Wagner coarsening at constant crystal volume. Wall deposition uses a single first-order capture velocity. Agglomeration and breakage are not modelled. Membrane distillation is a lumped direct-contact model (vapour-pressure driving force with a temperature-polarisation coefficient, no wetting or module pressure drop); electrodialysis uses the Faraday law with a cell-pair voltage from ohmic and membrane potentials and a water-transport ceiling, with the diluate polished by RO. Filter sizing uses the incompressible-cake Ruth equation. Costs are order-of-magnitude correlations (± 40 %) for comparing options, not a budget estimate. Evaporator energy is a lumped single-stage balance (MVC) or a steam-economy correlation (MEE/TVC); use suite 6 for effect-by-effect thermal design.',
 
   inputs: [
     { group: 'Feed brine', help: 'The brine to be taken to zero liquid discharge.', fields: [
@@ -742,6 +981,16 @@ const suite = {
       { key: 'seedMass', label: 'Seed loading', unit: 'kg/m³', value: 20, min: 0, max: 400 }, { key: 'seedL', label: 'Seed size', unit: 'µm', value: 100, min: 5, max: 1000 },
       { key: 'sigma0', label: 'Initial supersaturation', unit: '%', value: 0.5, min: 0, max: 50 }, { key: 'tEnd', label: 'Simulated time', unit: 'residence times', value: 12, min: 3, max: 40 },
     ] },
+    { group: 'Crystallizer flow field and population balance', tab: 'setup', help: 'Optional study: the steady two-dimensional flow in a vertical section of the crystallizer body is solved with the Navier–Stokes solver of suite 4, and the supersaturation and the moments of the crystal population are transported on that field with the nucleation and growth laws entered above. It shows where the supersaturation is generated and consumed and what that does to the product size. Takes a few seconds.', fields: [
+      { key: 'cfdOn', label: 'Solve the flow field of the crystallizer body', type: 'bool', value: false, help: 'Adds field plots of velocity, supersaturation, nucleation rate and local crystal size and compares the product size with the ideal mixed crystallizer and the two-zone model.' },
+      { key: 'cfdBaffle', label: 'Baffle height', unit: '% of liquid height', value: 55, min: 0, max: 85, help: 'Bottom-mounted baffle between the return nozzle and the suction nozzle; 0 = no baffle.', showIf: (v) => v.cfdOn },
+      { key: 'cfdReT', label: 'Turbulent Reynolds number of the eddy viscosity', unit: '–', value: 35, min: 10, max: 300, help: 'Constant eddy viscosity ν_t = (inlet velocity × nozzle height) / Re_t; about 35 for free jets and mixing layers. Larger values mean less turbulent mixing.', showIf: (v) => v.cfdOn },
+      { key: 'cfdScheme', label: 'Convection scheme of the scalars', type: 'select', value: 'tvd', options: [{ value: 'tvd', label: 'Van Leer TVD (second order, bounded)' }, { value: 'upwind', label: 'First-order upwind' }], help: 'Scheme for the supersaturation and the crystal moments on the flow grid.', showIf: (v) => v.cfdOn },
+    ] },
+    { group: 'Grid of the crystallizer flow study', tab: 'mesh', help: 'Cells of the two-dimensional section (width × height). Used only when the flow study is switched on.', fields: [
+      { key: 'cfdNx', label: 'Cells across the vessel', unit: '', value: 32, min: 12, max: 96, step: 1, help: 'Horizontal cells; the vessel section is one diameter wide.' },
+      { key: 'cfdNy', label: 'Cells over the liquid height', unit: '', value: 64, min: 24, max: 192, step: 1, help: 'Vertical cells; the liquid is two diameters deep.' },
+    ] },
     { group: 'Discretisation', tab: 'mesh', help: 'Number of evaporation steps along the concentration path and the size grid of the population balance.', fields: [
       { key: 'nEvap', label: 'Evaporation steps', unit: '', value: 32, min: 6, max: 300, step: 1, help: 'Geometric steps in remaining water, shared between the units.' },
       { key: 'nL', label: 'Crystal-size cells', unit: '', value: 80, min: 10, max: 1000, step: 1 },
@@ -861,7 +1110,7 @@ const suite = {
       streams: { purge: { Q: r.purgeQ, T: v.Tcx, P: 1, pH: +end.pH.toFixed(3), tds: end.tds, ions: Object.fromEntries(ION_IDS.map((k) => [k, +end.ions[k].toPrecision(6)])) } },
       ...X.out,
     };
-    return {
+    const result = {
       summary: `${fmt(r.recovered, 3)} m³/h of water is recovered from ${fmt(v.Q, 3)} m³/h of brine (${fmt(recPct, 3)} %), leaving ${fmt(td(r.solidsTotal), 3)} t/d of solids${r.prod > 0 ? ` including ${fmt(td(r.prod), 3)} t/d of ${(MINERALS[r.main]?.name || 'salt').toLowerCase()} at ${fmt(100 * r.purity, 3)} % purity` : ''}; ${zld ? 'no liquid discharge remains' : `${fmt(r.liquid, 3)} m³/h of liquid purge remains`}. Energy: ${fmt(r.kWe, 3)} kW electric and ${fmt(r.kWt, 3)} kW heat.`,
       warnings: W, kpis,
       recommendations: [
@@ -927,10 +1176,18 @@ const suite = {
       })(),
       outputs: out,
     };
+    // optional study: flow field of the crystallizer body coupled to the population balance (asynchronous)
+    if (!v.cfdOn) return result;
+    if (!ph || !csd) { W.push({ level: 'info', msg: 'The crystallizer flow study was requested, but the crystallizer is idle for this case — nothing to solve.' }); return result; }
+    return crystallizerFlowStudy(v, r, ph, ctx).then((cf) => {
+      result.kpis.push(...cf.K); result.plots.push(...cf.PL); result.tables.push(...cf.TB); result.balances.push(...cf.BAL); W.push(...cf.W); Object.assign(result.outputs, cf.out);
+      return result;
+    });
   },
 
   mesh: [
     { name: 'Crystal-size grid of the population balance', keys: ['nL'], min: 10, note: 'The size grid of the finite-volume population balance is refined at fixed kinetics and domain length.', metrics: [{ label: 'Median crystal size L50', unit: 'µm', get: (r) => r.outputs.L50um }, { label: 'Coefficient of variation', unit: '–', get: (r) => r.outputs.cv }] },
+    { name: 'Grid of the crystallizer flow / population-balance study', keys: ['cfdNx', 'cfdNy'], min: 12, note: 'Flow field and scalar transport are solved again on each grid. Switch the flow study on first.', metrics: [{ label: 'Product L₄₃ (flow-field model)', unit: 'µm', get: (r) => needCfd(r.outputs.cfdL43um) }, { label: 'Highest / draw-off supersaturation', unit: '–', get: (r) => needCfd(r.outputs.cfdSigmaRatio) }] },
     { name: 'Evaporation steps along the concentration path', keys: ['nEvap'], min: 6, metrics: [{ label: 'Halite onset concentration factor', unit: '×', get: (r) => r.outputs.haliteOnsetCF }, { label: 'Solids crystallised along the path', unit: 't/d', get: (r) => r.outputs.pathSolidsTpd }] },
   ],
 
@@ -944,7 +1201,7 @@ const suite = {
     get validationSample() { return (this._v ||= synth(23, [[0.9, 320], [1.2, 180], [1.8, 340], [2.2, 130], [2.8, 260], [3.5, 220]])); },
   },
 
-  verify() {
+  async verify() {
     const C = [], add = (name, expected, got, tol, note) => C.push({ name, expected, got, tol, pass: Math.abs(got - expected) <= tol, note });
     const d = D(), r = simulateZLD(d), w = r.water;
     add('Water balance of the train closes', 0, (w.in - w.perm - w.dist - w.cond - w.hydration - w.cake - w.purge) / w.in, 1e-9, 'Feed water = recovered + hydration + cake moisture + purge');
@@ -1018,6 +1275,35 @@ const suite = {
     const ec = zldEconomics(d, r, { rev: 0, reagCost: 0 });
     add('Levelised cost equals annual cost over brine treated', ec.annual / (d.Q * 8760 * 0.92), ec.perBrine, 1e-9, 'Capital charge + operating cost, 92 % availability');
     add('Salt yield is insensitive to the number of evaporation steps (16 → 32)', 0, Math.abs((coarse.cxSolids.halite || 0) - (r.cxSolids.halite || 0)) / Math.max(1e-9, r.cxSolids.halite || 0), 0.01, 'Relative change of the halite production');
+    // crystallizer flow field coupled to the population balance
+    const Kc = { kg: 5e-6, g: 1, kb: 1e8, b: 2, j: 1, kv: 1, rhoc: 2165, cstar: 104.3, primA: 1e30, primB: 4.78 }, rkc = Kc.rhoc * Kc.kv;
+    {
+      // (i) once-through plug flow, no nucleation: monodisperse seeds grow while they consume the supersaturation
+      const N0 = 2e9, L0 = 1e-4, x0 = 2, U = 0.05, Lx = 20, nxp = 80, nyp = 3, dxp = Lx / nxp, dyp = 1 / nyp, plug = { nx: nxp, ny: nyp, dx: dxp, dy: dyp, solid: new Uint8Array(nxp * nyp), Fx: new Float64Array((nxp + 1) * nyp).fill(U * dyp), Fy: new Float64Array(nxp * (nyp + 1)), q: U, theta: Lx / U, D: 0 };
+      const ode = rk45((t, y) => [(Kc.kg * Math.max(x0 - rkc * N0 * (y[0] ** 3 - L0 ** 3), 0)) / Kc.cstar], [L0], 0, Lx / U, { rtol: 1e-10, atol: 1e-14 }), Le = ode.y[ode.y.length - 1][0], xe = x0 - rkc * N0 * (Le ** 3 - L0 ** 3);
+      const pp = pbeOnFlow(Kc, plug, { tau: 1e9, MT: 10, nuc: false, plug: { x0, m: [0, 1, 2, 3, 4, 5].map((k) => N0 * L0 ** k) } });
+      add('Flow-field population balance, plug flow without nucleation: crystal size follows dL/dt = G(σ)', 1, pp.out.L10 / Le, 2e-3, `Seeds of 100 µm grow to ${fmt(Le * 1e6, 5)} µm over 400 s (Runge–Kutta reference); ${nxp} cells, van Leer fluxes`);
+      add('…and the supersaturation they consume matches the same reference', 1, pp.out.x / xe, 1e-2, `Dissolved excess falls from ${x0} to ${fmt(xe, 4)} kg/m³`);
+      add('…while the crystal number is conserved', 1, pp.out.m[0] / N0, 1e-9, 'No nucleation, no loss: m₀ at the outlet equals the seed number');
+    }
+    const fo = { L: 2.6, H: 5.2, theta: 26, tau: 5400, MT: 250, baffleH: 0.55, ReT: 35, rho: 1300 }, grids = [[27, 54], [18, 36], [12, 24]], sol = [];
+    for (const [gx, gy] of grids) { const f = await crystallizerFlow({ ...fo, nx: gx, ny: gy }); sol.push({ f, p: pbeOnFlow(Kc, f, fo) }); }
+    const [fine, medium] = sol, pf = fine.p, idc = pf.ideal;
+    add('Flow field: discrete continuity after the projection', 0, fine.f.div, 1e-12, `Largest cell imbalance over the inlet flow; ${fmt(fine.f.divRaw, 2)} before the projection (${fine.f.iters} flow iterations, converged: ${fine.f.converged})`);
+    add('Flow-field population balance: salt balance closes', 0, (pf.balance.in - pf.balance.out) / pf.balance.in, 1e-8, 'Salt set free by the flash = crystals + dissolved excess drawn off');
+    add('…and solute + crystal mass entering the section equals the mass leaving it', 0, (pf.pass.in - pf.pass.out) / pf.pass.in, 1e-10, 'Growth moves mass from the liquor to the crystals without creating any');
+    const wm = pbeOnFlow(Kc, medium.f, { ...fo, Dmult: 1e4 });
+    add('Flow-field population balance, well-mixed limit: product size of the ideal crystallizer', 1, wm.out.L43 / idc.L43, 1e-3, `Diffusivity × 10⁴: L₄₃ = ${fmt(wm.out.L43 * 1e6, 6)} µm against 4·G·τ = ${fmt(idc.L43 * 1e6, 6)} µm`);
+    add('…and its supersaturation', 1, wm.out.sigma / idc.sigma, 1e-2, `σ = ${fmt(wm.out.sigma, 4)} against ${fmt(idc.sigma, 4)}; highest local value ${fmt(wm.sigmaMax / idc.sigma, 4)} × ideal`);
+    add('Ideal crystallizer with dissolved excess reduces to the closed-form MSMPR', 1, idc.L43 / msmprSteady(Kc, 5400, 250).L43, 2e-3, 'The dissolved excess is 0.25 % of the magma density');
+    const gq = gci(grids.map(([gx]) => 1 / gx), sol.map((q) => q.p.out.L43 * 1e6)), chg = Math.abs(pf.out.L43 / medium.p.out.L43 - 1);
+    add('Flow-field population balance: grid refinement changes the product size by less than 1 %', 0, chg, 0.01, `L₄₃ = ${sol.map((q) => fmt(q.p.out.L43 * 1e6, 5)).reverse().join(' / ')} µm on ${grids.map((q) => q.join('×')).reverse().join(' / ')} cells; grid-convergence index of the fine grid ${fmt(100 * gq.gciFine, 2)} %`);
+    add('…and the grid-convergence index of the fine grid is below 2 %', 0, gq.gciFine, 0.02, `Richardson extrapolation ${fmt(gq.fExact, 5)} µm, ${gq.type}`);
+    add('Finite circulation in the flow field: nucleation concentrates near the return nozzle and the product is finer', 1, pf.sigmaMax > 2 * pf.out.sigma && pf.out.L43 < 0.97 * idc.L43 && pf.Bavg > 1.1 * idc.B ? 1 : 0, 0, `σ_max/σ_out = ${fmt(pf.sigmaMax / pf.out.sigma, 3)}, L₄₃ = ${fmt(pf.out.L43 / idc.L43, 3)} × ideal, mean nucleation ${fmt(pf.Bavg / idc.B, 3)} × ideal`);
+    // the study as the user runs it: through run(), with every number that is shown checked
+    const rs = await suite.run({ ...d, cfdOn: true, cfdNx: 16, cfdNy: 32 }, {}), shown = JSON.stringify([rs.kpis, rs.tables.map((t) => [t.rows, t.note]), rs.outputs, rs.balances, rs.warnings]), fields = rs.plots.filter((q) => q.type === 'field' && /Crystallizer body/.test(q.title));
+    add('Flow study through run(): four field plots, no non-finite number, balances closed', 1, fields.length === 4 && fields.every((q) => q.z.length === q.y.length && q.z[0].length === q.x.length && q.z.every((row) => row.every(Number.isFinite))) && !/NaN|Infinity|undefined/.test(shown) && rs.outputs.cfdBalanceError < 1e-8 && rs.outputs.cfdConverged ? 1 : 0, 0, `Default case on 16 × 32 cells: L₄₃ = ${fmt(rs.outputs.cfdL43um, 4)} µm (${fmt(rs.outputs.cfdL43Ratio, 3)} × ideal; two-zone model ${fmt(rs.outputs.cfdZoneL43Ratio, 3)} × its ideal)`);
+    add('Without the study switch the result is returned synchronously and unchanged', 1, !(suite.run({ ...d }, {}) instanceof Promise) && rs.outputs.L50um === suite.run({ ...d }, {}).outputs.L50um ? 1 : 0, 0, 'The default run does not load the flow solver path');
     return C;
   },
 };

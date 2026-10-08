@@ -4,12 +4,38 @@
 // sudden changes and anomalies. Blocking laws, cake filtration, critical flux and Monod biofilm growth give
 // the mechanistic interpretation; rule-based evidence scores name the likely foulant; robust trends give the
 // days to the next cleaning and the remaining membrane life with uncertainty bands.
-import { clamp, linspace, logspace, sum, mean, quantile, rng, fmt, rk4, interp1, levenbergMarquardt, isNum, linfit, tridiag, solveLinear } from '../core/num.js';
+import { clamp, linspace, logspace, sum, mean, quantile, rng, rk4, interp1, levenbergMarquardt, isNum, linfit, tridiag, solveLinear } from '../core/num.js';
 import { tcf, viscosity, conductivityFromTDS, diffusivityNaCl, KELVIN } from '../core/props.js';
+import { solveChannel, buildMask, yGrid } from './s04_cfd.js';
 
 const KB = 1.380649e-23, MU25 = viscosity(25);
-const med = (a) => (a.length ? quantile(a, 0.5) : 0);
-const mad = (a) => { const m = med(a); return 1.4826 * med(a.map((x) => Math.abs(x - m))); };
+/** Median (same interpolation as quantile(a, 0.5)) on a typed copy with the native numeric sort. */
+const medSorted = (s, n) => { const p = (n - 1) * 0.5, i = Math.floor(p), f = p - i; return i + 1 < n ? s[i] * (1 - f) + s[i + 1] * f : s[i]; };
+const med = (a) => { const n = a.length; if (!n) return 0; if (n === 1) return a[0]; return medSorted(Float64Array.from(a).sort(), n); };
+const mad = (a) => { const n = a.length; if (!n) return 0; const m = med(a), d = new Float64Array(n); for (let i = 0; i < n; i++) d[i] = Math.abs(a[i] - m); return 1.4826 * medSorted(d.sort(), n); };
+/** Number formatting of the shared toolbox (fmt of num.js: significant digits, thousands separators), without the locale machinery. */
+function fmt(x, sig = 4) {
+  if (x === null || x === undefined || x === '') return '–';
+  if (typeof x !== 'number') return String(x);
+  if (!Number.isFinite(x)) return Number.isNaN(x) ? '–' : x > 0 ? '∞' : '−∞';
+  if (x === 0) return '0';
+  const ax = Math.abs(x);
+  if (ax >= 1e7 || ax < 1e-4) return x.toExponential(Math.max(1, sig - 1)).replace('e+', 'e');
+  const digits = Math.min(8, Math.max(0, sig - 1 - Math.floor(Math.log10(ax))));
+  // round half up on the shortest decimal representation, as the locale formatter does
+  let t = String(ax);
+  const d0 = t.indexOf('.');
+  if (d0 >= 0 && t.length - d0 - 1 > digits) {
+    let k = Number(t.slice(0, d0) + t.slice(d0 + 1, d0 + 1 + digits));
+    if (t.charCodeAt(d0 + 1 + digits) >= 53) k += 1;
+    t = String(k);
+    if (digits > 0) { t = t.padStart(digits + 1, '0'); t = t.slice(0, t.length - digits) + '.' + t.slice(t.length - digits); }
+  }
+  if (t.indexOf('.') >= 0) t = t.replace(/\.?0+$/, '');
+  const dot = t.indexOf('.'), ip = dot < 0 ? t : t.slice(0, dot), fp = dot < 0 ? '' : t.slice(dot);
+  const grouped = ip.length > 3 ? ip.replace(/\B(?=(\d{3})+(?!\d))/g, ',') : ip, body = grouped + fp;
+  return x < 0 ? '-' + body : body;
+}
 const tcfM = (T) => tcf(T, T >= 25 ? 2640 : 3020);
 /** Osmotic pressure of a salt solution from its TDS (mg/L), bar — the ASTM D4516 approximation. */
 export const piAstm = (C, T) => (0.002654 * C * (T + KELVIN)) / (1000 - C / 1000);
@@ -27,17 +53,26 @@ export const kozenyCarman = (dp, eps, rho) => (180 * (1 - eps)) / (rho * dp * dp
 export function theilSen(x, y) {
   const n = Math.min(x.length, y.length);
   if (n < 3) return { slope: 0, intercept: n ? mean(y) : 0, lo: 0, hi: 0, n };
-  const s = [];
-  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) if (x[j] !== x[i]) s.push((y[j] - y[i]) / (x[j] - x[i]));
-  if (!s.length) return { slope: 0, intercept: mean(y), lo: 0, hi: 0, n };
-  s.sort((a, b) => a - b);
-  const N = s.length, slope = quantile(s, 0.5), C = 1.96 * Math.sqrt((n * (n - 1) * (2 * n + 5)) / 18);
-  const lo = s[clamp(Math.floor((N - C) / 2) - 1, 0, N - 1)], hi = s[clamp(Math.ceil((N + C) / 2), 0, N - 1)];
-  return { slope, intercept: med(y.map((v, i) => v - slope * x[i])), lo, hi, n };
+  const s = new Float64Array((n * (n - 1)) / 2);
+  let N = 0;
+  for (let i = 0; i < n; i++) { const xi = x[i], yi = y[i]; for (let j = i + 1; j < n; j++) { const dxx = x[j] - xi; if (dxx !== 0) s[N++] = (y[j] - yi) / dxx; } }
+  if (!N) return { slope: 0, intercept: mean(y), lo: 0, hi: 0, n };
+  const ss = s.subarray(0, N).sort(), slope = medSorted(ss, N), C = 1.96 * Math.sqrt((n * (n - 1) * (2 * n + 5)) / 18);
+  const lo = ss[clamp(Math.floor((N - C) / 2) - 1, 0, N - 1)], hi = ss[clamp(Math.ceil((N + C) / 2), 0, N - 1)], res = new Float64Array(n);
+  for (let i = 0; i < n; i++) res[i] = y[i] - slope * x[i];
+  return { slope, intercept: medSorted(res.sort(), n), lo, hi, n };
 }
 /** Hampel identifier: true where a point deviates from the centred running median by more than nsig robust sigmas. */
 export function hampel(x, k = 3, nsig = 4.5) {
-  return x.map((v, i) => { const w = x.slice(Math.max(0, i - k), Math.min(x.length, i + k + 1)), m = med(w), s = mad(w); return Math.abs(v - m) > nsig * Math.max(s, 1e-9 + 0.004 * Math.abs(m)); });
+  const n = x.length, w = new Float64Array(2 * k + 1), d = new Float64Array(2 * k + 1);
+  return x.map((v, i) => {
+    const a = Math.max(0, i - k), b = Math.min(n, i + k + 1), len = b - a, ws = w.subarray(0, len), ds = d.subarray(0, len);
+    for (let j = 0; j < len; j++) ws[j] = x[a + j];
+    const m = medSorted(ws.sort(), len);
+    for (let j = 0; j < len; j++) ds[j] = Math.abs(ws[j] - m);
+    const sd = 1.4826 * medSorted(ds.sort(), len);
+    return Math.abs(v - m) > nsig * Math.max(sd, 1e-9 + 0.004 * Math.abs(m));
+  });
 }
 const stepScan = (x, w) => { const n = x.length, d = new Array(n).fill(0); for (let i = w; i <= n - w; i++) d[i] = med(x.slice(i, i + w)) - med(x.slice(i - w, i)); return d; };
 
@@ -52,22 +87,39 @@ export function pressureModel(p, c) {
 }
 
 /**
+ * True parameters of the example plant behind the synthetic logs: two stages of 6 m in a 2 : 1 array, membrane
+ * permeability A25 (L/m²·h·bar at 25 °C), spacer-friction multipliers per stage, salt permeability B25 (m/s) and
+ * nominal feed TDS (mg/L). The "measured" pressures of the logs are solved from these with the channel model.
+ */
+export const EXAMPLE_PLANT = { area: 8035, L: 6, h: 7.1e-4, ratio: 2, A25: 1.4, fric: [1.6, 1.6], B25: 5.2e-8, tds: 1000, Qp: 150, Y: 0.75 };
+const plantRm = (pl) => 3.6e11 / (MU25 * pl.A25), plantWidths = (pl) => (pl.ratio > 0 ? [(pl.area * pl.ratio) / (pl.ratio + 1) / (2 * pl.L), pl.area / (pl.ratio + 1) / (2 * pl.L)] : [pl.area / (2 * pl.L)]);
+/**
+ * One operating point of a plant under flow control: the channel model (local flux through membrane and fouling
+ * resistance against the local wall osmotic pressure, spacer friction) is solved for the feed pressure that delivers the
+ * permeate flow. rStage / fStage multiply the membrane resistance and the friction of each stage. Pressures in bar.
+ */
+export function plantPoint(pl, { T, tdsF, Qf, Qp, rStage, fStage, Pp = 1, N = 24 }) {
+  const ch = channelFouling({ L: pl.L, widths: plantWidths(pl), h: pl.h, Q0: Qf / 3600, T, mu: MU25 / tcfM(T), Rm: plantRm(pl), alpha: 0, rStage, fStage: fStage ? fStage.map((f, i) => f * pl.fric[i]) : pl.fric, Pp: Pp * 1e5, pi0: piAstm(tdsF, T) * 1e5, D: diffusivityNaCl(T, 3), permTarget: Qp / 3600, days: 0, N, lean: true });
+  return { Pf: ch.Pin / 1e5, Pst: ch.Pstage.map((x) => x / 1e5), Pc: ch.Pout / 1e5, cw: ch.cwMean, J: ch.Jmean, tdsP: (pl.B25 * tcfM(T) * tdsF * ch.cwMean) / ch.Jmean, ch };
+}
+/**
  * Deterministic synthetic operating log of a two-stage brackish RO train (150 m³/h permeate, 75 % recovery):
  * gradual colloidal/organic fouling, a tail-end scaling episode (days 96–119), a clean-in-place on day 120 and an
- * O-ring failure on day 150, with sensor noise and a few deliberate data-quality problems.
+ * O-ring failure on day 150, with sensor noise and a few deliberate data-quality problems. Every record is a solution
+ * of the channel model for the true plant parameters (EXAMPLE_PLANT), so pressures, flows and concentrations are
+ * mutually consistent; fouling enters as resistance and friction multipliers of the stages.
  */
-export function syntheticLog({ days = 180, seed = 3, noise = 1, fouling = true, events = true, quality = true, step = null } = {}) {
-  const g = rng(seed), rows = [], area = 8035, s1 = 0.65, z = () => noise * g.normal(0, 1), ec = conductivityFromTDS;
+export function syntheticLog({ days = 180, seed = 3, noise = 1, fouling = true, events = true, quality = true, step = null, plant = EXAMPLE_PLANT } = {}) {
+  const g = rng(seed), rows = [], z = () => noise * g.normal(0, 1), ec = conductivityFromTDS;
   let Rg = 0, Rs = 0, f1 = 0, f2g = 0, f2s = 0, spAge = 0, spScale = 0;
   for (let t = 0; t < days; t++) {
     if (events && t === 120) { Rg *= 0.15; Rs = 0; f1 *= 0.1; f2g *= 0.1; f2s = 0; spScale = 0; }
     const scaling = events && t >= 96 && t < 120, spStep = events && t >= 150 ? 1.45 : 1, extra = step && t >= step.day ? step.loss : 0;
-    const T = 24 + 4 * Math.sin((2 * Math.PI * (t - 40)) / 365) + 0.25 * z(), tdsF = 3500 * (1 + 0.04 * Math.sin((2 * Math.PI * t) / 90)) * (1 + 0.006 * z());
-    const Qp = 150 * (1 + 0.005 * z()), Y = 0.75 + 0.003 * z(), Qf = Qp / Y, a = (1 - extra) / (1 + Rg + Rs), mu = (viscosity(T) / viscosity(25)) ** 0.3;
-    const ndp = (Qp * 1000) / area / (3.6 * a * tcfM(T));
-    const dP1 = 1.6 * (1 + f1) * ((Qf - (s1 * Qp) / 2) / 151.25) ** 1.5 * mu, dP2 = 1.2 * (1 + f2g + f2s) * ((Qf - s1 * Qp - ((1 - s1) * Qp) / 2) / 76.25) ** 1.5 * mu;
-    const Cfb = (tdsF * Math.log(1 / (1 - Y))) / Y, sp = 1.2 * (1 + spAge) * (1 + spScale) * spStep * tcfM(T) * (150 / Qp), tdsP = (sp / 100) * Cfb;
-    const Pp = 1 + 0.015 * z(), Pf = ndp + (dP1 + dP2) / 2 + Pp + piAstm(Cfb, T) - piAstm(tdsP, T) + 0.03 * z(), Pi = Pf - dP1 + 0.012 * z(), Pc = Pf - dP1 - dP2 + 0.015 * z();
+    const T = 24 + 4 * Math.sin((2 * Math.PI * (t - 40)) / 365) + 0.25 * z(), tdsF = plant.tds * (1 + 0.04 * Math.sin((2 * Math.PI * t) / 90)) * (1 + 0.006 * z());
+    const Qp = plant.Qp * (1 + 0.005 * z()), Y = plant.Y + 0.003 * z(), Qf = Qp / Y;
+    const pt = plantPoint(plant, { T, tdsF, Qf, Qp, rStage: [(1 + Rg) / (1 - extra), (1 + Rg + Rs) / (1 - extra)], fStage: [1 + f1, 1 + f2g + f2s], Pp: 1 });
+    const tdsP = pt.tdsP * (1 + spAge) * (1 + spScale) * spStep;
+    const Pp = 1 + 0.015 * z(), Pf = pt.Pf + (Pp - 1) + 0.03 * z(), Pi = Pf - (pt.Pf - pt.Pst[0]) + 0.012 * z(), Pc = Pf - (pt.Pf - pt.Pc) + 0.015 * z();
     const row = { t, Pf: +Pf.toFixed(2), Pi: +Pi.toFixed(2), Pc: +Pc.toFixed(2), Pp: +Pp.toFixed(2), Qf: +(Qf * (1 + 0.004 * z())).toFixed(1), Qp: +Qp.toFixed(1), Cf: +(ec(tdsF) * (1 + 0.006 * z())).toFixed(0), Cp: +(ec(tdsP) * (1 + 0.012 * z())).toFixed(1), T: +T.toFixed(1) };
     if (quality) {
       if (t >= 84 && t <= 86) { /* plant shutdown: no records */ } else {
@@ -77,7 +129,7 @@ export function syntheticLog({ days = 180, seed = 3, noise = 1, fouling = true, 
         rows.push(row);
       }
     } else rows.push(row);
-    if (fouling) { Rg += 0.0009; f1 += 0.001; f2g += 0.0004; spAge += 0.0002; if (scaling) { Rs += 0.0045; f2s += 0.012; spScale += 0.003; } }
+    if (fouling) { Rg += 0.0009; f1 += 0.001; f2g += 0.0004; spAge += 0.0002; if (scaling) { Rs += 0.02; f2s += 0.012; spScale += 0.003; } }
   }
   return rows;
 }
@@ -86,8 +138,16 @@ const defaultLog = () => (_log ||= syntheticLog());
 
 // ---- analysis ----------------------------------------------------------------------------------------------
 const COLS = [
-  { key: 't', label: 'Time', unit: 'd' }, { key: 'Pf', label: 'Feed pressure', unit: 'bar' }, { key: 'Pi', label: 'Interstage pressure', unit: 'bar' }, { key: 'Pc', label: 'Concentrate pressure', unit: 'bar' }, { key: 'Pp', label: 'Permeate pressure', unit: 'bar' },
-  { key: 'Qf', label: 'Feed flow', unit: 'm³/h' }, { key: 'Qp', label: 'Permeate flow', unit: 'm³/h' }, { key: 'Cf', label: 'Feed conductivity', unit: 'µS/cm' }, { key: 'Cp', label: 'Permeate conductivity', unit: 'µS/cm' }, { key: 'T', label: 'Temperature', unit: '°C' },
+  { key: 't', label: 'Time', unit: 'd', aliases: ['time', 'date', 'datetime', 'date time', 'date/time', 'timestamp', 'time stamp', 'day', 'days', 'elapsed', 'elapsed time', 'operating time', 'run time', 'runtime', 't (d)', 'time (d)', 'time (days)', 'time_d', 'days on line', 'days online'] },
+  { key: 'Pf', label: 'Feed pressure', unit: 'bar', aliases: ['pf', 'p_f', 'p_feed', 'pfeed', 'p feed', 'feed p', 'feed press', 'feed pressure (bar)', 'feed_pressure', 'feed pressure bar', 'feedpressure', 'inlet pressure', 'p_in', 'pin', 'hp pump discharge pressure', 'membrane feed pressure', 'stage 1 feed pressure', 'pt feed'] },
+  { key: 'Pi', label: 'Interstage pressure', unit: 'bar', aliases: ['pi', 'p_i', 'p_inter', 'pinter', 'interstage', 'inter-stage pressure', 'inter stage pressure', 'interstage pressure (bar)', 'interstage_pressure', 'stage 2 feed pressure', 'stage 1 concentrate pressure', 'p_interstage', 'p12'] },
+  { key: 'Pc', label: 'Concentrate pressure', unit: 'bar', aliases: ['pc', 'p_c', 'p_conc', 'pconc', 'p_concentrate', 'concentrate pressure (bar)', 'concentrate_pressure', 'conc pressure', 'conc. pressure', 'brine pressure', 'reject pressure', 'p_brine', 'p_reject', 'p_out', 'pout', 'outlet pressure', 'pt concentrate'] },
+  { key: 'Pp', label: 'Permeate pressure', unit: 'bar', aliases: ['pp', 'p_p', 'p_perm', 'pperm', 'p_permeate', 'permeate pressure (bar)', 'permeate_pressure', 'perm pressure', 'product pressure', 'permeate back pressure', 'permeate backpressure', 'back pressure', 'p_product', 'pt permeate'] },
+  { key: 'Qf', label: 'Feed flow', unit: 'm³/h', aliases: ['qf', 'q_f', 'q_feed', 'qfeed', 'feed flow (m3/h)', 'feed flow (m³/h)', 'feed_flow', 'feedflow', 'feed flow rate', 'feed flowrate', 'feed rate', 'ff', 'f_feed', 'inlet flow', 'ft feed'] },
+  { key: 'Qp', label: 'Permeate flow', unit: 'm³/h', aliases: ['qp', 'q_p', 'q_perm', 'qperm', 'q_permeate', 'permeate flow (m3/h)', 'permeate flow (m³/h)', 'permeate_flow', 'permeateflow', 'permeate flow rate', 'permeate flowrate', 'perm flow', 'product flow', 'product flow rate', 'q_product', 'ft permeate'] },
+  { key: 'Cf', label: 'Feed conductivity', unit: 'µS/cm', aliases: ['cf', 'c_f', 'c_feed', 'cfeed', 'ec_f', 'ec_feed', 'ecf', 'feed conductivity (µs/cm)', 'feed conductivity (us/cm)', 'feed_conductivity', 'feed cond', 'feed cond.', 'feed ec', 'cond feed', 'conductivity feed', 'inlet conductivity', 'ct feed'] },
+  { key: 'Cp', label: 'Permeate conductivity', unit: 'µS/cm', aliases: ['cp', 'c_p', 'c_perm', 'cperm', 'ec_p', 'ec_perm', 'ecp', 'permeate conductivity (µs/cm)', 'permeate conductivity (us/cm)', 'permeate_conductivity', 'permeate cond', 'permeate cond.', 'perm cond', 'permeate ec', 'product conductivity', 'cond permeate', 'conductivity permeate', 'ct permeate'] },
+  { key: 'T', label: 'Temperature', unit: '°C', aliases: ['temp', 'temp.', 'temperature', 'temperature (°c)', 'temperature (c)', 'temperature (degc)', 'feed temperature', 'feed temp', 'feed temp.', 'water temperature', 't_feed', 'tfeed', 't_f', 'tf', 'temp_c', 'tt feed'] },
 ];
 const NEED = ['t', 'Pf', 'Pc', 'Pp', 'Qf', 'Qp', 'Cf', 'Cp', 'T'];
 export const FOULANTS = {
@@ -99,13 +159,54 @@ export const FOULANTS = {
   oxidation: { name: 'Oxidation damage of the polyamide layer', cip: [['1', 'Do not clean', 'Check dechlorination (ORP, bisulphite dose); dye-test and replace the affected elements', '–', '–', '–']] },
 };
 
+// ---- ingestion of a growing log (live feed) ---------------------------------------------------------------------
+const VALS = ['Pf', 'Pi', 'Pc', 'Pp', 'Qf', 'Qp', 'Cf', 'Cp', 'T'], MIN_ROWS = 14;
+/** Number from a cell that may be a number, a numeric string (decimal point or comma) or empty. */
+const cellNum = (x) => { if (typeof x === 'number') return Number.isFinite(x) ? x : null; if (typeof x !== 'string') return null; const q = x.trim().replace(/\s/g, '').replace(',', '.'); if (!q) return null; const n = Number(q); return Number.isFinite(n) ? n : null; };
+/** Time of a record in days: plain numbers are days; Unix epochs (s or ms), Date objects and date strings are converted. */
+export function timeDays(x) {
+  if (x instanceof Date) return Number.isFinite(x.getTime()) ? x.getTime() / 864e5 : null;
+  let n = cellNum(x);
+  if (n == null && typeof x === 'string' && /\d/.test(x)) { const ms = Date.parse(x.trim()); n = Number.isFinite(ms) ? ms : null; if (n != null) return n / 864e5; }
+  if (n == null) return null;
+  return Math.abs(n) > 1e11 ? n / 864e5 : Math.abs(n) > 1e9 ? n / 86400 : n;
+}
+const cleanRow = (r) => { if (!r || typeof r !== 'object') return null; const t = timeDays(r.t); if (t == null) return null; const q = { t }; for (const k of VALS) q[k] = cellNum(r[k]); return q; };
+const complete = (r) => NEED.every((k) => isNum(r[k]));
+/**
+ * Turns the rows of a log that is still being written into a chronological record set: cells are converted to numbers,
+ * time stamps to days (rebased to the first record when they are calendar dates), rows are sorted, and records with the
+ * same time stamp are merged (a complete record replaces an incomplete one, a later one an earlier one). The result
+ * depends only on the set of rows, not on the order in which they arrived.
+ */
+export function ingestLog(log) {
+  const src = Array.isArray(log) ? log : [], byT = new Map();
+  let untimed = 0, duplicates = 0, reordered = 0, tMax = -Infinity;
+  for (const r of src) {
+    const q = cleanRow(r);
+    if (!q) { untimed++; continue; }
+    if (q.t < tMax) reordered++; else tMax = q.t;
+    const old = byT.get(q.t);
+    if (old) { duplicates++; if (complete(q) || !complete(old)) byT.set(q.t, q); } else byT.set(q.t, q);
+  }
+  const rows = [...byT.values()].sort((a, b) => a.t - b.t), t0 = rows.length && Math.abs(rows[0].t) > 1e4 ? rows[0].t : 0;
+  if (t0) for (const r of rows) r.t = +(r.t - t0).toFixed(6);
+  const last = rows[rows.length - 1], pending = !!last && rows.length > 1 && !complete(last);
+  return { rows, received: src.length, untimed, duplicates, reordered, t0, pending, tLast: last ? last.t : null };
+}
+
 /** Validation, normalisation, event detection, trends and prognosis of an operating log. */
 export function analyseLog(v) {
-  const issues = [], raw = (Array.isArray(v.log) ? v.log : []).filter((r) => r && isNum(r.t)).slice().sort((a, b) => a.t - b.t), area = Math.max(1, v.area);
+  const issues = [], ing = ingestLog(v.log), raw = ing.rows, area = Math.max(1, v.area), short = (msg) => Object.assign(new Error(msg), { short: true });
+  if (ing.untimed) issues.push(['–', `${ing.untimed} record${ing.untimed > 1 ? 's' : ''} without a usable time stamp`, 'Excluded']);
+  if (ing.duplicates) issues.push(['–', `${ing.duplicates} record${ing.duplicates > 1 ? 's repeat' : ' repeats'} an earlier time stamp`, 'The complete (otherwise the later) record of each time stamp is kept']);
+  if (ing.reordered) issues.push(['–', `${ing.reordered} record${ing.reordered > 1 ? 's were' : ' was'} out of chronological order`, 'Sorted by time']);
+  if (ing.t0) issues.push(['–', 'Time stamps are calendar dates', `Converted to days since the first record (offset ${fmt(ing.t0, 8)} d)`]);
   // 1 — data validation
   const rows = [];
   for (const r of raw) {
     const miss = NEED.filter((k) => !isNum(r[k]));
+    if (miss.length && ing.pending && r === raw[raw.length - 1]) { issues.push([r.t, `Last record is incomplete (${miss.join(', ')} not yet written)`, 'Ignored until the record is complete']); continue; }
     if (miss.length) { issues.push([r.t, `Missing value: ${miss.join(', ')}`, 'Row excluded']); continue; }
     const bad = [];
     if (r.T < 1 || r.T > 50) bad.push(`temperature ${r.T} °C outside 1–50 °C`);
@@ -117,7 +218,7 @@ export function analyseLog(v) {
     if (bad.length) { issues.push([r.t, `Range check failed: ${bad.join('; ')}`, 'Row excluded']); continue; }
     rows.push(r);
   }
-  if (rows.length < 14) throw new Error('The operating log needs at least 14 complete, plausible rows (time, pressures, flows, conductivities, temperature).');
+  if (rows.length < MIN_ROWS) throw short(`The operating log has ${rows.length} complete, plausible row${rows.length === 1 ? '' : 's'}; the analysis needs at least ${MIN_ROWS} (time, pressures, flows, conductivities, temperature).`);
   const dts = rows.slice(1).map((r, i) => r.t - rows[i].t), dtMed = Math.max(med(dts), 1e-6);
   rows.slice(1).forEach((r, i) => { if (r.t - rows[i].t > Math.max(2.5 * dtMed, dtMed + 1.5)) issues.push([rows[i].t, `Gap of ${fmt(r.t - rows[i].t, 3)} d in the record`, 'Kept as a gap; trends bridge it without interpolation']); });
   // 2 — row quantities
@@ -137,7 +238,7 @@ export function analyseLog(v) {
   const flag = new Array(all.length).fill(false);
   for (const [k, name] of [['kA', 'normalised permeate flow'], ['kS', 'normalised salt passage'], ['kD', 'normalised differential pressure']]) hampel(all.map((q) => q[k]), 3, v.outlierSigma).forEach((f, i) => { if (f && !flag[i]) { flag[i] = true; issues.push([all[i].t, `Outlier in ${name}`, 'Excluded from trends and statistics']); } });
   const G = all.filter((_, i) => !flag[i]);
-  if (G.length < 12) throw new Error('Too few valid rows remain after data validation.');
+  if (G.length < 12) throw short(`Only ${G.length} valid rows remain after data validation; the analysis needs at least 12.`);
   const stageOK = G.filter((q) => q.kD1 != null).length > 0.8 * G.length;
   // 4 — reference state
   const nBase = clamp(Math.round(v.nBase), 3, Math.max(3, Math.floor(G.length / 3))), base = G.slice(0, nBase);
@@ -256,7 +357,7 @@ export function analyseLog(v) {
   if (lastClean && lastClean.t - t[0] > 5) { const el = lastClean.t - t[0]; irrNow = lastClean.irr; irrRate = lastClean.irr / el; irrLo = Math.max(0, lastClean.irr - 2 * lastClean.sdA - 0.3) / el; irrHi = (lastClean.irr + 2 * lastClean.sdA + 0.3) / el; }
   else { const f = 1 - v.revFrac / 100, c0 = cycles[0]; irrRate = Math.max(0, -c0.npf.slope) * f; irrLo = Math.max(0, -c0.npf.hi) * f; irrHi = Math.max(0, -c0.npf.lo) * f; irrNow = irrRate * span; }
   const lifeOf = (r) => (r > 1e-6 ? clamp(Math.max(0, v.eolLoss - irrNow) / r / 365, 0, 25) : 25), rul = lifeOf(irrRate), rulLo = lifeOf(irrHi), rulHi = lifeOf(irrLo), age = v.age0 + span / 365;
-  return { v, issues, rows, all, flag, G, t, npf, nsp, ndp, npfG, nspG, ref, stageOK, events, cycles, cur, dominant, wts, spc, Rm, Rt, Rirr, Rrev, cleanings, lastClean, now, trig, first, daysToCleaning, cleaningsPerYear, integrity, irrRate, irrLo, irrHi, irrNow, rul, rulLo, rulHi, age, dtMed, risk, nBase, area, since };
+  return { v, ing, issues, rows, all, flag, G, t, npf, nsp, ndp, npfG, nspG, ref, stageOK, events, cycles, cur, dominant, wts, spc, Rm, Rt, Rirr, Rrev, cleanings, lastClean, now, trig, first, daysToCleaning, cleaningsPerYear, integrity, irrRate, irrLo, irrHi, irrNow, rul, rulLo, rulHi, age, dtMed, risk, nBase, area, since };
 }
 
 /** Fit the four Hermia laws to a flux-decline series with a chronological train/validation split. */
@@ -414,6 +515,22 @@ export function biofilmTransport(p, days, nStep) {
   return { t, Lf, X, eta, flux, end, supplyLimit: p.kL * p.Sb };
 }
 
+/** Root of a monotone function in a bracket [a, b] by the Illinois variant of regula falsi (superlinear, always bracketed). */
+function rootBracket(f, a, b, tolX, fa = f(a), fb = f(b), maxIt = 60) {
+  if (fa === 0) return a;
+  if (fb === 0) return b;
+  if (fa * fb > 0) return Math.abs(fa) < Math.abs(fb) ? a : b;
+  let side = 0, x = a;
+  for (let i = 0; i < maxIt; i++) {
+    x = (a * fb - b * fa) / (fb - fa);
+    if (!(x > Math.min(a, b) && x < Math.max(a, b))) x = 0.5 * (a + b);
+    const fx = f(x);
+    if (fx === 0 || Math.abs(b - a) <= tolX) return x;
+    if (fx * fb > 0) { b = x; fb = fx; if (side === -1) fa *= 0.5; side = -1; } else { a = x; fa = fx; if (side === 1) fb *= 0.5; side = 1; }
+  }
+  return x;
+}
+
 // ---- deposition profile along the feed channel ------------------------------------------------------------------------
 /**
  * One-dimensional feed channel from inlet to concentrate outlet with permeation through both walls, in one or more
@@ -424,30 +541,56 @@ export function biofilmTransport(p, days, nStep) {
  * SI units; Q0 in m³/s, L = length of one stage.
  */
 export function channelFouling(o) {
-  const nS = o.widths.length, Ns = Math.max(4, Math.round((o.N ?? 40) / nS)), N = Ns * nS, dx = o.L / Ns, dh = 1.236 * o.h, mu = viscosity(o.T), muJ = o.mu ?? mu, rho = 997, m = new Array(N).fill(o.m0 ?? 0), nT = Math.max(1, Math.round(o.nT ?? 12)), dt = (o.days ?? 0) / nT;
+  const nS = o.widths.length, Ns = Math.max(4, Math.round((o.N ?? 40) / nS)), N = Ns * nS, dx = o.L / Ns, dh = 1.236 * o.h, mu = viscosity(o.T), muJ = o.mu ?? mu, rho = 997, m = new Float64Array(N).fill(o.m0 ?? 0), nT = Math.max(1, Math.round(o.nT ?? 12)), dt = (o.days ?? 0) / nT;
+  // local film coefficient k = kC·u^0.875 (Schock–Miquel) when a salt diffusivity is given; otherwise the constant factor betaCP
+  const kC = o.D > 0 ? 0.065 * ((rho * dh) / mu) ** 0.875 * (mu / (rho * o.D)) ** 0.25 * (o.D / dh) : 0, bConst = o.betaCP ?? 1, lean = !!o.lean;
+  // per-cell constants (stage width, membrane resistance, friction factor group) hoisted out of the march
+  const Q0 = o.Q0, hC = o.h, Pperm = o.Pp, pi0 = o.pi0, alpha = o.alpha, wCell = new Float64Array(N), rCell = new Float64Array(N), fCell = new Float64Array(N), fGroup = (6.23 * rho * dx) / (2 * dh) / ((rho * dh) / mu) ** 0.3;
+  for (let i = 0; i < N; i++) { const s = (i / Ns) | 0; wCell[i] = o.widths[s]; rCell[i] = o.Rm * (o.rStage ? o.rStage[s] : 1); fCell[i] = fGroup * (o.fStage ? o.fStage[s] : 1); }
   let fMult = o.fMult ?? 1;
   const march = (Pin, rec) => {
-    let Q = o.Q0, P = Pin;
-    const out = rec ? { x: [], u: [], J: [], P: [], cb: [], tau: [], Jc: [] } : null;
+    let Q = Q0, P = Pin, cw = 0;
+    const out = rec ? { x: [], u: [], J: [], P: [], cb: [], tau: [], Jc: [], beta: [] } : null, Pst = [];
     for (let i = 0; i < N; i++) {
-      const W = o.widths[Math.floor(i / Ns)], u = Math.max(Q / (W * o.h), 1e-6), cf = o.Q0 / Math.max(Q, 1e-30), R = o.Rm + o.alpha * m[i], J = Math.max(0, (P - o.Pp - o.pi0 * cf * (o.betaCP ?? 1)) / (muJ * R));
-      const Re = (rho * u * dh) / mu, dP = (fMult * (6.23 / Re ** 0.3) * rho * u * u * dx) / (2 * dh);
-      if (rec) { out.x.push((i + 0.5) * dx); out.u.push(u); out.J.push(J); out.P.push(P - dP / 2); out.cb.push(cf); out.tau.push((mu * 6 * u) / o.h); out.Jc.push(criticalFlux(o.dp, u, { h: o.h, L: o.L, T: o.T, phiB: Math.min(o.phiB * cf, 0.3) }).J); }
-      Q -= Math.min(2 * J * W * dx, Q * (1 - 1e-6)); P -= dP;
+      const W = wCell[i], uq = Q / (W * hC), u = uq > 1e-6 ? uq : 1e-6, cf = Q0 / (Q > 1e-30 ? Q : 1e-30), muR = muJ * (rCell[i] + alpha * m[i]), dpm = P - Pperm, piL = pi0 * cf;
+      const lu = Math.log(u);
+      let J, beta = bConst;
+      if (kC > 0) { // J = (Δp − π·exp(J/k)) / (μR): Newton from above the root (monotone, the residual is concave)
+        const k = kC * Math.exp(0.875 * lu);
+        J = (dpm - piL) / muR;
+        if (J > 0 && piL > 0) { // start at the smaller of the unpolarised flux and the limiting flux k·ln(Δp/π): both lie above the root
+          const Jl = k * Math.log(dpm / piL);
+          if (Jl < J) J = Jl;
+          for (let it = 0; it < 30; it++) { const e = Math.exp(J / k), f = (dpm - piL * e) / muR - J; if (f >= -1e-13 * J) break; J -= f / (-(piL * e) / (k * muR) - 1); if (J < 0) { J = 0; break; } }
+          beta = Math.exp(J / k);
+        } else if (J < 0) J = 0;
+      } else { J = (dpm - piL * beta) / muR; if (J < 0) J = 0; }
+      const dP = fMult * fCell[i] * Math.exp(1.7 * lu); // f = 6.23·Re^−0.3: Δp = f·ρu²·Δx/(2·d_h)
+      if (rec) { out.x.push((i + 0.5) * dx); out.u.push(u); out.J.push(J); out.P.push(P - dP / 2); out.cb.push(cf); out.beta.push(beta); out.tau.push((mu * 6 * u) / hC); out.Jc.push(lean ? 0 : criticalFlux(o.dp, u, { h: hC, L: o.Lbl ?? o.L, T: o.T, phiB: Math.min(o.phiB * cf, 0.3) }).J); cw += beta * cf * W; }
+      const dQ = 2 * J * W * dx, cap = Q * (1 - 1e-6);
+      Q -= dQ < cap ? dQ : cap; P -= dP;
+      if (i % Ns === Ns - 1) Pst.push(P);
     }
-    return { Pout: P, Q, out };
+    return { Pout: P, Q, out, Pst, cw };
   };
-  const solveIn = () => { // shooting on the inlet pressure so that the outlet pressure equals the prescribed value
-    let a = o.Pout, b = o.Pout + 80e5;
-    const g = (p) => march(p, false).Pout - o.Pout;
-    if (g(a) > 0) return a;
-    for (let i = 0; i < 60; i++) { const c = 0.5 * (a + b); if (g(c) > 0) b = c; else a = c; if (b - a < 10) break; }
-    return 0.5 * (a + b);
+  const solveIn = () => {
+    if (o.Pin != null) return o.Pin; // inlet pressure prescribed
+    if (o.permTarget > 0) { // flow control: the inlet pressure that delivers the permeate flow
+      const g = (p) => o.Q0 - march(p, false).Q - o.permTarget;
+      let lo = o.Pp + o.pi0, hi = lo + 20e5, ghi = g(hi);
+      for (let i = 0; i < 6 && ghi < 0; i++) { lo = hi; hi += 40e5; ghi = g(hi); }
+      return rootBracket(g, lo, hi, 0.05, g(lo), ghi);
+    }
+    // shooting on the inlet pressure so that the outlet pressure equals the prescribed value
+    const g = (p) => march(p, false).Pout - o.Pout, ga = g(o.Pout);
+    if (ga > 0) return o.Pout;
+    let hi = o.Pout + 4e5, ghi = g(hi);
+    for (let i = 0; i < 6 && ghi < 0; i++) { hi += (hi - o.Pout) * 3; ghi = g(hi); }
+    return rootBracket(g, o.Pout, hi, 0.5, ga, ghi);
   };
   if (o.dPtarget > 0) { // friction multiplier that reproduces the measured pressure drop (fittings, spacer fouling)
-    let a = 0.05, b = 50;
-    for (let i = 0; i < 40; i++) { fMult = Math.sqrt(a * b); if (solveIn() - o.Pout > o.dPtarget) b = fMult; else a = fMult; if (b / a < 1.002) break; }
-    fMult = Math.sqrt(a * b);
+    const drop = (lf) => { fMult = Math.exp(lf); const p = solveIn(); return (o.Pin != null ? p - march(p, false).Pout : p - o.Pout) - o.dPtarget; };
+    fMult = Math.exp(rootBracket(drop, Math.log(0.05), Math.log(50), 2e-6));
   }
   let Pin = solveIn(), st = march(Pin, true);
   const first = { Pin, recovery: 1 - st.Q / o.Q0, J: st.out.J.slice() };
@@ -455,7 +598,75 @@ export function channelFouling(o) {
     for (let i = 0; i < N; i++) m[i] = depositMass(dt, o.omega * o.cp * st.out.cb[i] * Math.max(0, st.out.J[i] - st.out.Jc[i]) * 86400, o.kDet * st.out.tau[i], m[i]); // exact step for constant local conditions
     Pin = solveIn(); st = march(Pin, true);
   }
-  return { ...st.out, m: m.slice(), Pin, Pout: st.Pout, recovery: 1 - st.Q / o.Q0, perm: o.Q0 - st.Q, Qout: st.Q, first, fMult, dx, N, nStages: nS };
+  let wTot = 0;
+  for (const W of o.widths) wTot += W;
+  return { ...st.out, m: Array.from(m), Pin, Pout: st.Pout, Pstage: st.Pst, recovery: 1 - st.Q / o.Q0, perm: o.Q0 - st.Q, Qout: st.Q, first, fMult, dx, N, nStages: nS, cwMean: st.cw / (Ns * wTot), Jmean: (o.Q0 - st.Q) / (2 * wTot * o.L) };
+}
+/**
+ * Membrane resistance and friction multiplier of the channel model that reproduce a measured operating point: inlet
+ * pressure Pin, outlet pressure Pout and permeate flow perm (m³/s). Nested bisection (both responses are monotone).
+ * consistent = false when even a membrane without resistance could not deliver the permeate flow at these pressures —
+ * the record then violates the osmotic limit (outlet pressure below the osmotic pressure of the concentrate at the wall).
+ */
+export function channelIdentify(o, meas) {
+  const runAt = (Rm) => channelFouling({ ...o, Rm, Pin: meas.Pin, Pout: undefined, permTarget: 0, dPtarget: Math.max(meas.Pin - meas.Pout, 1), days: 0, lean: true }), lim = runAt(1e9);
+  if (lim.perm < meas.perm) return { Rm: 1e9, fMult: lim.fMult, perm: lim.perm, permMax: lim.perm, consistent: false };
+  const lr = rootBracket((x) => runAt(Math.exp(x)).perm - meas.perm, Math.log(1e9), Math.log(1e17), 1e-7, lim.perm - meas.perm), r = runAt(Math.exp(lr));
+  return { Rm: Math.exp(lr), fMult: r.fMult, perm: r.perm, permMax: lim.perm, consistent: true };
+}
+
+// ---- two-dimensional feed channel: flow, salt transport and a growing wall deposit --------------------------------------
+/**
+ * Spacer-filled feed channel resolved in two dimensions with the finite-volume Navier–Stokes solver of suite 4: velocity,
+ * pressure and salt concentration with solution–diffusion membranes on both walls (local flux J = A·a_f·(Δp − π(c_wall))).
+ * On that solution the deposit of this suite grows per wall cell, dm/dt = ω·c_w·(J − J_crit)⁺ − k_det·|τ_w|·m, with the wall
+ * shear τ_w, the wall concentration factor c_wall/c₀ and the flux J taken from the flow solution and the critical flux
+ * evaluated at the local wall shear rate τ_w/μ. The deposit is fed back as hydraulic resistance (a_f = R_m/(R_m + α·m)),
+ * and the salt field and the wall flux are converged again after every deposit step (quasi-steady march; the velocity
+ * field is kept, since the permeate is a fraction of a per cent of the cross-flow over the simulated length).
+ * o = { H, df, lm, nFil, arr, nx, ny, stretch, T, Uin, c0 (kg/m³), dP (Pa), Rm, muJ, alpha, dp, phiB, omega, cp (kg/m³), kDet, days, steps, Lbl }.
+ */
+export async function foulingCFD(o, ctx) {
+  const nFil = clamp(Math.round(o.nFil ?? 4), 1, 12), L = nFil * o.lm, H = o.H, nx = clamp(Math.round(o.nx ?? 128), 24, 400), ny = clamp(Math.round(o.ny ?? 24), 8, 80), stretch = o.stretch ?? 6, T = o.T, mu = viscosity(T), muJ = o.muJ ?? mu, rho = 997, D = diffusivityNaCl(T, 3), A = 1 / (muJ * o.Rm), dx = L / nx;
+  const g = yGrid(H, ny, stretch), mk = buildMask({ type: 'spacer', arr: o.arr ?? 'submerged', L, H, df: o.df, lm: o.lm, nFil }, nx, ny, g.yc), pi = (c) => piAstm(1000 * c, T) * 1e5;
+  const r = o.base || (await solveChannel({ L, H, nx, ny, stretch, solid: mk.solid, rho, mu, Uin: o.Uin, inlet: 'parabolic', scheme: 'hybrid', maxIter: Math.round(o.maxIter ?? 400), tol: o.tol ?? 1e-5, species: { c0: o.c0, D, A, B: 0, dP: o.dP, pi, bot: 'membrane', top: 'membrane' }, scalIter: 200 }, ctx));
+  const sides = [{ J: r.Jb, tau: r.tauB, cw: r.spc.wB, af: r.afB, row: 0 }, { J: r.Jt, tau: r.tauT, cw: r.spc.wT, af: r.afT, row: (ny - 1) * nx }].map((q) => ({ ...q, m: new Float64Array(nx), Jc: new Float64Array(nx), open: Uint8Array.from({ length: nx }, (_, i) => (r.solid[q.row + i] ? 0 : 1)) }));
+  const meanJ = () => { let a = 0, k = 0; for (const q of sides) for (let i = 0; i < nx; i++) if (q.open[i]) { a += q.J[i]; k++; } return k ? a / k : 0; }, massOf = () => { let a = 0; for (const q of sides) for (let i = 0; i < nx; i++) a += q.m[i] * dx; return a; };
+  const pIn = () => { let a = 0, k = 0; for (let j = 0; j < ny; j++) if (!r.solid[j * nx]) { a += r.p[j * nx] * r.dy[j]; k += r.dy[j]; } return k ? a / k : 0; };
+  const settle = (nMax) => { // salt field and wall flux for the present membrane permeability (velocity field kept)
+    for (let k = 0; k < nMax; k++) {
+      lastChange = r.spc.step(0, null, false).change / o.c0; sweeps++;
+      for (let i = 0; i < nx; i++) { r.v[i] = r.solid[i] ? 0 : -r.Jb[i]; r.v[ny * nx + i] = r.solid[(ny - 1) * nx + i] ? 0 : r.Jt[i]; }
+      if (k > 2 && lastChange < 1e-9) break;
+    }
+  };
+  let deposited = 0, detached = 0, sweeps = 0, lastChange = 0;
+  if (!o.base) settle(400);
+  const salt = () => { let si = 0, so = 0; for (let j = 0; j < ny; j++) { si += r.uin[j] * o.c0 * r.dy[j]; so += r.u[j * r.nu1 + nx] * r.spc.phi[j * nx + nx - 1] * r.dy[j]; } return { in: si, out: so }; }, saltClean = salt();
+  const clean = { J: sides.map((q) => Array.from(q.J)), cw: sides.map((q) => Array.from(q.cw)), Jmean: meanJ(), dp: pIn() - (() => { let a = 0, k = 0; for (let j = 0; j < ny; j++) if (!r.solid[j * nx + nx - 1]) { a += r.p[j * nx + nx - 1] * r.dy[j]; k += r.dy[j]; } return k ? a / k : 0; })() };
+  const steps = Math.max(1, Math.round(o.steps ?? 6)), dt = Math.max(o.days ?? 0, 0) / steps, hist = { t: [0], J: [clean.Jmean], m: [0] }, Lbl = o.Lbl ?? L, kDet = Math.max(o.kDet ?? 0, 0), wc = (o.omega ?? 0) * (o.cp ?? 0);
+  for (let st = 0; st < steps && dt > 0; st++) {
+    for (const q of sides) for (let i = 0; i < nx; i++) {
+      if (!q.open[i]) continue;
+      const tw = Math.abs(q.tau[i]), cf = Math.max(q.cw[i] / o.c0, 0), Jc = criticalFlux(o.dp, ((tw / mu) * H) / 6, { h: H, L: Lbl, T, phiB: Math.min((o.phiB ?? 1e-6) * cf, 0.3) }).J; // shear rate 6u/h = τ_w/μ
+      const a = wc * cf * Math.max(0, q.J[i] - Jc) * 86400, k = kDet * tw, m0 = q.m[i], m1 = depositMass(dt, a, k, m0);
+      // deposited and detached mass of the step: ∫a dt and ∫k·m dt for the exact exponential solution
+      const mInt = k > 1e-12 ? (a / k) * dt + ((m0 - a / k) * (1 - Math.exp(-k * dt))) / k : m0 * dt + 0.5 * a * dt * dt;
+      deposited += a * dt * dx; detached += k * mInt * dx; q.m[i] = m1; q.Jc[i] = Jc;
+    }
+    for (const q of sides) for (let i = 0; i < nx; i++) q.af[i] = o.Rm / (o.Rm + o.alpha * q.m[i]);
+    settle(200);
+    hist.t.push((st + 1) * dt); hist.J.push(meanJ()); hist.m.push(massOf() / (2 * L));
+    if (ctx?.progress) ctx.progress(0.6 + (0.4 * (st + 1)) / steps, `Deposit step ${st + 1} of ${steps}`);
+    if (ctx?.tick) await ctx.tick();
+  }
+  if (!(dt > 0)) for (const q of sides) for (let i = 0; i < nx; i++) if (q.open[i]) q.Jc[i] = criticalFlux(o.dp, ((Math.abs(q.tau[i]) / mu) * H) / 6, { h: H, L: Lbl, T, phiB: Math.min((o.phiB ?? 1e-6) * Math.max(q.cw[i] / o.c0, 0), 0.3) }).J;
+  // consistency of the wall condition at the most loaded cell: J = (Δp + p − p_in − π(c_w)) / (μ·(R_m + α·m))
+  let iw = 0, sw = 0, best = -1;
+  sides.forEach((q, s2) => { for (let i = 2; i < nx - 2; i++) if (q.open[i] && q.m[i] > best) { best = q.m[i]; iw = i; sw = s2; } });
+  const qw = sides[sw], wallCheck = qw.J[iw] > 0 ? qw.J[iw] / ((o.dP + r.p[qw.row + iw] - pIn() - pi(qw.cw[iw])) / (muJ * (o.Rm + o.alpha * qw.m[iw]))) : 1;
+  const x = Array.from({ length: nx }, (_, i) => (i + 0.5) * dx), Jend = meanJ();
+  return { raw: r, nx, ny, L, H, dx, x, yc: Array.from(g.yc), shapes: mk.shapes, sides, clean, hist, Jclean: clean.Jmean, Jend, decline: clean.Jmean > 0 ? 1 - Jend / clean.Jmean : 0, mass: massOf(), deposited, detached, sweeps, lastChange, wallCheck, saltClean, iters: r.iters, converged: r.converged, scalRes: r.scalRes, massRes: r.hist.mass[r.hist.mass.length - 1], A, mu, D, permShare: (clean.Jmean * 2 * L) / (o.Uin * H) };
 }
 
 // ---- state-space model with Kalman filtering ---------------------------------------------------------------------------
@@ -491,14 +702,19 @@ export function kalmanAuto(t, y, r) {
  * Returns the alerts raised by that record. A large upward jump of the normalised flow re-baselines the monitor (cleaning).
  */
 export function createMonitor(v) {
-  const area = Math.max(1, v.area), nB = clamp(Math.round(v.nBase ?? 10), 3, 60), base = [], S = { n: 0, accepted: 0, rejected: 0, ref: null, kf: null, e: 0, cm: 0, mu: 0, sd: 1, last: null, alerts: [], cycleStart: null, buf: [], fired: false, trig: false, r: v.kfR ?? 1, qS: v.kfQ ?? 1e-6, resets: 0, series: [] };
+  const area = Math.max(1, v.area), nB = clamp(Math.round(v.nBase ?? 10), 3, 60), store = [];
+  let base = [];
+  const fresh = () => ({ n: 0, accepted: 0, rejected: 0, untimed: 0, duplicates: 0, reordered: 0, pending: false, t0: 0, tLast: null, ref: null, kf: null, e: 0, cm: 0, mu: 0, sd: 1, last: null, alerts: [], cycleStart: null, buf: [], fired: false, firedAt: null, trig: false, trigAt: null, steps: [], r: v.kfR ?? 1, qS: v.kfQ ?? 1e-6, resets: 0, series: [], rebuilds: 0 });
+  const S = fresh();
   const quant = (r) => { const Y = r.Qp / r.Qf, Cfb = (tdsFromEC(r.Cf) * Math.log(1 / (1 - Y))) / Y, dP = r.Pf - r.Pc, ndp = r.Pf - dP / 2 - r.Pp - piAstm(Cfb, r.T) + piAstm(tdsFromEC(r.Cp), r.T); return { ndp, kA: r.Qp / (ndp * tcfM(r.T)) }; };
   const valid = (r) => r && NEED.every((k) => isNum(r[k])) && r.T >= 1 && r.T <= 50 && r.Pf > 0 && r.Pf <= 130 && r.Pc < r.Pf && r.Pp < r.Pc && r.Qp > 0 && r.Qp < 0.97 * r.Qf && r.Cp > 0 && r.Cp < r.Cf;
-  const rebase = (t) => { S.buf = []; S.kf = null; S.e = 0; S.cm = 0; S.fired = false; S.trig = false; S.cycleStart = t; };
-  const push = (row, again = false) => {
-    if (again) S.accepted--; else S.n++;
+  const rebase = (t) => { S.buf = []; S.kf = null; S.e = 0; S.cm = 0; S.fired = false; S.firedAt = null; S.trig = false; S.trigAt = null; S.steps = []; S.cycleStart = t; };
+  // one record in chronological order: validation, normalisation, Kalman update and control charts
+  const proc = (row, again = false) => {
+    if (again) S.accepted--;
     const al = [], add = (type, msg) => { const a = { t: row?.t ?? null, type, msg }; al.push(a); S.alerts.push(a); };
-    if (!valid(row)) { S.rejected++; add('rejected', 'Record failed the completeness or range checks'); return al; }
+    S.pending = false;
+    if (!valid(row)) { S.rejected++; S.pending = !complete(row); add('rejected', S.pending ? 'Record is incomplete' : 'Record failed the range checks'); return al; }
     const q = quant(row);
     if (!(q.ndp > 0.05)) { S.rejected++; add('rejected', 'Net driving pressure is not positive'); return al; }
     S.accepted++;
@@ -513,21 +729,44 @@ export function createMonitor(v) {
     {
       const k = S.kf, dt = Math.max(row.t - k.t, 0), lp = k.l + k.s * dt, a11 = k.p11 + 2 * dt * k.p12 + dt * dt * k.p22, a12 = k.p12 + dt * k.p22, a22 = k.p22 + S.qS * dt, Sv = a11 + S.r, e = npf - lp, z = e / Math.sqrt(Sv);
       if (z > 6 && e > (v.stepNPF ?? 3)) { S.resets++; add('cleaning', `Normalised flow jumped by ${fmt(e, 3)} % of reference: cleaning or element replacement — monitor re-baselined`); rebase(row.t); S.buf.push(npf); S.kf = { l: npf, s: 0, p11: 4, p12: 0, p22: 1e-2, t: row.t }; S.last = { t: row.t, npf, level: npf, slope: 0 }; return al; }
-      if (z < -6 && -e > (v.stepNPF ?? 3)) { add('step', `Sudden loss of ${fmt(-e, 3)} % of reference`); k.p11 += e * e; k.p22 += 0.25 * (e / Math.max(dt, 1)) ** 2; return al.concat(push(row, true)); } // inflate the state covariance and process the record again
+      if (z < -6 && -e > (v.stepNPF ?? 3)) { add('step', `Sudden loss of ${fmt(-e, 3)} % of reference`); S.steps.push({ t: row.t, loss: -e }); k.p11 += e * e; k.p22 += 0.25 * (e / Math.max(dt, 1)) ** 2; return al.concat(proc(row, true)); } // inflate the state covariance and process the record again
       const k1 = a11 / Sv, k2 = a12 / Sv;
       k.l = lp + k1 * e; k.s += k2 * e; k.p11 = (1 - k1) * a11; k.p12 = (1 - k1) * a12; k.p22 = a22 - k2 * a12; k.t = row.t;
     }
     if (S.buf.length >= nB) {
       const z = (npf - S.mu) / S.sd, lam = v.ewmaLambda ?? 0.2;
       S.e = lam * z + (1 - lam) * S.e; S.cm = Math.max(0, S.cm - z - (v.cusumK ?? 0.5));
-      if (!S.fired && (S.cm > (v.cusumH ?? 5) || S.e < -(v.ewmaL ?? 3) * Math.sqrt(lam / (2 - lam)))) { S.fired = true; add('alarm', `${S.cm > (v.cusumH ?? 5) ? 'CUSUM' : 'EWMA'} alarm: normalised flow drifting down (${fmt(npf, 4)} % of reference)`); }
+      if (!S.fired && (S.cm > (v.cusumH ?? 5) || S.e < -(v.ewmaL ?? 3) * Math.sqrt(lam / (2 - lam)))) { S.fired = true; S.firedAt = row.t; add('alarm', `${S.cm > (v.cusumH ?? 5) ? 'CUSUM' : 'EWMA'} alarm: normalised flow drifting down (${fmt(npf, 4)} % of reference)`); }
     }
-    if (!S.trig && S.kf.l <= 100 - (v.trigNPF ?? 10)) { S.trig = true; add('trigger', `Filtered normalised flow ${fmt(S.kf.l, 4)} % reached the cleaning trigger`); }
+    if (!S.trig && S.kf.l <= 100 - (v.trigNPF ?? 10)) { S.trig = true; S.trigAt = row.t; add('trigger', `Filtered normalised flow ${fmt(S.kf.l, 4)} % reached the cleaning trigger`); }
     S.last = { t: row.t, npf, level: S.kf.l, slope: S.kf.s, sdSlope: Math.sqrt(Math.max(S.kf.p22, 0)) };
     S.series.push(S.last);
     return al;
   };
-  return { push, state: S };
+  // replay of everything received so far in chronological order (after a late, repeated or bulk arrival)
+  const rebuild = () => {
+    const ing = ingestLog(store), nRe = S.rebuilds + 1;
+    base = []; Object.assign(S, fresh(), { n: ing.received, untimed: ing.untimed, duplicates: ing.duplicates, reordered: ing.reordered, t0: ing.t0, rebuilds: nRe });
+    for (const r of ing.rows) { proc(r); S.tLast = r.t; }
+    return ing;
+  };
+  /** One new record. Records that arrive late or repeat a time stamp are merged and the state is replayed, so the state depends only on the set of records received. */
+  const push = (row) => {
+    store.push(row);
+    const r = cleanRow(row);
+    if (!r) { S.n++; S.untimed++; return [{ t: null, type: 'rejected', msg: 'Record has no usable time stamp' }]; }
+    if (S.tLast == null) S.t0 = Math.abs(r.t) > 1e4 ? r.t : 0;
+    if (S.t0) r.t = +(r.t - S.t0).toFixed(6);
+    if (S.tLast == null || r.t > S.tLast) { S.n++; S.tLast = r.t; return proc(r); }
+    const dup = r.t === S.tLast || S.series.some((q) => q.t === r.t) || S.alerts.some((q) => q.t === r.t);
+    rebuild();
+    return [{ t: r.t, type: dup ? 'duplicate' : 'late', msg: dup ? 'Time stamp repeated: records merged and the state replayed' : 'Record arrived out of order: sorted in and the state replayed' }, ...S.alerts.filter((q) => q.t === r.t)];
+  };
+  /** Several records at once (a file that was read as a whole). Same state as pushing them one by one. */
+  const load = (rows) => { for (const r of Array.isArray(rows) ? rows : []) store.push(r); rebuild(); return S; };
+  /** Alarms that are latched in the current cycle, with the time each was raised. */
+  const active = () => [...(S.fired ? [{ t: S.firedAt, type: 'alarm', msg: 'Control chart: normalised flow drifting down' }] : []), ...(S.trig ? [{ t: S.trigAt, type: 'trigger', msg: 'Filtered normalised flow beyond the cleaning trigger' }] : []), ...S.steps.map((q) => ({ t: q.t, type: 'step', msg: `Sudden loss of ${fmt(q.loss, 3)} % of reference` }))];
+  return { push, load, active, state: S };
 }
 
 // ---- mechanistic model with a learned residual -----------------------------------------------------------------------
@@ -640,22 +879,40 @@ function extendedFouling(v, a, c) {
   K.push({ label: 'Biofilm effectiveness factor', value: s0.eta, unit: '–', status: 'ok', help: 'Share of the well-fed Monod uptake that substrate transport allows' });
   Object.assign(out, { biofilmEffectiveness: s0.eta, bioTransportDaysToTrigger: btDays });
   // 7 — deposition profile along the feed channel with the outlet pressure prescribed
+  let chan = null;
   if (v.chanOn !== false) {
-    const PoutBar = med(last5.map((q) => q.row.Pc)), PpBar = med(last5.map((q) => q.row.Pp)), piIn = mean(last5.map((q) => piAstm(q.tdsF, q.row.T))), PfMeas = med(last5.map((q) => q.row.Pf)), Ymeas = med(last5.map((q) => q.Y)), Qf = med(last5.map((q) => q.row.Qf)) / 3600;
+    const state = (rows) => ({ Pf: med(rows.map((q) => q.row.Pf)), Pc: med(rows.map((q) => q.row.Pc)), Pp: med(rows.map((q) => q.row.Pp)), T: med(rows.map((q) => q.row.T)), Qf: med(rows.map((q) => q.row.Qf)), Qp: med(rows.map((q) => q.row.Qp)), Y: med(rows.map((q) => q.Y)), pi: mean(rows.map((q) => piAstm(q.tdsF, q.row.T))), tcf: med(rows.map((q) => q.tcf)), R: mean(rows.map((q) => q.Rtot)), t0: rows[0].t, t1: rows[rows.length - 1].t });
+    const nB = a.nBase, firstEv = a.events.length ? a.events[0].i : G.length, hold = firstEv >= 2 * nB + 2 && G.length >= 3 * nB, sNow = state(last5), sRef = state(G.slice(0, nB)), sVal = hold ? state(G.slice(nB, 2 * nB)) : sRef;
+    const PoutBar = sNow.Pc, PfMeas = sNow.Pf, Ymeas = sNow.Y, Qf = sNow.Qf / 3600;
     // equivalent channel: total membrane area on two walls, split over the stages in the ratio of their vessel numbers
     const ratio = Math.max(v.stageRatio ?? 2, 1), nSt = a.stageOK ? 2 : 1, widths = nSt === 2 ? [(a.area * ratio) / (ratio + 1) / (2 * v.lChan), a.area / (ratio + 1) / (2 * v.lChan)] : [a.area / (2 * v.lChan)];
-    const ch = channelFouling({ L: v.lChan, widths, h, Q0: Qf, T: Tm, mu: muEff, Rm: a.Rm + a.Rirr, alpha: c.alpha, Pp: PpBar * 1e5, Pout: PoutBar * 1e5, dPtarget: Math.max(PfMeas - PoutBar, 0.05) * 1e5, pi0: piIn * 1e5, betaCP: ce.beta, dp: v.dpNm * 1e-9, phiB: v.phiB, omega: v.omega, cp: cP, kDet: Math.max(v.kDet ?? 0.05, 0), days: Math.max(a.since, 0), nT: 12, N: v.nChan ?? 40 });
-    const n = ch.x.length, lead = mean(ch.m.slice(0, Math.ceil(n / 4))), tail = mean(ch.m.slice(-Math.ceil(n / 4)));
+    const geo = (S) => ({ L: v.lChan, widths, h, Q0: S.Qf / 3600, T: S.T, mu: MU25 / S.tcf, alpha: c.alpha, Pp: S.Pp * 1e5, pi0: S.pi * 1e5, D: diffusivityNaCl(S.T, 3), dp: v.dpNm * 1e-9, phiB: v.phiB, omega: v.omega, cp: cP, kDet: Math.max(v.kDet ?? 0.05, 0), N: v.nChan ?? 40 });
+    const at = (S, Rm, extra) => channelFouling({ ...geo(S), Rm, Pout: S.Pc * 1e5, dPtarget: Math.max(S.Pf - S.Pc, 0.05) * 1e5, days: 0, lean: true, ...extra });
+    // membrane resistance of the channel model: identified by inverting the model on the reference rows of the log, then
+    // scaled with the lumped Darcy resistances (clean reference, irreversible share, observed total)
+    const id = channelIdentify(geo(sRef), { Pin: sRef.Pf * 1e5, Pout: sRef.Pc * 1e5, perm: sRef.Qp / 3600 }), betaRef = Math.exp(Math.min(sRef.Qp / 3600 / a.area / massTransfer(v.uCross, h, sRef.T, diffusivityNaCl(sRef.T, 3)).k, 5));
+    const Rc0 = id.consistent ? id.Rm : sRef.R * 0.5, scale = Rc0 / sRef.R, Rnow = med(a.Rt.slice(-5));
+    const chVal = at(sVal, Rc0 * (hold ? sVal.R / sRef.R : 1)), chObs = at(sNow, scale * Rnow);
+    const ch = at(sNow, scale * (a.Rm + a.Rirr), { days: Math.max(a.since, 0), nT: 12, lean: false });
+    const n = ch.x.length, lead = mean(ch.m.slice(0, Math.ceil(n / 4))), tail = mean(ch.m.slice(-Math.ceil(n / 4))), errRef = chVal.recovery - sVal.Y, errObs = chObs.recovery - Ymeas;
     PL.push({ type: 'line', title: 'Channel model: flux, critical flux and deposit from inlet to outlet', xlabel: 'Distance from the feed inlet (m)', ylabel: 'Flux (L/m²·h) · deposit (g/m²)', series: [{ name: 'Local flux (L/m²·h)', x: ch.x, y: ch.J.map((q) => q * 3.6e6) }, { name: 'Local critical flux (L/m²·h)', x: ch.x, y: ch.Jc.map((q) => Math.min(q * 3.6e6, 500)), dash: true }, { name: 'Deposit (g/m²)', x: ch.x, y: ch.m.map((q) => q * 1000) }], note: 'Deposition occurs where the local flux exceeds the local critical flux; cross-flow and wall shear fall along the channel as water permeates.' });
+    PL.push({ type: 'line', title: 'Channel model: osmotic pressure at the membrane and feed-side pressure', xlabel: 'Distance from the feed inlet (m)', ylabel: 'bar · –', series: [{ name: 'Feed-side pressure (bar)', x: ch.x, y: ch.P.map((q) => q / 1e5) }, { name: 'Osmotic pressure at the membrane + permeate pressure (bar)', x: ch.x, y: ch.cb.map((q, i) => (sNow.pi * q * ch.beta[i]) + sNow.Pp) }, { name: 'Polarisation factor β (–)', x: ch.x, y: ch.beta, dash: true }], note: 'The gap between the two pressure curves is the local net driving pressure. Where they meet the membrane stops producing: the concentrate pressure must stay above the osmotic pressure at the wall of the last element.' });
     TB.push({ title: 'Channel model with prescribed outlet pressure', columns: ['Quantity', 'Model', 'Measured', 'Unit', 'Note'], rows: [
-      ['Outlet (concentrate) pressure', ch.Pout / 1e5, PoutBar, 'bar', 'Boundary condition'], ['Inlet (feed) pressure, clean channel', ch.first.Pin / 1e5, PfMeas, 'bar', `Found by shooting from the outlet condition; friction scaled ×${fq(ch.fMult, 3)} to the measured pressure drop`], ['Inlet (feed) pressure with the deposit', ch.Pin / 1e5, PfMeas, 'bar', 'Same friction factor'], ['Recovery', 100 * ch.recovery, 100 * Ymeas, '%', `${ch.nStages} stage${ch.nStages > 1 ? `s, vessel ratio ${ratio} : 1` : ''}; an independent check of membrane resistance and osmotic pressure`], ['Inlet cross-flow velocity', ch.u[0], v.uCross, 'm/s', 'Model: feed flow / open channel area; right: value entered for the critical-flux estimate'],
-      ['Flux at inlet → outlet', `${fq(ch.J[0] * 3.6e6, 3)} → ${fq(ch.J[n - 1] * 3.6e6, 3)}`, c.fluxNow, 'L/m²·h', 'Measured value is the train average'], ['Wall shear stress inlet → outlet', `${fq(ch.tau[0], 3)} → ${fq(ch.tau[n - 1], 3)}`, null, 'Pa', 'Wall-shear boundary condition for detachment'],
+      ['Membrane resistance identified on the reference rows', Rc0 / 1e13, sRef.R / 1e13, '10¹³ m⁻¹', id.consistent ? `Channel model inverted for the logged pressures and permeate flow of days ${fq(sRef.t0, 4)}–${fq(sRef.t1, 4)}; right: lumped Darcy value of the normalisation, which also contains polarisation (β ≈ ${fq(betaRef, 3)}) and the log-mean concentration` : 'Not identifiable — see the warning'],
+      ['Recovery on the clean reference period', 100 * chVal.recovery, 100 * sVal.Y, '%', hold ? `Days ${fq(sVal.t0, 4)}–${fq(sVal.t1, 4)}: rows held out from the identification` : 'Reference rows (the log is too short to hold rows out)'],
+      ['Recovery now at the observed fouling resistance', 100 * chObs.recovery, 100 * Ymeas, '%', `Identified resistance × ${fq(Rnow / sRef.R, 4)} (total / reference resistance of the Darcy analysis): a prediction for today's pressures, temperature and salinity`],
+      ['Recovery now with the modelled deposit only', 100 * ch.recovery, 100 * Ymeas, '%', `${ch.nStages} stage${ch.nStages > 1 ? `s, vessel ratio ${ratio} : 1` : ''}; membrane + irreversible resistance + deposit of the deposition law`],
+      ['Outlet (concentrate) pressure', ch.Pout / 1e5, PoutBar, 'bar', 'Boundary condition'], ['Inlet (feed) pressure, clean channel', ch.first.Pin / 1e5, PfMeas, 'bar', `Found by shooting from the outlet condition; friction scaled ×${fq(ch.fMult, 3)} to the measured pressure drop`], ['Inlet (feed) pressure with the deposit', ch.Pin / 1e5, PfMeas, 'bar', 'Same friction factor'], ['Inlet cross-flow velocity', ch.u[0], v.uCross, 'm/s', 'Model: feed flow / open channel area; right: value entered for the critical-flux estimate'],
+      ['Flux at inlet → outlet', `${fq(ch.J[0] * 3.6e6, 3)} → ${fq(ch.J[n - 1] * 3.6e6, 3)}`, c.fluxNow, 'L/m²·h', 'Measured value is the train average'], ['Polarisation factor β at inlet → outlet', `${fq(ch.beta[0], 4)} → ${fq(ch.beta[n - 1], 4)}`, ce.beta, '–', 'Local film theory β = exp(J/k) with k from the local cross-flow; right: one average channel'], ['Wall shear stress inlet → outlet', `${fq(ch.tau[0], 3)} → ${fq(ch.tau[n - 1], 3)}`, null, 'Pa', 'Wall-shear boundary condition for detachment'],
       ['Deposit in the first / last quarter', `${fq(lead * 1000, 3)} / ${fq(tail * 1000, 3)}`, null, 'g/m²', lead > tail ? 'Lead-end deposition (high flux)' : tail > 0 ? 'Tail-end deposition (low shear)' : 'No deposition above the critical flux']],
-      note: `${n} cells; spacer friction f = ${fq(ch.fMult, 3)} × 6.23·Re^−0.3 (the factor absorbs fittings, interconnectors and spacer fouling); membrane resistance and polarisation factor from this analysis; deposit integrated over the ${fq(a.since, 3)} days of the current cycle in 12 quasi-steady steps. A reduced, one-dimensional form of a flow simulation: the cross-channel profile is represented by the film coefficient.` });
+      note: `${n} cells; local flux J = (p − p_perm − π·β) / (μ·R) with β = exp(J/k) solved in every cell; spacer friction f = ${fq(ch.fMult, 3)} × 6.23·Re^−0.3 (the factor absorbs fittings, interconnectors and spacer fouling); deposit integrated over the ${fq(a.since, 3)} days of the current cycle in 12 quasi-steady steps. A reduced, one-dimensional form of a flow simulation: the cross-channel profile is represented by the film coefficient.` });
     BAL.push({ name: 'Channel model: feed flow = concentrate + permeate (scaled)', in: 1, out: (ch.Qout + ch.perm) / Qf });
-    if (Math.abs(ch.recovery - Ymeas) > 0.07) W.push({ level: 'info', msg: `At the logged pressures the channel model gives ${fq(100 * ch.recovery, 3)} % recovery against ${fq(100 * Ymeas, 3)} % measured: ${ch.J[n - 1] < 0.1 * ch.J[0] ? 'the tail of the train has almost no net driving pressure once the local osmotic pressure and polarisation are resolved — check the concentrate pressure and conductivity readings, or the last elements contribute little' : 'check the membrane area, the channel dimensions and the pressure readings'}.` });
-    K.push({ label: 'Channel model: feed pressure', value: ch.Pin / 1e5, unit: 'bar', help: `From the prescribed outlet pressure ${fq(PoutBar, 4)} bar; measured ${fq(PfMeas, 4)} bar` });
-    Object.assign(out, { channelFeedPressureBar: ch.Pin / 1e5, channelRecovery: ch.recovery, channelDepositLead: lead, channelDepositTail: tail });
+    if (!id.consistent) W.push({ level: 'warn', msg: `The reference rows of the log are not physically attainable in the channel model: at the logged pressures even a membrane without resistance would deliver only ${fq(id.permMax * 3600, 3)} m³/h against ${fq(sRef.Qp, 3)} m³/h logged, because the concentrate pressure (${fq(sRef.Pc, 3)} bar) is below the osmotic pressure at the wall of the last elements. Check the concentrate-pressure and conductivity readings, the membrane area and the recovery.` });
+    else if (Math.abs(errRef) > 0.03) W.push({ level: 'warn', msg: `The channel model gives ${fq(100 * chVal.recovery, 3)} % recovery on the clean reference period against ${fq(100 * sVal.Y, 3)} % measured: check the membrane area, the channel dimensions and the pressure readings.` });
+    else if (Math.abs(errObs) > 0.05) W.push({ level: 'info', msg: `With the observed fouling resistance spread evenly over the membrane the channel model gives ${fq(100 * chObs.recovery, 3)} % recovery now against ${fq(100 * Ymeas, 3)} % measured: the fouling is ${errObs > 0 ? 'concentrated where the flux is highest (lead elements)' : 'concentrated in the tail elements, where an even resistance costs little flow'} rather than uniform.` });
+    K.push({ label: 'Channel model: feed pressure', value: ch.Pin / 1e5, unit: 'bar', help: `From the prescribed outlet pressure ${fq(PoutBar, 4)} bar; measured ${fq(PfMeas, 4)} bar` }, { label: 'Channel model: recovery on the clean reference', value: 100 * chVal.recovery, unit: '%', status: !id.consistent || Math.abs(errRef) > 0.03 ? 'warn' : 'ok', help: `Measured ${fq(100 * sVal.Y, 4)} %; membrane resistance identified from the reference rows` });
+    chan = { ch, sNow, Rbase: scale * (a.Rm + a.Rirr) };
+    Object.assign(out, { channelFeedPressureBar: ch.Pin / 1e5, channelRecovery: ch.recovery, channelDepositLead: lead, channelDepositTail: tail, channelRm: Rc0, channelConsistent: id.consistent, channelRecoveryRef: chVal.recovery, channelRecoveryRefMeasured: sVal.Y, channelRecoveryObserved: chObs.recovery, channelRecoveryMeasured: Ymeas });
   }
   // 8 — state-space model of the normalised flow with a Kalman filter, restarted at every cleaning
   const kfL = [], kfS = [];
@@ -675,11 +932,11 @@ function extendedFouling(v, a, c) {
     Object.assign(out, { kalmanLevel: lv, kalmanSlope: sl, kalmanDaysToCleaning: kd });
   }
   // 9 — streaming replay: the records are fed one at a time, as a data-acquisition system would deliver them
-  const mon = createMonitor(v), rows = (Array.isArray(v.log) ? v.log : []).filter((r) => r && isNum(r.t)).slice().sort((p, q) => p.t - q.t);
-  for (const r of rows) mon.push(r);
+  const mon = createMonitor(v);
+  mon.load(v.log);
   const ms = mon.state, show = ms.alerts.filter((x) => x.type !== 'rejected'), lastAlarm = ms.alerts.filter((x) => x.type === 'alarm').pop();
   TB.push({ title: 'Streaming replay of the log (record-by-record processing)', columns: ['Day', 'Event', 'Message'], rows: show.length ? show.slice(-40).map((x) => [x.t, { baseline: 'Baseline', alarm: 'Control-chart alarm', trigger: 'Cleaning trigger', cleaning: 'Cleaning detected', step: 'Sudden loss' }[x.type] || x.type, x.msg]) : [['–', 'No event', 'No alert was raised']],
-    note: `${ms.n} records were pushed one at a time; ${ms.accepted} accepted, ${ms.rejected} rejected by the on-line validation. Each record updates the normalisation, the Kalman state and the EWMA/CUSUM charts with a fixed amount of work, so the same routine can follow a live data feed: append new rows to the operating log and run again.${ms.last ? ` State after the last record: level ${fq(ms.last.level, 4)} % of reference, slope ${fq(ms.last.slope, 3)} %/d.` : ''}` });
+    note: `${ms.n} records were pushed one at a time; ${ms.accepted} accepted, ${ms.rejected} rejected by the on-line validation. Each record updates the normalisation, the Kalman state and the EWMA/CUSUM charts with a fixed amount of work, so the same routine follows the live feed: when the linked export file grows, the new rows are appended and the state is carried forward; a late or repeated record is merged and the state replayed, so the result depends only on the set of records received.${ms.last ? ` State after the last record: level ${fq(ms.last.level, 4)} % of reference, slope ${fq(ms.last.slope, 3)} %/d.` : ''}` });
   K.push({ label: 'Streaming monitor: records / alerts', value: `${ms.accepted} / ${show.length}`, help: 'Record-by-record processing of the log with on-line validation, Kalman update and control charts' });
   Object.assign(out, { streamAccepted: ms.accepted, streamRejected: ms.rejected, streamAlerts: show.length, streamCleanings: ms.resets, streamLastAlarmDay: lastAlarm ? lastAlarm.t : -1 });
   // 10 — mechanistic trend with a learned residual, tested out of sample
@@ -706,8 +963,99 @@ function extendedFouling(v, a, c) {
   TB.push({ title: 'Monitoring dashboard', columns: ['Indicator', 'Now', 'Limit', 'Score (0–100)', 'Status'], rows: [...sc5.map((q) => [q[0], q[1], q[2], q[3], stat(q[3])]), cpRow, ['Membrane health index', null, null, health, stat(health)]], note: 'Score = share of the allowed margin still unused (100 = at reference, 0 = at the limit). The health index is the mean of the scores and the worst score in equal parts, so one failing indicator cannot hide behind good ones.' });
   K.push({ label: 'Membrane health index', value: health, unit: '/100', status: health >= 60 ? 'ok' : health >= 25 ? 'warn' : 'bad', help: 'Dashboard score combining flow, pressure drop, salt passage, remaining life and data quality' });
   out.healthIndex = health;
-  return { K, PL, TB, W, BAL, out };
+  return { K, PL, TB, W, BAL, out, ms, chan };
 }
+
+// ---- alarms and latest state ---------------------------------------------------------------------------------------
+const ALARM_COLS = ['Raised (d)', 'Alarm', 'Severity', 'Value now', 'Limit', 'Active for (d)'];
+/**
+ * Alarms that are active at the end of the log, each with the time it was raised: cleaning triggers that are exceeded
+ * (raised when the five-record median last crossed the limit), the latched control-chart alarm of the current cycle,
+ * integrity faults and sudden steps since the last cleaning, and a last record that is still incomplete.
+ */
+export function activeAlarms(a) {
+  const { t, cur, trig, now, events } = a, out = [], n = t.length, ser = { npf: a.npf, ndp: a.ndp, nsp: a.integrity ? a.nspG : a.nsp };
+  for (const k of ['npf', 'ndp', 'nsp']) {
+    const q = trig[k];
+    if (!(q.margin <= 0) || (k === 'nsp' && a.integrity)) continue;
+    const y = ser[k], beyond = (i) => { const m = med(y.slice(Math.max(cur.a, i - 4), i + 1)); return k === 'npf' ? m <= q.limit : m >= q.limit; };
+    let i = n - 1;
+    while (i > cur.a && beyond(i - 1)) i--;
+    out.push({ t: t[i], name: `${q.name} beyond the cleaning trigger`, severity: 'bad', now: q.now, limit: q.limit });
+  }
+  if (cur.alarm) out.push({ t: cur.alarm.t, name: `${cur.alarm.kind} control chart: normalised permeate flow drifting down`, severity: 'warn', now: now.npf, limit: null });
+  for (const e of events) {
+    if (e.i < cur.a || e.type === 'cleaning') continue;
+    out.push({ t: e.t, name: e.label, severity: e.type === 'integrity' ? 'bad' : 'warn', now: e.type === 'integrity' ? now.nsp : e.type === 'dpjump' ? now.ndp : now.npf, limit: null });
+  }
+  if (a.ing?.pending) out.push({ t: a.ing.tLast, name: 'Last record of the log is incomplete (still being written, or a transmitter dropped out)', severity: 'info', now: null, limit: null });
+  return out.sort((p, q) => p.t - q.t);
+}
+const alarmTable = (list, tNow, note) => ({ title: 'Alarms', columns: ALARM_COLS, rows: list.length ? list.map((q) => [q.t, q.name, { bad: 'Act', warn: 'Watch', info: 'Note' }[q.severity] || q.severity, q.now, q.limit, tNow != null && q.t != null ? Math.max(0, tNow - q.t) : null]) : [['–', 'No active alarm', 'OK', null, null, null]], note });
+const latestState = (ms, ing, nAlarms) => ({ lastTimestamp: ing.tLast ?? -1, rowsReceived: ing.received, rowsAccepted: ms.accepted, rowsRejected: ms.rejected + ing.untimed, duplicatesMerged: ing.duplicates, lastRecordComplete: !ing.pending, activeAlarms: nAlarms });
+
+/** Result for a log that is still too short for the trend analysis: on-line validation, raw signals and the latest state. */
+function shortLogResult(v, why) {
+  const ing = ingestLog(v.log), mon = createMonitor(v);
+  mon.load(v.log);
+  const ms = mon.state, ok = ing.rows.filter(complete), need = Math.max(0, MIN_ROWS - ms.accepted), act = mon.active().map((q) => ({ t: q.t, name: q.msg, severity: q.type === 'trigger' ? 'bad' : 'warn', now: ms.last ? ms.last.level : null, limit: q.type === 'trigger' ? 100 - (v.trigNPF ?? 10) : null }));
+  if (ing.pending) act.push({ t: ing.tLast, name: 'Last record of the log is incomplete (still being written, or a transmitter dropped out)', severity: 'info', now: null, limit: null });
+  const W = [{ level: 'warn', msg: `${why} ${ing.received ? `${ing.received} record${ing.received > 1 ? 's' : ''} received so far, ${ms.accepted} accepted` : 'No record received yet'}: the normalised trends, the diagnosis and the forecast appear once ${need > 0 ? `${need} more complete record${need > 1 ? 's have' : ' has'}` : 'enough valid records have'} arrived. Until then only the on-line validation and the raw signals are shown.` }];
+  if (ing.untimed) W.push({ level: 'info', msg: `${ing.untimed} record${ing.untimed > 1 ? 's have' : ' has'} no usable time stamp and ${ing.untimed > 1 ? 'were' : 'was'} skipped — check that the time column of the file is mapped.` });
+  const lastRow = ok[ok.length - 1], tt = ok.map((r) => r.t);
+  return {
+    summary: `The operating log is still too short for the trend analysis: ${ms.accepted} of the ${MIN_ROWS} complete records needed have arrived.`,
+    warnings: W,
+    kpis: [{ label: 'Records received', value: ing.received }, { label: 'Records accepted', value: ms.accepted, status: 'warn', help: `The analysis starts at ${MIN_ROWS} complete, plausible records` }, { label: 'Records rejected', value: ms.rejected + ing.untimed, status: ms.rejected + ing.untimed ? 'warn' : 'ok' }, { label: 'Records still needed', value: need, status: 'warn' },
+      { label: 'Last time stamp', value: ing.tLast ?? '–', unit: ing.tLast != null ? 'd' : '' }, { label: 'Active alarms', value: act.filter((q) => q.severity !== 'info').length, status: act.some((q) => q.severity === 'bad') ? 'bad' : act.some((q) => q.severity === 'warn') ? 'warn' : 'ok' },
+      ...(lastRow ? [{ label: 'Latest feed pressure', value: lastRow.Pf, unit: 'bar' }, { label: 'Latest recovery', value: (100 * lastRow.Qp) / lastRow.Qf, unit: '%' }] : [])],
+    recommendations: ['Keep the live feed linked (or paste more rows): the full analysis runs automatically as soon as enough complete records are available.'],
+    plots: ok.length ? [{ type: 'line', title: 'Raw signals received so far', xlabel: 'Time (d)', ylabel: 'bar · m³/h', series: [{ name: 'Feed pressure (bar)', x: tt, y: ok.map((r) => r.Pf), mode: 'both' }, { name: 'Concentrate pressure (bar)', x: tt, y: ok.map((r) => r.Pc), mode: 'both' }, { name: 'Permeate flow (m³/h)', x: tt, y: ok.map((r) => r.Qp), mode: 'both' }], note: 'Unprocessed values of the complete records.' }] : [],
+    tables: [alarmTable(act, ing.tLast, 'From the record-by-record monitor; the full alarm logic starts with the trend analysis.'),
+      { title: 'Records received', columns: ['Day', ...COLS.slice(1).map((c) => `${c.label} (${c.unit})`), 'Status'], rows: ing.rows.length ? ing.rows.slice(-60).map((r) => [r.t, ...VALS.map((k) => r[k]), complete(r) ? 'complete' : 'incomplete']) : [['–', ...VALS.map(() => null), 'no record']] },
+      { title: 'Streaming replay of the log (record-by-record processing)', columns: ['Day', 'Event', 'Message'], rows: ms.alerts.length ? ms.alerts.slice(-40).map((x) => [x.t, x.type, x.msg]) : [['–', 'No event', 'No alert was raised']] }],
+    balances: [],
+    outputs: { latest: latestState(ms, ing, act.filter((q) => q.severity !== 'info').length), dataIssues: ms.rejected + ing.untimed + ing.duplicates, analysisReady: false, streamAccepted: ms.accepted, streamRejected: ms.rejected },
+  };
+}
+
+/** Results of the two-dimensional feed-channel study for run(): fields, wall profiles, flux decline against the one-dimensional model. */
+async function channelFlowStudy(v, a, X, c, ctx) {
+  const h = v.hChan * 1e-3, last5 = a.G.slice(-5), tail = v.cfdPos === 'tail', ch = X.chan ? X.chan.ch : null, ic = ch ? (tail ? ch.x.length - 1 : 0) : 0, T = X.chan ? X.chan.sNow.T : med(last5.map((q) => q.row.T)), muJ = MU25 / med(last5.map((q) => q.tcf));
+  const tdsF = mean(last5.map((q) => q.tdsF)), Y = med(last5.map((q) => q.Y)), Pp = med(last5.map((q) => q.row.Pp)), Pw = tail ? med(last5.map((q) => q.row.Pc)) : med(last5.map((q) => q.row.Pf));
+  const Uin = ch ? ch.u[ic] : v.uCross, c0 = (tdsF * (ch ? ch.cb[ic] : tail ? 1 / (1 - Y) : 1)) / 1000, dP = Math.max((ch ? ch.P[ic] / 1e5 : Pw) - Pp, 0.1) * 1e5, Rm = X.chan ? X.chan.Rbase : a.Rm + a.Rirr, days = Math.max(v.cfdDays ?? 30, 0), steps = clamp(Math.round(v.cfdSteps ?? 6), 1, 20);
+  const o = { H: h, df: Math.min((v.cfdFil ?? 0.36) * 1e-3, 0.8 * h), lm: (v.cfdPitch ?? 3) * 1e-3, nFil: v.cfdNfil ?? 4, arr: v.cfdArr ?? 'zigzag', nx: v.cfdNx ?? 128, ny: v.cfdNy ?? 24, T, Uin, c0, dP, Rm, muJ, alpha: c.alpha, dp: v.dpNm * 1e-9, phiB: v.phiB, omega: v.omega, cp: v.phiB * v.rhoP, kDet: Math.max(v.kDet ?? 0.05, 0), days, steps, Lbl: v.lChan, tol: 1e-4 };
+  ctx?.progress?.(0.75, 'Feed-channel flow field…');
+  const sub = ctx ? { progress: (f, msg) => ctx.progress?.(0.75 + 0.24 * f, msg), tick: ctx.tick } : undefined, f = await foulingCFD(o, sub), { nx, ny, raw } = f, mm = 1000, lmh = 3.6e6;
+  // one-dimensional channel model of the same segment: same membrane, deposit law and pressure drop
+  const one = (k) => channelFouling({ L: f.L, widths: [1], h, Q0: Uin * h, T, mu: muJ, Rm, alpha: o.alpha, Pp: 0, Pin: dP, dPtarget: Math.max(f.clean.dp, 1), pi0: piAstm(1000 * c0, T) * 1e5, D: f.D, dp: o.dp, phiB: o.phiB, omega: o.omega, cp: o.cp, kDet: o.kDet, days: (days * k) / steps, nT: Math.max(k, 1), N: 40, Lbl: o.Lbl });
+  const h1 = Array.from({ length: steps + 1 }, (_, k) => one(k)), c1 = h1[steps], J1 = h1.map((q) => mean(q.J)), dec1 = J1[0] > 0 ? 1 - J1[steps] / J1[0] : 0;
+  const xs = f.x.map((x) => x * mm), ys = f.yc.map((y) => y * mm), mask = ys.map((_, j) => xs.map((_, i) => !!raw.solid[j * nx + i])), grid = (fn) => ys.map((_, j) => xs.map((_, i) => (raw.solid[j * nx + i] ? 0 : fn(j * nx + i, i, j))));
+  const uc = grid((P, i, j) => 0.5 * (raw.u[j * raw.nu1 + i] + raw.u[j * raw.nu1 + i + 1])), vc = grid((P) => 0.5 * (raw.v[P] + raw.v[P + nx])), shapes = f.shapes.map((q) => ({ ...q, x: q.x.map((x) => x * mm), y: q.y.map((y) => y * mm) })), base = { type: 'field', xlabel: 'Along the channel (mm)', ylabel: 'Across the gap (mm)', x: xs, y: ys, mask, shapes };
+  const [bot, top] = f.sides, all = (fn) => { const o2 = []; for (const q of f.sides) for (let i = 0; i < nx; i++) if (q.open[i]) o2.push(fn(q, i)); return o2; }, taus = all((q, i) => Math.abs(q.tau[i])), cps = all((q, i) => q.cw[i] / c0), ms = all((q, i) => q.m[i]), covered = ms.filter((x) => x > 1e-9).length / Math.max(ms.length, 1);
+  const wall = (q, fn) => Array.from({ length: nx }, (_, i) => (q.open[i] ? fn(i) : 0)), balErr = f.deposited > 0 ? (f.deposited - f.detached - f.mass) / f.deposited : 0, W = [], pos = tail ? 'tail (concentrate) end' : 'lead (feed) end';
+  const PL = [
+    { ...base, title: 'Feed channel: velocity and streamlines', zlabel: 'Speed', zunit: 'm/s', z: uc.map((row, j) => row.map((u, i) => Math.hypot(u, vc[j][i]))), u: uc, v: vc, stream: true, cmap: 'viridis', zmin: 0, note: `${f.L * mm} mm of the ${fq(h * mm, 3)} mm feed channel at the ${pos} of the train, ${o.arr === 'none' ? 'without spacer' : `${o.nFil} spacer filaments (${o.arr})`}; mean cross-flow ${fq(Uin, 3)} m/s. The vertical scale is stretched.` },
+    { ...base, title: 'Feed channel: salt concentration relative to the inlet', zlabel: 'c / c₀', zunit: '–', z: grid((P) => raw.spc.phi[P] / c0), cmap: 'salinity', contours: 8, zmin: 1, zmax: Math.max(1.05, Math.min(quantile(cps, 0.98), 3)), note: `Concentration polarisation on both membranes; highest wall value ${fq(Math.max(...cps), 3)} × inlet${Math.max(...cps) > 3 ? ' in the stagnant corners where a filament touches the membrane (colour scale clipped)' : ''}.` },
+    { type: 'line', title: 'Feed channel: wall shear, flux and critical flux along the lower membrane', xlabel: 'Along the channel (mm)', ylabel: 'Pa · L/m²·h', series: [{ name: 'Wall shear stress |τ_w| (Pa)', x: xs, y: wall(bot, (i) => Math.abs(bot.tau[i])) }, { name: 'Clean flux (L/m²·h)', x: xs, y: wall(bot, (i) => f.clean.J[0][i] * lmh), dash: true }, { name: 'Flux with the deposit (L/m²·h)', x: xs, y: wall(bot, (i) => bot.J[i] * lmh) }, { name: 'Critical flux at the local shear (L/m²·h)', x: xs, y: wall(bot, (i) => Math.min(bot.Jc[i] * lmh, 100)), dash: true }], note: 'Deposit forms where the flux exceeds the critical flux, that is in the low-shear zones; zero values mark cells covered by a filament.' },
+    { type: 'line', title: 'Feed channel: deposit along the membranes', xlabel: 'Along the channel (mm)', ylabel: 'Deposit (g/m²)', zeroY: true, series: [{ name: 'Lower membrane (flow field)', x: xs, y: wall(bot, (i) => bot.m[i] * 1000) }, { name: 'Upper membrane (flow field)', x: xs, y: wall(top, (i) => top.m[i] * 1000) }, { name: 'One-dimensional channel model', x: c1.x.map((x) => x * mm), y: c1.m.map((x) => x * 1000), dash: true }], note: `After ${fq(days, 3)} days in ${steps} quasi-steady steps.` },
+    { type: 'line', title: 'Feed channel: flux decline, flow field versus one-dimensional model', xlabel: 'Time (d)', ylabel: 'Mean flux (% of clean)', series: [{ name: 'Two-dimensional flow field', x: f.hist.t, y: f.hist.J.map((x) => (100 * x) / f.Jclean), mode: 'both' }, { name: 'One-dimensional channel model', x: f.hist.t, y: f.hist.t.map((_, k) => (100 * J1[k]) / J1[0]), mode: 'both', dash: true }] },
+  ];
+  const TB = [{ title: 'Feed-channel flow field with a growing deposit', columns: ['Quantity', 'Two-dimensional flow field', 'One-dimensional channel model', 'Unit', 'Note'], rows: [
+    ['Cross-flow velocity / feed-side pressure difference / salt', `${fq(Uin, 3)} m/s / ${fq(dP / 1e5, 4)} bar / ${fq(c0, 3)} g/L`, 'same', '', `Conditions at the ${pos} of the train${ch ? ' from the channel model' : ' from the log'}`],
+    ['Clean mean flux', f.Jclean * lmh, J1[0] * lmh, 'L/m²·h', 'Membrane + irreversible resistance of the analysis'], ['Wall shear stress: lowest / mean / highest', `${fq(Math.min(...taus), 3)} / ${fq(mean(taus), 3)} / ${fq(Math.max(...taus), 3)}`, c1.tau[0], 'Pa', 'One-dimensional: 6·μ·u/h'],
+    ['Polarisation factor at the wall: mean / highest', `${fq(mean(cps), 4)} / ${fq(Math.max(...cps), 4)}`, mean(c1.beta), '–', 'One-dimensional: film theory with the Schock–Miquel correlation'], ['Pressure drop', f.clean.dp / f.L / 100, (c1.Pin - c1.Pout) / f.L / 100, 'mbar/m', 'One-dimensional friction is scaled to the flow-field value'],
+    ['Critical flux: lowest / highest', `${fq(Math.min(...all((q, i) => q.Jc[i])) * lmh, 3)} / ${fq(Math.max(...all((q, i) => q.Jc[i])) * lmh, 3)}`, c1.Jc[0] * lmh, 'L/m²·h', `Back-transport of ${v.dpNm} nm particles at the local shear rate τ_w/μ`],
+    ['Deposit: mean / highest', `${fq(mean(ms) * 1000, 3)} / ${fq(Math.max(...ms) * 1000, 3)}`, mean(c1.m) * 1000, 'g/m²', `${fq(100 * covered, 3)} % of the membrane carries deposit in the flow field`], [`Flux decline after ${fq(days, 3)} d`, 100 * f.decline, 100 * dec1, '%', 'Deposit resistance fed back on the local wall flux'],
+    ['Foulant deposited / detached / on the membrane', `${fq(f.deposited * 1000, 3)} / ${fq(f.detached * 1000, 3)} / ${fq(f.mass * 1000, 3)}`, null, 'g per m width', `Balance error ${fq(Math.abs(balErr), 2)}`], ['Grid, flow iterations, salt sweeps', `${nx} × ${ny}, ${f.iters}, ${f.sweeps}`, `${c1.N} cells`, '', `Continuity residual ${fq(f.massRes, 2)}, last salt change ${fq(f.lastChange, 2)}; permeate = ${fq(100 * f.permShare, 2)} % of the cross-flow`]],
+    note: `Finite-volume Navier–Stokes solution of suite 4 with solution–diffusion membranes on both walls; deposit law of this suite per wall cell, dm/dt = ω·c_w·(J − J_crit)⁺ − k_det·|τ_w|·m, with wall shear, wall concentration factor and flux from the flow field, fed back as R_m → R_m + α·m. The salt field and the wall flux are converged again after every deposit step on the unchanged velocity field. Two-dimensional section across the filaments: the three-dimensional net geometry, deposit thickness as a flow obstacle and foulant transport as a separate species are not resolved.` }];
+  if (!f.converged) W.push({ level: 'warn', msg: `The feed-channel flow field stopped at a continuity residual of ${fq(f.massRes, 2)} after ${f.iters} iterations — the flow may be unsteady at this velocity; treat the flow-field results as approximate.` });
+  if (f.decline > 2 * dec1 + 0.005) W.push({ level: 'info', msg: `The flow field gives a flux decline of ${fq(100 * f.decline, 3)} % in ${fq(days, 3)} days against ${fq(100 * dec1, 3)} % in the one-dimensional model: ${fq(100 * covered, 3)} % of the membrane operates above its local critical flux, most of all in the low-shear zones next to the spacer filaments, which a channel-average shear cannot represent.` });
+  return { W, PL, TB, K: [{ label: `Flux decline in ${fq(days, 3)} d, flow-field model`, value: 100 * f.decline, unit: '%', help: `One-dimensional channel model: ${fq(100 * dec1, 3)} %; deposit on ${fq(100 * covered, 3)} % of the membrane` }, { label: 'Wall shear in the feed channel, lowest / highest', value: `${fq(Math.min(...taus), 3)} / ${fq(Math.max(...taus), 3)}`, unit: 'Pa', help: `Channel average 6·μ·u/h = ${fq(c1.tau[0], 3)} Pa` }],
+    BAL: [{ name: 'Feed-channel flow field: foulant deposited = on the membrane + detached (g per m width)', in: f.deposited * 1000, out: (f.mass + f.detached) * 1000 }],
+    out: { cfdFluxDecline: f.decline, cfdFluxDecline1D: dec1, cfdCleanFluxLMH: f.Jclean * lmh, cfdDepositMean: mean(ms), cfdDepositMax: Math.max(...ms), cfdDepositCoverage: covered, cfdShearMin: Math.min(...taus), cfdShearMax: Math.max(...taus), cfdCpMax: Math.max(...cps), cfdDepositBalanceError: Math.abs(balErr), cfdConverged: f.converged } };
+}
+const needCfd = (x) => { if (x == null) throw new Error('select the task “Solve the flow field of the feed channel” on the Setup tab before running this study'); return x; };
 
 const D = () => Object.fromEntries(suite.inputs.flatMap((g) => g.fields).map((f) => [f.key, f.value]));
 const modelPars = (v) => ({ area: v.area, Aclean: v.Aclean, kFoul: v.kFoul, law: v.law, dp0: v.dp0, kDp: v.kDp, qRef: v.qRef, mFlow: v.mFlow, sp0: v.sp0, Pp: v.PpRef });
@@ -715,21 +1063,23 @@ const modelPars = (v) => ({ area: v.area, Aclean: v.Aclean, kFoul: v.kFoul, law:
 const suite = {
   id: 'fouling', num: 10, title: 'Fouling & Membrane-Performance Monitoring', short: 'Fouling monitor', icon: '📈',
   tagline: 'Normalise operating data, separate real deterioration from operating changes, diagnose the foulant and forecast cleaning and membrane life.',
-  description: 'Reads an operating log (pressures, flows, conductivities, temperature), validates it and normalises permeate flow, salt passage and differential pressure to reference conditions, so that temperature, salinity and set-point changes no longer hide or mimic fouling. Darcy resistances, blocking-law and combined cake/adsorption–pore-blocking fits, adsorption isotherms, a deposition–detachment law, threshold- and critical-flux relations, concentration polarisation with its coupling to the deposit, a channel deposition profile and biofilm growth with substrate transport interpret the decline; a Kalman-filtered state-space model, a record-by-record streaming monitor and a mechanistic model with a learned residual complement the statistics; robust trends, EWMA/CUSUM charts and step detection separate gradual from sudden changes; evidence rules score the likely foulant; and the trends are extrapolated to the cleaning triggers and to end of membrane life with uncertainty bands.',
+  description: 'Reads an operating log (pressures, flows, conductivities, temperature), validates it and normalises permeate flow, salt passage and differential pressure to reference conditions, so that temperature, salinity and set-point changes no longer hide or mimic fouling. Darcy resistances, blocking-law and combined cake/adsorption–pore-blocking fits, adsorption isotherms, a deposition–detachment law, threshold- and critical-flux relations, concentration polarisation with its coupling to the deposit, a channel deposition profile (with an optional two-dimensional flow-field study of the spacer-filled channel) and biofilm growth with substrate transport interpret the decline; a Kalman-filtered state-space model, a record-by-record streaming monitor and a mechanistic model with a learned residual complement the statistics; robust trends, EWMA/CUSUM charts and step detection separate gradual from sudden changes; evidence rules score the likely foulant; and the trends are extrapolated to the cleaning triggers and to end of membrane life with uncertainty bands.',
   guide: [
     'Paste or import the operating log on the Inputs tab (one row per day or shift). The built-in 180-day example contains gradual fouling, a scaling episode, a cleaning and an O-ring failure.',
+    'To follow a running plant, open the Live feed tab and link the file that the historian or SCADA export keeps appending to: the log is reloaded and analysed again whenever the file grows, and the Alarms table shows what is active now.',
     'Enter the membrane area and choose the reference: the first days of the log (clean baseline) or the design point.',
     'Add what you know about the feed: SDI, MFI, organic carbon, scaling margin from suite 2.',
     'Run. Check the data-validation table first, then the three normalised trends, the detected events, the diagnosis and the forecast.',
   ],
-  referenceOnly: ['real-time operating-data acquisition'],
   implemented: ['resistance-in-series', 'darcy membrane', 'cake-filtration', 'hermia complete-blocking', 'hermia standard-blocking', 'hermia intermediate-blocking', 'hermia cake-filtration', 'pore-blocking equations', 'cake-compressibility', 'kozeny–carman', 'deposition-rate', 'critical-flux', 'concentration-polarization equation', 'normalized permeate-flow', 'normalized salt-passage', 'normalized pressure-drop',
     'cake–pore-blocking', 'fouling–scaling', 'resistance–compressibility', 'mechanistic–statistical monitoring', 'remaining-useful-life/prognostic',
     'adsorption equations', 'langmuir isotherm', 'freundlich isotherm', 'detachment-rate', 'threshold-flux', 'fouling–concentration-polarization', 'adsorption–pore-blocking', 'biofilm-growth–transport', 'deposition–detachment', 'cfd–fouling', 'membrane-performance–state-space', 'mechanistic–machine-learning',
     'initial pore availability', 'initial scaling mass', 'membrane deposition-flux', 'foulant attachment/detachment', 'zero-flux wall', 'outlet-pressure condition', 'real-time operating-data acquisition', 'concentration-polarisation assessment', 'dashboards',
     'clean-membrane resistance', 'initial permeability', 'initial deposit thickness', 'initial biofilm biomass', 'baseline normalized performance', 'inlet foulant concentration', 'permeate-flux boundary', 'transmembrane-pressure boundary', 'wall shear condition', 'cleaning/reset',
     'data validation and cleaning', 'membrane-performance normalisation', 'permeate-flow monitoring', 'salt-passage and rejection monitoring', 'pressure-drop monitoring', 'flux monitoring', 'organic-fouling assessment', 'biological-fouling assessment', 'colloidal-fouling assessment', 'inorganic-scaling assessment', 'membrane-ageing analysis', 'fouling-resistance modelling', 'cleaning-in-place monitoring', 'cleaning-effectiveness assessment', 'anomaly detection', 'trend analysis', 'membrane-health indicators', 'fault diagnosis', 'remaining-useful-life prediction', 'predictive maintenance', 'alarms', 'historical performance comparison'],
-  equationsNote: 'Normalisation follows the ASTM D4516 approach for one train: log-mean feed–brine concentration, osmotic pressure from TDS, an Arrhenius temperature-correction factor and a flow-exponent correction of the pressure drop. It assumes steady operating points; start-ups, flushing periods and rows with large recovery changes should be removed. Conductivity is converted to TDS with a generic correlation — a site-specific factor improves salt-passage accuracy. Foulant scores are evidence rules, not probabilities from a trained classifier, and should be confirmed by autopsy or targeted water analysis. Blocking laws are fitted to the normalised (constant-pressure-equivalent) flux decline. Forecasts extrapolate the current robust trend; they do not anticipate operating changes. Stage-resolved diagnosis needs the interstage pressure column. The isotherm and threshold-flux relations are fitted to the laboratory rows entered on the Inputs tab (the built-in rows are examples, not properties of your foulant). Polarisation uses film theory with the Schock–Miquel correlation for one average channel; the cake-enhanced osmotic pressure follows Hoek and Elimelech with an assumed deposit porosity. The deposition–detachment law lumps the whole membrane area into one deposit mass. The channel model is one-dimensional (feed to concentrate, one equivalent channel for all stages) and represents the cross-channel profile by the film coefficient — a reduced-order form of a flow simulation, not a resolved spacer geometry (suite 4). The biofilm model solves steady diffusion–reaction across the film with a zero-flux membrane but treats the film as uniform along the channel. The state-space model is a local linear trend with Gaussian noise; the learned residual is a linear ridge regression and can only capture effects present in its training period. The streaming monitor processes one record at a time from the log table; connecting it to a plant historian is outside this application. Scale growth is a screening law driven by the entered scaling margin.',
+  equationsNote: 'Normalisation follows the ASTM D4516 approach for one train: log-mean feed–brine concentration, osmotic pressure from TDS, an Arrhenius temperature-correction factor and a flow-exponent correction of the pressure drop. It assumes steady operating points; start-ups, flushing periods and rows with large recovery changes should be removed. Conductivity is converted to TDS with a generic correlation — a site-specific factor improves salt-passage accuracy. Foulant scores are evidence rules, not probabilities from a trained classifier, and should be confirmed by autopsy or targeted water analysis. Blocking laws are fitted to the normalised (constant-pressure-equivalent) flux decline. Forecasts extrapolate the current robust trend; they do not anticipate operating changes. Stage-resolved diagnosis needs the interstage pressure column. The isotherm and threshold-flux relations are fitted to the laboratory rows entered on the Inputs tab (the built-in rows are examples, not properties of your foulant). Polarisation uses film theory with the Schock–Miquel correlation for one average channel; the cake-enhanced osmotic pressure follows Hoek and Elimelech with an assumed deposit porosity. The deposition–detachment law lumps the whole membrane area into one deposit mass. The channel model is one-dimensional (feed to concentrate, one equivalent channel for all stages) and represents the cross-channel profile by a local film coefficient; its membrane resistance is identified by inverting the model on the reference rows of the log, and it reports when a record violates the osmotic limit. The built-in example logs are solutions of this same channel model for stated plant parameters plus sensor noise, so the lumped normalisation is not exact for them (residual seasonal variation of about 0.5 % in flow and 2–3 % in salt passage and pressure drop, as in a real multi-element train). The optional flow study resolves a short length of the spacer-filled channel in two dimensions with the finite-volume Navier–Stokes solver of suite 4 (velocity, pressure, salt, permeating membranes on both walls) and grows the deposit of this suite per wall cell from the computed wall shear, wall concentration and flux, with the deposit resistance fed back on the flux in quasi-steady steps; it is a planar section across the filaments on a Cartesian grid (stagnant corners at filament contacts are grid-sensitive), the velocity field is not recomputed for the deposit thickness, and the foulant is not transported as its own species. The biofilm model solves steady diffusion–reaction across the film with a zero-flux membrane but treats the film as uniform along the channel. The state-space model is a local linear trend with Gaussian noise; the learned residual is a linear ridge regression and can only capture effects present in its training period. Real-time operating data are acquired by live-following a local export file: link the file that the plant historian or SCADA system keeps appending to (CSV, TSV, JSON or XLSX) on the Live feed tab; it is polled every few seconds, its columns are matched by header name, the rows replace the operating-log table and the suite runs again. Records are merged by time stamp, so late, repeated and half-written rows do not change the result once complete; below 14 complete records only the on-line validation is shown. There is no direct network connection to a historian (OPC, Modbus) — the export file is the interface. Scale growth is a screening law driven by the entered scaling margin.',
+
+  live: { key: 'log', label: 'Plant operating log', help: 'Link the file that the plant historian or SCADA export keeps appending to (CSV, TSV, JSON or XLSX). Columns are matched by header: time (days, a date or a Unix time stamp), feed, interstage (optional), concentrate and permeate pressure in bar, feed and permeate flow in m³/h, feed and permeate conductivity in µS/cm and temperature in °C. Each time the file grows the log is reloaded and the analysis runs again; a half-written last line is ignored until it is complete.' },
 
   inputs: [
     { group: 'Operating log', help: 'One row per logged operating point, in chronological order. Rows with missing or implausible values are reported and skipped.', fields: [
@@ -756,9 +1106,9 @@ const suite = {
       { key: 'refMode', label: 'Reference state', type: 'select', value: 'baseline', options: [{ value: 'baseline', label: 'First days of the log (clean baseline)' }, { value: 'design', label: 'Design point entered below' }] },
       { key: 'nBase', label: 'Rows in the baseline window', unit: '', value: 10, min: 3, max: 60, step: 1, showIf: (v) => v.refMode === 'baseline' },
       { key: 'dQf', label: 'Design feed flow', unit: 'm³/h', value: 200, min: 0.1, max: 1e5, showIf: (v) => v.refMode === 'design' }, { key: 'dQp', label: 'Design permeate flow', unit: 'm³/h', value: 150, min: 0.1, max: 1e5, showIf: (v) => v.refMode === 'design' },
-      { key: 'dPf', label: 'Design feed pressure', unit: 'bar', value: 12.7, min: 1, max: 120, showIf: (v) => v.refMode === 'design' }, { key: 'dPc', label: 'Design concentrate pressure', unit: 'bar', value: 9.9, min: 0.5, max: 120, showIf: (v) => v.refMode === 'design' },
+      { key: 'dPf', label: 'Design feed pressure', unit: 'bar', value: 17.3, min: 1, max: 120, showIf: (v) => v.refMode === 'design' }, { key: 'dPc', label: 'Design concentrate pressure', unit: 'bar', value: 14.5, min: 0.5, max: 120, showIf: (v) => v.refMode === 'design' },
       { key: 'dPp', label: 'Design permeate pressure', unit: 'bar', value: 1, min: 0, max: 20, showIf: (v) => v.refMode === 'design' }, { key: 'dT', label: 'Design temperature', unit: '°C', value: 25, min: 1, max: 45, showIf: (v) => v.refMode === 'design' },
-      { key: 'dCf', label: 'Design feed conductivity', unit: 'µS/cm', value: 5860, min: 10, max: 1e5, showIf: (v) => v.refMode === 'design' }, { key: 'dCp', label: 'Design permeate conductivity', unit: 'µS/cm', value: 153, min: 0.1, max: 5000, showIf: (v) => v.refMode === 'design' },
+      { key: 'dCf', label: 'Design feed conductivity', unit: 'µS/cm', value: 1813, min: 10, max: 1e5, showIf: (v) => v.refMode === 'design' }, { key: 'dCp', label: 'Design permeate conductivity', unit: 'µS/cm', value: 43, min: 0.1, max: 5000, showIf: (v) => v.refMode === 'design' },
     ] },
     { group: 'Normalisation model', tab: 'setup', fields: [
       { key: 'mFlow', label: 'Flow exponent of the pressure drop', unit: '–', value: 1.5, min: 1, max: 2, help: 'ΔP ∝ (average feed–brine flow)^m; 1.4–1.7 for spacer-filled channels.' },
@@ -781,9 +1131,9 @@ const suite = {
       { key: 'revFrac', label: 'Assumed reversible share of fouling (if no cleaning is in the log)', unit: '%', value: 85, min: 0, max: 100 },
     ] },
     { group: 'Fouling-resistance model', tab: 'setup', help: 'Parameters of the mechanistic pressure model (permeability decline by a blocking law, linear growth of the pressure drop). Calibrate them on the Calibrate tab.', fields: [
-      { key: 'Aclean', label: 'Clean water permeability (25 °C)', unit: 'L/m²·h·bar', value: 3.3, min: 0.2, max: 15 }, { key: 'kFoul', label: 'Fouling rate constant k', unit: '1/d', value: 0.002, min: 0, max: 0.2 },
+      { key: 'Aclean', label: 'Clean water permeability (25 °C)', unit: 'L/m²·h·bar', value: 1.35, min: 0.2, max: 15 }, { key: 'kFoul', label: 'Fouling rate constant k', unit: '1/d', value: 0.0012, min: 0, max: 0.2 },
       { key: 'law', label: 'Blocking law', type: 'select', value: 'intermediate', options: Object.entries(HERMIA).map(([value, h]) => ({ value, label: `${h.name} (n = ${h.n})` })) },
-      { key: 'dp0', label: 'Clean differential pressure at reference flow', unit: 'bar', value: 2.6, min: 0.1, max: 15 }, { key: 'kDp', label: 'Pressure-drop growth rate', unit: '1/d', value: 0.0015, min: 0, max: 0.1 },
+      { key: 'dp0', label: 'Clean differential pressure at reference flow', unit: 'bar', value: 2.6, min: 0.1, max: 15 }, { key: 'kDp', label: 'Pressure-drop growth rate', unit: '1/d', value: 0.001, min: 0, max: 0.1 },
       { key: 'qRef', label: 'Reference average feed–brine flow', unit: 'm³/h', value: 125, min: 0.1, max: 1e5 }, { key: 'sp0', label: 'Salt passage at reference', unit: '%', value: 1.2, min: 0.01, max: 50 }, { key: 'PpRef', label: 'Permeate pressure', unit: 'bar', value: 1, min: 0, max: 20 },
     ] },
     { group: 'Deposit, critical flux and biofilm', tab: 'setup', help: 'Cake filtration (Kozeny–Carman with compressibility), particle back-transport and Monod biofilm growth.', fields: [
@@ -806,6 +1156,20 @@ const suite = {
       { key: 'stageRatio', label: 'Vessel ratio between the stages', unit: ': 1', value: 2, min: 1, max: 4, help: 'Number of first-stage vessels per second-stage vessel (2 for a 2 : 1 array); used by the channel model when the log has an interstage pressure.', showIf: (v) => v.chanOn },
       { key: 'chanOn', label: 'Solve the deposition profile along the feed channel', type: 'bool', value: true, help: 'One-dimensional channel from feed inlet to concentrate outlet: cross-flow, pressure, local flux, wall shear, critical flux and deposit, with the concentrate pressure of the log as outlet boundary condition.' },
     ] },
+    { group: 'Feed-channel flow field with deposit', tab: 'setup', help: 'Optional study: a short length of the spacer-filled feed channel is solved in two dimensions with the Navier–Stokes solver of suite 4 (velocity, pressure, salt concentration, permeating membranes on both walls). The deposit law of this suite then grows a deposit in every wall cell from the local wall shear, wall concentration and flux, and its resistance is fed back on the flux. Takes several seconds.', fields: [
+      { key: 'cfdOn', label: 'Solve the flow field of the feed channel', type: 'bool', value: false, help: 'Adds field plots, the deposit profile along the membranes and the flux decline compared with the one-dimensional channel model.' },
+      { key: 'cfdPos', label: 'Position in the train', type: 'select', value: 'lead', options: [{ value: 'lead', label: 'Lead end (feed inlet: highest flux)' }, { value: 'tail', label: 'Tail end (concentrate outlet: lowest cross-flow)' }], help: 'Cross-flow velocity, pressure and salt concentration of the segment are taken from the channel model at this position.', showIf: (v) => v.cfdOn },
+      { key: 'cfdArr', label: 'Spacer filaments', type: 'select', value: 'zigzag', options: [{ value: 'zigzag', label: 'Alternating on the two membranes (zigzag)' }, { value: 'submerged', label: 'In mid-channel (submerged)' }, { value: 'none', label: 'No spacer (empty channel)' }], help: 'Filaments that touch the membrane leave stagnant corners with low shear and high polarisation.', showIf: (v) => v.cfdOn },
+      { key: 'cfdFil', label: 'Filament diameter', unit: 'mm', value: 0.36, min: 0.05, max: 1.5, help: 'About half the channel height for a two-layer net.', showIf: (v) => v.cfdOn && v.cfdArr !== 'none' },
+      { key: 'cfdPitch', label: 'Filament spacing', unit: 'mm', value: 3, min: 0.5, max: 10, help: 'Centre-to-centre distance of successive filaments.', showIf: (v) => v.cfdOn },
+      { key: 'cfdNfil', label: 'Number of pitches simulated', unit: '', value: 4, min: 2, max: 10, step: 1, help: 'Domain length = pitches × spacing.', showIf: (v) => v.cfdOn },
+      { key: 'cfdDays', label: 'Deposit growth time', unit: 'd', value: 30, min: 0, max: 730, help: 'Operating time over which the deposit grows from a clean membrane.', showIf: (v) => v.cfdOn },
+      { key: 'cfdSteps', label: 'Quasi-steady deposit steps', unit: '', value: 6, min: 1, max: 20, step: 1, help: 'After each step the salt field and the wall flux are converged again with the new deposit resistance.', showIf: (v) => v.cfdOn },
+    ] },
+    { group: 'Grid of the feed-channel flow study', tab: 'mesh', help: 'Cells of the two-dimensional channel section. Used only when the flow study is switched on.', fields: [
+      { key: 'cfdNx', label: 'Cells along the channel', unit: '', value: 128, min: 32, max: 400, step: 1, help: 'At least four cells across a filament diameter.' },
+      { key: 'cfdNy', label: 'Cells across the gap', unit: '', value: 24, min: 10, max: 80, step: 1, help: 'Clustered towards both membranes.' },
+    ] },
     { group: 'Time stepping', tab: 'mesh', help: 'Fixed-step fourth-order Runge–Kutta integration of the biofilm model over the forecast horizon.', fields: [
       { key: 'nStep', label: 'Time steps over the horizon', unit: '', value: 60, min: 4, max: 5000, step: 1 },
       { key: 'nChan', label: 'Cells along the feed channel', unit: '', value: 40, min: 8, max: 400, step: 1, help: 'Axial cells of the channel deposition model.' },
@@ -818,7 +1182,7 @@ const suite = {
     { name: 'Same plant, first 90 days only (early-warning view)', values: { get log() { return defaultLog().filter((r) => r.t < 90); } } },
     { name: 'Biofouling-prone warm feed, no interstage pressure', values: { get log() { return bioLog(); }, aoc: 120, toc: 3.5, sdi: 2.4, siMargin: -0.6, trigDP: 15 } },
     { name: 'Tighter triggers measured from the last cleaning', values: { trigNPF: 8, trigDP: 12, trigSP: 8, refAfter: 'postclean' } },
-    { name: 'Design-point reference instead of baseline', values: { refMode: 'design', dQf: 200, dQp: 150, dPf: 12.7, dPc: 9.9, dPp: 1, dT: 25, dCf: 5860, dCp: 153 } },
+    { name: 'Design-point reference instead of baseline', values: { refMode: 'design', dQf: 200, dQp: 150, dPf: 17.3, dPc: 14.5, dPp: 1, dT: 25, dCf: 1813, dCp: 43 } },
   ],
 
   pull: ({ outputs }) => {
@@ -833,7 +1197,9 @@ const suite = {
 
   run(v, ctx) {
     ctx?.progress?.(0.2, 'Validating and normalising the log…');
-    const a = analyseLog(v), { G, t, npf, nsp, ndp, cycles, cur, events, trig, now, spc } = a, W = [];
+    let a;
+    try { a = analyseLog(v); } catch (e) { if (e.short) return shortLogResult(v, e.message); throw e; }
+    const { G, t, npf, nsp, ndp, cycles, cur, events, trig, now, spc } = a, W = [];
     const FN = (k) => FOULANTS[k].name, pct = (x) => fmt(x, 3);
     // Hermia fits on the first cycle with a chronological split
     const c1 = cycles[0], hy = npf.slice(c1.a, c1.b).map((x) => x / 100), ht = t.slice(c1.a, c1.b).map((x) => x - t[c1.a]), hf = ht.length >= 10 ? fitHermia(ht, hy, 0.7) : null;
@@ -871,13 +1237,17 @@ const suite = {
     const pm = modelPars(v), pred = G.map((q) => { const cy = cycles.find((c) => q.t >= c.t0 && q.t <= c.t1) || cur; return pressureModel(pm, { tc: q.t - cy.t0, T: q.row.T, Qf: q.row.Qf, Qp: q.row.Qp, Cf: q.row.Cf, Pp: q.row.Pp }); });
     const probs = Object.keys(FOULANTS), recipe = FOULANTS[a.integrity && cur.topFoulant && cur.loss < 3 && now.ndp < trig.ndp.limit ? 'integrity' : cur.topFoulant].cip, recipeFor = a.integrity && cur.loss < 3 && now.ndp < trig.ndp.limit ? 'integrity' : cur.topFoulant;
     const Rnow = med(a.Rt.slice(-5)), dstr = (x) => (x >= 3650 ? '> 3650' : fmt(x, 3));
+    const alarms = activeAlarms(a), nAl = alarms.filter((q) => q.severity !== 'info').length;
+    if (a.ing.pending) W.push({ level: 'info', msg: `The last record (day ${fmt(a.ing.tLast, 5)}) is incomplete and is ignored until its missing values arrive.` });
+    if (G.length < 30) W.push({ level: 'warn', msg: `Only ${G.length} valid records are available: trends, change detection and the forecast are statistically weak below about 30 records — treat rates and days-to-cleaning as indicative.` });
     const out = {
+      latest: latestState(X.ms, a.ing, nAl), analysisReady: true,
       foulingRate: foulRate, daysToCleaning: a.daysToCleaning, daysToCleaningLow: trig[a.first].lo, daysToCleaningHigh: trig[a.first].hi, cleaningsPerYear: a.cleaningsPerYear, membraneLife: life, remainingLife: a.rul, remainingLifeLow: a.rulLo, remainingLifeHigh: a.rulHi,
       normPermeability: now.npf / 100, normSaltPassage: now.nsp / 100, normDP: now.ndp / 100, dominantFoulant: FN(a.dominant), currentIssue: FN(curIssue), integrityFault: a.integrity, irreversibleLoss: a.irrNow, cleaningRecovery: a.lastClean ? a.lastClean.recovery : null,
       limitingTrigger: trig[a.first].name, permeability: (a.ref.kA * now.npf * 10) / a.area, cleanPermeability: (a.ref.kA * 1000) / a.area, Rm: a.Rm, Rreversible: a.Rrev, Rirreversible: a.Rirr, criticalFluxLMH: jc, bestBlockingLaw: hf ? HERMIA[hf.best.law].name : 'not fitted', bioDaysToTrigger: bioDays, bioDpAtHorizon: bioDp[bioDp.length - 1], dataIssues: a.issues.length, events: events.map((e) => ({ day: e.t, type: e.type })), ...X.out,
     };
     if (out.cleaningRecovery == null) delete out.cleaningRecovery;
-    return {
+    const result = {
       summary: `Normalised permeate flow is at ${pct(now.npf)} % of reference, salt passage at ${pct(now.nsp)} % and differential pressure at ${pct(now.ndp)} %. Permeability is falling by ${fmt(foulRate, 2)} %/d; ${dueNow ? 'a cleaning is due now' : `the next cleaning is expected in about ${dstr(a.daysToCleaning)} days (${dstr(trig[a.first].lo)}–${dstr(trig[a.first].hi)})`}. Dominant foulant over the record: ${FN(a.dominant).toLowerCase()}${a.integrity ? '; an integrity fault is active' : ''}.`,
       warnings: W,
       kpis: [
@@ -890,6 +1260,7 @@ const suite = {
         { label: 'Operating flux', value: fluxNow, unit: 'L/m²·h', status: fluxNow > jc ? 'warn' : 'ok' }, { label: 'Critical flux estimate', value: jc, unit: 'L/m²·h' },
         { label: 'Fouling resistance / membrane resistance', value: (Rnow - a.Rm) / a.Rm, unit: '–', help: 'Darcy resistance in series, referred to 25 °C: (R_total − R_membrane)/R_membrane' }, { label: 'Deposit loading (cake model)', value: mCake * 1000, unit: 'g/m²' },
         { label: 'Best blocking law', value: hf ? HERMIA[hf.best.law].name : 'not fitted', help: hf ? `R² = ${fmt(hf.best.r2, 4)} on the training part of the first cycle` : '' }, { label: 'Detected events', value: `${events.filter((e) => e.type === 'cleaning').length} cleaning · ${events.filter((e) => e.type !== 'cleaning').length} fault/step` },
+        { label: 'Active alarms', value: nAl, status: alarms.some((q) => q.severity === 'bad') ? 'bad' : nAl ? 'warn' : 'ok', help: `Latest record: day ${fmt(a.ing.tLast, 5)}; ${X.ms.accepted} records accepted, ${X.ms.rejected + a.ing.untimed} rejected` },
         ...X.K,
       ],
       recommendations: [
@@ -917,6 +1288,7 @@ const suite = {
         ...X.PL,
       ],
       tables: [
+        alarmTable(alarms, now.t, `State at the latest record (day ${fmt(a.ing.tLast, 5)}): ${a.ing.received} records received, ${X.ms.accepted} accepted, ${X.ms.rejected + a.ing.untimed} rejected${a.ing.duplicates ? `, ${a.ing.duplicates} repeated time stamps merged` : ''}. A trigger alarm is raised when the five-record median crosses its limit; control-chart alarms, integrity faults and sudden steps stay latched until the next cleaning.`),
         { title: 'Operating cycles', columns: ['Cycle', 'From (d)', 'To (d)', 'Permeate flow start → end (% ref.)', 'Flow trend (%/d)', '95 % interval', 'Salt-passage trend (%/d)', 'ΔP trend (%/d)', 'First-stage ΔP trend (%/d)', 'Last-stage ΔP trend (%/d)', 'Most likely cause', 'Evidence share (%)', 'Early-warning lead (d)'],
           rows: cycles.map((c, i) => [i + 1, c.t0, c.t1, `${pct(c.startNPF)} → ${pct(c.endNPF)}`, c.npf.slope, `${fmt(c.npf.lo, 2)} … ${fmt(c.npf.hi, 2)}`, c.nsp.slope, c.ndp.slope, a.stageOK ? c.ndp1.slope : null, a.stageOK ? c.ndp2.slope : null, FN(c.top), 100 * c.prob[c.top], c.lead]),
           note: 'Trends are Theil–Sen slopes of the gradual component (sudden steps removed) in % of reference per day. The cause is diagnosed from the last part of each cycle. Lead = days between the first control-chart alarm and the cleaning trigger.' },
@@ -951,11 +1323,18 @@ const suite = {
       })(),
       outputs: out,
     };
+    // optional study: two-dimensional flow field of the feed channel with a growing deposit (asynchronous)
+    if (!v.cfdOn) return result;
+    return channelFlowStudy(v, a, X, { alpha }, ctx).then((cf) => {
+      result.kpis.push(...cf.K); result.plots.push(...cf.PL); result.tables.splice(result.tables.length - 2, 0, ...cf.TB); result.balances.push(...cf.BAL); result.warnings.push(...cf.W); Object.assign(result.outputs, cf.out);
+      return result;
+    });
   },
 
   mesh: [{ name: 'Time step of the biofilm projection', keys: ['nStep'], min: 4, note: 'The Monod biofilm model is integrated with fixed-step RK4; the study refines the step over the forecast horizon.',
     metrics: [{ label: 'Projected pressure drop at the horizon', unit: '% of ref.', get: (r) => r.outputs.bioDpAtHorizon }, { label: 'Biofilm-model days to the ΔP trigger', unit: 'd', get: (r) => r.outputs.bioDaysToTrigger }] },
   { name: 'Axial grid of the channel model', keys: ['nChan'], min: 8, note: 'Cells from feed inlet to concentrate outlet.', metrics: [{ label: 'Feed pressure from the outlet condition', unit: 'bar', get: (r) => r.outputs.channelFeedPressureBar ?? 0 }, { label: 'Channel recovery', unit: '–', get: (r) => r.outputs.channelRecovery ?? 0 }] },
+  { name: 'Grid of the feed-channel flow study', keys: ['cfdNx', 'cfdNy'], min: 10, note: 'Flow, salt field and deposit march are solved again on each grid. Switch the flow study on first.', metrics: [{ label: 'Clean mean flux (flow field)', unit: 'L/m²·h', get: (r) => needCfd(r.outputs.cfdCleanFluxLMH) }, { label: 'Flux decline (flow field)', unit: '–', get: (r) => needCfd(r.outputs.cfdFluxDecline) }] },
   { name: 'Grid across the biofilm', keys: ['nzBio'], min: 4, note: 'Cells of the substrate profile between the membrane and the biofilm surface.', metrics: [{ label: 'Biofilm effectiveness factor', unit: '–', get: (r) => r.outputs.biofilmEffectiveness }] }],
 
   calibration: {
@@ -963,19 +1342,19 @@ const suite = {
     params: [{ key: 'Aclean', label: 'Clean water permeability', lo: 0.5, hi: 12 }, { key: 'kFoul', label: 'Fouling rate constant k', lo: 0, hi: 0.05 }, { key: 'dp0', label: 'Clean differential pressure', lo: 0.3, hi: 10 }, { key: 'kDp', label: 'Pressure-drop growth rate', lo: 0, hi: 0.02 }],
     columns: [{ key: 'tc', label: 'Time since clean start', unit: 'd' }, { key: 'Tx', label: 'Temperature', unit: '°C' }, { key: 'QfX', label: 'Feed flow', unit: 'm³/h' }, { key: 'QpX', label: 'Permeate flow', unit: 'm³/h' }, { key: 'CfX', label: 'Feed conductivity', unit: 'µS/cm' }, { key: 'PfM', label: 'Feed pressure', unit: 'bar' }, { key: 'dPM', label: 'Differential pressure', unit: 'bar' }],
     targets: [{ key: 'PfM', label: 'Feed pressure', unit: 'bar' }, { key: 'dPM', label: 'Differential pressure', unit: 'bar' }],
-    model(v) { const r = pressureModel(modelPars(v), { tc: v.tc ?? 0, T: v.Tx ?? 25, Qf: v.QfX ?? 200, Qp: v.QpX ?? 150, Cf: v.CfX ?? 5800 }); return { PfM: r.Pf, dPM: r.dP }; },
+    model(v) { const r = pressureModel(modelPars(v), { tc: v.tc ?? 0, T: v.Tx ?? 25, Qf: v.QfX ?? 200, Qp: v.QpX ?? 150, Cf: v.CfX ?? 1810 }); return { PfM: r.Pf, dPM: r.dP }; },
     get sample() { return (this._s ||= calRows([3, 8, 14, 20, 27, 33, 40, 46, 52, 59, 66])); },
     get validationSample() { return (this._v ||= calRows([70, 74, 78, 82, 88, 91, 94])); },
   },
 
-  verify() {
+  async verify() {
     const C = [], add = (name, expected, got, tol, note) => C.push({ name, expected, got, tol, pass: Math.abs(got - expected) <= tol, note });
     const d = D();
     // clean plant with varying temperature, salinity and flow: normalised indicators must stay constant
     const clean = analyseLog({ ...d, log: syntheticLog({ noise: 0, fouling: false, events: false, quality: false }) }), spread = (y) => (Math.max(...y) - Math.min(...y)) / mean(y);
     add('Normalised permeate flow is invariant to temperature, salinity and set-point changes', 0, spread(clean.npf), 5e-3, 'Clean synthetic plant, 180 days of seasonal variation, no noise');
-    add('Normalised salt passage is invariant', 0, spread(clean.nsp), 2e-2, 'Same case (conductivity rounding limits the precision)');
-    add('Normalised differential pressure is invariant', 0, spread(clean.ndp), 1e-2, 'Same case');
+    add('Normalised salt passage is invariant', 0, spread(clean.nsp), 3e-2, 'Same case. The plant behind the log is now the distributed channel model: polarisation changes with temperature, which the lumped normalisation cannot remove (tolerance 2 % → 3 %)');
+    add('Normalised differential pressure is invariant', 0, spread(clean.ndp), 2.5e-2, 'Same case. In the distributed plant warm water shifts permeation to the lead elements and lowers the tail cross-flow, a real residual of the single-exponent correction (tolerance 1 % → 2.5 %)');
     add('Zero-fouling limit: fouling resistance vanishes', 0, (med(clean.Rt.slice(-10)) - clean.Rm) / clean.Rm, 5e-3, 'Resistance-in-series with no foulant');
     add('No false alarms or events on the clean plant', 0, clean.events.length + clean.spc.alarms.length, 0, 'Control charts and step detection stay silent');
     // exact recovery of an injected fault
@@ -1062,6 +1441,59 @@ const suite = {
     add('Scale mass grows from its initial value only beyond saturation', 0, Math.abs(scaleMass(50, { m0: 2, k: 0.2, S: 1.5, mc: 10 }).m - (2 + 0.2 * 0.25 * 50)) + Math.abs(scaleMass(50, { m0: 2, k: 0.2, S: 0.9, mc: 10 }).m - 2), 1e-12, 'm = m₀ + k·(S − 1)²·t for S > 1, constant otherwise');
     const cleanRun = suite.run({ ...d, log: syntheticLog({ noise: 0, fouling: false, events: false, quality: false }) }, {});
     add('Dashboard: a clean plant scores a health index near 100', 100, cleanRun.outputs.healthIndex, 3, 'No fouling, no faults, complete data');
+    // live feed: incremental, late, repeated and half-written records
+    const lg = defaultLog(), dig = (S) => JSON.stringify([S.n, S.accepted, S.rejected, S.resets, S.last, S.e, S.cm, S.alerts]), mA = createMonitor(d), mB = createMonitor(d), mC = createMonitor(d), g4 = rng(4), mix = lg.slice();
+    for (let i = mix.length - 1; i > 0; i--) { const k = g4.int(i + 1); [mix[i], mix[k]] = [mix[k], mix[i]]; }
+    const late = [...mix, ...lg.slice(20, 40)];
+    for (const row of lg) mA.push(row);
+    mB.load(lg);
+    for (const row of late) mC.push(row);
+    add('Live feed: records arriving one by one give the same state as the whole log at once', 1, dig(mA.state) === dig(mB.state) ? 1 : 0, 0, `${mA.state.n} records; Kalman state, control charts and alert list compared exactly`);
+    add('Live feed: shuffled arrival with 20 repeated time stamps gives the same monitor state', 1, JSON.stringify([mC.state.accepted, mC.state.rejected, mC.state.last, mC.state.alerts]) === JSON.stringify([mA.state.accepted, mA.state.rejected, mA.state.last, mA.state.alerts]) ? 1 : 0, 0, 'Late and repeated records are merged by time stamp and the state is replayed');
+    const full = suite.run({ ...d }, {}), strip = (o) => JSON.stringify({ ...o, latest: null, dataIssues: 0 }), mixed = suite.run({ ...d, log: late.map((r) => Object.fromEntries(Object.entries(r).map(([k, x]) => [k, x == null ? '' : String(x)]))) }, {});
+    add('Live feed: suite outputs do not depend on arrival order, repeats or text cells', 1, strip(full.outputs) === strip(mixed.outputs) ? 1 : 0, 0, 'All published outputs compared exactly (shuffled rows, 20 duplicates, numbers delivered as text)');
+    const half = suite.run({ ...d, log: [...lg, { t: 180, Pf: 12.4, Pi: null, Pc: null, Pp: null, Qf: null, Qp: null, Cf: null, Cp: null, T: null }] }, {});
+    add('Half-written last record is ignored and reported', 1, half.outputs.normPermeability === full.outputs.normPermeability && half.outputs.latest.lastRecordComplete === false && half.tables[0].rows.some((r) => r[0] === 180) ? 1 : 0, 0, 'Same results as without the record; listed in the alarm table until it is complete');
+    let shortOK = 1;
+    for (const nn of [0, 1, 5, 13]) { const r5 = suite.run({ ...d, log: lg.slice(0, nn) }, {}); if (!(r5.warnings.length && r5.outputs.analysisReady === false && r5.outputs.latest.rowsReceived === nn)) shortOK = 0; }
+    add('Very short logs give a warning instead of an error', 1, shortOK, 0, '0, 1, 5 and 13 rows: on-line validation only, with the number of records still needed');
+    add('Alarm table: the integrity fault is active and time-stamped', 150, full.tables[0].rows.find((r) => /integrity/.test(r[1]))?.[0] ?? -1, 1, `${full.outputs.latest.activeAlarms} active alarms at day ${full.outputs.latest.lastTimestamp}`);
+    add('Latest-state summary counts the records', lg.length, full.outputs.latest.rowsAccepted + full.outputs.latest.rowsRejected, 0, 'Accepted + rejected = received');
+    add('Live feed is declared on the operating-log table and every column has header aliases', 1, suite.live.key === 'log' && COLS.every((c) => Array.isArray(c.aliases) && c.aliases.length > 5) && new Set(COLS.flatMap((c) => c.aliases)).size === COLS.flatMap((c) => c.aliases).length ? 1 : 0, 0, 'No alias is shared by two columns');
+    add('Calendar time stamps are converted to days since the first record', 179, ingestLog(lg.map((r) => ({ ...r, t: new Date(Date.UTC(2025, 0, 1) + r.t * 864e5).toISOString() }))).tLast, 1e-6, 'ISO date strings; Unix epochs in s or ms are recognised by magnitude');
+    // self-consistent example plant and the channel model
+    const fo = full.outputs, Rtrue = plantRm(EXAMPLE_PLANT), pp0 = plantPoint(EXAMPLE_PLANT, { T: 25, tdsF: 1000, Qf: 200, Qp: 150 }), c0 = pp0.ch, k0 = massTransfer(c0.u[0], EXAMPLE_PLANT.h, 25, diffusivityNaCl(25, 3)).k;
+    add('Example plant: the solved feed pressure delivers the permeate flow set-point', 150, c0.perm * 3600, 1e-4, `Flow control: bisection on the inlet pressure of the channel model (${fmt(pp0.Pf, 4)} bar feed, ${fmt(pp0.Pc, 4)} bar concentrate)`);
+    add('Channel model: local flux satisfies J = (Δp − π·β)/(μR) with β = exp(J/k)', 0, Math.abs((c0.Pin - 1e5 - piAstm(1000, 25) * 1e5 * c0.beta[0]) / (MU25 * Rtrue) / c0.J[0] - 1) + Math.abs(Math.exp(c0.J[0] / k0) / c0.beta[0] - 1), 1e-9, 'First cell; k from the Schock–Miquel correlation at the local cross-flow');
+    add('Example log is attainable: the concentrate pressure exceeds the osmotic pressure at the wall of the last cell', 1, c0.P[c0.P.length - 1] - 1e5 > piAstm(1000, 25) * 1e5 * c0.cb[c0.cb.length - 1] * c0.beta[c0.beta.length - 1] ? 1 : 0, 0, `Tail flux ${fmt(c0.J[c0.J.length - 1] * 3.6e6, 3)} L/m²·h; the earlier lumped example log violated this limit, which is why no membrane resistance could reproduce its recovery`);
+    add('Channel model identifies the true membrane resistance of the example plant from the noisy log', 1, fo.channelRm / Rtrue, 0.03, `True ${fmt(Rtrue / 1e13, 4)}·10¹³ m⁻¹ (A = ${EXAMPLE_PLANT.A25} L/m²·h·bar); lumped Darcy value ${fmt(fo.Rm / 1e13, 4)}·10¹³ m⁻¹`);
+    add('Channel model reproduces the measured recovery on the clean reference period', fo.channelRecoveryRefMeasured, fo.channelRecoveryRef, 0.03, 'Rows held out from the identification; absolute recovery');
+    add('Channel model predicts the recovery of the last days from the observed fouling resistance', fo.channelRecoveryMeasured, fo.channelRecoveryObserved, 0.03, 'Different temperature, salinity and fouling state than the reference rows');
+    add('No channel-model warning on the example log', 0, full.warnings.filter((w) => /channel model/i.test(w.msg)).length, 0, 'Reference recovery within 3 %, prediction within 5 %');
+    const imp = suite.run({ ...d, log: lg.map((r) => ({ ...r, Cf: r.Cf * 6 })) }, {});
+    add('A log that violates the osmotic limit is reported as not attainable', 1, imp.outputs.channelConsistent === false && imp.warnings.some((w) => /not physically attainable/.test(w.msg)) ? 1 : 0, 0, 'Feed conductivity of the example log multiplied by six at unchanged pressures: the concentrate would need more than its logged pressure');
+    // two-dimensional feed channel with a growing deposit (flow solver of suite 4)
+    {
+      const T2 = 25, mu2 = viscosity(T2), co = { H: 7.1e-4, df: 3.6e-4, lm: 3e-3, nFil: 2, arr: 'zigzag', nx: 64, ny: 16, T: T2, Uin: 0.17, c0: 1, dP: 16e5, Rm: 2.9e14, muJ: mu2, alpha: 8e18, dp: 2e-8, phiB: 1e-6, omega: 0.15, cp: 2e-3, kDet: 0.05, days: 30, steps: 4, Lbl: 6, tol: 5e-5 };
+      const z0 = await foulingCFD({ ...co, cp: 0 }), mz = Math.max(...z0.sides.flatMap((q) => Array.from(q.m)));
+      add('Flow-field fouling, no foulant in the feed: no deposit forms', 0, mz, 0, 'Deposit mass per wall cell after 30 days with a foulant concentration of zero');
+      add('…and the flux stays at the clean flow-field value', 0, z0.decline, 1e-6, `Mean wall flux ${fmt(z0.Jclean * 3.6e6, 5)} L/m²·h before and after the deposit march (relative change)`);
+      add('Flow field: salt balance of the clean channel', 0, (z0.saltClean.in - z0.saltClean.out) / z0.saltClean.in, 2e-4, 'Fully rejecting membranes: salt in = salt out although water permeates');
+      const f1 = await foulingCFD({ ...co, base: z0.raw }), dep = [], tAll = [];
+      for (const q of f1.sides) for (let i = 0; i < f1.nx; i++) if (q.open[i]) { tAll.push(Math.abs(q.tau[i])); if (q.m[i] > 0.1 * f1.mass / (2 * f1.L)) dep.push(Math.abs(q.tau[i])); }
+      add('Flow-field fouling: deposit mass balance', 0, (f1.deposited - f1.detached - f1.mass) / f1.deposited, 1e-10, `Deposited ${fmt(f1.deposited * 1000, 4)} g = on the membrane ${fmt(f1.mass * 1000, 4)} g + detached ${fmt(f1.detached * 1000, 4)} g per m width`);
+      add('…the fouled wall flux obeys J = (Δp − π(c_wall)) / (μ·(R_m + α·m))', 1, f1.wallCheck, 1e-5, 'Recomputed from the converged pressure and wall concentration at the most loaded wall cell');
+      add('…the deposit lowers the flux and sits where the wall shear is low', 1, f1.decline > 1e-3 && mean(dep) < mean(tAll) ? 1 : 0, 0, `Flux decline ${fmt(100 * f1.decline, 3)} %; mean wall shear ${fmt(mean(dep), 3)} Pa under the deposit against ${fmt(mean(tAll), 3)} Pa overall`);
+      const e0 = await foulingCFD({ ...co, arr: 'none', cp: 0, days: 0, nx: 48 }), tw = e0.sides[0].tau[40], e1 = channelFouling({ L: e0.L, widths: [1], h: co.H, Q0: co.Uin * co.H, T: T2, mu: mu2, Rm: co.Rm, alpha: co.alpha, Pp: 0, Pin: co.dP, dPtarget: Math.max(e0.clean.dp, 1), pi0: piAstm(1000, T2) * 1e5, D: e0.D, dp: co.dp, phiB: co.phiB, omega: 0, cp: 0, kDet: 0, days: 0, N: 40, lean: true });
+      add('Flow field, empty channel: wall shear equals 6·μ·u/h', (6 * mu2 * co.Uin) / co.H, tw, 0.03 * (6 * mu2 * co.Uin) / co.H, 'Developed laminar flow between parallel plates; this is the shear the one-dimensional model uses');
+      add('…and the clean flux agrees with the one-dimensional channel model', 1, e0.Jclean / mean(e1.J), 0.02, `${fmt(e0.Jclean * 3.6e6, 4)} against ${fmt(mean(e1.J) * 3.6e6, 4)} L/m²·h (resolved polarisation layer against the film correlation)`);
+    }
+    // the flow study as the user runs it: through run(), with every number that is shown checked
+    {
+      const rs = await suite.run({ ...d, cfdOn: true, cfdNx: 64, cfdNy: 16, cfdNfil: 2 }, {}), shown = JSON.stringify([rs.kpis, rs.tables.map((t) => [t.rows, t.note]), rs.outputs, rs.balances, rs.warnings]), fields = rs.plots.filter((p) => p.type === 'field' && /Feed channel/.test(p.title)), lines = rs.plots.filter((p) => p.type === 'line' && /Feed channel/.test(p.title));
+      add('Flow study through run(): field plots and wall profiles, no non-finite number, deposit balance closed', 1, fields.length === 2 && lines.length === 3 && fields.every((p) => p.z.length === p.y.length && p.z[0].length === p.x.length && p.z.every((row) => row.every(Number.isFinite))) && lines.every((p) => p.series.every((sr) => sr.x.length === sr.y.length && sr.y.every(Number.isFinite))) && !/NaN|Infinity|undefined/.test(shown) && rs.outputs.cfdDepositBalanceError < 1e-9 ? 1 : 0, 0, `Example log, lead end, 64 × 16 cells: flux decline ${fmt(100 * rs.outputs.cfdFluxDecline, 3)} % in 30 d against ${fmt(100 * rs.outputs.cfdFluxDecline1D, 3)} % in the one-dimensional model`);
+      add('Without the study switch the result is returned synchronously', 1, full instanceof Promise ? 0 : 1, 0, 'The default run does not enter the flow-solver path');
+    }
     add('Darcy law is recovered from the resistance', q.flux, ((q.ndp * q.tcf * 1e5) / (MU25 * q.Rtot)) * 3.6e6, 1e-9, 'J = NDP·TCF / (μ₂₅·R_total), resistance referred to 25 °C');
     return C;
   },
@@ -1084,16 +1516,15 @@ function calRows(days) {
   const log = defaultLog();
   return days.map((d) => log.find((r) => r.t === d)).filter((r) => r && NEED.every((k) => isNum(r[k]))).map((r) => ({ tc: r.t, Tx: r.T, QfX: r.Qf, QpX: r.Qp, CfX: r.Cf, PfM: r.Pf, dPM: +(r.Pf - r.Pc).toFixed(2) }));
 }
-/** Second example: single pressure-drop signal with exponential (biological) growth and no interstage pressure. */
+/** Second example: single-stage train at 50 % recovery, one pressure-drop signal with logistic (biological) growth and no interstage pressure. */
 let _bio = null;
 function bioLog() {
   if (_bio) return _bio;
-  const g = rng(11), rows = [];
+  const g = rng(11), rows = [], plant = { ...EXAMPLE_PLANT, ratio: 0, fric: [2.4], tds: 3200, Y: 0.5 };
   for (let t = 0; t < 75; t++) {
-    const T = 29 + 2 * Math.sin(t / 20) + 0.2 * g.normal(0, 1), X = 12 / (1 + (12 / 0.05 - 1) * Math.exp(-0.085 * t)), Qp = 150 * (1 + 0.004 * g.normal(0, 1)), Qf = Qp / 0.75;
-    const a = 1 / (1 + 0.012 * X), ndp = (Qp * 1000) / 8035 / (3.6 * a * tcfM(T)), dP = 2.8 * (1 + 0.09 * X) * ((Qf - Qp / 2) / 125) ** 1.5 * (viscosity(T) / viscosity(25)) ** 0.3;
-    const Cfb = (3200 * Math.log(4)) / 0.75, tdsP = 0.012 * tcfM(T) * Cfb, Pf = ndp + dP / 2 + 1 + piAstm(Cfb, T) - piAstm(tdsP, T) + 0.03 * g.normal(0, 1);
-    rows.push({ t, Pf: +Pf.toFixed(2), Pi: null, Pc: +(Pf - dP + 0.015 * g.normal(0, 1)).toFixed(2), Pp: 1, Qf: +Qf.toFixed(1), Qp: +Qp.toFixed(1), Cf: +(conductivityFromTDS(3200) * (1 + 0.005 * g.normal(0, 1))).toFixed(0), Cp: +(conductivityFromTDS(tdsP) * (1 + 0.01 * g.normal(0, 1))).toFixed(1), T: +T.toFixed(1) });
+    const T = 29 + 2 * Math.sin(t / 20) + 0.2 * g.normal(0, 1), X = 12 / (1 + (12 / 0.05 - 1) * Math.exp(-0.085 * t)), Qp = 150 * (1 + 0.004 * g.normal(0, 1)), Qf = Qp / plant.Y;
+    const pt = plantPoint(plant, { T, tdsF: plant.tds, Qf, Qp, rStage: [1 + 0.012 * X], fStage: [1 + 0.09 * X], Pp: 1 }), Pf = pt.Pf + 0.03 * g.normal(0, 1);
+    rows.push({ t, Pf: +Pf.toFixed(2), Pi: null, Pc: +(Pf - (pt.Pf - pt.Pc) + 0.015 * g.normal(0, 1)).toFixed(2), Pp: 1, Qf: +Qf.toFixed(1), Qp: +Qp.toFixed(1), Cf: +(conductivityFromTDS(plant.tds) * (1 + 0.005 * g.normal(0, 1))).toFixed(0), Cp: +(conductivityFromTDS(pt.tdsP) * (1 + 0.01 * g.normal(0, 1))).toFixed(1), T: +T.toFixed(1) });
   }
   return (_bio = rows);
 }
