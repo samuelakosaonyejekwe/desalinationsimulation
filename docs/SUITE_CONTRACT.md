@@ -125,6 +125,14 @@ Streams are `{ Q (m³/h), T (°C), P (bar), pH, tds (mg/L), ions: { Na: mg/L, �
 `pressure` (hPa), `solar` (W/m²), `ghiDaily` (kWh/m²/d), `elevation` (m), `inflation` (%/y), `lendingRate` (%/y),
 `fxPerUSD`, `currency`, `electricityPrice` ($/kWh), `gridCarbon` (kgCO₂/kWh).
 
+Ranges and extremes where the sources give them: `sstMin`, `sstMax` (°C), `salinityMin`, `salinityMax` (g/kg), `tideSpring`, `tideNeap` (m),
+`seaLevelMean` (m), `waveHeightMax`, `waveHeightP95` (m), `waveHeightMonthly` (m, 12 values), `wavePeriodStorm` (s), `renewableShare` (%),
+`seaFraction` (share of the terrain grid below sea level), `iso3`, `fxDate`, and the year of each national figure (`gridCarbonYear`, `renewableShareYear`, …).
+
+When a service cannot be reached the field is answered from the built-in atlas (`js/data/atlas_*.js`). `atlasFields` lists the fields that
+came from it, `atlasNotes` and `atlasVintage` say which data set and year, and `sstEstimated`, `salinityEstimated`, `depthEstimated`,
+`solarEstimated` flag the individual values, so a suite can say in its warnings that a value is a climatological estimate rather than a live reading.
+
 ## Shared toolbox
 
 - `num.js`: `brent, solve1, newton1, newtonN, solveLinear, tridiag, rk4, rk45, nelderMead, diffEvolution, levenbergMarquardt, lstsq, linfit, trapz, interp1, linspace, logspace, metrics, gci, lhs, rng, histogram, mean, std, variance, quantile, sum, clamp, fmt, isNum`
