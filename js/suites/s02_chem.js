@@ -90,13 +90,15 @@ const SA = SID.map((id) => (SIZE[id] || [4, 0.041])[0]), SB = SID.map((id) => (S
 //  · fluorides, KNO3, Mg(NO3)2, phosphates and θ(Cl,NO3) (Pitzer 1991 tabulation), NaNO3 and Ca(NO3)2 (refits with
 //    α1 = 2): LLNL EQ3/6 Yucca Mountain Pitzer file data0.ypf (25 °C terms);
 //  · silica λ: PHREEQC pitzer.dat (Appelo 2015).
-// Analogue assignments that remain: Ba–SO4 uses the Ca–SO4 set — the approximation of Rogers (1981, LBL-12356), who
-// computed barite solubility with the CaSO4 parameters. No published Ba–SO4 binary could be read: PHRQPITZ (Dal Pozzo
-// 1991, Table 2.2), the current PHREEQC pitzer.dat (Appelo 2015) and data0.ypf carry no Ba–SO4 term at all, and the two
-// barite models built on measurements in sulphate media treat the interaction as an explicit BaSO4(aq) ion pair instead
-// (Felmy, Rai & Amonette 1990: log K 2.72 ± 0.09 with log Ksp −10.05 ± 0.05; Monnin 1999 as described by Monnin et
-// al. 1999). Barite solubility in water and in NaCl solutions does not depend on the choice; what it does to the barite
-// index of a sulphate-bearing water is evaluated by bariteBand() below and reported with every result. For NH4, Fe and Mn only the pairs
+// Ba–SO4: no published Ba–SO4 binary could be read — PHRQPITZ (Dal Pozzo 1991, Table 2.2), the current PHREEQC pitzer.dat
+// (Appelo 2015) and data0.ypf carry no Ba–SO4 term at all, and the two barite models built on measurements in sulphate
+// media treat the interaction as an explicit BaSO4(aq) ion pair (Felmy, Rai & Amonette 1990: log K 2.72 ± 0.09 with
+// log Ksp −10.05 ± 0.05; Monnin 1999 as described by Monnin et al. 1999). The default is therefore that published
+// ion-pair treatment (BARITE_MODELS below); the row "Ba SO4" of the table that follows is the Ca–SO4 set — the
+// approximation of Rogers (1981, LBL-12356) — and is used only when the 'analogue' treatment is selected. In water and
+// in NaCl solutions the treatments differ by their solubility products alone; what the choice does to the barite index
+// of a sulphate-bearing water is evaluated by bariteBand() below and reported with every result.
+// Analogue assignments that remain: for NH4, Fe and Mn only the pairs
 // and mixing terms without a value in the files named above are still borrowed (NH4 from K, Fe/Mn from Mg: θ, ψ and
 // the binaries with OH, CO3, F, HPO4, borate; HCO3 for Fe/Mn); H3SiO4 borrows HCO3 throughout.
 const PZ_ID = { NH4: 'K', Fe: 'Mg', Mn: 'Mg', H3SiO4: 'HCO3' };
@@ -129,6 +131,39 @@ const PZ = (() => {
   return { B0, B1, B2, CM, TH, LAM, PSI, HASPSI, HASB, cat: all.filter((i) => ZS[i] > 0), an: all.filter((i) => ZS[i] < 0), neu: all.filter((i) => ZS[i] === 0), pc: new Int32Array(NS), pa: new Int32Array(NS) };
 })();
 
+// ---- Ba–SO4 interaction on the Pitzer path: selectable treatment -------------------------------------
+// 'pair'     Pitzer coefficients for the free ions, no Ba–SO4 binary, an explicit BaSO4(aq) ion pair with log K 2.72
+//            (± 0.09) and barite log Ksp −10.05 (± 0.05): Felmy, Rai & Amonette (1990, J. Solution Chem. 19, 175), the
+//            treatment they prefer for BaSO4 on their barite solubilities in Na2SO4 solutions at 25 °C. Only the
+//            abstract and the first two pages of that paper were read: the two constants are theirs; the free-ion
+//            parameters (Ba–Cl of Pitzer & Mayorga 1973 and the Harvie–Møller–Weare set), an activity coefficient of 1
+//            for the neutral pair, a temperature-independent log K and the temperature and pressure function of the
+//            barite log Ksp (the WATEQ4F expression shifted to −10.05 at 25 °C) are those of this suite, not statements
+//            of the paper. Monnin et al. (1999, Mar. Chem. 65, 253) describe the model of Monnin (1999) as of the same
+//            kind (BaSO4(aq), SrSO4(aq) and CaSO4(aq) pairs, all other interactions by Pitzer parameters) but print
+//            no constants, so it cannot be offered as a treatment of its own.
+// 'analogue' the Ca–SO4 binary (β⁰ 0.2, β¹ 3.1973, β² −54.24) for Ba–SO4, barite log Ksp −9.97 (WATEQ4F): the
+//            approximation of Rogers (1981, LBL-12356).
+// 'none'     no Ba–SO4 term, barite log Ksp −9.97: USGS PHREEQC pitzer.dat (Appelo 2015) and LLNL data0.ypf.
+// An equilibrium state keeps the treatment it was made with (eq.ba) and hands it on to every solution derived from it.
+export const BARITE_MODELS = {
+  pair: { label: 'BaSO₄(aq) ion pair, log K 2.72, barite log Ksp −10.05 (Felmy, Rai & Amonette 1990)', b: [0, 0, 0], logK: 2.72, sd: 0.09, logKsp: -10.05, sdKsp: 0.05 },
+  analogue: { label: 'Ca–SO₄ analogue binary, barite log Ksp −9.97 (Rogers 1981)', b: [0.2, 3.1973, -54.24] },
+  none: { label: 'No Ba–SO₄ term, barite log Ksp −9.97 (USGS pitzer.dat)', b: [0, 0, 0] },
+  pairw: { label: 'BaSO₄(aq) ion pair, log K 2.72 (Felmy, Rai & Amonette 1990), barite log Ksp −9.965 fitted in this work to pure-water solubility', b: [0, 0, 0], logK: 2.72, sd: 0.09, logKsp: -9.965, sdKsp: 0.01, fitted: true },
+};
+export const BARITE_MODEL_DEFAULT = 'analogue';
+let BARITE_MODEL = BARITE_MODEL_DEFAULT;
+/** Treatment of the Ba–SO4 interaction used by default for new solutions (Pitzer model). */
+export const bariteModel = () => BARITE_MODEL;
+/** Select the default treatment (a key of BARITE_MODELS); returns the previous one. */
+export function setBariteModel(id) { const prev = BARITE_MODEL; if (BARITE_MODELS[id]) BARITE_MODEL = id; return prev; }
+const isPair = (ba) => BARITE_MODELS[ba]?.logK != null; // treatments with an explicit BaSO4(aq) species
+const KBASO4 = si('Ba') * NS + si('SO4');
+/** Pitzer parameter view with a given Ba–SO4 binary (all other tables shared). */
+const pzWith = ([b0, b1, b2]) => { const c = (A, x) => { const B = Float64Array.from(A); B[KBASO4] = x; return B; }; return { ...PZ, B0: c(PZ.B0, b0), B1: c(PZ.B1, b1), B2: c(PZ.B2, b2) }; };
+const PZ_BA = Object.fromEntries(Object.entries(BARITE_MODELS).map(([id, t]) => [id, pzWith(t.b)]));
+
 /** Higher-order electrostatic mixing term Eθ and its ionic-strength derivative (Pitzer 1975 approximation of J). */
 const pzJ = (x) => x / (4 + 4.581 * x ** -0.7237 * Math.exp(-0.012 * x ** 0.528));
 const pzJp = (x) => { const e = 4.581 * x ** -0.7237 * Math.exp(-0.012 * x ** 0.528), d = 4 + e, dd = e * (-0.7237 / x - 0.012 * 0.528 * x ** -0.472); return 1 / d - (x * dd) / (d * d); };
@@ -142,8 +177,8 @@ const ETH = new Float64Array(2);
 
 /** Pitzer model: fills lnG (natural log of molal activity coefficients); returns the ionic strength and sets PZ_OUT. */
 const PZ_OUT = { I: 0, phi: 1, aw: 1 };
-function pitzer(m, T, lnG) {
-  const { B0, B1, B2, CM, TH, LAM, PSI, HASPSI, HASB, cat, an, neu, pc, pa } = PZ;
+function pitzer(m, T, lnG, par = PZ) {
+  const { B0, B1, B2, CM, TH, LAM, PSI, HASPSI, HASB, cat, an, neu, pc, pa } = par;
   let I = 0, Z = 0, sm = 0, nc = 0, na = 0;
   for (let i = 0; i < NS; i++) { const z = ZS[i], x = m[i]; lnG[i] = 0; if (!(x > 0)) continue; I += x * z * z; Z += x * (z < 0 ? -z : z); sm += x; if (z > 0) pc[nc++] = i; else if (z < 0) pa[na++] = i; }
   I *= 0.5;
@@ -222,12 +257,14 @@ function dhOsm(s, b) { const y = b * s; return y < 0.01 ? (s * s * s) / 3 - (b *
 // Nuttall (1978) up to I = 3 mol/kg (rms 0.004 in log γ±); the same fit returns 0.135 for CaCl2, 0.198 for MgCl2 and 0.057 for
 // BaCl2 against the NEA values 0.14, 0.19 and 0.07. Unlisted pairs use ε = 0.
 // Bromley constants: the salt constants B and the individual-ion table (B = B₊ + B₋ + δ₊δ₋, used for salts without a
-// fitted constant) are those of Bromley (1973, AIChE J. 19, 313–320), Table 1 (p. 315) and Table 2 (p. 316). All 16 salt
-// constants and the 23 ion pairs (B, δ) below were read from page images of the journal article itself (a scan held on a
-// document-sharing site, not a publisher copy) and agree with the reprint in Appendix 4.2 of Zemaitis, Clark, Rafal &
-// Scrivner, Handbook of Aqueous Electrolyte Thermodynamics (DIPPR/AIChE 1986, pp. 170–174). One entry of the reprint is a
-// misprint: RbI is 0.0108 in the article and −0.0108 in the handbook. The constants are corroborated by an independent
-// refit from the NIST evaluations (BR_REFIT, fitBromleyB, fitBromleyIons below).
+// fitted constant) are those of Bromley (1973, AIChE J. 19, 313–320) as reproduced in Appendix 4.2 of Zemaitis, Clark,
+// Rafal & Scrivner, Handbook of Aqueous Electrolyte Thermodynamics (DIPPR/AIChE 1986, pp. 170–174); the 1973 article
+// itself was not read. All 16 salt constants and the 23 ion pairs (B, δ) below were compared with that reprint, and the
+// salt constants are corroborated by an independent refit to the NIST evaluations (Hamer & Wu 1972; Goldberg & Nuttall
+// 1978; Goldberg 1981 — BR_REFIT, fitBromleyB, fitBromleyIons below). One entry is not taken as printed: the handbook
+// prints −0.0108 for RbI, which is inconsistent with the refit to the NIST data (+0.0100) and with the sum of Bromley's
+// own individual-ion values (+0.0157), so the sign is taken as a misprint in the reprint and the positive value is used
+// (RbI enters only the comparison of the published and refitted tables, not a calculation of the suite).
 // Both models return the osmotic coefficient that satisfies the Gibbs–Duhem equation with their activity coefficients.
 const PFAM = { pitzer: 1, bromley: 1 }; // model families that use the strong-electrolyte species set (no sulphate ion pairs)
 const BR_ION = { H: [0.0875, 0.103], Na: [0, 0.028], K: [-0.0452, -0.079], NH4: [-0.042, -0.02], Mg: [0.057, 0.157], Ca: [0.0374, 0.119], Sr: [0.0245, 0.11], Ba: [0.0022, 0.098], Mn: [0.037, 0.21], Fe: [0.046, 0.21], F: [0.0295, -0.93], Cl: [0.0643, -0.067], NO3: [-0.025, 0.27], OH: [0.076, -1], SO4: [0, -0.4], CO3: [0.028, -0.67], HPO4: [-0.01, -0.57] };
@@ -269,7 +306,7 @@ function pairModel(model, m, T, lnG) {
 }
 
 // Independent refit of the Bromley constants from the NIST evaluations (this work). BR_REFIT: per salt "cation anion B rms n Imax
-// [B published]" — B by fitBromleyB on the tabulated γ± (Hamer & Wu 1972 for 1:1 salts; Goldberg & Nuttall 1978 for the
+// [B published, from the handbook reprint; RbI with the corrected sign]" — B by fitBromleyB on the tabulated γ± (Hamer & Wu 1972 for 1:1 salts; Goldberg & Nuttall 1978 for the
 // alkaline-earth halides; Goldberg 1981 for the sulphates), rms = weighted root-mean-square deviation in log₁₀ γ±, n points to
 // the ionic strength Imax ≤ 6 mol/kg. BR_DATA: the rows [m γ± m γ± …] behind the suite's own salts, so that the regression can
 // be repeated. BR_ION_REFIT: [B, δ] per ion from fitBromleyIons over the 52 refitted salts whose ions occur in at least three
@@ -343,18 +380,21 @@ export function fitBromleyIons(salts, fix = { Bc: { Na: 0 }, dc: { Na: 0.028 }, 
 // species lists used in the inner loops: derived species active per model family, and alkalinity carriers
 const ACTIVE = [6, 7].map((f) => Int32Array.from(DER.map((d, j) => (d[f] ? j : -1)).filter((j) => j >= 0)));
 const ALKI = Int32Array.from(ALK.map((a, s) => (a !== 0 ? s : -1)).filter((s) => s >= 0)), ALKV = Float64Array.from(ALKI, (s) => ALK[s]);
+const JBASO4 = DER.findIndex((d) => d[0] === 'BaSO4°'), ACT_PAIR = Int32Array.from([...ACTIVE[0], JBASO4].sort((a, b) => a - b)); // Pitzer species list with the BaSO4(aq) pair
 const KCACHE = new Map();
-function kset(T, model) {
-  const fam = PFAM[model] ? 5 + 1 : 7, key = fam + '|' + T;
+function kset(T, model, pair = false, pk = 0) {
+  const fam = PFAM[model] ? 5 + 1 : 7, key = fam + (pair ? 'p' + pk + '|' : '|') + T;
   let k = KCACHE.get(key);
-  if (!k) { if (KCACHE.size > 400) KCACHE.clear(); k = DER.map((d) => (d[fam] ? d[fam](T) : NaN)); KCACHE.set(key, k); }
+  if (!k) { if (KCACHE.size > 400) KCACHE.clear(); k = DER.map((d) => (d[fam] ? d[fam](T) : NaN)); if (pair) k[JBASO4] = BARITE_MODELS.pair.logK + pk; KCACHE.set(key, k); }
   return k;
 }
 
 /** Aqueous equilibrium state at temperature T for one activity model. */
 class Eq {
-  constructor(T, model = 'pitzer') {
-    this.T = T; this.model = ACTIVITY_MODELS[model] ? model : 'pitzer'; this.K = kset(T, this.model); this.kH = 10 ** logKH(T); this.act = ACTIVE[PFAM[this.model] ? 0 : 1];
+constructor(T, model = 'pitzer', ba = BARITE_MODEL, pk = 0) {
+    this.T = T; this.model = ACTIVITY_MODELS[model] ? model : 'pitzer'; this.ba = BARITE_MODELS[ba] ? ba : BARITE_MODEL; this.pair = this.model === 'pitzer' && isPair(this.ba); this.pz = PZ_BA[this.ba];
+    this.pk = this.pair && Number.isFinite(pk) ? pk : 0; // offset of log K of BaSO4(aq) fitted to a user's own measurements (calibration); 0 = published constant
+    this.K = kset(T, this.model, this.pair, this.pk); this.kH = 10 ** logKH(T); this.act = this.pair ? ACT_PAIR : ACTIVE[PFAM[this.model] ? 0 : 1];
     this.m = new Float64Array(NS); this.lnG = new Float64Array(NS); this._l = new Float64Array(NS); this.Kg = new Float64Array(ND); this.tot = new Float64Array(NM); this._b = new Float64Array(NM); this._hp = new Float64Array(4);
     this.aw = 1; this.phi = 1; this.I = 0; this.pH = 7.5; this.alk = 0; this.iterations = 0;
   }
@@ -417,7 +457,7 @@ class Eq {
     return f1 + alkT;
   }
   _act() {
-    const r = this.model === 'pitzer' ? pitzer(this.m, this.T, this._l) : this.model === 'bromley' || this.model === 'sit' ? pairModel(this.model, this.m, this.T, this._l) : debye(this.model, this.m, this.T, this._l);
+    const r = this.model === 'pitzer' ? pitzer(this.m, this.T, this._l, this.pz) : this.model === 'bromley' || this.model === 'sit' ? pairModel(this.model, this.m, this.T, this._l) : debye(this.model, this.m, this.T, this._l);
     this.I = r.I; this.phi = r.phi; this.aw = r.aw;
   }
   /**
@@ -513,9 +553,11 @@ export const MINERALS = {
   bischofite: mk('Bischofite', 'MgCl₂·6H₂O', 203.30, { Mg: 1, Cl: 2 }, analytic(3.524, 0, 277.6, 0), { nW: 6, rho: 1570, kg: 1e-7, group: 'salt' }),
 };
 /** log K of a mineral for the species set of an activity model (see the note above the table). */
-const logKfor = (M, T, model) => (PFAM[model] ? M.kP || M.logK : M.kI || M.logK)(T);
+const DK_PAIR = BARITE_MODELS.pair.logKsp - MINERALS.barite.logK(25); // shift of the barite log Ksp that belongs to the ion-pair treatment (−10.05 against −9.970)
+const dkPair = (ba) => (isPair(ba) ? BARITE_MODELS[ba].logKsp - MINERALS.barite.logK(25) : 0); // the same for every pair treatment: its own log Ksp at 25 °C against −9.970
+const logKfor = (M, T, model, ba = BARITE_MODEL) => (PFAM[model] ? M.kP || M.logK : M.kI || M.logK)(T) + (M === MINERALS.barite && model === 'pitzer' ? dkPair(ba) : 0);
 for (const [id, M] of Object.entries(MINERALS)) {
-  M.id = id; M.logKfor = (T, model = 'pitzer') => logKfor(M, T, model); M.stoichiometry = { ...M.stoich, ...(M.nOH ? { OH: M.nOH } : {}), ...(M.nW ? { H2O: M.nW } : {}) };
+  M.id = id; M.logKfor = (T, model = 'pitzer', ba = BARITE_MODEL) => logKfor(M, T, model, ba); M.stoichiometry = { ...M.stoich, ...(M.nOH ? { OH: M.nOH } : {}), ...(M.nW ? { H2O: M.nW } : {}) };
   M._st = Object.entries(M.stoich).map(([k, n]) => [mi(k), n]); M._i = Int32Array.from(M._st.map((x) => x[0])); M._n = Float64Array.from(M._st.map((x) => x[1])); M._alk = 2 * (M.stoich.C || 0) + M.nOH; M._nu = sum(Object.values(M.stoich)) + M.nOH;
 }
 export const SCALE_MINERALS = ['calcite', 'aragonite', 'gypsum', 'anhydrite', 'barite', 'celestite', 'fluorite', 'silica', 'brucite', 'halite'];
@@ -531,7 +573,7 @@ export function saturationIndex(eq, id, P = 1, dk = 0) {
   if (M.nW) s += M.nW * Math.log10(eq.aw);
   if (M.awx) s += M.awx * Math.log10(eq.aw);
   const dP = M.dV ? (-M.dV * 1e-6 * (P - 1) * 1e5) / (R * tk(eq.T) * LN10) : 0; // pressure raises solubility when ΔV < 0
-  return s - (logKfor(M, eq.T, eq.model) + dP + dk);
+  return s - (logKfor(M, eq.T, eq.model, eq.ba) + dP + dk);
 }
 const present = (eq, id) => MINERALS[id]._st.every(([i]) => eq.tot[i] > 0);
 /** Saturation indices of every mineral whose components are present. */
@@ -542,45 +584,64 @@ export function saturation(eq, P = 1, dk = {}, ids = Object.keys(MINERALS)) {
 }
 
 // ---- barite index: sensitivity to the Ba–SO4 interaction ---------------------------------------------
-// The Ba–SO4 binary of the Pitzer set is an analogue (Ca–SO4). The treatments found in the literature are listed here
-// with the barite log Ksp each is used with, and the barite index is recomputed under every one of them:
+// The default treatment of the Ba–SO4 interaction on the Pitzer path is the Ca–SO4 analogue with log Ksp −9.97
+// (BARITE_MODELS.analogue): of the published treatments it reproduces the measured solubility in water, under pressure
+// and at temperature most closely, and in sulphate-bearing waters it lies at the cautious end. The verdicts do not rest
+// on that choice alone: they use the highest index among the published treatments (bariteVerdict). The treatments found
+// in the literature are listed here with the barite log Ksp each is used with, and the barite index is recomputed under every one of them:
+//  · explicit BaSO4(aq) ion pair, log K 2.72 ± 0.09, with log Ksp −10.05 ± 0.05 — Felmy, Rai & Amonette (1990, J. Solution
+//    Chem. 19, 175; abstract and first two pages read), from their own barite solubilities in Na2SO4 solutions at 25 °C;
+//    the model of Monnin (1999) is described as of the same kind (Monnin et al. 1999, Mar. Chem. 65, 253; no constants given);
 //  · Ca–SO4 analogue, log Ksp −9.97 — Rogers (1981, LBL-12356); the default of this suite;
 //  · Sr–SO4 analogue, log Ksp −9.97 — the Sr–SO4 set of THEREDA (Scharge 2016) in place of the Ca–SO4 one;
-//  · no Ba–SO4 term, log Ksp −9.97 — USGS PHREEQC pitzer.dat (Appelo 2015) and LLNL data0.ypf;
-//  · explicit BaSO4(aq) ion pair, log K 2.72 ± 0.09, with log Ksp −10.05 ± 0.05 — Felmy, Rai & Amonette (1990, J. Solution
-//    Chem. 19, 175; abstract and first two pages read), fitted to their own barite solubilities in Na2SO4 solutions at
-//    25 °C; the model of Monnin (1999) uses an explicit ion pair as well (Monnin et al. 1999, Mar. Chem. 65, 253).
-// Barium is a trace ion, so the change of the index is closed-form: a binary changes ln γ(Ba) by 2·m(SO4)·ΔB(I), an ion
+//  · no Ba–SO4 term, log Ksp −9.97 — USGS PHREEQC pitzer.dat (Appelo 2015) and LLNL data0.ypf.
+// Barium is a trace ion, so the change of the index is closed-form: a binary changes ln γ(Ba) by 2·m(SO4)·B(I), an ion
 // pair lowers the free barium by the factor 1 + K·γ(Ba)·γ(SO4)·m(SO4) (free-ion coefficients without a Ba–SO4 term,
-// γ of the neutral pair = 1). The measurements that would decide between the treatments (barite solubility in Na2SO4
-// solutions: Felmy et al. 1990, figures and tables of the closed paper) could not be read, so none is preferred.
+// γ of the neutral pair = 1). The measurements that would decide between the treatments in sulphate media (barite
+// solubility in Na2SO4 solutions: Felmy et al. 1990, figures and tables of the closed paper) could not be read.
 export const BASO4_TREATMENTS = [
-  { id: 'ca', label: 'Ca–SO₄ analogue (Rogers 1981)', b: [0.2, 3.1973, -54.24] },
+  { id: 'pair', model: 'pair', label: 'BaSO₄(aq) ion pair, log K 2.72 ± 0.09, with log Ksp −10.05 (Felmy et al. 1990)', logK: BARITE_MODELS.pair.logK, sd: BARITE_MODELS.pair.sd, logKsp: BARITE_MODELS.pair.logKsp },
+  { id: 'ca', model: 'analogue', label: 'Ca–SO₄ analogue (Rogers 1981)', b: BARITE_MODELS.analogue.b },
   { id: 'sr', label: 'Sr–SO₄ analogue (THEREDA Sr–SO₄ set)', b: [0.2, 1.30949, -24.31] },
-  { id: 'zero', label: 'no Ba–SO₄ term (PHREEQC pitzer.dat, data0.ypf)', b: [0, 0, 0] },
-  { id: 'pair', label: 'BaSO₄(aq) ion pair, log K 2.72 ± 0.09, with log Ksp −10.05 (Felmy et al. 1990)', logK: 2.72, sd: 0.09, logKsp: -10.05 },
+  { id: 'zero', model: 'none', label: 'no Ba–SO₄ term (PHREEQC pitzer.dat, data0.ypf)', b: [0, 0, 0] },
 ];
-/** Seawater-type waters (free sulphate up to so4 mol/kg, a twofold seawater concentrate): the barite index under every treatment stays within lo … hi of the suite's value; a wider band than warn is reported with the results. */
-export const BARITE_BAND = { so4: 0.06, lo: -0.1, hi: 0.08, warn: 0.1 };
+/** Seawater-type waters (free sulphate up to so4 mol/kg, a twofold seawater concentrate): the barite index under every treatment stays within lo … hi of the value of the default treatment; a wider band than warn is reported with the results. */
+export const BARITE_BAND = { so4: 0.06, lo: -0.16, hi: 0.09, warn: 0.1 };
 /**
- * Change of the barite saturation index under the alternative treatments of the Ba–SO4 interaction (Pitzer model only).
- * Returns { mSO4, I, shift: { sr, zero, pair, pairLo, pairHi, pairSameK }, lo, hi, width, ion, paired } — shifts relative
- * to the index of the suite (Ca–SO4 analogue); lo ≤ 0 ≤ hi span all treatments, each with its own log Ksp; ion is the
- * spread of the three ion-interaction treatments alone; paired the share of barium bound in the pair. Null when the
- * model is not Pitzer or the water holds no sulphate.
+ * Change of the barite saturation index under the other treatments of the Ba–SO4 interaction (Pitzer model only).
+ * Returns { ref, mSO4, I, shift: { ca, sr, zero, pair, pairLo, pairHi, pairSameK, pairw }, lo, hi, up, width, ion, paired } — shifts
+ * relative to the index of the state itself, whose treatment is ref ('pair', 'analogue' or 'none'; its own shift is 0);
+ * lo ≤ 0 ≤ hi span all treatments, each with its own log Ksp; up (0 ≤ up ≤ hi) is the shift to the highest index among the
+ * published treatments ('pair' with its central constants, 'ca', 'zero') — the conservative envelope; pairw is the ion pair
+ * with the log Ksp fitted in this work to pure-water solubility; ion is the spread of the three ion-interaction treatments
+ * alone; paired the share of barium bound in the pair under the ion-pair treatment; pairSameK the ion pair with the
+ * log Ksp of the other treatments. Null when the model is not Pitzer or the water holds no sulphate.
  */
 export function bariteBand(eq) {
   if (eq.model !== 'pitzer') return null;
   const iBa = si('Ba'), iS = si('SO4'), mS = eq.m[iS], I = eq.I;
   if (!(mS > 0) || !(I > 0)) return null;
-  const sI = Math.sqrt(I), g14 = pzG(1.4 * sI), g12 = pzG(12 * sI), k = iBa * NS + iS;
-  const Bdef = PZ.B0[k] + PZ.B1[k] * g14 + PZ.B2[k] * g12, dB = ([b0, b1, b2]) => (2 * mS * (b0 + b1 * g14 + b2 * g12 - Bdef)) / LN10;
-  const T = Object.fromEntries(BASO4_TREATMENTS.map((t) => [t.id, t])), ca = dB(T.ca.b), sr = dB(T.sr.b), zero = dB(T.zero.b);
-  const q = Math.exp(eq.lnG[iBa] - 2 * mS * Bdef + eq.lnG[iS]) * mS; // γ(Ba)·γ(SO4)·m(SO4) without a Ba–SO4 term (Cφ of the binary is zero in every treatment)
-  const dK = logKfor(MINERALS.barite, 25, 'pitzer') - T.pair.logKsp, pr = (lk) => zero - Math.log10(1 + 10 ** lk * q);
-  const pairSameK = pr(T.pair.logK), pair = pairSameK + dK, pairLo = pr(T.pair.logK + T.pair.sd) + dK, pairHi = pr(T.pair.logK - T.pair.sd) + dK;
-  const all = [0, ca, sr, zero, pairLo, pairHi], lo = Math.min(...all), hi = Math.max(...all);
-  return { mSO4: mS, I, shift: { ca, sr, zero, pair, pairLo, pairHi, pairSameK }, lo, hi, width: hi - lo, ion: Math.max(0, ca, sr, zero) - Math.min(0, ca, sr, zero), paired: 1 - 1 / (1 + 10 ** T.pair.logK * q) };
+  const sI = Math.sqrt(I), g14 = pzG(1.4 * sI), g12 = pzG(12 * sI), P = eq.pz, T = Object.fromEntries(BASO4_TREATMENTS.map((t) => [t.id, t]));
+  const Bown = P.B0[KBASO4] + P.B1[KBASO4] * g14 + P.B2[KBASO4] * g12, zB = ([b0, b1, b2]) => (2 * mS * (b0 + b1 * g14 + b2 * g12)) / LN10; // index relative to "no Ba–SO4 term, log Ksp −9.97"
+  const q = Math.exp(eq.lnG[iBa] - 2 * mS * Bown + eq.lnG[iS]) * mS; // γ(Ba)·γ(SO4)·m(SO4) without a Ba–SO4 term (Cφ of the binary is zero in every treatment)
+  const zP = (lk) => -Math.log10(1 + 10 ** lk * q), own = eq.pair ? zP(T.pair.logK + eq.pk) - dkPair(eq.ba) : (2 * mS * Bown) / LN10;
+  const ca = zB(T.ca.b) - own, sr = zB(T.sr.b) - own, zero = -own, pairSameK = zP(T.pair.logK) - own, pair = pairSameK - DK_PAIR, pairLo = zP(T.pair.logK + T.pair.sd) - DK_PAIR - own, pairHi = zP(T.pair.logK - T.pair.sd) - DK_PAIR - own, pairw = pairSameK - dkPair('pairw');
+  const all = [0, ca, sr, zero, pairLo, pairHi, pairw], lo = Math.min(...all), hi = Math.max(...all), up = Math.max(0, ca, zero, pair);
+  return { ref: eq.ba, mSO4: mS, I, shift: { ca, sr, zero, pair, pairLo, pairHi, pairSameK, pairw }, lo, hi, up, width: hi - lo, ion: Math.max(ca, sr, zero) - Math.min(ca, sr, zero), paired: 1 - 1 / (1 + 10 ** T.pair.logK * q) };
+}
+/** Treatments of the Ba–SO4 interaction that are published as such (the conservative envelope is the highest barite index among them and the treatment in use). */
+export const BARITE_PUBLISHED = ['pair', 'analogue', 'none'];
+/**
+ * Barite index used for verdicts: the best estimate SI (the state's own treatment) and the conservative envelope —
+ * the highest index among the published treatments (ion pair with the constants of Felmy et al. 1990, Ca–SO4 analogue of
+ * Rogers 1981, no Ba–SO4 term as in pitzer.dat) and the treatment in use. se > 0 marks an index calibrated against the
+ * user's own measurements (standard error of the fitted Δ log Ksp): the range is then ± 2·se and the envelope SI + 2·se.
+ * basis 'best' returns the best estimate as the verdict value. Outside the Pitzer model there is one treatment only.
+ */
+export function bariteVerdict(eq, P = 1, dk = 0, { basis = 'envelope', se = 0 } = {}) {
+  const si0 = saturationIndex(eq, 'barite', P, dk), b = bariteBand(eq), cal = se > 0;
+  const lo = cal ? -2 * se : b ? b.lo : 0, hi = cal ? 2 * se : b ? b.hi : 0, up = cal ? 2 * se : b ? b.up : 0;
+  return { best: si0, lo: si0 + lo, hi: si0 + hi, envelope: si0 + up, verdict: basis === 'best' ? si0 : si0 + up, up: basis === 'best' ? 0 : up, basis: basis === 'best' ? 'best' : 'envelope', calibrated: cal, band: b };
 }
 
 // ---- solutions (mole basis) ------------------------------------------------------------------------
@@ -596,17 +657,19 @@ function molalBasis(ions, T) {
   tot[IC] = h + c3;
   return { tot, alkC: h + 2 * c3, kgw, rho, S, tds: t };
 }
-const wrap = (T, model, n, alk, w, eq, extra = {}) => ({ T, model, n, alk, w, pH: eq.pH, eq, ...extra });
+const wrap = (T, model, n, alk, w, eq, extra = {}) => ({ T, model, n, alk, w, pH: eq.pH, eq, ...extra, ba: eq.ba, pk: eq.pk });
+const pkOf = (sol) => sol.pk ?? sol.eq?.pk ?? 0; // offset of the BaSO4(aq) association constant a solution was made with
+const baOf = (sol) => sol.ba ?? sol.eq?.ba ?? BARITE_MODEL; // Ba–SO4 treatment a solution was made with
 const totOf = (n, w) => { const t = new Float64Array(NM); for (let i = 0; i < NM; i++) t[i] = Math.max(0, n[i]) / w; return t; };
 
 /** Build a solution from a water analysis (mg/L), temperature and measured pH. */
-export function makeSolution({ ions, T = 25, pH = 8, model = 'pitzer', kgw = 1 }) {
-  const b = molalBasis(ions, T), eq = new Eq(T, model).run(b.tot, { pH, alkC: b.alkC });
+export function makeSolution({ ions, T = 25, pH = 8, model = 'pitzer', kgw = 1, bariteModel: ba = BARITE_MODEL, pairDK = 0 }) {
+  const b = molalBasis(ions, T), eq = new Eq(T, model, ba, pairDK).run(b.tot, { pH, alkC: b.alkC });
   return wrap(T, eq.model, eq.tot.map((x) => x * kgw), eq.alk * kgw, kgw, eq, { kgwPerL: b.kgw });
 }
 /** Re-equilibrate a solution: o.pH fixes the pH (alkalinity then follows), o.pCO2 opens it to a gas phase, o.T changes temperature. */
 export function equilibrate(sol, o = {}) {
-  const T = o.T ?? sol.T, eq = new Eq(T, o.model || sol.model);
+  const T = o.T ?? sol.T, eq = new Eq(T, o.model || sol.model, o.bariteModel ?? baOf(sol), o.pairDK ?? pkOf(sol));
   eq.pH = sol.pH; if (sol.eq && T === sol.T && eq.model === sol.model) { eq.lnG.set(sol.eq.lnG); eq.aw = sol.eq.aw; }
   eq.run(totOf(sol.n, sol.w), o.pH != null ? { pH: o.pH, pCO2: o.pCO2 } : { alk: sol.alk / sol.w, pCO2: o.pCO2 });
   const n = Float64Array.from(sol.n); n[IC] = eq.tot[IC] * sol.w;
@@ -625,7 +688,7 @@ export function concentrateSolution(sol, cf, { co2 = 'closed', pCO2 = 4.2e-4, re
 /** Blend two solutions; fb = share of solution b in the mixed water (0–1). */
 export function mixSolutions(a, b, fb) {
   const n = a.n.map((x, i) => (x / a.w) * (1 - fb) + (b.n[i] / b.w) * fb);
-  return equilibrate({ T: a.T * (1 - fb) + b.T * fb, model: a.model, n, alk: (a.alk / a.w) * (1 - fb) + (b.alk / b.w) * fb, w: 1, pH: a.pH, kgwPerL: a.kgwPerL });
+  return equilibrate({ T: a.T * (1 - fb) + b.T * fb, model: a.model, n, alk: (a.alk / a.w) * (1 - fb) + (b.alk / b.w) * fb, w: 1, pH: a.pH, kgwPerL: a.kgwPerL, ba: baOf(a), pk: pkOf(a) });
 }
 // Reagents: equivalents of alkalinity added per mole and the components they carry.
 export const REAGENTS = {
@@ -649,7 +712,7 @@ export function doseSolution(sol, reagent, mol) {
  */
 export function precipitateSolution(sol, minerals, { pCO2 = null, reservoir = {}, P = 1, dk = {}, hint = [] } = {}) {
   const ids = minerals.filter((id) => MINERALS[id]), mins = ids.map((id) => MINERALS[id]), nK = ids.length, xi = new Float64Array(nK), res = ids.map((id) => reservoir[id] || 0);
-  const n = new Float64Array(NM), tot = new Float64Array(NM), SIv = new Float64Array(nK), tol = 1e-8, E = new Eq(sol.T, sol.model);
+  const n = new Float64Array(NM), tot = new Float64Array(NM), SIv = new Float64Array(nK), tol = 1e-8, E = new Eq(sol.T, sol.model, baOf(sol), pkOf(sol));
   const ro = { alk: 0, pCO2 }, gas = pCO2 != null, dkv = ids.map((id) => dk[id] || 0);
   let alk = sol.alk, w = sol.w, evals = 0;
   E.pH = sol.pH; if (sol.eq) { E.lnG.set(sol.eq.lnG); E.aw = sol.eq.aw; E.m.set(sol.eq.m); }
@@ -798,19 +861,19 @@ function describe(sol, P = 1, dk = {}, full = true) {
   return r;
 }
 /** Full chemical state of a water: speciation, activities, saturation and scaling/corrosion indices. */
-export function analyzeWater({ ions, T = 25, pH = 8, P = 1, model = 'pitzer' }) {
-  const r = describe(makeSolution({ ions, T, pH, model }), P);
+export function analyzeWater({ ions, T = 25, pH = 8, P = 1, model = 'pitzer', bariteModel: ba }) {
+  const r = describe(makeSolution({ ions, T, pH, model, bariteModel: ba }), P);
   for (const id of Object.keys(MINERALS)) if (!(id in r.SI)) { r.SI[id] = -99; r.omega[id] = 0; } // −99 marks a mineral whose constituents are absent
   return r;
 }
 /** Concentrate a water by the factor cf with carbonate re-equilibration. Returns the new analysis (mg/L), pH and state. */
-export function concentrate({ ions, T = 25, pH = 8, cf = 2, model = 'pitzer', co2 = 'ro', rej = 1, P = 1 }) {
-  const s = concentrateSolution(makeSolution({ ions, T, pH, model }), Math.max(cf, 1e-6), { co2, rej }), d = describe(s, P, {}, false);
+export function concentrate({ ions, T = 25, pH = 8, cf = 2, model = 'pitzer', co2 = 'ro', rej = 1, P = 1, bariteModel: ba }) {
+  const s = concentrateSolution(makeSolution({ ions, T, pH, model, bariteModel: ba }), Math.max(cf, 1e-6), { co2, rej }), d = describe(s, P, {}, false);
   return { ions: d.ions, pH: d.pH, T, tds: d.tds, cf, I: d.I, aw: d.aw, SI: d.SI, density: d.density, solution: s };
 }
 /** Equilibrium precipitation of the listed minerals. Solids in mg per litre of the original water. */
-export function precipitate({ ions, T = 25, pH = 8, minerals = SCALE_MINERALS.filter((k) => k !== 'aragonite' && k !== 'anhydrite'), model = 'pitzer', P = 1 }) {
-  const s0 = makeSolution({ ions, T, pH, model }), r = precipitateSolution(s0, minerals, { P }), io = solutionToIons(r.sol), f = s0.kgwPerL / s0.w;
+export function precipitate({ ions, T = 25, pH = 8, minerals = SCALE_MINERALS.filter((k) => k !== 'aragonite' && k !== 'anhydrite'), model = 'pitzer', P = 1, bariteModel: ba }) {
+  const s0 = makeSolution({ ions, T, pH, model, bariteModel: ba }), r = precipitateSolution(s0, minerals, { P }), io = solutionToIons(r.sol), f = s0.kgwPerL / s0.w;
   const solids = Object.fromEntries(Object.entries(r.solids).map(([k, x]) => [k, Math.max(0, x) * MINERALS[k].mw * 1000 * f]));
   return { solids, totalSolids: sum(Object.values(solids)), ions: io.ions, pH: r.sol.pH, tds: io.tds, SI: saturation(r.sol.eq, P), solution: r.sol, moles: r.solids };
 }
@@ -830,13 +893,13 @@ export const componentIndex = mi;
 // ---- Gibbs-energy minimisation ------------------------------------------------------------------------
 // Standard chemical potentials (in units of RT) follow from the equilibrium constants with the master species,
 // H⁺ and H₂O as the reference: derived species μ° = −ln K, solids μ° = ln Ksp − n(OH)·ln Kw.
-const solidMu0 = (M, T, P, dk, model = 'pitzer') => LN10 * (logKfor(M, T, model) + (M.dV ? (-M.dV * 1e-6 * (P - 1) * 1e5) / (R * tk(T) * LN10) : 0) + dk - M.nOH * logKw(T));
+const solidMu0 = (M, T, P, dk, model = 'pitzer', ba = BARITE_MODEL) => LN10 * (logKfor(M, T, model, ba) + (M.dV ? (-M.dV * 1e-6 * (P - 1) * 1e5) / (R * tk(T) * LN10) : 0) + dk - M.nOH * logKw(T));
 /** Total Gibbs energy G/RT (mol) of a solution plus solids ({ id: mol }), on the reference above. */
 export function gibbsEnergy(sol, solids = {}, { P = 1, dk = {} } = {}) {
   const e = sol.eq, K = e.K;
   let g = (sol.w / MW_W) * Math.log(e.aw);
   for (let s = 0; s < NS; s++) { const x = e.m[s]; if (x > 0) g += x * sol.w * ((s > IH ? -LN10 * K[s - NM - 1] : 0) + Math.log(x) + e.lnG[s]); }
-  for (const [id, n] of Object.entries(solids)) if (MINERALS[id] && n) g += n * solidMu0(MINERALS[id], sol.T, P, dk[id] || 0, sol.model);
+  for (const [id, n] of Object.entries(solids)) if (MINERALS[id] && n) g += n * solidMu0(MINERALS[id], sol.T, P, dk[id] || 0, sol.model, baOf(sol));
   return g;
 }
 /** Gaussian elimination with partial pivoting on a flat row-major matrix (destroys A and b); false when singular. */
@@ -860,7 +923,7 @@ function gaussInPlace(A, b, x, n) {
  * neutral solution of free ions, so the result is independent of the mass-action solver.
  */
 export function gibbsMinimize(sol, minerals = [], { P = 1, dk = {}, reservoir = {}, pH0 = 7 } = {}) {
-  const T = sol.T, E = new Eq(T, sol.model), K = E.K, w0 = sol.w, law0 = LN10 * logKw(T);
+  const T = sol.T, E = new Eq(T, sol.model, baOf(sol), pkOf(sol)), K = E.K, w0 = sol.w, law0 = LN10 * logKw(T);
   const ids = minerals.filter((id) => MINERALS[id]), mins = ids.map((id) => MINERALS[id]), nK = ids.length, res = ids.map((id) => Math.max(0, reservoir[id] || 0));
   const nTot = Float64Array.from(sol.n, (x) => Math.max(0, x));
   let bH = 2 * nTot[IC] - sol.alk;
@@ -883,7 +946,7 @@ export function gibbsMinimize(sol, minerals = [], { P = 1, dk = {}, reservoir = 
     if (DNH[j]) { ci.push(iHc); ai.push(DNH[j]); }
     sp.push({ s: NM + 1 + j, ci, ai, lk: LN10 * K[j], nW: DNW[j] });
   }
-  const so = mins.map((M, k) => { const ok = M._st.every(([i]) => cIdx[i] >= 0), ci = M._st.map(([i]) => cIdx[i]), ai = M._st.map(([, nu]) => nu); if (M.nOH) { ci.push(iHc); ai.push(-M.nOH); } return { ok, ci, ai, mu: solidMu0(M, T, P, dk[ids[k]] || 0, sol.model), nW: M.nW + M.nOH + M.awx }; });
+  const so = mins.map((M, k) => { const ok = M._st.every(([i]) => cIdx[i] >= 0), ci = M._st.map(([i]) => cIdx[i]), ai = M._st.map(([, nu]) => nu); if (M.nOH) { ci.push(iHc); ai.push(-M.nOH); } return { ok, ci, ai, mu: solidMu0(M, T, P, dk[ids[k]] || 0, sol.model, E.ba), nW: M.nW + M.nOH + M.awx }; });
   const nS = sp.length, lam = new Float64Array(NC), lnG = new Float64Array(NS), ms = new Float64Array(nS), nk = Float64Array.from(res), r = new Float64Array(NC), sc = new Float64Array(NC);
   for (let c = 0; c < nc; c++) lam[c] = Math.log(b[c] / w0);
   lam[iHc] = -LN10 * pH0;
@@ -1447,6 +1510,7 @@ const BARITE_BLOUNT = { P: [[100, 0.0117], [500, 0.0184], [1000, 0.029]], T: [[6
 // as chloride). calc: what Rogers computed for that seawater with the CaSO4 parameters for BaSO4 and K = 1.10·10⁻¹⁰ — barium
 // at barite saturation (mol/kg) and γ±(BaSO4).
 const SW_CLB = { Na: 0.48523, K: 0.01058, Mg: 0.05518, Ca: 0.01068, Sr: 0.00009, SO4: 0.02927, cel: [[0.06598, 0, 0.414], [0.05519, 0.01076, 0.416], [0.03801, 0.02795, 0.423], [0.02099, 0.04497, 0.422]], calc: { Ba: 2.09e-7, g: 0.134 } };
+/*BSD0*/const BARITE_SULPHATE = [], BARITE_SULPHATE_MEDIA = {};/*BSD1*/
 /** Osmotic coefficient of MgSO4(aq) at 298.15 K from the extended ion-interaction model of Archer & Rard (1998), parameters as reprinted in Table 3 of Miladinović et al. (2007): β⁰ −0.03089, β¹ 3.7687, β² −37.3659, C⁰ 0.016406, C¹ 0.34549, α 1.4 and 12, ω 1, Aφ 0.391475; fitted to 3.6176 mol/kg. */
 const archerRardPhi = (m) => { const s = Math.sqrt(4 * m); return 1 - (4 * 0.391475 * s) / (1 + 1.2 * s) + m * (-0.03089 + 3.7687 * Math.exp(-1.4 * s) - 37.3659 * Math.exp(-12 * s)) + 4 * m * m * (0.016406 + 0.34549 * Math.exp(-s)); };
 /** Largest relative deviation of γ± and φ of one model from a reference table, up to the molality mMax. */
@@ -1467,10 +1531,10 @@ const BR_STAT = (() => {
   const rf = BR_REFIT.split('|').map((r) => r.split(' ')), own = rf.filter(([c, a]) => BR_DATA[c + ' ' + a]), d = rf.filter((r) => r[6] != null).map((r) => +r[2] - +r[6]);
   return `Refitted B (published; rms in log γ±): ${own.map(([c, a, B, rms, , , pub]) => `${c}–${a} ${B} (${pub}; ${rms})`).join(', ')}. Over the ${d.length} salts with a published constant the difference is ${fmt(Math.sqrt(sum(d.map((x) => x * x)) / d.length), 2)} kg/mol rms (largest ${fmt(Math.max(...d.map(Math.abs)), 2)}). The refitted ion table reproduces the 52 salt constants with rms 0.0081 (largest 0.022), Bromley’s with 0.0110 (largest 0.037)`;
 })();
-/** Where every constant set of the suite comes from and how it was checked. Status: confirmed, corrected, replaced, fitted or refitted here, analogue or unconfirmed. */
+/** Where every constant set of the suite comes from and how it was checked. Status: confirmed, corrected, replaced, fitted or refitted here, analogue or unconfirmed (with a qualification where the source was read only in part or second-hand). */
 const PROVENANCE = [
   ['Pitzer β⁰, β¹, β², Cφ, θ, ψ and CO₂ λ of the Na–K–Mg–Ca–H–Cl–SO₄–OH–HCO₃–CO₃–CO₂ system', 'Harvie, Møller & Weare (1984), read from the LLNL EQ3/6 database file data0.hmw', '173 numbers compared by script: all identical', '25 °C; to salt saturation (I ≈ 20 mol/kg)', 'confirmed'],
-  ['Mg–SO₄ within that set (β⁰ 0.221, β¹ 3.343, β² −37.23, Cφ 0.025)', 'Harvie, Møller & Weare (1984) in data0.hmw; the Pitzer & Mayorga (1974) paper itself was not retrievable', 'Independent data: φ within 1.0 % of six isopiestic measurements from 0.72 to 3.14 mol/kg (Miladinović et al. 2007); γ± and φ within 0.5 % of the Archer & Rard (1998) evaluation from 0.25 to 1.5 mol/kg; epsomite solubility 2.97 mol/kg against 2.96 and 3.02 retrieved; water activity of the saturated solution 0.9077 against 0.9038–0.9074 computed here from the Archer & Rard model parameters (derived). Added: φ within 0.7 % of a second isopiestic series of 12 points from 1.56 to 2.39 mol/kg (Ivanović, Popović, Rard et al. 2017 — primary, read through the NIST ThermoML transcription); solubility 3.035 ± 0.122 (Xue et al. 2016), 3.14 (Chen et al. 2018) and 3.18 mol/kg (Wang et al. 2017) from the same archive — the model is 2–7 % below them; measured vapour pressure of the saturated solution near 25 °C: p/p° 0.94 (López-Borrell et al. 2024, hygrometer, ±2 % RH), 0.91 (Apelblat & Manzurola 2003) and 0.88 (Diesnis 1937), the last two replotted in the first — all read from a figure (digitised, ±0.03). Still not retrieved: Archer & Rard 1998 and Rard & Miller 1981 (known only through the reprint in Miladinović et al.; OSTI holds the Archer & Rard record without full text), the tables of Apelblat & Manzurola 2003, and any JPCRD evaluation of MgSO₄ (none was found in the NIST reprint index)', '25 °C; to epsomite saturation', 'confirmed'],
+  ['Mg–SO₄ within that set (β⁰ 0.221, β¹ 3.343, β² −37.23, Cφ 0.025)', 'Harvie, Møller & Weare (1984) in data0.hmw; the Pitzer & Mayorga (1974) paper itself was not retrievable', 'Independent data: φ within 1.0 % of six isopiestic measurements from 0.72 to 3.14 mol/kg (Miladinović et al. 2007); γ± and φ within 0.5 % of the Archer & Rard (1998) evaluation from 0.25 to 1.5 mol/kg; epsomite solubility 2.97 mol/kg against 2.96 and 3.02 retrieved; saturated-solution water activity: from measured isopiestic osmotic coefficients at the saturation molality — ln a_w = −2·m·M_w·φ (exact) with φ of Miladinović et al. (0.6542, 0.7508 and 0.9669 at 1.947, 2.387 and 3.14 mol/kg) interpolated to each retrieved solubility (2.96, 2.97 model, 3.018, 3.035 mol/kg): a_w 0.9076, 0.9070, 0.9041, 0.9030, i.e. 0.9053 ± 0.0023 (solubility spread) ± 0.0003 (φ ± 0.003) ± 0.0006 (interpolation); the suite gives 0.9077, +0.0024 from the centre of that range and +0.0007 at its own saturation molality. Secondary: 0.9038–0.9074 computed here from the Archer & Rard model parameters (derived). Also: φ within 0.7 % of a second isopiestic series of 12 points from 1.56 to 2.39 mol/kg (Ivanović, Popović, Rard et al. 2017 — primary, read through the NIST ThermoML transcription); solubility 3.035 ± 0.122 (Xue et al. 2016), 3.14 (Chen et al. 2018) and 3.18 mol/kg (Wang et al. 2017) from the same archive — the model is 2–7 % below them; measured vapour pressure of the saturated solution near 25 °C: p/p° 0.94 (López-Borrell et al. 2024, hygrometer, ±2 % RH), 0.91 (Apelblat & Manzurola 2003) and 0.88 (Diesnis 1937), the last two replotted in the first — all read from a figure (digitised, ±0.03; a loose cross-check only, the primary reference is the one built on the measured osmotic coefficients). Still not retrieved: Archer & Rard 1998 and Rard & Miller 1981 (known only through the reprint in Miladinović et al.; OSTI holds the Archer & Rard record without full text), the tables of Apelblat & Manzurola 2003, and any JPCRD evaluation of MgSO₄ (none was found in the NIST reprint index)', '25 °C; to epsomite saturation', 'confirmed'],
   ['Pitzer parameters of BaCl₂ and borate (B(OH)₄⁻, B(OH)₃ λ)', 'USGS PHREEQC pitzer_2012.dat and LLNL data0.ypf (Pitzer & Mayorga 1973 for BaCl₂; Felmy & Weare 1986 for borate)', 'Numbers compared with the files; BaCl₂ γ± and φ within 3.3 % and 1.2 % of Goldberg & Nuttall (1978) to saturation (1.785 mol/kg)', '25 °C', 'confirmed'],
   ['Strontium: Pitzer Sr–Cl, Sr–SO₄, θ(Sr,Na), θ(Sr,K), θ(Sr,Mg), θ(Sr,Ca), ψ(Sr,M,Cl)', 'THEREDA database, PHREEQC release of 2020-10-22 (reference SCH2016, Scharge 2016); β⁰(Sr–SO₄) = 0.2 is adopted there from CaSO₄, β¹ 1.30949 and β² −24.31 are fitted', 'Replaces the Sr–SO₄ entry of pitzer.dat, which is numerically the Ca–SO₄ set. SrCl₂: γ± within 2.4 %, φ within 1.1 % of Goldberg & Nuttall (1978) to 3 mol/kg (previous set 5.5 %). Celestite with log K −6.63 (next row): within 4.4 % of Reardon & Armstrong (1987) in 11 NaCl solutions from 0.05 to 5 mol/kg, +1.8 % in 0.7 mol/kg NaCl and +1.4 to +4.2 % in four synthetic seawaters (Culberson et al. 1978), −4.2 % in water', '25 °C; NaCl solutions to 5 mol/kg and seawater tested; fitted within the THEREDA oceanic-salt set and used here with the Harvie–Møller–Weare set', 'replaced'],
   ['log K of celestite with the Pitzer model: −6.63 (was −6.550)', 'USGS WATEQ4F wateq4f.dat and PHREEQC pitzer.dat/phreeqc.dat (−6.63); the THEREDA value −6.550 (Dyrssen et al. 1969) that accompanies the strontium parameters is not used', 'With −6.550 the model lies 6 % above the measured solubility in water, 10–15 % above Reardon & Armstrong (1987) in NaCl solutions and 22–25 % above Culberson et al. (1978) in seawater; it had been accepted on the two-figure data of Brower & Renault (1971), which lie well above both. Measurements read from secondary tabulations (Dal Pozzo 1991, Table C.1; Rogers 1981, Tables 6 and 8); Reardon & Armstrong (1987) and Culberson, Latham & Bates (1978) are closed (no open-access location in Unpaywall, OpenAlex, CORE or Semantic Scholar; the IUPAC–NIST Solubility Data Series has no volume on alkaline-earth sulphates). Felmy, Rai & Amonette (1990, primary, abstract) give log Ksp −6.62 ± 0.02 from celestite solubilities in Na₂SO₄ solutions', '25 °C; ΔH −4.3 kJ/mol for other temperatures', 'corrected'],
@@ -1478,7 +1542,7 @@ const PROVENANCE = [
   ['Pitzer parameters of NaF, KF, KNO₃, Mg(NO₃)₂, Na₂HPO₄, K₂HPO₄, θ(Cl,NO₃)', 'Pitzer (1991) tabulation, read from the LLNL EQ3/6 Pitzer file data0.ypf', '19 numbers compared; Mg(NO₃)₂ restored to full precision, K₂HPO₄ added', '25 °C', 'confirmed'],
   ['Pitzer parameters of NaNO₃ and Ca(NO₃)₂', 'LLNL EQ3/6 data0.ypf (revision 0): refits with α₁ = 2 to the Archer (2000) and Oakes et al. (2000) evaluations', 'The earlier values could not be found in a retrievable file and were replaced by this set', '25 °C; NaNO₃ checked here against Hamer & Wu to 6 mol/kg', 'replaced'],
   ['Pitzer λ of dissolved silica with Na⁺, K⁺, Mg²⁺, Ca²⁺, SO₄²⁻', 'USGS PHREEQC pitzer.dat (Appelo 2015)', 'The earlier values could not be found in any database and were replaced', '25 °C', 'replaced'],
-  ['Ba–SO₄ interaction of the Pitzer model: the Ca–SO₄ binary (β⁰ 0.2, β¹ 3.1973, β² −54.24); no θ or ψ with Ba²⁺', 'Analogue — the approximation of Rogers (1981, PhD thesis with K. S. Pitzer, LBL-12356; read). No measured Ba–SO₄ binary could be read. Read instead: USGS PHREEQC pitzer.dat (Appelo 2015; current file), LLNL data0.ypf, PHRQPITZ (Dal Pozzo 1991, Table 2.2), THEREDA, frezchem, ColdChem and SOLMINEQ.88 — none has a Ba–SO₄ term; Felmy, Rai & Amonette (1990, J. Solution Chem. 19, 175 — primary; abstract and first two pages from the publisher’s preview): their barite solubilities in Na₂SO₄ solutions are described with an explicit BaSO₄(aq) ion pair, log K 2.72 ± 0.09, and log Ksp −10.05 ± 0.05; Monnin et al. (1999, Mar. Chem. 65, 253 — primary, open copy): the model of Monnin (1999) treats BaSO₄(aq) as an explicit ion pair as well. Not readable: Monnin & Galinier (1988), Monnin (1999), the tables and figures of Felmy et al. (1990), Jiang (1996, beyond the preview), Dideriksen et al. (2024)', 'The barite index is recomputed under the four published treatments, each with its own log Ksp (bariteBand), and given with its range in the saturation table, in the table “Barite index: sensitivity to the Ba–SO₄ interaction” and, where the verdict depends on the treatment or the range exceeds 0.1 SI, in a warning. Verify tab: closed-form shift equal to a recalculation with exchanged parameters (2·10⁻⁷ SI); twofold seawater concentrate: ion-interaction treatments within 0.041 SI, all treatments between −0.070 and 0 of the suite’s value; the eight example waters: −0.092 to +0.072; dilute sodium-sulphate waters: up to 0.33. Barite solubility in water and in NaCl solutions does not depend on the term. No treatment is preferred: the solubility data in sulphate media that would decide could not be read, so nothing was fitted', 'Barite index within −0.10 … +0.08 SI for seawater-type waters up to a twofold concentrate (free SO₄²⁻ ≤ 0.06 mol/kg); wider (to 0.4–0.6 SI) for dilute sulphate-type waters and sulphate brines, reported with every run', 'analogue'],
+  ['Ba–SO₄ interaction of the Pitzer model. Default: explicit BaSO₄(aq) ion pair, log K 2.72, with barite log Ksp −10.05 and no Ba–SO₄ binary. Selectable instead (input “Barium–sulphate interaction”): the Ca–SO₄ binary as an analogue (β⁰ 0.2, β¹ 3.1973, β² −54.24; the previous default) or no Ba–SO₄ term, both with log Ksp −9.97. No θ or ψ with Ba²⁺', 'Default — a published model: Felmy, Rai & Amonette (1990, J. Solution Chem. 19, 175 — primary). Read: the abstract and the first two pages only (publisher’s preview). Taken from them: log K of BaSO₄(aq) 2.72 ± 0.09, barite log Ksp −10.05 ± 0.05, and the statement that for BaSO₄ the explicit ion-association species is preferred over a description by ion-interaction parameters alone, on their own barite solubilities in Na₂SO₄ solutions. Not read (model section, tables and figures are closed): the activity-coefficient expressions of their ion-association model, the Ba–Cl, Ba–Na and Na–SO₄ parameters it uses, whether any Ba–SO₄ β terms accompany the pair, and the solubility data. The structure used here — Pitzer parameters of this suite for every other interaction, an explicit association equilibrium for BaSO₄(aq), free-ion activity product against Ksp — is the one that Monnin et al. (1999, Mar. Chem. 65, 253 — primary, open copy, read) describe for the model of Monnin (1999); they print neither constants nor parameters, so that model cannot be offered as a treatment of its own (it also pairs SrSO₄ and CaSO₄, which this suite does not). Assumptions of this suite, not of the sources: activity coefficient 1 for the neutral pair; log K independent of temperature; temperature and pressure dependence of the barite log Ksp as in WATEQ4F, shifted by −0.080. Alternatives: Rogers (1981, PhD thesis with K. S. Pitzer, LBL-12356; read) computed barite solubility with the CaSO₄ parameters; USGS PHREEQC pitzer.dat (Appelo 2015; current file), LLNL data0.ypf, PHRQPITZ (Dal Pozzo 1991, Table 2.2), THEREDA, frezchem, ColdChem and SOLMINEQ.88 have no Ba–SO₄ term. Not readable: Monnin & Galinier (1988), Monnin (1999), Jiang (1996, beyond the preview), Dideriksen et al. (2024)', 'Every barite solubility check runs under the default and under the previous default (Verify tab). Previous → default: water at 25 °C 0.0107 → 0.0098 mmol/kg (−0.2 → −8.7 % of the measured 0.0107); Templeton’s NaCl table, 1–4 mol/kg, largest deviation 7.1 → 15.2 %, root mean square over 0.05–5 mol/kg 0.054 → 0.084 in log₁₀; Blount, 100–1000 bar 4.4 → 10.6 %; Blount, 60 and 100 °C 7.9 → 1.5 %; Puchelt as tabulated by Blount 15.9 → 5.8 %, his points in Blount’s Fig. 9 20.8 → 10.3 %; mean of Davis & Collins and Templeton at 1 and 2 mol/kg 8.4 → 9.2 %; all 32 primary points pooled 0.060 → 0.067 in log₁₀. In water and NaCl solutions the treatments differ by the solubility product alone, and the measurements do not decide between −9.97 and −10.05: the published value is worse in water, against Templeton and under pressure, better against Puchelt, Davis & Collins and at 60–100 °C. The published treatment is therefore the default; its weak point is pure water, where it lies 9 % below three concordant measurements (more than its stated ±0.05 in log Ksp, i.e. ±6 %, allows). In sulphate media the treatments differ in substance (barite in 0.1 mol/kg Na₂SO₄: 81, 44 and 41 nmol/kg of barium with the ion pair, the analogue and no term) and no measurement could be read to compare with. Consistency checks: free-ion solubilities of the three treatments coincide within 0.001 in log₁₀ in 0–4 mol/kg NaCl once each uses its own log Ksp; BaSO₄(aq) at barite saturation equals K·Ksp (4.68·10⁻⁸ mol/kg) in every medium; free plus paired barium equals the total (10⁻¹²) and barium is conserved through precipitation; the closed-form band equals a recalculation of the speciation (5·10⁻⁷ SI). The barite index is also given under every other treatment (bariteBand) in the saturation table, in the table “Barite index: sensitivity to the Ba–SO₄ interaction” and, where the verdict depends on the treatment or the range exceeds 0.1 SI, in a warning', 'Constants at 25 °C. The other treatments lie within −0.08 … +0.11 SI of the default for the example waters and for seawater up to a twofold concentrate (free SO₄²⁻ ≤ 0.06 mol/kg): higher than the default where sulphate is a major anion, lower by 0.07 in sulphate-poor waters; wider (to 0.4–0.6 SI) for dilute sulphate-type waters and sulphate brines, reported with every run', 'replaced — published model; the two constants are from the abstract and first pages only, the activity framework of the source was not read'],
   ['Other Pitzer analogues that remain: θ, ψ and the binaries of NH₄⁺ (from K⁺), Fe²⁺ and Mn²⁺ (from Mg²⁺) that have no value in the files above; H₃SiO₄⁻ (uses HCO₃⁻)', 'Assignment by chemical similarity', 'No independent check; the binaries with chloride and sulphate of these ions are taken from the files named above and tested against the NIST tables', 'Trace constituents only', 'analogue'],
   ['Debye–Hückel slope Aφ(T)', 'Grid of the LLNL EQ3/6 Pitzer file data0.ypf (0.3767, 0.3915, 0.4190, 0.4605 at 0, 25, 60, 100 °C)', 'Fit reproduces the four grid values within 0.0005', '0–100 °C', 'confirmed'],
   ['Carbonate, water, silicate, borate, HSO₄⁻ and HF dissociation; CO₂ Henry constant (ion-pair models)', 'USGS WATEQ4F database wateq4f.dat (Plummer & Busenberg 1982; Ball & Nordstrom 1991); borate log K as in MINTEQA2 v4', 'All coefficients of the six temperature functions and four log K/ΔH pairs compared', '0–90 °C', 'confirmed'],
@@ -1486,18 +1550,19 @@ const PROVENANCE = [
   ['Ion-pair constants (CaSO₄°, MgSO₄°, NaSO₄⁻, KSO₄⁻, CaHCO₃⁺, MgHCO₃⁺, NaHCO₃°, NaCO₃⁻, CaCO₃°, MgCO₃°, CaOH⁺, MgOH⁺, CaF⁺, MgF⁺, BaSO₄°, SrSO₄°)', 'USGS WATEQ4F database wateq4f.dat (CaOH⁺ ΔH from MINTEQA2 v4); Pitzer-set CaCO₃°, MgCO₃°, MgOH⁺ from data0.hmw', '16 log K and 12 ΔH compared: identical after rounding; two Pitzer-set ΔH adjusted to pitzer.dat', 'I < 0.7 mol/kg', 'confirmed'],
   ['Ion-size å and b of the Truesdell–Jones and extended Debye–Hückel models', 'USGS WATEQ4F database wateq4f.dat', '18 ions compared; b of Ba²⁺, NH₄⁺, Fe²⁺, Mn²⁺, NO₃⁻, F⁻, OH⁻ and å of HPO₄²⁻ corrected', 'I < 1 mol/kg', 'corrected'],
   ['Ion-size default (å = 4, b = 0.041) for species without a tabulated entry', 'Model assumption', 'No source', 'Ion pairs and minor species only', 'unconfirmed'],
-  ['log K(T) of calcite, aragonite, gypsum, anhydrite, barite, celestite, fluorite, amorphous silica, strontianite, witherite, siderite, dolomite', 'USGS WATEQ4F database wateq4f.dat', 'All analytic coefficients and ΔH compared: identical; silica now carries the water activity of SiO₂ + 2 H₂O = H₄SiO₄. Barite in water 0.0107 mmol/kg against 0.0108 (Templeton 1960) and 0.0106 (Blount 1977). Primary tables of Blount (1977, Am. Mineral. 62, 942; open journal copy, read from page images): barite in water at 100, 500 and 1000 bar within 4.4 % (Table 3), at 60 and 100 °C within 7.9 % (Table 3), in 0.2 and 1.0 mol/kg NaCl 11 and 16 % above the measurements of Puchelt (1967) that Blount tabulates (Table 11) and 21 and 7 % below the Templeton (1960) table — the model lies between the two series. Templeton’s table is still second-hand (Appelo 2015) but agrees within 4 % with his points in Blount’s Fig. 9, digitised here (±0.01 in log₁₀). Celestite −6.63 with every model (celestite row)', '0–90 °C', 'confirmed'],
+  ['log K(T) of calcite, aragonite, gypsum, anhydrite, barite, celestite, fluorite, amorphous silica, strontianite, witherite, siderite, dolomite', 'USGS WATEQ4F database wateq4f.dat', 'All analytic coefficients and ΔH compared: identical; silica now carries the water activity of SiO₂ + 2 H₂O = H₄SiO₄. Barite (log K −9.970 of this file; used with the Ca–SO₄ analogue and no-term treatments and with every model other than Pitzer — the default Pitzer treatment shifts it to −10.05, see the Ba–SO₄ row, where the deviations of the default are listed): in water 0.0107 mmol/kg against 0.0108 (Templeton 1960) and 0.0106 (Blount 1977). Primary tables of Blount (1977, Am. Mineral. 62, 942; open journal copy, read from page images): barite in water at 100, 500 and 1000 bar within 4.4 % (Table 3), at 60 and 100 °C within 7.9 % (Table 3), in 0.2 and 1.0 mol/kg NaCl 11 and 16 % above the measurements of Puchelt (1967) that Blount tabulates (Table 11) and 21 and 7 % below the Templeton (1960) table — with this log K the model lies between the two series. Templeton’s table is still second-hand (Appelo 2015) but agrees within 4 % with his points in Blount’s Fig. 9, digitised here (±0.01 in log₁₀). Celestite −6.63 with every model (celestite row)', '0–90 °C', 'confirmed'],
   ['log K of calcite and aragonite with the Pitzer model (−8.406, −8.219)', 'Harvie, Møller & Weare (1984) in data0.hmw; temperature function of pitzer.dat', 'Corrected (was the ion-pair value −8.480, −8.336); verified against the seawater solubility of Mucci (1983)', '25 °C exact', 'corrected'],
   ['log K of halite, sylvite, the Na/Mg/K/Ca sulphate and chloride salts, brucite, portlandite, magnesite, nesquehonite', 'Harvie, Møller & Weare (1984) in data0.hmw and USGS PHREEQC pitzer.dat (PHRQPITZ lineage)', '19 values at 25 °C compared: identical to 0.001 (mirabilite follows pitzer.dat, −1.214)', '25 °C', 'confirmed'],
   ['The same minerals with the ion-pair models (brucite −11.16, magnesite −8.03, nesquehonite −5.62, epsomite −2.14, mirabilite −1.11, thenardite −0.18, halite 1.58)', 'USGS WATEQ4F database wateq4f.dat', 'Added: the Pitzer-set values had been used with every model', 'I < 0.7 mol/kg', 'corrected'],
   ['Temperature dependence of sylvite, hexahydrite, bischofite (analytic) and kieserite (ΔH −29 kJ/mol)', 'USGS PHREEQC pitzer.dat (PHRQPITZ expressions; kieserite slope from the Appelo 2015 expression)', 'Replaced: the earlier ΔH of hexahydrite and kieserite were not found in a database', '0–100 °C, indicative', 'replaced'],
   ['SIT interaction coefficients ε(cation, anion)', 'OECD-NEA thermochemical database, 2020 update of the SIT tables (B-6, B-7); ThermoChimie sit.dat of USGS PHREEQC', '26 of 27 pairs identical in the NEA tables; 19 also in sit.dat; FeCl₂, MnCl₂, NaH₃SiO₄ and NH₄NO₃ (−0.06) added from sit.dat; against the NIST tables to 1 mol/kg: MnCl₂ 1.3 %, NH₄Cl 1.8 %, NH₄NO₃ 8.5 %, FeCl₂ 8.8 % in γ±', 'I ≤ 3 mol/kg', 'confirmed'],
   ['SIT ε(Sr²⁺, Cl⁻) = 0.10 kg/mol', 'Fitted in this work to the SrCl₂ activity coefficients of Goldberg & Nuttall (1978, Table 23) — the pair is not in the NEA tables', 'Weighted least squares on log γ± to I = 3 mol/kg: ε = 0.103, rms 0.004. The same fit gives 0.135, 0.198 and 0.057 for CaCl₂, MgCl₂ and BaCl₂ (NEA: 0.14, 0.19, 0.07)', 'I ≤ 3 mol/kg', 'fitted here'],
-  ['Bromley salt constants B of 16 salts and the individual-ion table (B₊, δ₊, B₋, δ₋) of 17 ions', 'Bromley (1973, AIChE J. 19, 313–320), Table 1 (p. 315) and Table 2 (p. 316) — primary, read from page images of the journal article (a scan on a document-sharing site, not a publisher or author copy); also the reprint in Appendix 4.2 of Zemaitis, Clark, Rafal & Scrivner, Handbook of Aqueous Electrolyte Thermodynamics (DIPPR/AIChE 1986), pp. 170–174 — secondary', 'All 16 salt constants and the (B, δ) pairs of 23 ions identical in the article and in the reprint. The RbI entry is resolved: the article prints 0.0108, the handbook −0.0108 (a misprint of the reprint; the refit gives 0.0100 and Bromley’s ion values 0.0157). δ of Mn²⁺ and Fe²⁺ are marked as estimates in the article. The MgSO₄ constant −0.0153 is listed with a standard deviation of 0.051 in log γ±. Not retrieved: Bromley (1972, J. Chem. Thermodyn. 4, 669), and no report of Bromley’s own (OSTI, eScholarship, Office of Saline Water reports) that tabulates the constants', 'I ≤ 6 mol/kg; not for 2:2 salts', 'confirmed'],
+  ['Bromley salt constants B of 16 salts and the individual-ion table (B₊, δ₊, B₋, δ₋) of 17 ions', 'Tables 1 and 2 of Bromley (1973, AIChE J. 19, 313–320) as reproduced in Appendix 4.2 of Zemaitis, Clark, Rafal & Scrivner, Handbook of Aqueous Electrolyte Thermodynamics (DIPPR/AIChE 1986), pp. 170–174 — a reprint (secondary); the 1973 article itself was not read', 'All 16 salt constants and the (B, δ) pairs of 23 ions compared with the handbook reprint: identical, with one exception. RbI: the handbook prints −0.0108, which is inconsistent with the refit to the NIST data (+0.0100) and with the sum of Bromley’s own individual-ion values (+0.0157), so the sign is taken as a misprint in the reprint and the positive value is used (RbI is not a salt of the suite; it enters only the comparison of the published and refitted tables). Independent refit of the salt constants to the NIST evaluations (Hamer & Wu 1972; Goldberg & Nuttall 1978; Goldberg 1981): per-salt agreement in the next row. δ of Mn²⁺ and Fe²⁺ are marked as estimates in the reprint. The MgSO₄ constant −0.0153 is listed there with a standard deviation of 0.051 in log γ±. Not retrieved: Bromley (1973) itself, Bromley (1972, J. Chem. Thermodyn. 4, 669), and no report of Bromley’s own (OSTI, eScholarship, Office of Saline Water reports) that tabulates the constants', 'I ≤ 6 mol/kg; not for 2:2 salts', 'confirmed against handbook reprint; independently refitted; RbI sign corrected on the evidence of the refit'],
   ['Bromley constants refitted in this work from NIST evaluations (corroboration; the published values stay in use)', 'γ± tables of Hamer & Wu (1972), Goldberg & Nuttall (1978) and Goldberg (1981): 58 salts, weighted least squares on log γ± to I = 6 mol/kg (fitBromleyB); ion values by a global fit of B = B₊ + B₋ + δ₊δ₋ over 52 salts (fitBromleyIons)', BR_STAT, 'I ≤ 6 mol/kg', 'refitted here'],
   ['Hydrous ferric oxide: site density, surface area, protonation and sorption constants', 'Dzombak & Morel (1990) and Swedlund & Webster (1999), read from the SURFACE_SPECIES block of USGS PHREEQC phreeqc.dat', '10 constants, 600 m²/g and 0.2 mol/mol compared: identical; solver reproduces PHREEQC example 8', '25 °C, I < 0.7 mol/kg', 'confirmed'],
   ['Interfacial energies, growth constants and antiscalant limits of the minerals', 'Order-of-magnitude engineering defaults', 'Not source-checked; adjustable through the kinetic inputs and the limit fields', 'Screening only', 'unconfirmed'],
 ];
+const BA_SHORT = { pair: 'BaSO₄(aq) ion pair, Felmy et al. 1990', analogue: 'Ca–SO₄ analogue', none: 'no Ba–SO₄ term', pairw: 'BaSO₄(aq) ion pair, log Ksp fitted to pure water' };
 const limitsOf = (v) => { const p = (x) => Math.log10(Math.max(x, 1) / 100); return { calcite: v.limCalcite, aragonite: v.limCalcite, gypsum: p(v.limGypsum), anhydrite: p(v.limGypsum), barite: p(v.limBarite), celestite: p(v.limCelestite), fluorite: p(v.limFluorite), silica: p(v.limSilica), brucite: 0, halite: 0 }; };
 const scaleSet = (v) => ['calcite', 'gypsum', ...(v.T > 50 ? ['anhydrite'] : []), 'barite', 'celestite', 'fluorite', 'silica', 'brucite', 'halite'];
 const dkOf = (v) => ({ calcite: v.dkCalcite || 0, aragonite: v.dkCalcite || 0, gypsum: v.dkGypsum || 0, barite: v.dkBarite || 0, silica: v.dkSilica || 0 });
@@ -1534,10 +1599,17 @@ function applyDosing(feed, v, wallCF, copt) {
 /** Complete scaling assessment used by run(), the mesh study and the verification checks. */
 export function assessScaling(v) {
   const model = v.model, dk = dkOf(v), lim = limitsOf(v), set = scaleSet(v), P = v.P;
-  let raw = makeSolution({ ions: v.ions, T: v.T, pH: v.pH, model });
+  const ba = BARITE_MODELS[v.bariteModel] ? v.bariteModel : BARITE_MODEL, pairDK = Number.isFinite(v.dkBaPair) ? v.dkBaPair : 0;
+  // Verdict basis for barite: every decision (status, limiting mineral, recovery limits) is taken on the conservative envelope —
+  // the highest index among the published treatments of the Ba–SO4 interaction — unless the user selects the best estimate;
+  // after a calibration against the user's own measurements (seBarite > 0) the envelope is the fitted index + 2 standard errors.
+  const vb = { basis: v.bariteVerdict === 'best' ? 'best' : 'envelope', se: Math.max(0, Number.isFinite(v.seBarite) ? v.seBarite : 0) };
+  const upOf = (eq) => (vb.basis === 'best' ? 0 : vb.se > 0 ? 2 * vb.se : bariteBand(eq)?.up ?? 0);
+  const satV = (eq) => { const q = saturation(eq, P, dk, set), u = q.barite != null ? upOf(eq) : 0; return u ? [q, { ...q, barite: q.barite + u }] : [q, q]; }; // [best estimate, verdict basis]
+  let raw = makeSolution({ ions: v.ions, T: v.T, pH: v.pH, model, bariteModel: ba, pairDK });
   const unmixed = raw;
   let other = null;
-  if (v.mixOn && tds(cloneIons(v.mixIons)) > 0 && v.mixFrac > 0) { other = makeSolution({ ions: v.mixIons, T: v.mixT, pH: v.mixPH, model }); raw = mixSolutions(raw, other, clamp(v.mixFrac / 100, 0, 1)); raw.T = raw.eq.T; }
+  if (v.mixOn && tds(cloneIons(v.mixIons)) > 0 && v.mixFrac > 0) { other = makeSolution({ ions: v.mixIons, T: v.mixT, pH: v.mixPH, model, bariteModel: ba, pairDK }); raw = mixSolutions(raw, other, clamp(v.mixFrac / 100, 0, 1)); raw.T = raw.eq.T; }
   // optional pretreatment: sorption of silica and boron on ferric hydroxide, then sodium-cycle softening
   let scm = null, ix = null;
   if (v.scmOn && v.feDose > 0) {
@@ -1557,20 +1629,61 @@ export function assessScaling(v) {
   const dose = applyDosing(raw, v, cfOf(R) * beta, copt), feed = dose.sol;
   const concAt = (r, b = 1) => concentrateSolution(feed, cfOf(r) * b, copt);
   const useRo = v.useRoBrine && tds(cloneIons(v.roBrine)) > 0;
-  const conc = useRo ? makeSolution({ ions: v.roBrine, T: v.T, pH: v.roBrinePH, model }) : concAt(R);
+  const conc = useRo ? makeSolution({ ions: v.roBrine, T: v.T, pH: v.roBrinePH, model, bariteModel: ba, pairDK }) : concAt(R);
   const wall = useRo ? concentrateSolution(conc, beta, { co2: 'closed' }) : concAt(R, beta);
   // recovery sweep at the membrane wall
   const g0 = solutionToIons(feed).gPerKgw, Rmax = clamp(1 - (beta * g0) / 380, 0.3, 0.98), nRec = Math.max(4, Math.round(v.nRec));
-  const Rs = linspace(0, Rmax, nRec), sweep = Rs.map((r) => saturation(concAt(r, beta).eq, P, dk, set));
+  const Rs = linspace(0, Rmax, nRec), both = Rs.map((r) => satV(concAt(r, beta).eq)), sweep = both.map((q) => q[0]), sweepV = both.map((q) => q[1]);
   const maxRec = {};
   for (const id of set) {
-    const ys = sweep.map((q) => q[id] ?? -99), here = present(feed.eq, id);
+    const ys = sweepV.map((q) => q[id] ?? -99), here = present(feed.eq, id);
     maxRec[id] = { plain: here ? cross(Rs, ys, 0) : null, as: here ? cross(Rs, ys, Math.max(lim[id] ?? 0, 0)) : null, present: here };
   }
   const pick = (key) => { let best = null; for (const id of set) { const r = maxRec[id][key]; if (maxRec[id].present && r != null && (best == null || r < best.r)) best = { id, r }; } return best || { id: null, r: Rmax }; };
-  return { v, model, dk, lim, set, P, raw, unmixed, other, scm, ix, feed, dose, conc, wall, R, rej, beta, Rs, Rmax, sweep, maxRec, limitPlain: pick('plain'), limitAS: pick('as'), concAt, copt, useRo, cf: cfOf(R) };
+  return { v, model, bariteModel: ba, vb, upOf, satV, sweepV, dk, lim, set, P, raw, unmixed, other, scm, ix, feed, dose, conc, wall, R, rej, beta, Rs, Rmax, sweep, maxRec, limitPlain: pick('plain'), limitAS: pick('as'), concAt, copt, useRo, cf: cfOf(R) };
 }
 
+// ---- barite treatments against measured solubility ----------------------------------------------------
+/** Standard seawater of salinity S as molalities: the composition of Culberson, Latham & Bates (1978; SW_CLB, salinity 35) scaled on the water-mass basis. */
+function seawaterTot(S = 35) {
+  const f = (S / (1000 - S)) / (35 / 965), tot = new Float64Array(NM);
+  for (const k of ['Na', 'K', 'Mg', 'Ca', 'Sr', 'SO4']) tot[mi(k)] = SW_CLB[k] * f;
+  tot[mi('Cl')] = (SW_CLB.Na + SW_CLB.K + 2 * (SW_CLB.Mg + SW_CLB.Ca + SW_CLB.Sr - SW_CLB.SO4)) * f;
+  return tot;
+}
+export const BARITE_TREATMENT_IDS = ['pairw', 'pair', 'analogue', 'none'];
+let BEV = null;
+/**
+ * Every treatment of the Ba–SO4 interaction against the measured barite solubilities embedded in this file: pure water at
+ * 25 °C, pure water at other temperatures and pressures, NaCl solutions, and the sulphate-bearing media (BARITE_SULPHATE).
+ * Returns { media: [{ id, label, n, stat: { treatment: { bias, rms } } }], pooled, primary, points }; deviations are
+ * log10(model / measured). Computed once per session.
+ */
+export function bariteEvidence() {
+  if (BEV) return BEV;
+  const memo = new Map(), once = (k, f) => { if (!memo.has(k)) memo.set(k, f()); return memo.get(k); };
+  const mk = (tot, T, B) => equilibrate({ T, model: 'pitzer', n: tot, alk: 0, w: 1, pH: 7 }, { bariteModel: B });
+  const nacl = (c) => { const n = new Float64Array(NM); n[mi('Na')] = c; n[mi('Cl')] = c; return n; };
+  const sat = (key, tot, T, P, B) => once(key + '|' + T + '|' + P + '|' + B, () => { const r = solubility(mk(tot, T, B), 'barite', { excess: 0.01, P }); return [r.m * 1000, r.sol.eq.tot[mi('Ba')] * 1000]; }); // mmol/kg water: dissolved from the solid, total at saturation
+  const pts = [], add = (medium, src, kind, cond, meas, f) => pts.push({ medium, src, kind, cond, meas, model: Object.fromEntries(BARITE_TREATMENT_IDS.map((B) => [B, f(B)])) });
+  for (const [src, x] of [['Templeton 1960', 0.0108], ['Davis & Collins 1971', 0.011], ['Blount 1977', 0.0106]]) add('w25', src, 'primary', '25 °C, 1 bar', x, (B) => sat('w', nacl(0), 25, 1, B)[0]);
+  for (const [P, x] of BARITE_BLOUNT.P) add('wTP', 'Blount 1977, Table 3', 'primary', `25 °C, ${P} bar`, x, (B) => sat('w', nacl(0), 25, P, B)[0]);
+  for (const [T, x] of BARITE_BLOUNT.T) add('wTP', 'Blount 1977, Table 3', 'primary', `${T} °C, 1 bar`, x, (B) => sat('w', nacl(0), T, 1, B)[0]);
+  for (const [c, x] of BARITE_NACL.slice(1)) add('nacl', 'Templeton 1960', 'primary', `${c} mol/kg NaCl, 25 °C`, x, (B) => sat('n' + c, nacl(c), 25, 1, B)[0]);
+  for (const [c, x] of BARITE_DC.slice(1)) add('nacl', 'Davis & Collins 1971', 'primary', `${c} mol/kg NaCl, 25 °C`, x, (B) => sat('n' + c, nacl(c), 25, 1, B)[0]);
+  for (const [c, x] of BARITE_BLOUNT.nacl) add('nacl', 'Puchelt 1967 (Blount 1977, Table 11)', 'primary', `${c} mol/kg NaCl, 25 °C`, x, (B) => sat('n' + c, nacl(c), 25, 1, B)[0]);
+  for (const [c, x] of BARITE_BLOUNT.fig9P.filter((r) => Math.abs(r[0] - 0.213) > 1e-9 && Math.abs(r[0] - 1.074) > 1e-9)) add('nacl', 'Puchelt 1967 (Blount 1977, Fig. 9, digitised)', 'primary', `${c} mol/kg NaCl, 25 °C`, x, (B) => sat('n' + c, nacl(c), 25, 1, B)[0]);
+  for (const d of BARITE_SULPHATE) {
+    const tot = d.S != null ? seawaterTot(d.S) : (() => { const n = new Float64Array(NM); for (const [k, x] of Object.entries(d.comp)) n[mi(k)] = x; return n; })(), kgw = d.S != null ? 1 - d.S / 1000 : 1;
+    add(d.medium, d.src, d.kind, d.cond, d.ba, (B) => sat(d.S != null ? 'sw' + d.S : JSON.stringify(d.comp), tot, d.T, d.P ?? 1, B)[1] * 1e6 * (d.perKgWater ? 1 : kgw)); // nmol of barium per kg of solution (per kg of water where the source says so)
+  }
+  const LABEL = { w25: 'Pure water, 25 °C, 1 bar', wTP: 'Pure water, 60–100 °C and 100–1000 bar', nacl: 'NaCl solutions, 0.05–5 mol/kg, 25 °C', ...BARITE_SULPHATE_MEDIA };
+  const stat = (rows) => Object.fromEntries(BARITE_TREATMENT_IDS.map((B) => { const d = rows.map((p) => Math.log10(p.model[B] / p.meas)); return [B, { bias: sum(d) / Math.max(d.length, 1), rms: Math.sqrt(sum(d.map((x) => x * x)) / Math.max(d.length, 1)) }]; }));
+  const media = Object.keys(LABEL).map((id) => { const rows = pts.filter((p) => p.medium === id); return { id, label: LABEL[id], n: rows.length, nPrimary: rows.filter((p) => p.kind === 'primary').length, sulphate: !['w25', 'wTP', 'nacl'].includes(id), stat: stat(rows) }; }).filter((q) => q.n);
+  return (BEV = { points: pts, media, pooled: stat(pts), n: pts.length, sulphate: stat(pts.filter((p) => !['w25', 'wTP', 'nacl'].includes(p.medium))), nSulphate: pts.filter((p) => !['w25', 'wTP', 'nacl'].includes(p.medium)).length });
+}
+
+/*BNT0*/const BARITE_NOTE = () => 'x', BARITE_EVIDENCE_TABLE = () => ({ title: 'Barite treatments against measured solubility', columns: ['a'], rows: [['b']] });/*BNT1*/
 /** Compact number formatting for notes (significant digits, no locale lookup). */
 const fq = (x, sig = 4) => (typeof x !== 'number' ? String(x ?? '–') : !Number.isFinite(x) ? '–' : x === 0 ? '0' : Math.abs(x) >= 1e7 || Math.abs(x) < 1e-4 ? x.toExponential(Math.max(1, sig - 1)) : String(+x.toPrecision(sig)));
 const SCM_NOTE = 'Generalised two-layer model for hydrous ferric oxide (Dzombak & Morel constants at 25 °C; silicate constants of Swedlund & Webster). Only weak sites are counted; major ions are not depleted by sorption.';
@@ -1965,6 +2078,8 @@ const suite = {
       { key: 'mixT', label: 'Second-stream temperature', unit: '°C', value: 25, min: 0, max: 120, showIf: (v) => v.mixOn },
     ] },
     { group: 'Thermodynamic model', tab: 'setup', help: 'Activity-coefficient model and the boundary condition for dissolved CO₂.', fields: [
+      { key: 'bariteModel', label: 'Barium–sulphate interaction (Pitzer model): best estimate', type: 'select', value: BARITE_MODEL_DEFAULT, options: [{ value: 'analogue', label: 'Ca–SO₄ analogue binary, log Ksp −9.97 (Rogers 1981) — fits the measured solubility in water' }, { value: 'pairw', label: 'BaSO₄(aq) ion pair, log K 2.72 (Felmy et al. 1990), log Ksp −9.965 fitted in this work to pure-water solubility' }, { value: 'pair', label: 'BaSO₄(aq) ion pair, log K 2.72, log Ksp −10.05 (Felmy et al. 1990)' }, { value: 'none', label: 'No Ba–SO₄ term, log Ksp −9.97 (USGS pitzer.dat)' }], showIf: (v) => v.model === 'pitzer', help: 'How barium and sulphate interact in the Pitzer model, with the barite solubility product that belongs to each treatment; this choice sets the best estimate of the barite index. Three treatments are published as such; the fourth combines the published ion-pair constant with a solubility product fitted in this work to the measured solubility in pure water. Their agreement with measured solubilities is listed in the results table “Barite treatments against measured solubility”.' },
+      { key: 'bariteVerdict', label: 'Barite verdict basis', type: 'select', value: 'envelope', options: [{ value: 'envelope', label: 'Conservative envelope: highest index among the published treatments' }, { value: 'best', label: 'Best estimate only' }], help: 'Which barite index decides the status, the recovery limits, the limiting mineral and the warnings. The envelope is the highest saturation index among the published treatments of the barium–sulphate interaction (and the selected one), so barite is never reported as within its limit while a published treatment says otherwise; after a calibration against own measurements it is the fitted index plus two standard errors. The reported saturation index is the best estimate in both cases.' },
       { key: 'model', label: 'Activity model', type: 'select', value: 'pitzer', options: MODEL_OPTS, help: 'Pitzer is required for seawater and brines. The Debye–Hückel family (with explicit ion pairs) is offered for dilute waters and for cross-checking.' },
       { key: 'co2', label: 'Dissolved CO₂ during concentration', type: 'select', value: 'ro', options: [{ value: 'ro', label: 'Passes the membrane (RO/NF): CO₂ stays at feed level' }, { value: 'closed', label: 'Closed system: all carbon retained' }, { value: 'open', label: 'Open to gas phase at fixed CO₂ partial pressure' }], help: 'Controls how the pH moves as the water is concentrated.' },
       { key: 'pCO2', label: 'CO₂ partial pressure of the gas phase', unit: 'µatm', value: 420, min: 1, max: 1e6, showIf: (v) => v.co2 === 'open', help: 'Atmospheric air ≈ 420 µatm.' },
@@ -1981,6 +2096,8 @@ const suite = {
     { group: 'Solubility-product adjustments', tab: 'setup', help: 'Offsets added to log Ksp. Leave at zero unless calibrated against solubility measurements (Calibrate tab).', fields: [
       { key: 'dkCalcite', label: 'Δ log Ksp calcite', unit: '', value: 0, min: -1, max: 1 }, { key: 'dkGypsum', label: 'Δ log Ksp gypsum', unit: '', value: 0, min: -1, max: 1 },
       { key: 'dkBarite', label: 'Δ log Ksp barite', unit: '', value: 0, min: -1, max: 1 }, { key: 'dkSilica', label: 'Δ log Ksp amorphous silica', unit: '', value: 0, min: -1, max: 1 },
+      { key: 'dkBaPair', label: 'Δ log K of the BaSO₄(aq) ion pair', unit: '', value: 0, min: -1, max: 1, showIf: (v) => v.model === 'pitzer', help: 'Offset of the association constant of BaSO₄(aq) (published value 2.72 ± 0.09) for the two ion-pair treatments; without effect on the others. Fit it on the Calibrate tab only with barium measurements at clearly different sulphate concentrations.' },
+      { key: 'seBarite', label: 'Standard error of a calibrated Δ log Ksp barite', unit: '', value: 0, min: 0, max: 0.5, help: '0 = not calibrated: the range of the barite index is the spread between the treatments of the barium–sulphate interaction. After fitting Δ log Ksp barite to own measurements (Calibrate tab) enter the “± Std. error” of the fit here: the range becomes ± 2 standard errors and the conservative verdict uses the fitted index plus 2 standard errors. Valid for waters close to the one measured.' },
     ] },
     { group: 'Nucleation and growth kinetics', tab: 'setup', help: 'Initial condition: a crystal-free supersaturated solution. Classical nucleation theory with a heterogeneous-nucleation factor and a parabolic growth law.', fields: [
       { key: 'het', label: 'Heterogeneous-nucleation factor f(θ)', unit: '–', value: 0.1, min: 0.005, max: 1, help: '1 = homogeneous nucleation; 0.05–0.2 is typical on membranes and particles.' },
@@ -2082,27 +2199,33 @@ const suite = {
     const best = v.antiscalant ? a.limitAS : a.limitPlain, name = (id) => (id ? MINERALS[id].name : 'none');
     // antiscalant dose heuristic: severity = highest SI relative to its controllable limit
     let sev = 0;
-    for (const id of set) if ((lim[id] ?? 0) > 0 && wd.SI[id] > 0) sev = Math.max(sev, wd.SI[id] / lim[id]);
+    // Barite: the numbers shown are the best estimate; every verdict below is taken on wSI, where barite carries the verdict basis (conservative envelope unless the best estimate is selected)
+    const bOpt = a.vb, bV = present(wall.eq, 'barite') ? { Feed: bariteVerdict(feed.eq, P, dk.barite || 0, bOpt), Concentrate: bariteVerdict(conc.eq, P, dk.barite || 0, bOpt), 'Membrane wall': bariteVerdict(wall.eq, P, dk.barite || 0, bOpt) } : null;
+    const wSI = bV ? { ...wd.SI, barite: bV['Membrane wall'].verdict } : wd.SI, bUp = bV ? bV['Membrane wall'].up : 0;
+    for (const id of set) if ((lim[id] ?? 0) > 0 && wSI[id] > 0) sev = Math.max(sev, wSI[id] / lim[id]);
     const keepF = 1 - R * (1 - a.rej), asDose = v.antiscalant && sev > 0 ? (clamp(2 + 6 * sev, 2, 12) * (1 - R)) / keepF : 0;
     const status = (id, s) => (s == null ? '–' : s <= 0 ? 'Undersaturated' : !v.antiscalant ? 'Scaling without inhibitor' : s <= limOf(id) ? 'Supersaturated — controlled by antiscalant' : 'Exceeds antiscalant limit');
     for (const id of set) {
-      const s = wd.SI[id];
+      const s = wSI[id], env = id === 'barite' && bUp > 0 ? ` on the conservative envelope of the ${bOpt.se > 0 ? 'calibration (fitted index + 2 standard errors)' : 'published Ba–SO₄ treatments'}; best estimate SI ${fmt(wd.SI[id], 3)}` : '';
       if (s == null || s <= 0) continue;
-      if (s > limOf(id)) W.push({ level: 'bad', msg: `${MINERALS[id].name} is ${fmt(10 ** s * 100, 3)} % saturated at the membrane wall (SI ${fmt(s, 3)}), above the ${v.antiscalant ? 'antiscalant limit' : 'saturation limit'} of SI ${fmt(limOf(id), 3)} — lower the recovery${id === 'calcite' ? ' or dose acid' : id === 'silica' ? ', raise the temperature or pH, or use a silica dispersant' : ''}.` });
-      else W.push({ level: 'info', msg: `${MINERALS[id].name} is supersaturated at the wall (SI ${fmt(s, 3)}) but within the antiscalant limit.` });
+      if (s > limOf(id)) W.push({ level: 'bad', msg: `${MINERALS[id].name} is ${fmt(10 ** s * 100, 3)} % saturated at the membrane wall (SI ${fmt(s, 3)}${env}), above the ${v.antiscalant ? 'antiscalant limit' : 'saturation limit'} of SI ${fmt(limOf(id), 3)} — lower the recovery${id === 'calcite' ? ' or dose acid' : id === 'silica' ? ', raise the temperature or pH, or use a silica dispersant' : ''}.` });
+      else W.push({ level: 'info', msg: `${MINERALS[id].name} is supersaturated at the wall (SI ${fmt(s, 3)}${env}) but within the antiscalant limit.` });
     }
-    // barite index under the alternative treatments of the Ba–SO4 interaction (Pitzer model, barium present)
-    const bBand = present(wall.eq, 'barite') ? { Feed: [feed, fd], Concentrate: [conc, cd], 'Membrane wall': [wall, wd] } : {}, bRows = [];
-    let bWall = null;
-    for (const [nm, [sol, d]] of Object.entries(bBand)) {
-      const b = bariteBand(sol.eq), s = d.SI.barite, lim0 = nm === 'Membrane wall' ? limOf('barite') : 0;
-      if (!b || s == null) continue;
-      const split = s + b.lo <= lim0 !== s + b.hi <= lim0;
-      if (nm === 'Membrane wall') bWall = { ...b, s, split };
-      bRows.push([nm, b.mSO4, b.I, s, s + b.shift.sr, s + b.shift.zero, `${fmt(s + b.shift.pair, 3)} (${fmt(s + b.shift.pairLo, 3)} to ${fmt(s + b.shift.pairHi, 3)})`, 100 * b.paired, s + b.lo, s + b.hi, split ? `Depends on the treatment (${nm === 'Membrane wall' ? 'limit' : 'saturation,'} SI ${fmt(lim0, 3)})` : nm === 'Membrane wall' ? (s + b.hi <= lim0 ? 'Within the limit under every treatment' : 'Above the limit under every treatment') : s + b.hi <= 0 ? 'Undersaturated under every treatment' : 'Supersaturated under every treatment']);
+    // barite: best estimate, range and verdict basis for the three streams (Pitzer model, barium present)
+    const bRows = [], bWall = bV ? bV['Membrane wall'] : null, bLim = limOf('barite');
+    for (const [nm, [sol]] of Object.entries(bV ? { Feed: [feed], Concentrate: [conc], 'Membrane wall': [wall] } : {})) {
+      const q = bV[nm], b = q.band, s = q.best, lim0 = nm === 'Membrane wall' ? bLim : 0, word = nm === 'Membrane wall' ? ['Within the limit', 'Above the limit'] : ['Undersaturated', 'Supersaturated'];
+      if (!b) continue;
+      const over = q.verdict > lim0, overBest = s > lim0, overAny = q.envelope > lim0;
+      bRows.push([nm, b.mSO4, b.I, s, `${fmt(s + b.shift.pair, 3)} (${fmt(s + b.shift.pairLo, 3)} to ${fmt(s + b.shift.pairHi, 3)})`, s + b.shift.pairw, s + b.shift.ca, s + b.shift.sr, s + b.shift.zero, 100 * b.paired, q.lo, q.hi, q.verdict,
+        (over ? word[1] : word[0]) + (over !== overBest ? ' on the conservative envelope (best estimate: ' + word[0].toLowerCase() + ')' : !over && overAny ? ' on the best estimate (a published treatment: ' + word[1].toLowerCase() + ')' : q.calibrated ? ' (calibrated)' : ' under every published treatment')]);
     }
-    if (bWall && bWall.split) W.push({ level: 'warn', msg: `Barite: SI ${fmt(bWall.s, 3)} at the wall with the Ba–SO₄ parameters of this suite (an analogue), but between ${fmt(bWall.s + bWall.lo, 3)} and ${fmt(bWall.s + bWall.hi, 3)} under the other published treatments of the Ba–SO₄ interaction — the verdict against the limit of SI ${fmt(limOf('barite'), 3)} depends on that choice; treat barite as marginal (see the table “Barite index: sensitivity to the Ba–SO₄ interaction”).` });
-    else if (bWall && bWall.width > BARITE_BAND.warn) W.push({ level: 'info', msg: `Barite: the index at the wall (SI ${fmt(bWall.s, 3)}) is uncertain by ${fmt(bWall.lo, 2)} / +${fmt(bWall.hi, 2)} because the Ba–SO₄ interaction is not settled in the literature${bWall.mSO4 > BARITE_BAND.so4 ? ` and this water holds ${fmt(bWall.mSO4, 3)} mol/kg of free sulphate, more than a twofold seawater concentrate` : ' and sulphate is a major anion at this low ionic strength, where ion pairing of barium counts most'}; the verdict is the same under every treatment.` });
+    if (bWall && bWall.band) {
+      const st = `best estimate SI ${fmt(bWall.best, 3)} at the wall (${BA_SHORT[a.bariteModel]}), range ${fmt(bWall.lo, 3)} to ${fmt(bWall.hi, 3)}${bWall.calibrated ? ' (± 2 standard errors of the calibration)' : ' over the treatments of the Ba–SO₄ interaction'}`;
+      if (bWall.verdict > bLim !== bWall.best > bLim) W.push({ level: 'warn', msg: `Barite: ${st}. The best estimate is within the limit of SI ${fmt(bLim, 3)}, the conservative envelope (SI ${fmt(bWall.verdict, 3)}) is not: status, recovery limits and limiting mineral are taken on the envelope. A jar test on this water settles it (Calibrate tab).` });
+      else if (bOpt.basis === 'best' && bWall.envelope > bLim !== bWall.best > bLim) W.push({ level: 'warn', msg: `Barite: ${st}. The verdict uses the best estimate only (input “Barite verdict basis”); a published treatment of the Ba–SO₄ interaction gives SI ${fmt(bWall.envelope, 3)}, above the limit of SI ${fmt(bLim, 3)} — treat barite as marginal.` });
+      else if (bWall.hi - bWall.lo > BARITE_BAND.warn) W.push({ level: 'info', msg: `Barite: ${st}${bWall.calibrated ? '' : ` (free sulphate ${fmt(bWall.band.mSO4, 3)} mol/kg, ${fmt(100 * bWall.band.paired, 2)} % of the barium paired under the ion-pair treatments)`}. The verdict against the limit of SI ${fmt(bLim, 3)} is the same over the whole range.` });
+    }
     if (Math.abs(rawD.chargeErrorPct) > 5) W.push({ level: 'warn', msg: `The feed analysis has a charge imbalance of ${fmt(rawD.chargeErrorPct, 3)} % — check the laboratory data; saturation indices inherit that error.` });
     if (v.model !== 'pitzer' && wd.I > ({ dh: 0.01, davies: 0.5, edh: 0.1, sit: 3.5, bromley: 6 }[v.model] ?? 1)) W.push({ level: 'warn', msg: `Ionic strength ${fmt(wd.I, 3)} mol/kg is outside the validity range of the selected activity model — switch to Pitzer.` });
     if (v.T > 60 || v.T < 5) W.push({ level: 'info', msg: 'Pitzer interaction parameters are 25 °C values; at this temperature the saturation indices are indicative.' });
@@ -2131,14 +2254,14 @@ const suite = {
     const pathIds = pset.filter((id) => path.some((q) => q.solids[id] > 1e-10));
     // kinetics at the wall
     const kin = shown.map((id) => [id, wd.SI[id] > 0 ? nucleationKinetics(id, wd.SI[id], v.T, v) : null]).filter(([, k]) => k);
-    const fast = kin.filter(([id, k]) => k.tInd < v.tRes && wd.SI[id] > limOf(id));
+    const fast = kin.filter(([id, k]) => k.tInd < v.tRes && wSI[id] > limOf(id));
     for (const [id, k] of fast) W.push({ level: 'warn', msg: `${MINERALS[id].name}: estimated induction time ${fmt(k.tInd, 2)} s is shorter than the concentrate residence time (${v.tRes} s).` });
     // activity-coefficient comparison for NaCl
     const ms = logspace(0.001, 6, 19), gam = Object.keys(ACTIVITY_MODELS).map((mod) => ({ name: ACTIVITY_MODELS[mod].split(' (')[0].split(' +')[0], x: ms, y: ms.map((m) => Math.min(saltActivity('Na', 'Cl', m, { T: 25, model: mod }).gamma, 3)) }));
     ctx?.progress?.(0.8, 'Scaling map…');
     // scaling-margin map over recovery and feed pH
     const fx = linspace(0, a.Rmax, 13), fy = linspace(5.5, 9, 8);
-    const fz = fy.map((ph) => { const f = equilibrate(a.raw, { pH: ph }); return fx.map((r) => { const q = saturation(concentrateSolution(f, a.beta / (1 - r), a.copt).eq, P, dk, set); let m = -9; for (const id of set) if (q[id] != null) m = Math.max(m, q[id] - limOf(id)); return clamp(m, -3, 3); }); });
+    const fz = fy.map((ph) => { const f = equilibrate(a.raw, { pH: ph }); return fx.map((r) => { const q = a.satV(concentrateSolution(f, a.beta / (1 - r), a.copt).eq)[1]; let m = -9; for (const id of set) if (q[id] != null) m = Math.max(m, q[id] - limOf(id)); return clamp(m, -3, 3); }); });
     const mixPlot = a.other ? (() => { const fs = linspace(0, 1, 11), rows = fs.map((f) => saturation(mixSolutions(a.unmixed, a.other, f).eq, P, dk, set)); return { type: 'line', title: 'Compatibility of the two streams (before concentration)', xlabel: 'Share of second stream in the blend (%)', ylabel: 'Saturation index', series: set.filter((id) => rows.some((q) => q[id] != null)).map((id) => ({ name: MINERALS[id].name, x: fs.map((f) => 100 * f), y: rows.map((q) => clamp(q[id] ?? -8, -8, 8)) })), hlines: [{ y: 0, label: 'saturation' }], vlines: [{ x: v.mixFrac, label: 'blend' }], note: 'A maximum between the end members reveals incompatible waters (typically barium meeting sulphate).' }; })() : null;
 
     ctx?.progress?.(0.9, 'Kinetics, transport and cross-checks…');
@@ -2154,7 +2277,9 @@ const suite = {
     const out = {
       streams: { brine }, SI: Object.fromEntries(Object.entries(cd.SI).map(([k, x]) => [k, +x.toFixed(4)])), SIwall: Object.fromEntries(Object.entries(wd.SI).map(([k, x]) => [k, +x.toFixed(4)])),
       maxRecovery: best.r ?? a.Rmax, maxRecoveryNoAntiscalant: a.limitPlain.r ?? a.Rmax, maxRecoveryAntiscalant: a.limitAS.r ?? a.Rmax, limitingMineral: best.id || 'none', antiscalantDose: asDose, acidDose: a.dose.mg, doseChemical: a.dose.reagent || 'none',
-      scalingMargin: Math.max(-9, ...set.filter((id) => wd.SI[id] != null).map((id) => wd.SI[id] - limOf(id))),
+      scalingMargin: Math.max(-9, ...set.filter((id) => wSI[id] != null).map((id) => wSI[id] - limOf(id))),
+      bariteSIwallBest: bWall ? bWall.best : -99, bariteSIwallLow: bWall ? bWall.lo : -99, bariteSIwallHigh: bWall ? bWall.hi : -99, bariteSIwallVerdict: bWall ? bWall.verdict : -99, bariteVerdictBasis: bOpt.basis, bariteModel: a.bariteModel,
+      maxRecoveryBariteNoAntiscalant: a.maxRec.barite?.present ? a.maxRec.barite.plain ?? a.Rmax : a.Rmax, maxRecoveryBariteAntiscalant: a.maxRec.barite?.present ? a.maxRec.barite.as ?? a.Rmax : a.Rmax,
       lsi: cd.siCalcite, lsiClassic: cd.lsi, sdsi: cd.sdsi, ionicStrength: cd.I, waterActivity: cd.aw, osmoticPressureBar: cd.osmoticPressure, pHConcentrate: cd.pH, feedPH: fd.pH, precipitationPotential: totalSolid, ccpp: cd.ccpp, density: cd.density, model: v.model, ...X.out,
     };
     return {
@@ -2165,7 +2290,7 @@ const suite = {
         { label: 'Ionic strength', value: cd.I, unit: 'mol/kg' }, { label: 'Water activity', value: cd.aw, unit: '–', sig: 5 },
         { label: 'Calcite SI at wall', value: wd.SI.calcite ?? 0, unit: '', status: (wd.SI.calcite ?? -9) > limOf('calcite') ? 'bad' : (wd.SI.calcite ?? -9) > 0 ? 'warn' : 'ok', help: 'Thermodynamic Langelier index: log(IAP/Ksp) with the selected activity model' },
         { label: 'Stiff–Davis index', value: cd.sdsi, unit: '', help: 'Classical S&DSI of the bulk concentrate' }, { label: 'Ryznar index', value: cd.rsi, unit: '', help: '< 6 scale forming, > 7 corrosive' },
-        { label: 'Gypsum saturation at wall', value: sat('gypsum'), unit: '%', status: (wd.SI.gypsum ?? -9) > limOf('gypsum') ? 'bad' : 'ok' }, { label: 'Barite saturation at wall', value: sat('barite'), unit: '%', status: (wd.SI.barite ?? -9) > limOf('barite') ? 'bad' : 'ok' },
+        { label: 'Gypsum saturation at wall', value: sat('gypsum'), unit: '%', status: (wd.SI.gypsum ?? -9) > limOf('gypsum') ? 'bad' : 'ok' }, { label: 'Barite saturation at wall', value: sat('barite'), unit: '%', status: (wSI.barite ?? -9) > limOf('barite') ? 'bad' : 'ok', ...(bWall && bWall.band ? { help: `Best estimate; range ${fmt(100 * 10 ** bWall.lo, 3)}–${fmt(100 * 10 ** bWall.hi, 3)} %. The status uses ${bOpt.basis === 'best' ? 'the best estimate' : `the conservative envelope, ${fmt(100 * 10 ** bWall.verdict, 3)} %`}` } : {}) },
         { label: 'Silica saturation at wall', value: sat('silica'), unit: '%', status: (wd.SI.silica ?? -9) > limOf('silica') ? 'bad' : 'ok' },
         { label: 'Max recovery, no antiscalant', value: recStr(a.limitPlain.r), unit: '%', help: `Limited by ${name(a.limitPlain.id)}` }, { label: 'Max recovery, with antiscalant', value: recStr(a.limitAS.r), unit: '%', status: a.limitAS.r != null && R > a.limitAS.r ? 'bad' : 'ok', help: `Limited by ${name(a.limitAS.id)}` },
         { label: 'Limiting mineral', value: name(best.id) }, { label: 'Antiscalant dose (feed)', value: asDose, unit: 'mg/L', help: 'Screening estimate' },
@@ -2183,7 +2308,7 @@ const suite = {
         'Send the concentrate to suite 9 (ZLD) for the evaporation path and salt recovery, or to suite 5 for the discharge assessment.',
       ].filter(Boolean),
       plots: [
-        { type: 'line', title: `Saturation index versus recovery (membrane wall, β = ${fmt(a.beta, 3)})`, xlabel: 'Recovery (%)', ylabel: 'Saturation index log(IAP/Ksp)', series: line(Rs.map((r) => 100 * r), sweep), hlines: [{ y: 0, label: 'saturation' }], vlines: [{ x: 100 * R, label: 'design' }, ...(best.r != null ? [{ x: 100 * best.r, label: 'limit' }] : [])], ymin: -4, ymax: 4 },
+        { type: 'line', title: `Saturation index versus recovery (membrane wall, β = ${fmt(a.beta, 3)})`, xlabel: 'Recovery (%)', ylabel: 'Saturation index log(IAP/Ksp)', series: [...line(Rs.map((r) => 100 * r), sweep), ...(bUp > 0 && shown.includes('barite') ? [{ name: 'Barite, conservative envelope (verdict basis)', x: Rs.map((r) => 100 * r), y: a.sweepV.map((q) => clamp(q.barite ?? -99, -8, 8)), dash: true }] : [])], hlines: [{ y: 0, label: 'saturation' }], vlines: [{ x: 100 * R, label: 'design' }, ...(best.r != null ? [{ x: 100 * best.r, label: 'limit' }] : [])], ymin: -4, ymax: 4 },
         { type: 'line', title: 'Saturation index versus pH (concentrate, constant total carbon)', xlabel: 'pH', ylabel: 'Saturation index', series: line(pHs, phRuns, (e, id) => saturationIndex(e, id, P, dk[id] || 0)), hlines: [{ y: 0, label: 'saturation' }], vlines: [{ x: wd.pH, label: 'concentrate' }], ymin: -6, ymax: 6 },
         { type: 'line', title: 'Saturation index versus temperature (concentrate)', xlabel: 'Temperature (°C)', ylabel: 'Saturation index', series: line(Ts, tRuns), hlines: [{ y: 0, label: 'saturation' }], vlines: [{ x: v.T, label: 'design' }], ymin: -4, ymax: 4, note: 'Calcium carbonate, anhydrite and brucite become less soluble on heating; silica, barite and gypsum behave the opposite way.' },
         { type: 'line', title: 'Carbonate and borate speciation versus pH (concentrate)', xlabel: 'pH', ylabel: 'Fraction of total (–)', ymin: 0, ymax: 1, series: [
@@ -2198,10 +2323,11 @@ const suite = {
       ],
       tables: [
         { title: 'Mineral saturation', columns: ['Mineral', 'Formula', 'SI feed', 'SI concentrate', 'SI at wall', 'Saturation at wall (%)', 'Limit (SI)', 'Max recovery, no antiscalant (%)', 'Max recovery, antiscalant (%)', 'Status'],
-          rows: allIds.map((id) => [MINERALS[id].name, MINERALS[id].formula, fd.SI[id] ?? null, cd.SI[id] ?? null, wd.SI[id], 100 * 10 ** clamp(wd.SI[id], -12, 12), set.includes(id) ? limOf(id) : null, a.maxRec[id] ? recStr(a.maxRec[id].plain) : null, a.maxRec[id] ? recStr(a.maxRec[id].as) : null, (MINERALS[id].group === 'inhibited' ? 'Kinetically inhibited — not a practical scale' : set.includes(id) ? status(id, wd.SI[id]) : wd.SI[id] > 0 ? 'Supersaturated' : 'Undersaturated') + (id === 'barite' && bWall ? ` · SI ${fmt(bWall.s + bWall.lo, 3)} to ${fmt(bWall.s + bWall.hi, 3)} under the alternative Ba–SO₄ treatments` : '')]),
-          note: `SI = log₁₀(ion-activity product / Ksp) with the ${ACTIVITY_MODELS[a.model]} model at ${v.T} °C and ${v.P} bar. “> x” means the limit is not reached within the sweep.${bWall ? ` Barite at the wall: SI ${fmt(bWall.s, 3)} (${fmt(bWall.lo, 2)} / +${fmt(bWall.hi, 2)} from the Ba–SO₄ interaction, next table).` : ''}` },
-        ...(bRows.length ? [{ title: 'Barite index: sensitivity to the Ba–SO₄ interaction', columns: ['Stream', 'Free SO₄²⁻ (mol/kg)', 'Ionic strength (mol/kg)', 'SI, this suite (Ca–SO₄ analogue)', 'SI, Sr–SO₄ analogue', 'SI, no Ba–SO₄ term', 'SI, BaSO₄(aq) ion pair with log Ksp −10.05 (range for log K ± 0.09)', 'Barium bound in the pair (%)', 'Lowest SI', 'Highest SI', 'Verdict'], rows: bRows,
-          note: `No measured Ba–SO₄ Pitzer binary could be read, so the barite index is recomputed under each treatment found in the literature, with the log Ksp that belongs to it: the Ca–SO₄ analogue of this suite (Rogers 1981), the Sr–SO₄ analogue, no Ba–SO₄ term (PHREEQC pitzer.dat, Appelo 2015; data0.ypf) — all with log Ksp −9.97 — and an explicit BaSO₄(aq) ion pair with log K 2.72 ± 0.09 and log Ksp −10.05 ± 0.05 (Felmy, Rai & Amonette 1990, fitted to barite solubilities in Na₂SO₄ solutions; the model of Monnin 1999 is of the same kind). For seawater, its concentrates up to a factor of two (free sulphate ≤ ${BARITE_BAND.so4} mol/kg) and the other example waters of the suite every treatment stays within ${fmt(BARITE_BAND.lo, 2)} … +${fmt(BARITE_BAND.hi, 2)} SI of the suite’s value (Verify tab); the spread grows to 0.2–0.4 where sulphate is a major anion of a dilute water (ion pairing) and to 0.4–0.6 in sodium-sulphate brines. The measurements that would decide between them (Felmy et al. 1990, barite in Na₂SO₄) could not be read.` }] : []),
+          rows: allIds.map((id) => [MINERALS[id].name, MINERALS[id].formula, fd.SI[id] ?? null, cd.SI[id] ?? null, wd.SI[id], 100 * 10 ** clamp(wd.SI[id], -12, 12), set.includes(id) ? limOf(id) : null, a.maxRec[id] ? recStr(a.maxRec[id].plain) : null, a.maxRec[id] ? recStr(a.maxRec[id].as) : null, (MINERALS[id].group === 'inhibited' ? 'Kinetically inhibited — not a practical scale' : set.includes(id) ? status(id, wSI[id]) : wd.SI[id] > 0 ? 'Supersaturated' : 'Undersaturated') + (id === 'barite' && bWall && bWall.band ? ` · best estimate SI ${fmt(bWall.best, 3)}, range ${fmt(bWall.lo, 3)} to ${fmt(bWall.hi, 3)}; verdict on ${bOpt.basis === 'best' ? 'the best estimate' : `the conservative envelope, SI ${fmt(bWall.verdict, 3)}`}` : '')]),
+          note: `SI = log₁₀(ion-activity product / Ksp) with the ${ACTIVITY_MODELS[a.model]} model at ${v.T} °C and ${v.P} bar. “> x” means the limit is not reached within the sweep.${bWall && bWall.band ? ` Barite: the SI columns give the best estimate (${BA_SHORT[a.bariteModel]}), SI ${fmt(bWall.best, 3)} at the wall with a range of ${fmt(bWall.lo, 3)} to ${fmt(bWall.hi, 3)} ${bWall.calibrated ? 'from the calibration against the user’s own measurements (± 2 standard errors)' : 'over the treatments of the Ba–SO₄ interaction'}. ${bOpt.basis === 'best' ? 'The status and the recovery limits of barite use the best estimate (input “Barite verdict basis”).' : `The status, the recovery limits of barite and the limiting mineral use the upper end among the published treatments — the conservative envelope, SI ${fmt(bWall.verdict, 3)} at the wall — so that barite is never reported as within its limit while a published treatment says otherwise.`}` : ''}` },
+        ...(bRows.length ? [{ title: 'Barite index: sensitivity to the Ba–SO₄ interaction', columns: ['Stream', 'Free SO₄²⁻ (mol/kg)', 'Ionic strength (mol/kg)', `SI, best estimate of this run (${BA_SHORT[a.bariteModel]})`, 'SI, BaSO₄(aq) ion pair with log Ksp −10.05 (range for log K ± 0.09)', 'SI, BaSO₄(aq) ion pair with log Ksp −9.965 (fitted here)', 'SI, Ca–SO₄ analogue', 'SI, Sr–SO₄ analogue', 'SI, no Ba–SO₄ term', 'Barium bound in the pair (%)', 'Lowest SI', 'Highest SI', `SI used for the verdict (${bOpt.basis === 'best' ? 'best estimate' : 'conservative envelope'})`, 'Verdict'], rows: bRows,
+          note: BARITE_NOTE(a, bOpt) }] : []),
+        BARITE_EVIDENCE_TABLE(),
         { title: 'Speciation of the concentrate', columns: ['Species', 'Charge', 'Molality (mol/kg)', 'Activity coefficient γ', 'Activity', 'Share of dissolved species (%)'], rows: spec.map((s) => [s.label, s.z, s.m, s.gamma, s.a, (100 * s.m) / sum(spec.map((q) => q.m))]), note: `Water activity ${fmt(cd.aw, 5)}, osmotic coefficient ${fmt(cd.osmoticCoeff, 4)}, ionic strength ${fmt(cd.I, 4)} mol/kg, pCO₂ ${fmt(cd.pCO2 * 1e6, 3)} µatm.` },
         { title: 'Stream compositions (mg/L)', columns: ['Constituent', 'Raw feed', 'Feed after dosing', 'Concentrate', 'Concentrate after precipitation'],
           rows: [...ION_IDS.map((k) => [`${IONS[k].name} ${IONS[k].label}`, rawD.ions[k], fd.ions[k], cd.ions[k], after.ions[k]]), ['TDS', rawD.tds, fd.tds, cd.tds, after.tds], ['pH', rawD.pH, fd.pH, cd.pH, pr.sol.pH], ['Alkalinity (mg/L CaCO₃)', rawD.alkalinity, fd.alkalinity, cd.alkalinity, pr.sol.eq.alk * after.kgwPerL * 50043],
@@ -2240,18 +2366,29 @@ const suite = {
   { name: 'Flow-model grid across the channel', keys: ['cfdNy'], min: 8, note: 'Wall-normal cells of the two-dimensional channel model.', metrics: [{ label: 'Largest local polarisation factor', unit: '–', get: (r) => r.outputs.cfdBetaMax ?? 1 }, { label: 'Channel pressure drop', unit: 'bar', get: (r) => r.outputs.cfdPressureDropBar ?? 0 }] }],
 
   calibration: {
-    note: 'Fit the solubility-product offsets to laboratory solubility data. Each row is one equilibrium experiment in an NaCl background solution: gypsum is equilibrated in a closed vessel, calcite under a fixed CO₂ partial pressure. The measured dissolved calcium is compared with the model. Validate with experiments at other salinities and temperatures.',
-    params: [{ key: 'dkGypsum', label: 'Δ log Ksp gypsum', lo: -0.4, hi: 0.4 }, { key: 'dkCalcite', label: 'Δ log Ksp calcite', lo: -0.4, hi: 0.4 }],
-    columns: [{ key: 'mNaCl', label: 'NaCl background', unit: 'mol/kg' }, { key: 'Tc', label: 'Temperature', unit: '°C' }, { key: 'pCO2x', label: 'CO₂ pressure', unit: 'atm' }, { key: 'sGyp', label: 'Gypsum solubility', unit: 'mmol/kg' }, { key: 'sCal', label: 'Calcite solubility', unit: 'mmol/kg' }],
-    targets: [{ key: 'sGyp', label: 'Gypsum solubility', unit: 'mmol/kg' }, { key: 'sCal', label: 'Calcite solubility', unit: 'mmol/kg' }],
+    note: 'Fit the solubility-product offsets to laboratory solubility data. Gypsum and calcite rows: one equilibrium experiment each in an NaCl background solution (gypsum in a closed vessel, calcite under a fixed CO₂ partial pressure); the measured dissolved calcium is compared with the model. Barite rows use the water of this case (feed analysis, pH and activity model of the Scenario and Model setup tabs) concentrated by the factor given in the row (1 / (1 − recovery); below 1 for a dilution), at the row temperature: either the dissolved barium measured after equilibration with barite, or the concentration factor at which barite was first seen to precipitate. How to run the barite jar test: bring the water to the concentration factor of interest (pilot concentrate, evaporated or blended feed) at the test temperature without antiscalant, add about 1 g/L of fine reagent-grade barite as seed and stir in a closed bottle for at least 72 h, sampling at 24, 48 and 72 h until two successive barium readings agree within the analytical error. Filter each sample at temperature through 0.2 µm or finer (fines passing the filter are the classic cause of high readings), acidify, and measure barium by ICP-MS or ICP-OES together with sulphate. Enter one row per test, fit “Δ log Ksp barite” (and the ion-pair constant only if the tests span clearly different sulphate concentrations), apply it, and type its “± Std. error” into “Standard error of a calibrated Δ log Ksp barite” on the Model setup tab: the range of the barite index then reflects the fit instead of the spread between treatments. An onset observed without seed lies above saturation and makes barite look more soluble than it is — use seeded tests for the fit and onset rows as a cross-check. The sample rows are a synthetic illustration generated with the model, shifted constants and noise — not measurements; replace them with your own. Validate with experiments at other salinities, concentration factors and temperatures.',
+    params: [{ key: 'dkGypsum', label: 'Δ log Ksp gypsum', lo: -0.4, hi: 0.4 }, { key: 'dkCalcite', label: 'Δ log Ksp calcite', lo: -0.4, hi: 0.4 }, { key: 'dkBarite', label: 'Δ log Ksp barite', lo: -0.5, hi: 0.5 }, { key: 'dkBaPair', label: 'Δ log K BaSO₄(aq) ion pair (ion-pair treatments only; needs tests at different sulphate levels)', lo: -0.6, hi: 0.6 }],
+    columns: [{ key: 'mNaCl', label: 'NaCl background (gypsum, calcite)', unit: 'mol/kg' }, { key: 'Tc', label: 'Temperature', unit: '°C' }, { key: 'pCO2x', label: 'CO₂ pressure (calcite)', unit: 'atm' }, { key: 'sGyp', label: 'Gypsum solubility', unit: 'mmol/kg' }, { key: 'sCal', label: 'Calcite solubility', unit: 'mmol/kg' },
+      { key: 'cfBa', label: 'Barite test: concentration factor of the case water', unit: '×' }, { key: 'baEq', label: 'Barite test: dissolved barium at equilibrium', unit: 'µg/L' }, { key: 'cfOn', label: 'Barite: concentration factor at observed onset of precipitation', unit: '×' }],
+    targets: [{ key: 'sGyp', label: 'Gypsum solubility', unit: 'mmol/kg' }, { key: 'sCal', label: 'Calcite solubility', unit: 'mmol/kg' }, { key: 'baEq', label: 'Dissolved barium at barite equilibrium', unit: 'µg/L' }, { key: 'cfOn', label: 'Concentration factor at barite saturation', unit: '×' }],
     model(v) {
-      const n = new Float64Array(NM), m = Math.max(0, v.mNaCl ?? 0), T = v.Tc ?? 25;
-      n[mi('Na')] = m; n[mi('Cl')] = m;
-      const base = equilibrate({ T, model: v.model, n, alk: 0, w: 1, pH: 7 });
-      return { sGyp: solubility(base, 'gypsum', { dk: { gypsum: v.dkGypsum || 0 }, excess: 0.3 }).m * 1000, sCal: solubility(base, 'calcite', { pCO2: Math.max(1e-6, v.pCO2x ?? 4.2e-4), dk: { calcite: v.dkCalcite || 0 }, excess: 0.3 }).m * 1000 };
+      const C = (this._c ||= new Map()), memo = (k, f) => { if (!C.has(k)) { if (C.size > 800) C.clear(); C.set(k, f()); } return C.get(k); };
+      const m = Math.max(0, v.mNaCl ?? 0), T = v.Tc ?? 25, bar = v.cfBa > 0, out = { sGyp: NaN, sCal: NaN };
+      if (!bar) { // gypsum and calcite in an NaCl background (rows without a barite test)
+        const base = memo(`b|${m}|${T}|${v.model}`, () => { const n = new Float64Array(NM); n[mi('Na')] = m; n[mi('Cl')] = m; return equilibrate({ T, model: v.model, n, alk: 0, w: 1, pH: 7 }); });
+        out.sGyp = memo(`g|${m}|${T}|${v.model}|${v.dkGypsum || 0}`, () => solubility(base, 'gypsum', { dk: { gypsum: v.dkGypsum || 0 }, excess: 0.3 }).m * 1000);
+        out.sCal = memo(`c|${m}|${T}|${v.model}|${v.dkCalcite || 0}|${v.pCO2x}`, () => solubility(base, 'calcite', { pCO2: Math.max(1e-6, v.pCO2x ?? 4.2e-4), dk: { calcite: v.dkCalcite || 0 }, excess: 0.3 }).m * 1000);
+      }
+      // barite in the water of the case: equilibrium with barite seed at the concentration factor of the row, and the factor at which SI = 0
+      const ba = BARITE_MODELS[v.bariteModel] ? v.bariteModel : BARITE_MODEL, pk = Number.isFinite(v.dkBaPair) ? v.dkBaPair : 0, dk = v.dkBarite || 0, ions = v.ions || WATERS.seawater.ions, wk = `${JSON.stringify(ions)}|${v.pH}|${T}|${v.model}|${ba}|${pk}`;
+      const feed = memo('w|' + wk, () => makeSolution({ ions, T, pH: v.pH ?? 8, model: v.model, bariteModel: ba, pairDK: pk })), cf = bar ? v.cfBa : 1;
+      out.baEq = memo(`e|${wk}|${cf}|${dk}`, () => { const r = solubility(concentrateSolution(feed, cf, { co2: 'closed' }), 'barite', { dk: { barite: dk }, excess: 1e-3 }); return solutionToIons(r.sol).ions.Ba * 1000; });
+      const grid = memo('s|' + wk, () => { const xs = logspace(0.05, clamp(300 / Math.max(solutionToIons(feed).gPerKgw, 1e-6), 1.5, 20), 21); return [xs, xs.map((x) => saturationIndex(concentrateSolution(feed, x, { co2: 'closed' }).eq, 'barite'))]; });
+      out.cfOn = feed.n[mi('Ba')] > 0 && feed.n[mi('SO4')] > 0 ? cross(grid[0], grid[1], dk) ?? grid[0].at(-1) : grid[0].at(-1);
+      return out;
     },
-    get sample() { return (this._s ||= synth(5, [[0, 25, 0.01], [0.25, 25, 0.01], [0.5, 25, 0.03], [1, 25, 0.03], [2, 25, 0.1], [3, 25, 0.1], [4, 25, 0.3], [0.5, 35, 0.3]])); },
-    get validationSample() { return (this._v ||= synth(17, [[0.1, 25, 0.05], [0.75, 30, 0.05], [1.5, 25, 0.2], [2.5, 20, 0.02], [3.5, 25, 0.5], [5, 25, 0.1]])); },
+    get sample() { return (this._s ||= [...synth(5, [[0, 25, 0.01], [0.25, 25, 0.01], [0.5, 25, 0.03], [1, 25, 0.03], [2, 25, 0.1], [3, 25, 0.1], [4, 25, 0.3], [0.5, 35, 0.3]]), ...synthBa(11, [[1, 25], [1.25, 25], [1.54, 25], [1.82, 25], [2.2, 25], [1.54, 15], [0.5, 25]], [25])]); },
+    get validationSample() { return (this._v ||= [...synth(17, [[0.1, 25, 0.05], [0.75, 30, 0.05], [1.5, 25, 0.2], [2.5, 20, 0.02], [3.5, 25, 0.5], [5, 25, 0.1]]), ...synthBa(23, [[1.1, 25], [1.67, 25], [2, 20], [1.33, 30]], [20])]); },
   },
 
   async verify() {
@@ -2385,13 +2522,20 @@ const suite = {
         const awAR = (m) => Math.exp(-2 * m * archerRardPhi(m) * MW_W), dTab = dv(MGSO4_REF.ar, ([I, , ph]) => Math.abs(archerRardPhi(I / 4) - ph));
         add('Archer & Rard (1998) MgSO₄ model as coded here: φ against the values printed with the parameters', 0, dTab, 1.5e-4, 'Transcription check of the nine parameters (Table 3 of Miladinović et al. 2007) against the eleven φ of Table 6 of the same report, I = 1–6 mol/kg; largest absolute difference');
         add('MgSO₄ at 3.018 mol/kg (epsomite solubility): water activity against the Archer & Rard model', awAR(3.018), q(3.018).aw, 0.002, `Derived reference, not a measurement: a_w = exp(−2mφ·M_w) with φ = ${fmt(archerRardPhi(3.018), 4)} from the Archer & Rard (1998) parameters (reprinted, secondary) at the solubility 3.018 mol/kg; at 2.96 mol/kg the two models give ${fmt(awAR(2.96), 4)} and ${fmt(q(2.96).aw, 4)}`);
-        add('Epsomite-saturated solution, 25 °C: water activity (deliquescence humidity)', 0.5 * (awAR(2.96) + awAR(3.018)), eps.sol.eq.aw, 0.004, `Reference ${fmt(awAR(3.018), 4)}–${fmt(awAR(2.96), 4)}: the Archer & Rard model evaluated at the two retrieved solubilities (derived). Suite: ${fmt(eps.sol.eq.aw, 4)} at its own saturation ${fmt(eps.molality, 3)} mol/kg. The only retrieved statement of the deliquescence humidity is 91 % for bulk MgSO₄·7H₂O at room temperature (Linnow et al. 2014, Energy Procedia 48, 394, from the phase diagram of Steiger et al. 2011 — calculated, secondary). Measured vapour pressures are compared in the next check; Archer & Rard (1998) and Rard & Miller (1981) themselves have no open copy`);
+        add('Epsomite-saturated solution, 25 °C: water activity against the Archer & Rard model (secondary)', 0.5 * (awAR(2.96) + awAR(3.018)), eps.sol.eq.aw, 0.004, `Secondary to the measurement-based check below. Reference ${fmt(awAR(3.018), 4)}–${fmt(awAR(2.96), 4)}: the Archer & Rard model evaluated at the two retrieved solubilities (derived). Suite: ${fmt(eps.sol.eq.aw, 4)} at its own saturation ${fmt(eps.molality, 3)} mol/kg. The only retrieved statement of the deliquescence humidity is 91 % for bulk MgSO₄·7H₂O at room temperature (Linnow et al. 2014, Energy Procedia 48, 394, from the phase diagram of Steiger et al. 2011 — calculated, secondary). Measured osmotic coefficients and vapour pressures are compared in the checks below; Archer & Rard (1998) and Rard & Miller (1981) themselves have no open copy`);
+        { // primary reference for the saturated solution: ln a_w = −ν·m·M_w·φ (exact) with the measured φ interpolated to the saturation molality
+          const top = MGSO4_REF.iso.slice(-3), lag = (pts, x) => sum(pts.map(([xi, yi], i) => yi * pts.reduce((p, [xj], j) => (j === i ? p : (p * (x - xj)) / (xi - xj)), 1))), awOf = (m, ph) => Math.exp(-2 * m * ph * MW_W), uPhi = 0.003;
+          const sat = [['CRC Handbook value quoted in ANL-EBS-MD-000045', 2.96], ['this model', eps.molality], ['Pabalan & Pitzer 1987, as entered by Appelo 2015', 3.018], ['Xue et al. 2016', MGSO4_REF.sol[0][1]]].map(([s, m]) => { const ph = lag(top, m), a = awOf(m, ph); return { s, m, ph, a, lin: awOf(m, lag(top.slice(1), m)), alt: awOf(m, lag([MGSO4_REF.iv[0], top[2]], m)), u: a * 2 * m * MW_W * uPhi }; });
+          const lo = Math.min(...sat.map((r) => r.a)), hi = Math.max(...sat.map((r) => r.a)), uM = Math.max(...sat.map((r) => r.u)), uI = Math.max(...sat.map((r) => Math.max(Math.abs(r.lin - r.a), Math.abs(r.alt - r.a)))), own = sat[1], aS = eps.sol.eq.aw;
+          add('Epsomite-saturated solution, 25 °C: water activity from measured isopiestic osmotic coefficients', 0.5 * (lo + hi), aS, 0.5 * (hi - lo) + Math.hypot(uM, uI), `Primary reference, derived from measurements through the exact relation ln a_w = −ν·m·M_w·φ (ν = 2, M_w = 0.0180153 kg/mol). φ: isopiestic points of pure MgSO₄ on both sides of saturation — ${top.map(([m, ph]) => `${ph} at ${m} mol/kg`).join(', ')} (Miladinović, Ninković, Todorović & Rard 2007, LLNL UCRL-JRNL-231697, Table 4, read first-hand) — interpolated by the parabola through the three points to each retrieved saturation molality: ${sat.map((r) => `${fmt(r.m, 4)} mol/kg (${r.s}): φ ${fmt(r.ph, 4)}, a_w ${fmt(r.a, 4)}`).join('; ')}. Reference a_w ${fmt(0.5 * (lo + hi), 4)} ± ${fmt(0.5 * (hi - lo), 2)} from the spread of the solubility values, ± ${fmt(uM, 1)} from ±${uPhi} in φ (assumed for isopiestic work; the source reports a mean deviation of 0.0013 from the Archer & Rard model) and ± ${fmt(uI, 1)} from the interpolation across the 0.75 mol/kg gap (parabola against the straight line between the two bracketing points, and against the bracket formed with the highest point of the second series, ${MGSO4_REF.iv[0][1]} at ${MGSO4_REF.iv[0][0]} mol/kg, Ivanović et al. 2017). Suite: ${fmt(aS, 4)} at its own saturation ${fmt(eps.molality, 3)} mol/kg — deviation ${fmt(aS - 0.5 * (lo + hi), 2)} from the centre of the reference range`);
+          add('MgSO₄ at the model’s saturation molality: water activity against the measured osmotic coefficients', own.a, aS, 0.001, `Same reference at one molality (${fmt(own.m, 4)} mol/kg), so the solubility value drops out: measured φ ${fmt(own.ph, 4)} → a_w ${fmt(own.a, 4)} ± ${fmt(Math.hypot(own.u, uI), 1)}; suite φ ${fmt(q(own.m).phi, 4)} → a_w ${fmt(aS, 4)}, deviation ${fmt(aS - own.a, 2)}. The Harvie–Møller–Weare set is ${fmt(100 * (1 - q(own.m).phi / own.ph), 2)} % low in φ here, as at the measured point 3.14 mol/kg`);
+        }
         { // measurements: second isopiestic series, recent solubilities, vapour pressure of the saturated solution
           const dIv = dv(MGSO4_REF.iv, ([m, ph]) => Math.abs(q(m).phi / ph - 1));
           add('MgSO₄ 1.56–2.39 mol/kg, Pitzer model: osmotic coefficient against a second isopiestic series', 0, dIv, 0.008, `Largest relative deviation from 12 points measured against KCl at 298.15 K (Ivanović, Popović, Rard et al. 2017, J. Chem. Thermodyn. 113, 91 — primary measurements, read through the NIST ThermoML transcription of the journal table; stated uncertainty 0.010–0.016 in φ)`);
           add('Epsomite solubility in water, 25 °C: against the measurement of Xue et al. (2016)', MGSO4_REF.sol[0][1], eps.molality, 0.122, `mol/kg; tolerance = the uncertainty stored with the value (NIST ThermoML transcription of Fluid Phase Equilib. 408, 115). Two further recent measurements lie higher: ${MGSO4_REF.sol.slice(1).map(([s, x]) => `${x} (${s})`).join(', ')} — ${fmt(100 * (MGSO4_REF.sol[1][1] / eps.molality - 1), 2)} and ${fmt(100 * (MGSO4_REF.sol[2][1] / eps.molality - 1), 2)} % above the model; the archive does not name the solid phase. The retrieved solubilities span 2.96–3.18 mol/kg`);
           const pw = (T) => Math.exp(34.494 - 4924.99 / (T - 273.15 + 237.1)) / (T - 273.15 + 105) ** 1.57 / 1000, rh = MGSO4_REF.pv.map(([s, T, p]) => [s, T, p / pw(T)]), mid = 0.5 * (Math.min(...rh.map((r) => r[2])) + Math.max(...rh.map((r) => r[2])));
-          add('Epsomite-saturated solution near 25 °C: water activity against measured vapour pressures (figure readings)', mid, eps.sol.eq.aw, 0.035, `p/p°(water), p° from the vapour-pressure equation of the same paper: ${rh.map(([s, T, x]) => `${fmt(x, 3)} at ${T} K (${s})`).join('; ')}. Read from Fig. 3(D) of López-Borrell et al. (2024, Polymers 16, 2335): own hygrometer measurement (±2 % RH; the authors note their values are 3–8 % high) and replotted literature points — digitised, ±0.03 in the ratio. A measured isopiestic point just above saturation (3.14 mol/kg, φ 0.9669, Miladinović et al. 2007) corresponds to a_w ${fmt(Math.exp(-2 * 3.14 * 0.9669 * MW_W), 4)}; model at 3.14 mol/kg ${fmt(q(3.14).aw, 4)}. The tabulated vapour pressures of Apelblat & Manzurola (2003, J. Chem. Thermodyn. 35, 221) could not be read`);
+          add('Epsomite-saturated solution near 25 °C: water activity against vapour pressures read from a figure (secondary, loose cross-check)', mid, eps.sol.eq.aw, 0.035, `Not the primary reference — that is the check built on measured osmotic coefficients above (a_w known to about ±0.003 there, ±0.03 here). p/p°(water), p° from the vapour-pressure equation of the same paper: ${rh.map(([s, T, x]) => `${fmt(x, 3)} at ${T} K (${s})`).join('; ')}. Read from Fig. 3(D) of López-Borrell et al. (2024, Polymers 16, 2335): own hygrometer measurement (±2 % RH; the authors note their values are 3–8 % high) and replotted literature points — digitised, ±0.03 in the ratio. A measured isopiestic point just above saturation (3.14 mol/kg, φ 0.9669, Miladinović et al. 2007) corresponds to a_w ${fmt(Math.exp(-2 * 3.14 * 0.9669 * MW_W), 4)}; model at 3.14 mol/kg ${fmt(q(3.14).aw, 4)}. The tabulated vapour pressures of Apelblat & Manzurola (2003, J. Chem. Thermodyn. 35, 221) could not be read`);
         }
       }
       const nn = { c: 'Na', a: 'NO3', d: [[0.1, 0.76, 0.921], [0.5, 0.618, 0.876], [1, 0.549, 0.852], [2, 0.478, 0.826], [3, 0.437, 0.81], [4, 0.408, 0.798], [5, 0.386, 0.789], [6, 0.372, 0.789]] }, qn = actDeviation(nn, 'pitzer', 6);
@@ -2399,47 +2543,70 @@ const suite = {
     }
     { // barite and celestite solubility in water and in NaCl solutions (Pitzer model)
       const nacl = (m) => { const n = new Float64Array(NM); n[mi('Na')] = m; n[mi('Cl')] = m; return equilibrate({ T: 25, model: 'pitzer', n, alk: 0, w: 1, pH: 7 }); };
-      const ba = BARITE_NACL.map(([c, x]) => [c, (solubility(nacl(c), 'barite', { excess: 0.01 }).m * 1000) / x - 1]), rms = (a) => Math.sqrt(sum(a.map((x) => Math.log10(1 + x) ** 2)) / a.length), pc = (x) => fmt(100 * x, 2);
-      add('Barite solubility in water, 25 °C', 0.0107, (ba[0][1] + 1) * BARITE_NACL[0][1], 0.0004, 'mmol/kg. Templeton (1960): 0.0108 (as entered by Appelo 2015); Blount (1977, Am. Mineral. 62, 942, Table 3): 0.0106. Tests log K = −9.97; no activity model parameter matters at this dilution');
-      const hi = ba.filter((r) => r[0] >= 1 && r[0] <= 4), lo = ba.filter((r) => r[0] > 0 && r[0] < 1);
-      add('Barite solubility in 1–4 mol/kg NaCl', 0, Math.max(...hi.map((r) => Math.abs(r[1]))), 0.08, `Largest relative deviation from the table of Templeton (1960) at ${hi.length} NaCl concentrations: ${hi.map((r) => `${r[0]}: ${pc(r[1])} %`).join(', ')}. Depends on the Ba–Cl and Na–SO₄ parameters only (no θ(Ba,Na) or ψ in the set); independent of the Ba–SO₄ analogue`);
-      add('Barite solubility in 0.05–5 mol/kg NaCl: root-mean-square deviation', 0, rms(ba.slice(1).map((r) => r[1])), 0.06, `In log₁₀ units over 15 concentrations. Below 1 mol/kg the model is lower than the table (${lo.map((r) => `${r[0]}: ${pc(r[1])} %`).join(', ')}): at 0.05 mol/kg the tabulated rise over pure water (factor 2.8) exceeds what the Debye–Hückel term allows (2.3), which no specific-interaction parameter can change`);
-      { // primary tables of Blount (1977) and the measurement series plotted in his Fig. 9
-        const bw = (T, P) => solubility(equilibrate({ T, model: 'pitzer', n: new Float64Array(NM), alk: 0, w: 1, pH: 7 }), 'barite', { excess: 0.01, P }).m * 1000, bn = (c) => solubility(nacl(c), 'barite', { excess: 0.01 }).m * 1000;
-        const dP = BARITE_BLOUNT.P.map(([P, x]) => [P, bw(25, P) / x - 1]), dT = BARITE_BLOUNT.T.map(([T, x]) => [T, bw(T, 1) / x - 1]), pu = BARITE_BLOUNT.nacl.map(([c, x]) => [c, x, bn(c), BARITE_NACL.find((r) => r[0] === c)[1]]);
-        add('Barite solubility in water at 25 °C and 100–1000 bar (Blount 1977, Table 3)', 0, Math.max(...dP.map((r) => Math.abs(r[1]))), 0.05, `Largest relative deviation; ${dP.map(([P, d]) => `${P} bar ${pc(d)} %`).join(', ')}. Primary table (0.0117, 0.0184, 0.0290 mmol/kg; his runs at 24 °C gave 0.0289 at 1002 bar). Tests the reaction volume −50.6 cm³/mol`);
-        add('Barite solubility in water at 60 and 100 °C, 1 bar (Blount 1977, Table 3)', 0, Math.max(...dT.map((r) => Math.abs(r[1]))), 0.09, `Largest relative deviation; ${dT.map(([T, d]) => `${T} °C ${pc(d)} %`).join(', ')}. Primary table (0.0152 from Melcher and Templeton, 0.0168 measured by Blount). Tests log K(T) of WATEQ4F`);
-        add('Barite solubility in 0.2 and 1.0 mol/kg NaCl, 25 °C (Blount 1977, Table 11)', 0, Math.max(...pu.map(([, x, g]) => Math.abs(g / x - 1))), 0.17, `Largest relative deviation from the measurements of Puchelt (1967) as tabulated by Blount: ${pu.map(([c, x, g]) => `${c} mol/kg ${fmt(g, 3)} against ${x}`).join(', ')} mmol/kg. Blount adopts this series, which lies 20–29 % below Templeton’s`);
-        add('Barite in 0.2 and 1.0 mol/kg NaCl: position of the model between the Puchelt and Templeton series', 0.5, Math.max(...pu.map(([, x, g, t]) => Math.abs((g - x) / (t - x) - 0.5))) + 0.5, 0.5, `0 = Puchelt (Blount Table 11), 1 = Templeton: ${pu.map(([c, x, g, t]) => `${c} mol/kg ${fmt((g - x) / (t - x), 2)}`).join(', ')}. The two measurement series disagree by more than the model deviates from either; the deviation of the model from Templeton below 1 mol/kg is of this origin`);
-        const tab = (c) => { const j = BARITE_NACL.findIndex((r) => r[0] >= c), [c0, x0] = BARITE_NACL[j - 1], [c1, x1] = BARITE_NACL[j]; return x0 + ((x1 - x0) * (c - c0)) / (c1 - c0); }, dg = BARITE_BLOUNT.fig9T.map(([c, x]) => [c, tab(c) / x - 1]);
-        add('Templeton (1960) table in use against Templeton’s points in Fig. 9 of Blount (1977), digitised', 0, Math.max(...dg.map((r) => Math.abs(r[1]))), 0.045, `Largest relative difference over ${dg.length} points from 0.05 to 3.2 mol/kg (${dg.map(([c, d]) => `${fmt(c, 2)}: ${pc(d)} %`).join(', ')}); table interpolated linearly. Digitised from the scan (reading uncertainty ±0.01 in log₁₀, i.e. 2.3 %, and ±8 % in molality, worth another 3 % in solubility): an independent reproduction of the second-hand table, not the original`);
-        const dPu = BARITE_BLOUNT.fig9P.map(([c, x]) => [c, bn(c) / x - 1]);
-        add('Barite solubility in 0.5–4.4 mol/kg NaCl against Puchelt’s points in Fig. 9 of Blount (1977), digitised', 0, Math.max(...dPu.filter((r) => r[0] >= 0.5).map((r) => Math.abs(r[1]))), 0.22, `Largest relative deviation over four points; all seven: ${dPu.map(([c, d]) => `${fmt(c, 3)}: ${pc(d)} %`).join(', ')}. The model is above this series throughout; its two lowest points (0.10 and 0.21 mol/kg, 0.0215 and 0.0303 mmol/kg) scatter below Blount’s own curve and the point he tabulates (0.037 at 0.2). Molalities read from the figure are uncertain by ±8 %`);
+      const rms = (a) => Math.sqrt(sum(a.map((x) => Math.log10(1 + x) ** 2)) / a.length), pc = (x) => fmt(100 * x, 2), mx = (rows, f = (r) => r[1]) => Math.max(...rows.map((r) => Math.abs(f(r))));
+      const KS2 = 10 ** BARITE_MODELS.pair.sdKsp - 1, KPAIR = 10 ** (BARITE_MODELS.pair.logK + BARITE_MODELS.pair.logKsp) * 1000; // 12 %: twice the stated ±0.05 of the published log Ksp in solubility terms (√Ksp); BaSO4(aq) at barite saturation, mmol/kg
+      const water = (T, B) => equilibrate({ T, model: 'pitzer', n: new Float64Array(NM), alk: 0, w: 1, pH: 7 }, { bariteModel: B }), bsat = (sol, P = 1) => solubility(sol, 'barite', { excess: 0.01, P });
+      const bset = (B) => { // every barite solubility comparison under one treatment of the Ba–SO4 interaction
+        const bn = (c) => bsat(equilibrate(nacl(c), { bariteModel: B })).m * 1000, bw = (T, P) => bsat(water(T, B), P).m * 1000, sN = BARITE_NACL.map(([c]) => [c, bn(c)]), at = (c) => sN.find((r) => r[0] === c)[1], ba = BARITE_NACL.map(([c, x], i) => [c, sN[i][1] / x - 1]);
+        return { sN, ba, hi: ba.filter((r) => r[0] >= 1 && r[0] <= 4), lo: ba.filter((r) => r[0] > 0 && r[0] < 1), dP: BARITE_BLOUNT.P.map(([P, x]) => [P, bw(25, P) / x - 1]), dT: BARITE_BLOUNT.T.map(([T, x]) => [T, bw(T, 1) / x - 1]),
+          pu: BARITE_BLOUNT.nacl.map(([c, x]) => [c, x, at(c), BARITE_NACL.find((r) => r[0] === c)[1]]), dPu: BARITE_BLOUNT.fig9P.map(([c, x]) => [c, bn(c) / x - 1]), dc: BARITE_DC.slice(1).map(([c, x]) => [c, x, BARITE_NACL.find((r) => r[0] === c)[1], at(c)]) };
+      };
+      const DEF = BARITE_MODEL_DEFAULT, CMP = DEF === 'pair' ? 'analogue' : 'pair', BS = Object.fromEntries([...new Set([DEF, 'pair', 'analogue'])].map((B) => [B, bset(B)])), other = (B) => (B === DEF ? CMP : DEF);
+      for (const B of [DEF, CMP]) { // the default treatment first, then the same checks under the published ion-pair constants (or, were those the default, under the analogue), so that the effect of the choice is on record
+        const s = BS[B], o = BS[other(B)], pr = B === 'pair', tag = B === DEF ? '' : ` — ${BA_SHORT[B]} treatment (${pr ? 'published constants' : 'comparison'})`, on = BA_SHORT[other(B)], wide = pr ? KS2 : 0;
+        const ks = pr ? 'log Ksp −10.05 ± 0.05 with the BaSO₄(aq) pair (Felmy et al. 1990)' : B === 'pairw' ? 'log Ksp −9.965, fitted in this work to these three values, with the BaSO₄(aq) pair of Felmy et al. (1990)' : 'log Ksp −9.97 (WATEQ4F)', wt = pr ? ` Tolerance: that used for the analogue treatment plus ${pc(KS2)} % (twice the stated ±0.05 of the published log Ksp, in solubility terms): the published constant puts the model about 9 % lower than log Ksp −9.97 in every chloride medium` : '';
+        add('Barite solubility in water, 25 °C' + tag, 0.0107, s.sN[0][1], pr ? 0.0107 * KS2 : 0.0004, `mmol/kg. Templeton (1960): 0.0108 (as entered by Appelo 2015); Blount (1977, Am. Mineral. 62, 942, Table 3): 0.0106; Davis & Collins (1971, as tabulated by Dal Pozzo 1991): 0.011. Tests ${ks}; no activity model parameter matters at this dilution. Model ${fmt(s.sN[0][1], 3)} (${pc(s.sN[0][1] / 0.0107 - 1)} %); with the ${on} treatment ${fmt(o.sN[0][1], 3)} (${pc(o.sN[0][1] / 0.0107 - 1)} %).${pr ? ` The published solubility product lies below all three measurements; tolerance = twice its stated ±0.05, in solubility terms (${pc(KS2)} %)` : ''}`);
+        add('Barite solubility in 1–4 mol/kg NaCl' + tag, 0, mx(s.hi), 0.08 + wide, `Largest relative deviation from the table of Templeton (1960) at ${s.hi.length} NaCl concentrations: ${s.hi.map((r) => `${r[0]}: ${pc(r[1])} %`).join(', ')}. Depends on the Ba–Cl and Na–SO₄ parameters and the solubility product only (no θ(Ba,Na) or ψ in the set). With the ${on} treatment: ${pc(mx(o.hi))} %.${wt}`);
+        add('Barite solubility in 0.05–5 mol/kg NaCl: root-mean-square deviation' + tag, 0, rms(s.ba.slice(1).map((r) => r[1])), 0.06 + (pr ? BARITE_MODELS.pair.sdKsp : 0), `In log₁₀ units over 15 concentrations of the Templeton table. Below 1 mol/kg the model is lower than the table (${s.lo.map((r) => `${r[0]}: ${pc(r[1])} %`).join(', ')}): at 0.05 mol/kg the tabulated rise over pure water (factor 2.8) exceeds what the Debye–Hückel term allows (2.3), which no specific-interaction parameter can change. With the ${on} treatment: ${fmt(rms(o.ba.slice(1).map((r) => r[1])), 2)}.${pr ? ' Tolerance: that used for the analogue treatment plus 0.05 (twice the stated uncertainty of the published log Ksp, halved for the solubility)' : ''}`);
+        add('Barite solubility in water at 25 °C and 100–1000 bar (Blount 1977, Table 3)' + tag, 0, mx(s.dP), 0.05 + wide, `Largest relative deviation; ${s.dP.map(([P, d]) => `${P} bar ${pc(d)} %`).join(', ')}. Primary table (0.0117, 0.0184, 0.0290 mmol/kg; his runs at 24 °C gave 0.0289 at 1002 bar). Tests the reaction volume −50.6 cm³/mol together with the solubility product. With the ${on} treatment: ${pc(mx(o.dP))} %.${wt}`);
+        add('Barite solubility in water at 60 and 100 °C, 1 bar (Blount 1977, Table 3)' + tag, 0, mx(s.dT), 0.09, `Largest relative deviation; ${s.dT.map(([T, d]) => `${T} °C ${pc(d)} %`).join(', ')}. Primary table (0.0152 from Melcher and Templeton, 0.0168 measured by Blount). Tests log K(T) of WATEQ4F${pr ? ', here shifted to −10.05 at 25 °C (the temperature function is an assumption of this suite, not of Felmy et al.)' : ''}. With the ${on} treatment: ${pc(mx(o.dT))} %`);
+        add('Barite solubility in 0.2 and 1.0 mol/kg NaCl, 25 °C (Blount 1977, Table 11)' + tag, 0, mx(s.pu, ([, x, g]) => g / x - 1), 0.17, `Largest relative deviation from the measurements of Puchelt (1967) as tabulated by Blount: ${s.pu.map(([c, x, g]) => `${c} mol/kg ${fmt(g, 3)} against ${x}`).join(', ')} mmol/kg. Blount adopts this series, which lies 20–29 % below Templeton’s. With the ${on} treatment: ${pc(mx(o.pu, ([, x, g]) => g / x - 1))} %`);
+        add('Barite in 0.2 and 1.0 mol/kg NaCl: position of the model between the Puchelt and Templeton series' + tag, 0.5, mx(s.pu, ([, x, g, t]) => (g - x) / (t - x) - 0.5) + 0.5, 0.5, `0 = Puchelt (Blount Table 11), 1 = Templeton: ${s.pu.map(([c, x, g, t]) => `${c} mol/kg ${fmt((g - x) / (t - x), 2)}`).join(', ')}; with the ${on} treatment ${o.pu.map(([c, x, g, t]) => fmt((g - x) / (t - x), 2)).join(', ')}. The two measurement series disagree by more than the two treatments differ: with log Ksp −9.97 the model sits between them, with −10.05 close to Puchelt’s`);
+        add('Barite solubility in 0.5–4.4 mol/kg NaCl against Puchelt’s points in Fig. 9 of Blount (1977), digitised' + tag, 0, mx(s.dPu.filter((r) => r[0] >= 0.5)), 0.22, `Largest relative deviation over four points; all seven: ${s.dPu.map(([c, d]) => `${fmt(c, 3)}: ${pc(d)} %`).join(', ')}. The model is above this series throughout; its two lowest points (0.10 and 0.21 mol/kg, 0.0215 and 0.0303 mmol/kg) scatter below Blount’s own curve and the point he tabulates (0.037 at 0.2). Molalities read from the figure are uncertain by ±8 %. With the ${on} treatment: ${pc(mx(o.dPu.filter((r) => r[0] >= 0.5)))} %`);
+        add('Barite solubility in 1 and 2 mol/kg NaCl against the mean of two measurement series' + tag, 0, mx(s.dc, ([, x, t, g]) => g / (0.5 * (x + t)) - 1), 0.1, `mmol/kg, model (Davis & Collins 1971; Templeton 1960): ${s.dc.map(([c, x, t, g]) => `${c} mol/kg ${fmt(g, 3)} (${x}; ${t})`).join(', ')}. Both series as tabulated on the molal scale by Dal Pozzo (1991, Table C.2) — secondary; they differ from each other by 14 %. With the ${on} treatment: ${pc(mx(o.dc, ([, x, t, g]) => g / (0.5 * (x + t)) - 1))} %`);
       }
-      { // second measurement series and a published calculation
-        const dc = BARITE_DC.slice(1).map(([c, x]) => { const t = BARITE_NACL.find((r) => r[0] === c)[1], g = ba.find((r) => r[0] === c)[1]; return [c, x, t, (g + 1) * t]; });
-        add('Barite solubility in 1 and 2 mol/kg NaCl against the mean of two measurement series', 0, Math.max(...dc.map(([, x, t, g]) => Math.abs(g / (0.5 * (x + t)) - 1))), 0.1, `mmol/kg, model (Davis & Collins 1971; Templeton 1960): ${dc.map(([c, x, t, g]) => `${c} mol/kg ${fmt(g, 3)} (${x}; ${t})`).join(', ')}. Both series as tabulated on the molal scale by Dal Pozzo (1991, Table C.2) — secondary; they differ from each other by 14 %`);
+      { // the Templeton table itself against his points in Blount's Fig. 9 (independent of the model)
+        const tab = (c) => { const j = BARITE_NACL.findIndex((r) => r[0] >= c), [c0, x0] = BARITE_NACL[j - 1], [c1, x1] = BARITE_NACL[j]; return x0 + ((x1 - x0) * (c - c0)) / (c1 - c0); }, dg = BARITE_BLOUNT.fig9T.map(([c, x]) => [c, tab(c) / x - 1]);
+        add('Templeton (1960) table in use against Templeton’s points in Fig. 9 of Blount (1977), digitised', 0, Math.max(...dg.map((r) => Math.abs(r[1]))), 0.045, `Largest relative difference over ${dg.length} points from 0.05 to 3.2 mol/kg (${dg.map(([c, d]) => `${fmt(c, 2)}: ${pc(d)} %`).join(', ')}); table interpolated linearly. Digitised from the journal figure (reading uncertainty ±0.01 in log₁₀, i.e. 2.3 %, and ±8 % in molality, worth another 3 % in solubility): an independent reproduction of the second-hand table, not the original`);
+      }
+      { // all primary points pooled: the evidence behind the choice of the default treatment
+        const pool = (s) => [...[0.0108, 0.011, 0.0106].map((x) => s.sN[0][1] / x - 1), ...s.ba.slice(1).map((r) => r[1]), ...s.dc.map(([, x, , g]) => g / x - 1), ...s.pu.map(([, x, g]) => g / x - 1), ...s.dPu.filter((r) => Math.abs(r[0] - 0.213) > 1e-9 && Math.abs(r[0] - 1.074) > 1e-9).map((r) => r[1]), ...s.dP.map((r) => r[1]), ...s.dT.map((r) => r[1])], pp = pool(BS.pair), pa = pool(BS.analogue);
+        add('Barite solubility, all ' + pp.length + ' primary points pooled: ion-pair model with log Ksp −10.05 against log Ksp −9.97', rms(pa), rms(pp), 0.012, `Root-mean-square deviation in log₁₀ over water (3 values), Templeton’s NaCl table (15), Davis & Collins (2), Puchelt (2 tabulated, 5 digitised), Blount’s pressure (3) and temperature (2) points: ${fmt(rms(pp), 2)} with the published ion-pair model, ${fmt(rms(pa), 2)} with the previous default; mean deviation ${fmt(sum(pp.map((x) => Math.log10(1 + x))) / pp.length, 2)} against ${fmt(sum(pa.map((x) => Math.log10(1 + x))) / pa.length, 2)}. The published model is worse in water, against Templeton and under pressure, better against Davis & Collins, Puchelt and at 60–100 °C: in the media where data exist the measurements do not decide between the two solubility products, so the published treatment is the default`);
+      }
+      { // the three treatments in the limit of no sulphate excess, the pair at saturation, and the barium balance
+        const cs = [0, 0.1, 1, 4], sZ = cs.map((c) => bsat(equilibrate(nacl(c), { bariteModel: 'none' })).m * 1000), sA = cs.map((c) => BS.analogue.sN.find((r) => r[0] === c)[1]), sP = cs.map((c) => BS.pair.sN.find((r) => r[0] === c)[1]);
+        add('Stoichiometric barite in 0–4 mol/kg NaCl: Ca–SO₄ analogue against no Ba–SO₄ term', 0, Math.max(...cs.map((c, i) => Math.abs(Math.log10(sA[i] / sZ[i])))), 1e-3, `log₁₀ of the solubility ratio at ${cs.join(', ')} mol/kg NaCl: ${cs.map((c, i) => fq(Math.log10(sA[i] / sZ[i]), 2)).join(', ')}. Without a sulphate excess the dissolved sulphate is 10⁻⁵–10⁻⁴ mol/kg and the Ba–SO₄ binary has nothing to act on`);
+        add('Stoichiometric barite in 0–4 mol/kg NaCl: ion-pair model against the other treatments once each uses its own log Ksp', 0, Math.max(...cs.map((c, i) => Math.abs(Math.log10((sP[i] - KPAIR) / sZ[i]) - DK_PAIR / 2))), 1e-3, `log₁₀[(solubility − BaSO₄(aq))/solubility without a Ba–SO₄ term] − ½·Δlog Ksp, Δlog Ksp = ${fmt(DK_PAIR, 3)}: ${cs.map((c, i) => fq(Math.log10((sP[i] - KPAIR) / sZ[i]) - DK_PAIR / 2, 2)).join(', ')} (against the analogue: ${cs.map((c, i) => fq(Math.log10((sP[i] - KPAIR) / sA[i]) - DK_PAIR / 2, 2)).join(', ')}). The free-ion solubilities coincide when each treatment is given its own solubility product; the residual in pure water is the activity coefficient at the 9 % lower ionic strength of the solution itself. As computed the ion-pair model is ${cs.map((c, i) => pc(sP[i] / sA[i] - 1)).join(', ')} % lower (BaSO₄(aq) adds ${fmt(KPAIR, 3)} mmol/kg, the lower log Ksp takes ${pc(1 - 10 ** (DK_PAIR / 2))} %). The treatments differ in sulphate media only`);
+        const iP = si('BaSO4°'), na2 = new Float64Array(NM); na2[mi('Na')] = 0.2; na2[mi('SO4')] = 0.1;
+        const sw0 = makeSolution({ ions: WATERS.seawater.ions, T: 25, pH: 8.1, bariteModel: 'pair' }), media = [['water', water(25, 'pair')], ['1 mol/kg NaCl', equilibrate(nacl(1), { bariteModel: 'pair' })], ['0.1 mol/kg Na₂SO₄', equilibrate({ T: 25, model: 'pitzer', n: na2, alk: 0, w: 1, pH: 7 }, { bariteModel: 'pair' })], ['seawater', sw0]].map(([nm, s]) => [nm, bsat(s)]);
+        add('Ion-pair model: BaSO₄(aq) at barite saturation equals K·Ksp in every medium', 1, Math.max(...media.map(([, r]) => Math.abs((r.sol.eq.m[iP] * 1000) / KPAIR - 1))) + 1, 1e-6, `m(BaSO₄°) = 10^(2.72 − 10.05) = ${fq(KPAIR / 1000, 3)} mol/kg (activity coefficient of the neutral pair 1) in ${media.map(([nm]) => nm).join(', ')}: ${media.map(([, r]) => fq(r.sol.eq.m[iP], 4)).join(', ')}. Share of the dissolved barium that is paired: ${media.map(([nm, r]) => `${nm} ${pc(r.sol.eq.m[iP] / r.sol.eq.tot[mi('Ba')])} %`).join(', ')}`);
+        const na2s = (B) => bsat(equilibrate({ T: 25, model: 'pitzer', n: na2, alk: 0, w: 1, pH: 7 }, { bariteModel: B })).sol.eq.tot[mi('Ba')] * 1e9, n2 = { pair: na2s('pair'), analogue: na2s('analogue'), none: na2s('none') };
+        add('Barite in 0.1 mol/kg Na₂SO₄: dissolved barium of the ion-pair model against its closed form', KPAIR * 1e6 + (10 ** BARITE_MODELS.pair.logKsp / (media[2][1].sol.eq.m[mi('SO4')] * media[2][1].sol.eq.gammaOf('Ba') * media[2][1].sol.eq.gammaOf('SO4'))) * 1e9, n2.pair, 1e-4, `nmol/kg: K·Ksp + Ksp/(γ(Ba)·γ(SO₄)·m(SO₄)). The three treatments give ${fmt(n2.pair, 3)} (ion pair), ${fmt(n2.analogue, 3)} (Ca–SO₄ analogue) and ${fmt(n2.none, 3)} (no term) nmol/kg — the medium in which they differ most, and the one measured by Felmy et al. (1990), whose data table could not be read: no measurement is at hand to compare with`);
+        const e2 = concentrateSolution(sw0, 2, { co2: 'closed' }).eq, iB = mi('Ba'), prB = precipitateSolution(concentrateSolution(sw0, 4.2, { co2: 'closed' }), ['calcite', 'gypsum', 'barite', 'celestite']), n0 = sw0.n[iB];
+        add('Ion-pair model: barium mass balance, free ion plus pair against the total', 1, (e2.m[iB] + e2.m[iP]) / e2.tot[iB], 1e-12, `Twofold seawater concentrate: Ba²⁺ ${fq(e2.m[iB], 4)} + BaSO₄° ${fq(e2.m[iP], 4)} = total ${fq(e2.tot[iB], 4)} mol/kg (${pc(e2.m[iP] / e2.tot[iB])} % paired)`);
+        add('Ion-pair model: barium is conserved through equilibrium precipitation', 1, (prB.sol.n[iB] + prB.solids.barite) / n0, 1e-10, `Seawater concentrated 4.2 times with calcite, gypsum, barite and celestite: dissolved (free ${fq(prB.sol.eq.m[iB] * prB.sol.w, 3)} + paired ${fq(prB.sol.eq.m[iP] * prB.sol.w, 3)} mol) + barite ${fq(prB.solids.barite, 3)} mol = initial ${fq(n0, 3)} mol; barite index of the final solution ${fq(saturationIndex(prB.sol.eq, 'barite'), 2)}`);
+      }
+      { // a published calculation, repeated with its own approximation
         const tot = new Float64Array(NM); for (const k of ['Na', 'K', 'Mg', 'Ca', 'Sr', 'SO4']) tot[mi(k)] = SW_CLB[k];
         tot[mi('Cl')] = SW_CLB.Na + SW_CLB.K + 2 * (SW_CLB.Mg + SW_CLB.Ca + SW_CLB.Sr - SW_CLB.SO4);
-        const bs = solubility(equilibrate({ T: 25, model: 'pitzer', n: tot, alk: 0, w: 1, pH: 7 }), 'barite', { excess: 1e-3 }), gB = Math.sqrt(bs.sol.eq.gammaOf('Ba') * bs.sol.eq.gammaOf('SO4'));
-        add('Barite in seawater of salinity 35: barium at saturation against the calculation of Rogers (1981)', SW_CLB.calc.Ba * 1e9, bs.m * 1e9, 16, `nmol/kg. Rogers (PhD thesis, LBL-12356, p. 235) obtained 209 with the CaSO₄ parameters for BaSO₄ and K = 1.10·10⁻¹⁰ — the same approximation as here (log K −9.97, i.e. 1.07·10⁻¹⁰). A published calculation, not a measurement: Rogers quotes 350 nmol/kg measured at 20 °C by Burton, Marshall & Phillips and attributes the difference to particle size. The Ba–SO₄ parameters remain an analogue`);
-        add('Barite in seawater: mean activity coefficient of BaSO₄ against Rogers (1981)', SW_CLB.calc.g, gB, 0.007, 'Rogers: 0.134 (16 % above Hanor, 14 % below Whitfield). Small differences come from the later Harvie–Møller–Weare parameters for the major ions');
+        const swb = (B) => solubility(equilibrate({ T: 25, model: 'pitzer', n: tot, alk: 0, w: 1, pH: 7 }, { bariteModel: B }), 'barite', { excess: 1e-3 }), bs = swb('analogue'), bp = swb('pair'), gB = Math.sqrt(bs.sol.eq.gammaOf('Ba') * bs.sol.eq.gammaOf('SO4'));
+        add('Barite in seawater of salinity 35, Ca–SO₄ analogue treatment: barium at saturation against the calculation of Rogers (1981)', SW_CLB.calc.Ba * 1e9, bs.m * 1e9, 16, `nmol/kg. Rogers (PhD thesis, LBL-12356, p. 235) obtained 209 with the CaSO₄ parameters for BaSO₄ and K = 1.10·10⁻¹⁰ — the approximation of the analogue treatment (log K −9.97, i.e. 1.07·10⁻¹⁰), which is therefore the like-for-like comparison. A published calculation, not a measurement: Rogers quotes 350 nmol/kg measured at 20 °C by Burton, Marshall & Phillips and attributes the difference to particle size. The default ion-pair model gives ${fmt(bp.m * 1e9, 4)} nmol/kg (${pc(bp.m / SW_CLB.calc.Ba - 1)} % above Rogers), ${pc(bp.sol.eq.m[si('BaSO4°')] / bp.sol.eq.tot[mi('Ba')])} % of it as BaSO₄(aq)`);
+        add('Barite in seawater, Ca–SO₄ analogue treatment: mean activity coefficient of BaSO₄ against Rogers (1981)', SW_CLB.calc.g, gB, 0.007, `Rogers: 0.134 (16 % above Hanor, 14 % below Whitfield). Small differences come from the later Harvie–Møller–Weare parameters for the major ions. Default ion-pair model: free-ion coefficient ${fmt(Math.sqrt(bp.sol.eq.gammaOf('Ba') * bp.sol.eq.gammaOf('SO4')), 3)}, stoichiometric (referred to total barium) ${fmt(Math.sqrt((bp.sol.eq.gammaOf('Ba') * bp.sol.eq.m[mi('Ba')] / bp.sol.eq.tot[mi('Ba')]) * bp.sol.eq.gammaOf('SO4')), 3)}`);
         { // Ba–SO4 interaction: spread of the barite index over the published treatments (bariteBand)
-          const swS = makeSolution({ ions: WATERS.seawater.ions, T: 25, pH: 8.1 }), sw2 = concentrateSolution(swS, 2, { co2: 'closed' }), b2 = bariteBand(sw2.eq), k = si('Ba') * NS + si('SO4'), keep = [PZ.B0[k], PZ.B1[k], PZ.B2[k]];
-          let direct = [];
-          try {
-            for (const t of BASO4_TREATMENTS.filter((q) => q.b && q.id !== 'ca')) { [PZ.B0[k], PZ.B1[k], PZ.B2[k]] = t.b; direct.push(saturationIndex(concentrateSolution(makeSolution({ ions: WATERS.seawater.ions, T: 25, pH: 8.1 }), 2, { co2: 'closed' }).eq, 'barite') - saturationIndex(sw2.eq, 'barite') - b2.shift[t.id]); }
-          } finally { [PZ.B0[k], PZ.B1[k], PZ.B2[k]] = keep; }
-          add('Barite index and the Ba–SO₄ binary: closed-form shift against a recalculation with exchanged parameters', 0, Math.max(...direct.map(Math.abs)), 2e-5, `Seawater concentrated twofold (free SO₄²⁻ ${fmt(b2.mSO4, 3)} mol/kg, I ${fmt(b2.I, 3)}): the Sr–SO₄ analogue and a zero Ba–SO₄ term put into the parameter table and the speciation repeated; barium is a trace ion, so ΔSI = 2·m(SO₄)·ΔB(I)/ln 10`);
-          add('Barite index in a twofold seawater concentrate: spread over the ion-interaction treatments of Ba–SO₄', 0, b2.ion, 0.045, `SI units. Ca–SO₄ analogue (this suite, Rogers 1981) 0, Sr–SO₄ analogue ${fmt(b2.shift.sr, 2)}, no Ba–SO₄ term (PHREEQC pitzer.dat, data0.ypf) ${fmt(b2.shift.zero, 2)}; all with log Ksp −9.97`);
+          const swS = makeSolution({ ions: WATERS.seawater.ions, T: 25, pH: 8.1 }), sw2 = concentrateSolution(swS, 2, { co2: 'closed' }), b2 = bariteBand(sw2.eq), s2 = saturationIndex(sw2.eq, 'barite'), Pn = PZ_BA.none, keep = [Pn.B0[KBASO4], Pn.B1[KBASO4], Pn.B2[KBASO4]];
+          const direct = BASO4_TREATMENTS.filter((q) => q.model).map((q) => saturationIndex(equilibrate(sw2, { bariteModel: q.model }).eq, 'barite') - s2 - b2.shift[q.id]);
+          try { const q = BASO4_TREATMENTS.find((r) => r.id === 'sr'); [Pn.B0[KBASO4], Pn.B1[KBASO4], Pn.B2[KBASO4]] = q.b; direct.push(saturationIndex(equilibrate(sw2, { bariteModel: 'none' }).eq, 'barite') - s2 - b2.shift.sr); } finally { [Pn.B0[KBASO4], Pn.B1[KBASO4], Pn.B2[KBASO4]] = keep; }
+          add('Barite index under the other Ba–SO₄ treatments: closed-form shift against a recalculation of the speciation', 0, Math.max(...direct.map(Math.abs)), 2e-5, `Seawater concentrated twofold (free SO₄²⁻ ${fmt(b2.mSO4, 3)} mol/kg, I ${fmt(b2.I, 3)}), default treatment ${BA_SHORT[b2.ref]}: the speciation repeated with the ion pair, the Ca–SO₄ analogue, no Ba–SO₄ term and the Sr–SO₄ analogue (parameters exchanged in the table); barium is a trace ion, so the shift is 2·m(SO₄)·ΔB(I)/ln 10 for a binary and −log₁₀(1 + K·γ(Ba)·γ(SO₄)·m(SO₄)) + Δlog Ksp for the pair`);
+          add('Barite index in a twofold seawater concentrate: spread over the ion-interaction treatments of Ba–SO₄', 0, b2.ion, 0.045, `SI units, relative to the default (${BA_SHORT[b2.ref]}, SI ${fmt(s2, 3)}): Ca–SO₄ analogue (Rogers 1981) ${fmt(b2.shift.ca, 2)}, Sr–SO₄ analogue ${fmt(b2.shift.sr, 2)}, no Ba–SO₄ term (PHREEQC pitzer.dat, data0.ypf) ${fmt(b2.shift.zero, 2)}; all three with log Ksp −9.97`);
           const all = [...Object.entries(WATERS).map(([nm, w]) => [w.name || nm, makeSolution({ ions: w.ions, T: 25, pH: w.pH ?? 7.5 })]), ['seawater ×2', sw2]].map(([nm, s]) => [nm, bariteBand(s.eq)]).filter((r) => r[1]);
           const lo = all.reduce((p, r) => (r[1].lo < p[1].lo ? r : p)), hi = all.reduce((p, r) => (r[1].hi > p[1].hi ? r : p));
-          add('Barite index: lowest value under any published Ba–SO₄ treatment, example waters and twofold seawater concentrate', 0, -lo[1].lo, -BARITE_BAND.lo, `SI below the suite’s value; largest for ${lo[0]} (${fmt(lo[1].lo, 3)}). Includes the explicit BaSO₄(aq) ion pair of Felmy, Rai & Amonette (1990; log K 2.72 + 0.09, log Ksp −10.05). Twofold seawater concentrate: ${fmt(b2.lo, 3)} … +${fmt(b2.hi, 3)}, ${fmt(100 * b2.paired, 2)} % of the barium paired. ${all.map(([nm, b]) => `${nm} ${fmt(b.lo, 2)}/+${fmt(b.hi, 2)}`).join('; ')}`);
-          add('Barite index: highest value under any published Ba–SO₄ treatment, same waters', 0, hi[1].hi, BARITE_BAND.hi, `SI above the suite’s value; largest for ${hi[0]}. In sulphate-poor waters this is the difference of the two solubility products (−9.97 here, −10.05 ± 0.05 of Felmy et al.), not the interaction term`);
-          const dil = [0.001, 0.003, 0.01].map((ms) => { const ions = { Na: 2 * ms * IONS.Na.mw * 1000, SO4: ms * IONS.SO4.mw * 1000, Ba: 0.001 }, p = makeSolution({ ions, T: 25, pH: 7 }), d = makeSolution({ ions, T: 25, pH: 7, model: 'davies' }); return [ms, saturationIndex(d.eq, 'barite') - saturationIndex(p.eq, 'barite'), bariteBand(p.eq)]; });
-          add('Barite index with a BaSO₄(aq) ion pair: closed form against the speciation of the ion-pair model', 0, Math.max(...dil.map(([, d, b]) => Math.abs(d - b.shift.pairSameK))), 0.035, `Na₂SO₄ solutions of 0.001, 0.003 and 0.01 mol/kg, same log Ksp: Davies model with BaSO₄° (log K 2.7, WATEQ4F) minus Pitzer model ${dil.map(([, d]) => fmt(d, 3)).join(', ')}; closed form with log K 2.72 ${dil.map(([, , b]) => fmt(b.shift.pairSameK, 3)).join(', ')}. In these dilute sulphate waters the treatments differ by up to ${fmt(Math.max(...dil.map(([, , b]) => b.width)), 2)} SI — the case flagged in the results`);
-          add('BaSO₄(aq) association constant of the ion-pair models against Felmy, Rai & Amonette (1990)', 2.72, DER.find((d) => d[0] === 'BaSO4°')[7](25), 0.09, 'log K at 25 °C: 2.7 in WATEQ4F (in use) against 2.72 ± 0.09 from barite solubilities in Na₂SO₄ solutions (J. Solution Chem. 19, 175, abstract — primary)');
-          add('Barite log Ksp of the suite against Felmy, Rai & Amonette (1990)', -10.05, logKfor(MINERALS.barite, 25, 'pitzer'), 0.1, 'Felmy et al.: −10.05 ± 0.05 from solubilities in Na₂SO₄ solutions, evaluated together with the ion pair; here −9.97 (WATEQ4F; Blount 1977: −9.98), which reproduces the solubility in water. The difference of 0.08 is carried in the band of the barite index');
+          add('Barite index: lowest value under any published Ba–SO₄ treatment, example waters and twofold seawater concentrate', 0, -lo[1].lo, -BARITE_BAND.lo, `SI below the value of the default treatment (${BA_SHORT[b2.ref]}); largest for ${lo[0]} (${fmt(lo[1].lo, 3)}). Includes the range log K 2.72 ± 0.09 of the pair; in sulphate-poor waters the other treatments lie lower by the difference of the solubility products (−9.97 against −10.05). Twofold seawater concentrate: ${fmt(b2.lo, 3)} … +${fmt(b2.hi, 3)}, ${fmt(100 * b2.paired, 2)} % of the barium paired. ${all.map(([nm, b]) => `${nm} ${fmt(b.lo, 2)}/+${fmt(b.hi, 2)}`).join('; ')}`);
+          add('Barite index: highest value under any published Ba–SO₄ treatment, same waters', 0, hi[1].hi, BARITE_BAND.hi, `SI above the value of the default treatment; largest for ${hi[0]} (+${fmt(hi[1].hi, 3)}). In waters with sulphate as a major anion the ion pair gives the lowest barite index of all treatments and the default lies near the top of the range; the verdicts use the highest value in any case`);
+          const dil = [0.001, 0.003, 0.01].map((ms) => { const ions = { Na: 2 * ms * IONS.Na.mw * 1000, SO4: ms * IONS.SO4.mw * 1000, Ba: 0.001 }, p = makeSolution({ ions, T: 25, pH: 7, bariteModel: 'analogue' }), d = makeSolution({ ions, T: 25, pH: 7, model: 'davies' }), x = makeSolution({ ions, T: 25, pH: 7, bariteModel: 'pair' }); return [ms, saturationIndex(d.eq, 'barite') - saturationIndex(p.eq, 'barite'), bariteBand(p.eq), saturationIndex(x.eq, 'barite') - saturationIndex(p.eq, 'barite')]; });
+          add('Barite index with a BaSO₄(aq) ion pair: Pitzer path against the speciation of the Davies ion-pair model', 0, Math.max(...dil.map(([, d, b]) => Math.abs(d - b.shift.pairSameK))), 0.035, `Na₂SO₄ solutions of 0.001, 0.003 and 0.01 mol/kg, same log Ksp, relative to the Ca–SO₄ analogue: Davies model with BaSO₄° (log K 2.7, WATEQ4F) ${dil.map(([, d]) => fmt(d, 3)).join(', ')}; Pitzer path with log K 2.72 ${dil.map(([, , b]) => fmt(b.shift.pairSameK, 3)).join(', ')} (closed form) and, with its own log Ksp, ${dil.map(([, , , x]) => fmt(x, 3)).join(', ')} (speciation). In these dilute sulphate waters the treatments differ by up to ${fmt(Math.max(...dil.map(([, , b]) => b.width)), 2)} SI — the case flagged in the results`);
+          add('Barite index in dilute Na₂SO₄ solutions: speciation of the ion-pair treatment against the closed form', 0, Math.max(...dil.map(([, , b, x]) => Math.abs(x - b.shift.pair))), 2e-5, 'Same three solutions: the index computed with the BaSO₄(aq) species in the Pitzer speciation minus the closed-form shift of bariteBand()');
+          add('BaSO₄(aq) association constant of the ion-pair models against Felmy, Rai & Amonette (1990)', 2.72, DER.find((d) => d[0] === 'BaSO4°')[7](25), 0.09, 'log K at 25 °C: 2.7 in WATEQ4F (in use with the Debye–Hückel family) against 2.72 ± 0.09 from barite solubilities in Na₂SO₄ solutions (J. Solution Chem. 19, 175, abstract — primary). The Pitzer path uses 2.72 itself');
+          add('Barite log Ksp of the ion-pair treatment against Felmy, Rai & Amonette (1990)', -10.05, logKfor(MINERALS.barite, 25, 'pitzer', 'pair'), 1e-9, `Felmy et al.: −10.05 ± 0.05 from solubilities in Na₂SO₄ solutions, evaluated together with the ion pair (log K 2.72 ± 0.09) — the two constants are used as a pair. The analogue and no-term treatments keep ${fmt(logKfor(MINERALS.barite, 25, 'pitzer', 'analogue'), 4)} (WATEQ4F; Blount 1977: −9.98; Templeton 1960: −9.96), which reproduces the solubility in water; the published compilation of Zhen-Wu et al. (2014) lists −9.96 to −10.05 for six studies`);
         }
       }
       const cel = (o) => { const n = new Float64Array(NM); for (const [k, x] of Object.entries(o)) n[mi(k)] = x; return solubility(equilibrate({ T: 25, model: 'pitzer', n, alk: 0, w: 1, pH: 7 }), 'celestite', { excess: 0.2 }).m * 1000; };
@@ -2466,8 +2633,8 @@ const suite = {
       add('Bromley refit: the regression on the embedded NIST tables returns the stored constants', 0, dFit, 6e-5, `fitBromleyB on γ± of ${Object.keys(BR_DATA).length} salts (Hamer & Wu 1972; Goldberg & Nuttall 1978; Goldberg 1981), weighted least squares on log γ± to I = 6 mol/kg`);
       add('Bromley constants in use (Bromley 1973) against the refit from NIST data', 0, dPub, 0.011, `Largest difference of B over the 16 salts of the suite with tabulated data — ${worst}; K₂SO₄ is tabulated only to 0.69 mol/kg`);
       const cmp = rf.filter((r) => r.pub != null), dAll = cmp.map((r) => r.B - r.pub), rbi = rf.find((r) => r.c === 'Rb' && r.a === 'I');
-      add('Bromley published salt constants against the refit: root-mean-square difference over all salts', 0, Math.sqrt(sum(dAll.map((x) => x * x)) / dAll.length), 0.004, `${cmp.length} salts with a value in Bromley’s Table 1 (AIChE J. 19, p. 315, read from the article; identical in Zemaitis et al. 1986 except RbI); largest ${fmt(Math.max(...dAll.map(Math.abs)), 3)} kg/mol`);
-      add('Bromley constant of RbI: value printed in the 1973 article against the refit', rbi.pub, rbi.B, 0.002, `kg/mol. The article prints 0.0108 (σ 0.005); the handbook reprint of Zemaitis et al. (1986) has −0.0108, a misprint. Refit to Hamer & Wu (1972) ${fmt(rbi.B, 3)}; Bromley’s ion values give ${fmt(BR_PUB.Rb[0] + BR_PUB.I[0] + BR_PUB.Rb[1] * BR_PUB.I[1], 3)}`);
+      add('Bromley published salt constants against the refit: root-mean-square difference over all salts', 0, Math.sqrt(sum(dAll.map((x) => x * x)) / dAll.length), 0.004, `${cmp.length} salts with a value in Bromley’s Table 1 as reproduced in Zemaitis et al. (1986, Appendix 4.2), RbI with the corrected sign; largest ${fmt(Math.max(...dAll.map(Math.abs)), 3)} kg/mol`);
+      add('Bromley constant of RbI: value in use (sign corrected) against the refit to the NIST data', rbi.pub, rbi.B, 0.002, `kg/mol. The handbook reprint (Zemaitis et al. 1986, Appendix 4.2) prints −0.0108 (σ 0.005), which is inconsistent with the refit to the NIST data (Hamer & Wu 1972: +${fmt(rbi.B, 3)}) and with the sum of Bromley’s own individual-ion values (+${fmt(BR_PUB.Rb[0] + BR_PUB.I[0] + BR_PUB.Rb[1] * BR_PUB.I[1], 3)}), so the sign is taken as a misprint in the reprint and the positive value is used. With the printed sign the difference from the refit would be ${fmt(Math.abs(-rbi.pub - rbi.B), 3)} kg/mol, against at most ${fmt(Math.max(...cmp.filter((r) => r !== rbi).map((r) => Math.abs(r.B - r.pub))), 3)} kg/mol for any other of the ${cmp.length - 1} salts`);
       let salts = rf.map((r) => [r.c, r.a, r.B]);
       for (;;) { const cnt = {}; for (const q of salts) { cnt['c' + q[0]] = (cnt['c' + q[0]] || 0) + 1; cnt['a' + q[1]] = (cnt['a' + q[1]] || 0) + 1; } const keep = salts.filter((q) => cnt['c' + q[0]] >= 3 && cnt['a' + q[1]] >= 3); if (keep.length === salts.length) break; salts = keep; }
       const ion = fitBromleyIons(salts), dIon = Math.max(...Object.entries(BR_ION_REFIT.c).map(([k, [B, d]]) => Math.max(Math.abs(ion.Bc[k] - B), Math.abs(ion.dc[k] - d))), ...Object.entries(BR_ION_REFIT.a).map(([k, [B, d]]) => Math.max(Math.abs(ion.Ba[k] - B), Math.abs(ion.da[k] - d))));
@@ -2563,8 +2730,14 @@ function synth(seed, pts) {
   const d = D(), g = rng(seed);
   return pts.map(([mNaCl, Tc, pCO2x]) => {
     const m = suite.calibration.model({ ...d, dkGypsum: 0.035, dkCalcite: -0.06, mNaCl, Tc, pCO2x });
-    return { mNaCl, Tc, pCO2x, sGyp: +(m.sGyp * (1 + g.normal(0, 0.012))).toFixed(2), sCal: +(m.sCal * (1 + g.normal(0, 0.015))).toFixed(3) };
+    return { mNaCl, Tc, pCO2x, sGyp: +(m.sGyp * (1 + g.normal(0, 0.012))).toFixed(2), sCal: +(m.sCal * (1 + g.normal(0, 0.015))).toFixed(3), cfBa: null, baEq: null, cfOn: null };
   });
+}
+/** Synthetic barite jar tests on the default water (an illustration, not measurements): the default model with Δ log Ksp barite = +0.06 and 4 % noise on barium; pts = [concentration factor, °C] of seeded equilibrium tests, onsetT = temperatures of onset observations (3 % noise). */
+function synthBa(seed, pts, onsetT = []) {
+  const d = D(), g = rng(seed), blank = { mNaCl: null, pCO2x: null, sGyp: null, sCal: null };
+  return [...pts.map(([cfBa, Tc]) => ({ ...blank, Tc, cfBa, baEq: +(suite.calibration.model({ ...d, dkBarite: 0.06, cfBa, Tc }).baEq * (1 + g.normal(0, 0.04))).toFixed(1), cfOn: null })),
+    ...onsetT.map((Tc) => ({ ...blank, Tc, cfBa: null, baEq: null, cfOn: +(suite.calibration.model({ ...d, dkBarite: 0.06, Tc }).cfOn * (1 + g.normal(0, 0.03))).toFixed(3) }))];
 }
 
 export default suite;

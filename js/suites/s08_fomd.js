@@ -12,7 +12,9 @@ import { IONS, ION_IDS, WATERS, cloneIons, tds, scaleIons, osmoticPressureIons }
 import roSuite, { simulateRO } from './s01_ro.js';
 import edSuite, { simulateED, gcs, mDonnan, pnpRamp, debyeLength } from './s07_ed.js';
 import { nsga2 } from './s11_opt.js';
+import { stressCases } from './s06_thermal.js';
 
+export const work = { flux: 0 }; // running count of local flux evaluations (FO and MD), used to bound searches that repeat the module models many times
 const MW_W = 0.018015, KB = 1.380649e-23, SIGMA_W = 2.641e-10, CPA = 1006, CPV = 1860, H0V = 2501e3;
 const K = (T) => T + KELVIN;
 const tFromH = (h, S) => { let T = h / cp(40, S); for (let i = 0; i < 14; i++) { const d = (hL(T, S) - h) / cp(T, S); T -= d; if (Math.abs(d) < 1e-11) break; } return T; };
@@ -58,6 +60,7 @@ function massTransfer(u, h, T, S, D, mult = 1) {
  * m = { A (m/s·Pa), Bd, Bf (m/s), KFf, KFd, KD (s/m), piF(f), piD(c), dP (Pa on the draw side) }.
  */
 export function foFlux(st, m) {
+  work.flux++;
   const ex = (x) => Math.exp(clamp(x, -60, 60));
   const at = (Jw) => {
     const EFf = ex(Jw * m.KFf), EFd = ex(Jw * m.KFd), ED = ex(-Jw * m.KD);
@@ -88,42 +91,143 @@ function foSetup(v, ov = {}) {
   return { p, T, d, ions, tdsF, S, m, mF, mD, Df, Dd, alds, pro };
 }
 
-/** Module-scale FO / PRO: 1-D co- or counter-current model along the membrane (N segments, midpoint rule). */
+/**
+ * Module-scale FO / PRO: 1-D co- or counter-current model along the membrane (N segments, midpoint rule). A segment in which the
+ * fluxes change sharply (approach to osmotic equilibrium, a stream running out) is integrated in adaptive sub-steps; where the driving
+ * force is exhausted (osmotic-equilibrium pinch) permeation stops and the remaining area is reported as idle.
+ */
 export function simulateFO(v, ov = {}) {
   const s = foSetup(v, ov), { p, m, d } = s, N = Math.max(2, Math.round(p.nSeg)), area = p.areaFO, dA = area / N, QF0 = p.Qf / 3600, QD0 = p.Qd / 3600, cD0 = p.cDraw * 1000, counter = p.flow === 'counter';
   const sgn = counter ? -1 : 1, state = (f, dd) => ({ f: f.nf / f.Q, cFd: f.nd / f.Q, cD: Math.max(dd.n, 0) / dd.Q });
-  const adv = (f, dd, fl, w) => [{ Q: f.Q - w * fl.Jw * dA, nf: f.nf - w * fl.Jf * dA, nd: f.nd + w * fl.Js * dA }, { Q: dd.Q + sgn * w * fl.Jw * dA, n: dd.n - sgn * w * fl.Js * dA, nf: dd.nf + sgn * w * fl.Jf * dA }];
-  /** One pass along the feed path; for counter-current flow g holds the guessed totals that fix the draw state at the feed inlet. */
-  const sweep = (g) => {
+  const adv = (f, dd, fl, w, h = dA) => [{ Q: f.Q - w * fl.Jw * h, nf: f.nf - w * fl.Jf * h, nd: f.nd + w * fl.Js * h }, { Q: dd.Q + sgn * w * fl.Jw * h, n: dd.n - sgn * w * fl.Js * h, nf: dd.nf + sgn * w * fl.Jf * h }];
+  // step control: a step may move at most half of what a stream holds and the fluxes at its start and middle must agree within a factor of two
+  const TH = 0.5, PINCH = 1e-9, SPENT = 1e-3, n0 = QD0 * cD0, // SPENT: the feed counts as used up when 99.9 % of it has been extracted
+    aF = 1e-12 * QF0, aD = 1e-12 * n0;
+  const fits = (F, D, fl, h, w = 1) => { const dV = w * fl.Jw * h, dS = w * fl.Js * h; return dV <= TH * F.Q && (!counter || dV <= TH * D.Q) && w * fl.Jf * h <= TH * F.nf + aF && (dS >= 0 ? counter || dS <= TH * Math.max(D.n, 0) + aD : -dS <= TH * F.nd + aD); };
+  const alike = (a, b, tol) => Math.abs(a - b) <= TH * Math.max(Math.abs(a), Math.abs(b)) + tol;
+  const smooth = (F, D, f1, f2, h, Jmax) => fits(F, D, f2, h) && alike(f1.Jw, f2.Jw, PINCH * Jmax) && alike(f1.Js, f2.Js, aD / area) && alike(f1.Jf, f2.Jf, aF / area);
+  /**
+   * One pass along the feed path; for counter-current flow g holds the guessed totals that fix the draw state at the feed inlet.
+   * a0 is membrane area at the feed-inlet end that lies beyond the pinch (no transport there).
+   */
+  const sweep = (g, a0 = 0) => {
     let F = { Q: QF0, nf: QF0, nd: 0 }, D = counter ? { Q: QD0 + g.Vw, n: QD0 * cD0 - g.Sd, nf: g.Sf } : { Q: QD0, n: QD0 * cD0, nf: 0 }; // feed: flow, feed-solute "factor flow", draw-solute moles
-    const segs = [], run = { Vw: 0, Sd: 0, Sf: 0 };
+    const segs = [], run = { Vw: 0, Sd: 0, Sf: 0, idle: 0, spent: false, over: 0 }, low = (D_) => counter && D_.Q < QD0 * (1 - 1e-6); // low: the draw has fallen below its inlet flow before the end of the module — the guessed transfer was too small
+    let Jmax = 0, stopped = false, steps = 0;
     for (let k = 0; k < N; k++) {
-      const f1 = foFlux(state(F, D), m), [Fm, Dm] = adv(F, D, f1, 0.5), stM = state(Fm, Dm), f2 = foFlux(stM, m);
-      f2.Jw = Math.min(f2.Jw, (0.5 * F.Q) / dA);
-      segs.push({ x: (k + 0.5) / N, ...f2, f: stM.f, cD: stM.cD, cFd: stM.cFd, QF: Fm.Q, QD: Dm.Q });
-      [F, D] = adv(F, D, f2, 1);
-      run.Vw += f2.Jw * dA; run.Sd += f2.Js * dA; run.Sf += f2.Jf * dA;
+      const st0 = state(F, D), f1 = foFlux(st0, m), lead = Math.min(dA, Math.max(0, a0 - k * dA));
+      if (!stopped && lead < dA) { Jmax = Math.max(Jmax, f1.Jw); if (!(f1.Jw > PINCH * Jmax)) stopped = true; else if (F.Q <= SPENT * QF0) stopped = run.spent = true; else if (low(D)) { stopped = true; run.over = f1.Jw * (N - k) * dA; } }
+      if (stopped || lead >= dA) { segs.push({ x: (k + 0.5) / N, ...f1, Jw: 0, Js: 0, Jf: 0, f: st0.f, cD: st0.cD, cFd: st0.cFd, QF: F.Q, QD: D.Q }); run.idle += dA; continue; }
+      if (lead === 0 && fits(F, D, f1, dA, 0.5)) {
+        const [Fm, Dm] = adv(F, D, f1, 0.5), stM = state(Fm, Dm), f2 = foFlux(stM, m);
+        f2.Jw = Math.min(f2.Jw, (0.5 * F.Q) / dA);
+        if (smooth(F, D, f1, f2, dA, Jmax) && F.Q - f2.Jw * dA > SPENT * QF0) {
+          segs.push({ x: (k + 0.5) / N, ...f2, f: stM.f, cD: stM.cD, cFd: stM.cFd, QF: Fm.Q, QD: Dm.Q });
+          [F, D] = adv(F, D, f2, 1);
+          run.Vw += f2.Jw * dA; run.Sd += f2.Js * dA; run.Sf += f2.Jf * dA;
+          continue;
+        }
+      }
+      // adaptive sub-steps over the active part of this segment
+      let done = lead, h = dA - lead, fa = f1, mid = null, tV = 0, tS = 0, tF = 0;
+      run.idle += lead;
+      while (dA - done > 1e-12 * dA) {
+        h = Math.min(h, dA - done);
+        if (done > lead) { fa = foFlux(state(F, D), m); Jmax = Math.max(Jmax, fa.Jw); }
+        // stop: equilibrium reached, the feed used up, the guessed draw outlet proven too low (the unused area is credited to the residual) or the step budget spent
+        if (!(fa.Jw > PINCH * Jmax) || F.Q <= SPENT * QF0 || low(D) || steps > 1500) { stopped = true; run.spent ||= F.Q <= SPENT * QF0; if (low(D)) run.over = fa.Jw * (dA - done + (N - 1 - k) * dA); run.idle += dA - done; break; }
+        let f2 = null, Fm, Dm, stM, dV, dF, dS, done1 = false, last = false;
+        const h0 = h;
+        const explicit = (stiffExit) => { // explicit midpoint step, halved until the fluxes at its start and middle agree; 'stiff' when a flux that is not growing still needs steps thousands of times smaller than the segment
+          for (let t = 0; t < 90; t++, h *= 0.5) {
+            if (!fits(F, D, fa, h, 0.5)) continue;
+            [Fm, Dm] = adv(F, D, fa, 0.5, h); stM = state(Fm, Dm);
+            const fm = foFlux(stM, m), fine = smooth(F, D, fa, fm, h, Jmax);
+            if (stiffExit && !fine && h < dA / 4096 && fm.Jw <= fa.Jw) return 'stiff';
+            if (fine || h <= 1e-11 * dA) { f2 = fm; return 'ok'; }
+          }
+          return 'none';
+        };
+        let mode = explicit(true);
+        if (mode === 'stiff') { // the water flux follows a moving equilibrium: backward-Euler step in the water transfer, solutes moved with the start-of-step fluxes
+          h = h0;
+          for (let t = 0; t < 60 && !done1; t++, h *= 0.5) {
+            dF = Math.min(fa.Jf * h, F.nf); dS = fa.Js >= 0 ? (counter ? fa.Js * h : Math.min(fa.Js * h, Math.max(D.n, 0))) : -Math.min(-fa.Js * h, F.nd);
+            if (h > 1e-9 * dA && !(dF <= TH * F.nf + aF && Math.abs(dS) <= TH * (fa.Js >= 0 ? (counter ? Infinity : Math.max(D.n, 0)) : F.nd) + aD)) continue;
+            const cap = Math.min(0.9 * F.Q, counter ? 0.9 * D.Q : Infinity), after = (x) => [{ Q: F.Q - x, nf: F.nf - dF, nd: F.nd + dS }, { Q: D.Q + sgn * x, n: D.n - sgn * dS, nf: D.nf + sgn * dF }];
+            const G = (x) => { const [Fe, De] = after(x); return foFlux(state(Fe, De), m).Jw * h - x; };
+            if (G(cap) >= 0) break; // more transfer does not lower the flux here (no relaxation towards an equilibrium): not a case for the implicit step
+            dV = G(0) <= 0 ? 0 : brent(G, 0, cap, 1e-10 * cap, 60);
+            [Fm, Dm] = after(dV); stM = state(Fm, Dm); f2 = foFlux(stM, m);
+            if (!(f2.Jw < 0.25 * fa.Jw && h > dA / 64 && fa.Jw > 1e-3 * Jmax)) done1 = true; // resolve a sharp fall of the flux before accepting large implicit steps
+            if (done1 && F.Q - dV < SPENT * QF0) { dV = Math.max(0, F.Q - SPENT * QF0); [Fm, Dm] = after(dV); last = true; } // the feed is used up within this step: stop exactly at the limit
+          }
+          if (done1) { F = Fm; D = Dm; } else { f2 = null; h = h0; mode = explicit(false); }
+        }
+        if (!f2) { stopped = true; run.idle += dA - done; break; }
+        if (!done1) { // transfers of the explicit sub-step, limited to what the giving stream holds
+          dV = Math.min(f2.Jw * h, 0.9 * F.Q, counter ? 0.9 * D.Q : Infinity); dF = Math.min(f2.Jf * h, F.nf); dS = f2.Js >= 0 ? (counter ? f2.Js * h : Math.min(f2.Js * h, Math.max(D.n, 0))) : -Math.min(-f2.Js * h, F.nd);
+          if (F.Q - dV < SPENT * QF0) { const part = Math.max(0, F.Q - SPENT * QF0) / dV; dV *= part; dF *= part; dS *= part; last = true; } // the feed is used up within this step: stop exactly at the limit
+          F = { Q: F.Q - dV, nf: F.nf - dF, nd: F.nd + dS }; D = { Q: D.Q + sgn * dV, n: D.n - sgn * dS, nf: D.nf + sgn * dF };
+        }
+        tV += dV; tS += dS; tF += dF; steps++;
+        if (!mid && done + h >= 0.5 * dA) mid = { ...f2, f: stM.f, cD: stM.cD, cFd: stM.cFd, QF: Fm.Q, QD: Dm.Q };
+        done += h; h *= 2;
+        if (last) { stopped = run.spent = true; run.idle += dA - done; break; }
+      }
+      if (!mid) { const st = state(F, D); mid = { ...foFlux(st, m), f: st.f, cD: st.cD, cFd: st.cFd, QF: F.Q, QD: D.Q }; }
+      segs.push({ ...mid, x: (k + 0.5) / N, Jw: tV / dA, Js: tS / dA, Jf: tF / dA });
+      run.Vw += tV; run.Sd += tS; run.Sf += tF;
     }
     return { F, D, segs, run };
   };
+  const miss = (q) => (counter ? (Math.abs(q.D.Q - QD0) + q.run.over) / (QD0 + q.run.Vw) + Math.abs(q.D.n - n0) / n0 : 0); // how far the integration misses the specified draw inlet (relative to the draw leaving)
   let sw = sweep({ Vw: 0, Sd: 0, Sf: 0 }), it = 0, conv = !counter;
   if (counter) { // secant on the transferred water; the (weakly coupled) solute totals follow by substitution
     const vmax = 0.98 * QF0;
-    let x0 = 0, h0 = sw.run.Vw, x1 = Math.min(sw.run.Vw, vmax), last = sw.run;
-    for (; it < 80; it++) {
+    let x0 = 0, h0 = sw.run.Vw + sw.run.over, x1 = Math.min(h0, vmax), last = sw.run;
+    for (; it < 40; it++) {
       sw = sweep({ Vw: x1, Sd: last.Sd, Sf: last.Sf });
-      const h1 = sw.run.Vw - x1, err = Math.abs(h1) / (Math.abs(sw.run.Vw) + 1e-30) + Math.abs(sw.run.Sd - last.Sd) / (Math.abs(sw.run.Sd) + 1e-30);
+      const h1 = sw.run.Vw + sw.run.over - x1, err = Math.abs(h1) / (Math.abs(sw.run.Vw) + 1e-30) + Math.abs(sw.run.Sd - last.Sd) / (Math.abs(sw.run.Sd) + 1e-30);
       last = sw.run;
       if (err < 1e-11) { conv = true; break; }
       const x2 = Math.abs(h1 - h0) > 1e-300 ? x1 - (h1 * (x1 - x0)) / (h1 - h0) : sw.run.Vw;
       x0 = x1; h0 = h1; x1 = Number.isFinite(x2) ? clamp(x2, 0, vmax) : Math.min(sw.run.Vw, vmax);
       if (x1 === x0) x1 = Math.min(sw.run.Vw, vmax);
     }
-    for (let k = 0; !conv && k < 8; k++) { // fallback when osmotic equilibrium inside the module makes the residual non-smooth: bracketing on a monotone residual
-      const fr = last, x = solve1((v) => sweep({ Vw: v, Sd: fr.Sd, Sf: fr.Sf }).run.Vw - v, 0, vmax, 1e-14 * QF0);
-      sw = sweep({ Vw: x, Sd: fr.Sd, Sf: fr.Sf }); it++;
-      conv = Math.abs(sw.run.Sd - fr.Sd) <= 1e-9 * Math.abs(sw.run.Sd) + 1e-30 && Math.abs(sw.run.Vw - x) <= 1e-8 * QF0;
-      last = sw.run;
+    if (conv && !(miss(sw) <= 1e-9)) conv = false;
+    if (!conv) { // two-point boundary problem solved by bracketing: the water residual falls monotonically with the guessed transfer
+      const tolW = 1e-11 * QD0 + 1e-15 * QF0, tolS = 1e-10 * n0, wMax = QF0;
+      const root = (fn, lo, hi, tol, width, near) => { // Brent's method on a bracket [lo: residual > 0, hi: residual < 0]; keeps the evaluation closest to the root; 'near' is a previous root tried first
+        let best = null;
+        const f = (x) => { const e = fn(x); it++; if (!best || Math.abs(e.r) < Math.abs(best.r)) { best = e; best.x = x; } if (Math.abs(e.r) <= tol) throw best; return e.r; };
+        try {
+          if (near > lo && near < hi) for (const x of [near - 0.02 * (near - lo), near + 0.02 * (hi - near)]) { if (f(x) > 0) lo = x; else { hi = x; break; } }
+          brent(f, lo, hi, width * Math.max(hi, 1e-300), 120);
+        } catch (e) { if (e !== best && !(best && /bracket/.test(e?.message || ""))) throw e; } // an unbracketed residual leaves the closest evaluation; the closure check then reports it
+        return { x: best.x, e: best, ok: Math.abs(best.r) <= tol };
+      };
+      const piF0 = m.piF(1), topAt = (c) => m.A * (m.piD(c) - piF0 - m.dP) - 3e-13, cEq = topAt(cD0) > 0 && topAt(0) < 0 ? brent(topAt, 0, cD0, 1e-13 * cD0, 200) : 0; // draw concentration in osmotic equilibrium with the entering feed
+      let wPrev = -1, aPrev = -1;
+      const inner = (Sd) => { // water transfer for a guessed draw-solute loss
+        const at = (x, a0 = 0) => { const q = sweep({ Vw: x, Sd, Sf: 0 }, a0); return { q, r: q.run.Vw + q.run.over - x }; }, e0 = at(0);
+        if (e0.r <= tolW) return { q: e0.q };
+        const wEq = cEq > 0 ? (n0 - Sd) / cEq - QD0 : Infinity, hi = Math.min(wEq, wMax), eH = at(hi); // no more water can be taken up than dilutes the leaving draw to equilibrium with the entering feed
+        if (Math.abs(eH.r) <= tolW) return { q: eH.q };
+        if (eH.r < 0) { const w = root(at, 0, hi, tolW, 1e-15, wPrev); wPrev = w.x; return { q: w.e.q }; }
+        if (hi < wEq) return { q: eH.q }; // the feed is used up first
+        // the draw leaves in equilibrium with the entering feed: the area next to the feed inlet lies beyond the pinch and its extent closes the balance
+        const ap = root((a) => at(hi, a), 0, area, tolW, 1e-15, aPrev); aPrev = ap.x;
+        return { q: ap.e.q };
+      };
+      const outer = (Sd) => { const q = inner(Sd).q; return { q, r: q.run.Sd - Sd }; };
+      let Sd = clamp(last.Sd, 0, 0.999 * n0) || 0, e = outer(Sd);
+      for (let k = 0; k < 3 && Math.abs(e.r) > tolS; k++) { const nx = clamp(e.q.run.Sd, 0, 0.999999 * n0); if (nx === Sd) break; Sd = nx; e = outer(Sd); } // weak solute coupling: substitution settles at once
+      if (Math.abs(e.r) > tolS) { // strong solute exchange: bracket the solute loss as well (the residual falls with the guessed loss)
+        const eLo = outer(0);
+        if (eLo.r > tolS) { const z = root(outer, 0, 0.999999 * n0, tolS, 1e-14, Sd); e = z.e; } else e = eLo;
+      }
+      sw = e.q; conv = miss(sw) <= 1e-8;
     }
   }
   const tot = sw.run, segs = sw.segs, F = sw.F, D = sw.D;
@@ -131,7 +235,7 @@ export function simulateFO(v, ov = {}) {
   const Jw = tot.Vw / area, Js = tot.Sd / area, cDout = drawOut.n / drawOut.Q, fOut = F.nf / F.Q;
   const dpF = s.mF.dpPerM * p.Lfo, dpD = s.mD.dpPerM * p.Lfo, Ppump = (QF0 * (dpF + (s.pro ? 0 : (p.dPfeed || 0) * 1e5)) + QD0 * dpD) / (p.etaPump / 100);
   return { ...s, N, area, segs, tot, conv, iterations: it, QF0, QD0, cD0, feedOut: F, drawOut, drawInEnd, Jw, Js, JwLMH: Jw * 3.6e6, JsGMH: Js * d.M * 3600, srsf: Jw > 0 ? (Js * d.M) / Jw / 1000 : 0, cDout, fOut,
-    recovery: tot.Vw / QF0, dilution: cD0 / cDout, dpF, dpD, Ppump, powerDensity: s.pro ? sum(segs.map((g) => g.Jw)) / N * m.dP : 0,
+    recovery: tot.Vw / QF0, dilution: cD0 / cDout, dpF, dpD, Ppump, powerDensity: s.pro ? sum(segs.map((g) => g.Jw)) / N * m.dP : 0, idle: Math.min(1, tot.idle / area), spent: tot.spent,
     closure: counter ? Math.abs(drawInEnd.Q - QD0) / QD0 + Math.abs(drawInEnd.n - QD0 * cD0) / (QD0 * cD0) : 0 };
 }
 
@@ -185,6 +289,7 @@ function mdChannel(u, h, T, S, L, c) {
  * DCMD/AGMD coolant, { T, pg } for the sweep gas; returns flux N (kg/m²·s), interface temperatures and heat fluxes.
  */
 export function mdLocal(c, Tf, S, cold) {
+  work.flux += 4;
   const type = c.type, P = c.P, kel = c.kelvin ? kelvinFactor(Tf, c.mem.r, c.theta) : 1;
   const pw = c.antoine ? antoine : psat;
   // fz = { N, dg } frozen flux (for concentration polarisation) and dusty-gas coefficients; null → evaluate them here
@@ -193,12 +298,12 @@ export function mdLocal(c, Tf, S, cold) {
     let Tc, pP, B, qc, dg = fz ? fz.dg : null;
     if (type === 'vmd') { Tc = tsat(c.Pv); pP = c.Pv; dg ||= memCoeff(c.mem, Tfm, 0.5 * (pF + c.Pv), 0.5 * (pF + c.Pv), c.model, true); B = dg.B; qc = 0; }
     else if (type === 'agmd') {
-      Tc = cold.T + (c.hf / c.hc) * (Tf - Tfm); pP = pw(Tc);
+      Tc = Math.min(cold.T + (c.hf / c.hc) * (Tf - Tfm), 400); pP = pw(Tc); // bounded: trial temperatures far from the heat balance of a poorly cooled plate would otherwise leave the range of the vapour-pressure curve
       const Tm = 0.5 * (Tfm + Tc), pm = 0.5 * (pF + pP); dg ||= memCoeff(c.mem, Tm, P, pm, c.model);
       const Bgap = (1.895e-5 * K(Tm) ** 2.072 * MW_W) / (Math.max(P - pm, 0.02 * P) * R * K(Tm) * c.gap);
       B = 1 / (1 / dg.B + 1 / Bgap); qc = (Tfm - Tc) / (1 / c.hm + c.gap / 0.027);
     } else if (type === 'sgmd') { Tc = (c.hm * Tfm + c.hg * cold.T) / (c.hm + c.hg); pP = cold.pg; dg ||= memCoeff(c.mem, 0.5 * (Tfm + Tc), P, 0.5 * (pF + pP), c.model); B = 1 / (1 / dg.B + 1 / c.Bg); qc = c.hm * (Tfm - Tc); }
-    else { Tc = cold.T + (c.hf / c.hp) * (Tf - Tfm); pP = pw(Tc); dg ||= memCoeff(c.mem, 0.5 * (Tfm + Tc), P, 0.5 * (pF + pP), c.model); B = dg.B; qc = c.hm * (Tfm - Tc); }
+    else { Tc = Math.min(cold.T + (c.hf / c.hp) * (Tf - Tfm), 400); pP = pw(Tc); dg ||= memCoeff(c.mem, 0.5 * (Tfm + Tc), P, 0.5 * (pF + pP), c.model); B = dg.B; qc = c.hm * (Tfm - Tc); }
     const N = B * (pF - pP), q = c.hf * (Tf - Tfm);
     return { N, Tc, pF, pP, B, qc, Sm, dg, Tfm, q, res: q - N * latentHeat(Tfm) - qc };
   };
@@ -210,7 +315,15 @@ export function mdLocal(c, Tf, S, cold) {
     if (pass < 2) fz = side(Tfm, { N: side(Tfm, fz).N, dg: null }); // refresh the frozen coefficients at the new temperatures
   }
   else fz = side(Tf, { N: side(Tf, fz).N, dg: null });
-  const e = side(Tfm, fz), lat = e.N * latentHeat(Tfm);
+  let e = side(Tfm, fz);
+  // the three passes above settle whenever the surface temperature moves by less than 0.5 K between passes; where it does not (strong polarisation),
+  // the frozen flux and the heat balance are iterated further over the whole temperature interval until they agree
+  const off = (q) => Math.abs(q.res) > 1e-6 * Math.max(Math.abs(q.q), 1) || Math.abs(q.N - fz.N) > 0.05 * Math.abs(q.N);
+  if (Thigh - Tlow > 1e-9) for (let pass = 0; pass < 25 && off(e); pass++) {
+    fz = side(Tfm, { N: 0.5 * (e.N + fz.N), dg: null });
+    Tfm = solve1((x) => side(x, fz).res, Tlow, Thigh, 1e-11); e = side(Tfm, fz);
+  }
+  const lat = e.N * latentHeat(Tfm);
   return { ...e, lat, eta: e.q > 0 ? clamp(lat / e.q, 0, 1) : 0, tpc: Thigh - Tlow < 1e-9 ? 1 : type === 'vmd' ? (Tfm - e.Tc) / Math.max(Tf - e.Tc, 1e-9) : (Tfm - e.Tc) / Math.max(Tf - cold.T, 1e-9) };
 }
 
@@ -227,30 +340,54 @@ export function mdModule(p, S0, ov = {}) {
   const q = { ...p, ...ov }, Tf0 = q.Tf, Tp0 = q.Tp, c = mdConfig(q, Tf0, Tp0, S0), N = Math.max(2, Math.round(q.nSeg)), dA = c.L / N, type = c.type, counter = q.flowMD === 'counter' && (type === 'dcmd' || type === 'agmd');
   const mf0 = density(Tf0, S0) * q.uFm * c.hF, salt = (mf0 * S0) / 1000, mc0 = type === 'sgmd' ? (101325 / (287.05 * K(Tp0))) * q.uGas * c.hF : density(Tp0, 0) * q.uPm * c.hF;
   const w0 = type === 'sgmd' ? (0.622 * (q.rhGas / 100) * psat(Tp0)) / (101325 - (q.rhGas / 100) * psat(Tp0)) : 0, hGas = (T, w) => CPA * T + w * (H0V + CPV * T), tGas = (h, w) => (h - w * H0V) / (CPA + CPV * w);
-  const march = (Tout, Ntot) => {
+  const march = (Tout, Ntot, a0 = 0) => { // a0: membrane length at the feed inlet that lies beyond a thermal pinch (no transfer there)
     const Tc0 = counter ? Tout : Tp0, sg = counter ? -1 : 1, segs = [];
-    let s = { mf: mf0, Hf: mf0 * hL(Tf0, S0), mc: type === 'dcmd' && counter ? mc0 + Ntot : mc0, w: counter ? w0 + Ntot / mc0 : w0, Hc: 0 }, Nsum = 0, qsum = 0, lat = 0, Hd = 0;
+    let s = { mf: mf0, Hf: mf0 * hL(Tf0, S0), mc: type === 'dcmd' && counter ? mc0 + Ntot : mc0, w: counter ? w0 + Ntot / mc0 : w0, Hc: 0 }, Nsum = 0, qsum = 0, lat = 0, Hd = 0, Hv = 0; // Hv: enthalpy of the vapour leaving the feed side
     s.Hc = type === 'sgmd' ? mc0 * hGas(Tc0, s.w) : s.mc * hL(Tc0, 0);
     const bulkT = (x) => (type === 'sgmd' ? tGas(x.Hc / mc0, x.w) : type === 'vmd' ? tsat(c.Pv) : tFromH(x.Hc / x.mc, 0));
     const local = (x) => {
       const S = Math.min((1000 * salt) / x.mf, 350), Tf = tFromH(x.Hf / x.mf, S), Tb = bulkT(x), pg = type === 'sgmd' ? Math.min((x.w * 101325) / (0.622 + x.w), psat(Tb)) : 0, lo = mdLocal(c, Tf, S, { T: Tb, pg });
       return { S, Tf, Tb, lo, flow: lo.q + lo.N * hL(lo.Tfm, 0) }; // flow = enthalpy leaving the feed per m²
     };
-    const adv = (x, e, f) => {
-      const o = { ...x, Hf: x.Hf - f * e.flow * dA, mf: x.mf - f * e.lo.N * dA };
-      if (type === 'dcmd') { o.Hc += sg * f * e.flow * dA; o.mc += sg * f * e.lo.N * dA; }
-      else if (type === 'agmd') o.Hc += sg * f * (e.flow - e.lo.N * hL(e.lo.Tc, 0)) * dA;
-      else if (type === 'sgmd') { o.Hc += sg * f * e.flow * dA; o.w += (sg * f * e.lo.N * dA) / mc0; }
+    const adv = (x, e, f, h = dA) => {
+      const o = { ...x, Hf: x.Hf - f * e.flow * h, mf: x.mf - f * e.lo.N * h };
+      if (type === 'dcmd') { o.Hc += sg * f * e.flow * h; o.mc += sg * f * e.lo.N * h; }
+      else if (type === 'agmd') o.Hc += sg * f * (e.flow - e.lo.N * hL(e.lo.Tc, 0)) * h;
+      else if (type === 'sgmd') { o.Hc += sg * f * e.flow * h; o.w += (sg * f * e.lo.N * h) / mc0; }
       return o;
     };
+    // a step is taken in one piece when the fluxes at its start and middle agree within a factor of two; otherwise (a stream of small heat
+    // capacity running into equilibrium with the other) it is split into adaptive sub-steps, and where the driving force has died out the rest of the module is idle
+    const alike = (a, b, tol) => Math.abs(a - b) <= 0.5 * Math.max(Math.abs(a), Math.abs(b)) + tol, ok = (x) => Number.isFinite(x.Hc) && Number.isFinite(x.Hf) && x.mf > 0;
+    let Nmax = 0, qmax = 0, idle = false, steps = 0, idleLen = Math.min(a0, c.L), cut = false;
     for (let k = 0; k < N; k++) { // midpoint rule
-      const e = local(adv(s, local(s), 0.5));
-      segs.push({ ...e.lo, x: (k + 0.5) * dA, Tf: e.Tf, Tb: e.Tb, S: e.S });
-      s = adv(s, e, 1); Nsum += e.lo.N * dA; qsum += e.lo.q * dA; lat += e.lo.N * latentHeat(e.lo.Tfm) * dA; Hd += type === 'agmd' ? e.lo.N * hL(e.lo.Tc, 0) * dA : 0;
+      const e0 = local(s), lead = Math.min(dA, Math.max(0, a0 - k * dA));
+      if (lead < dA) { Nmax = Math.max(Nmax, Math.abs(e0.lo.N)); qmax = Math.max(qmax, Math.abs(e0.lo.q)); }
+      if (idle || lead >= dA) { segs.push({ ...e0.lo, N: 0, x: (k + 0.5) * dA, Tf: e0.Tf, Tb: e0.Tb, S: e0.S }); if (idle) idleLen += dA; continue; }
+      const sm = lead === 0 ? adv(s, e0, 0.5) : null, e = sm && ok(sm) ? local(sm) : null;
+      if (e && alike(e0.lo.N, e.lo.N, 1e-7 * Nmax) && alike(e0.lo.q, e.lo.q, 1e-7 * qmax) && Number.isFinite(e.lo.N)) {
+        segs.push({ ...e.lo, x: (k + 0.5) * dA, Tf: e.Tf, Tb: e.Tb, S: e.S });
+        s = adv(s, e, 1); Nsum += e.lo.N * dA; qsum += e.lo.q * dA; lat += e.lo.N * latentHeat(e.lo.Tfm) * dA; Hd += type === 'agmd' ? e.lo.N * hL(e.lo.Tc, 0) * dA : 0; Hv += e.lo.N * hL(e.lo.Tfm, 0) * dA;
+      } else {
+        let done = lead, h = dA - lead, ea = e0, mid = null, tN = 0;
+        while (dA - done > 1e-12 * dA) {
+          h = Math.min(h, dA - done);
+          if (done > lead) { ea = local(s); Nmax = Math.max(Nmax, Math.abs(ea.lo.N)); qmax = Math.max(qmax, Math.abs(ea.lo.q)); }
+          if ((Math.abs(ea.lo.N) <= 1e-7 * Nmax && Math.abs(ea.lo.q) <= 1e-7 * qmax) || steps > 250 || !(s.mf > 0.02 * mf0)) { idle = true; cut ||= steps > 250; idleLen += dA - done; break; } // driving force died out (or the step budget is spent on a stream that only trails the other): the rest is idle
+          let eb = null;
+          for (let t = 0; t < 70; t++, h *= 0.5) { const xm = adv(s, ea, 0.5, h); if (!ok(xm)) continue; eb = local(xm); if ((Number.isFinite(eb.lo.N) && alike(ea.lo.N, eb.lo.N, 1e-7 * Nmax) && alike(ea.lo.q, eb.lo.q, 1e-7 * qmax)) || h <= 1e-10 * dA) break; }
+          if (!eb || !Number.isFinite(eb.lo.N)) { idle = true; idleLen += dA - done; break; }
+          s = adv(s, eb, 1, h); Nsum += eb.lo.N * h; qsum += eb.lo.q * h; lat += eb.lo.N * latentHeat(eb.lo.Tfm) * h; Hd += type === 'agmd' ? eb.lo.N * hL(eb.lo.Tc, 0) * h : 0; Hv += eb.lo.N * hL(eb.lo.Tfm, 0) * h; tN += eb.lo.N * h; steps++;
+          if (!mid && done + h >= 0.5 * dA) mid = eb;
+          done += h; h *= 2;
+        }
+        mid ||= ea;
+        segs.push({ ...mid.lo, N: tN / dA, x: (k + 0.5) * dA, Tf: mid.Tf, Tb: mid.Tb, S: mid.S });
+      }
       if (!(s.mf > 0.02 * mf0) || !Number.isFinite(s.Hc) || !Number.isFinite(s.Hf)) break;
     }
     const Sout = (1000 * salt) / s.mf;
-    return { segs, Nsum, qsum, lat, Hd, mf: s.mf, Hf: s.Hf, Sout, TfOut: tFromH(s.Hf / s.mf, Sout), TcEnd: bulkT(s), mcEnd: s.mc, wEnd: s.w, Hc: s.Hc };
+    return { segs, Nsum, qsum, lat, Hd, Hv, idle: idleLen / c.L, cut, mf: s.mf, Hf: s.Hf, Sout, TfOut: tFromH(s.Hf / s.mf, Sout), TcEnd: bulkT(s), mcEnd: s.mc, wEnd: s.w, Hc: s.Hc };
   };
   let res, Tout = Tp0, Ntot = 0, shots = 0;
   if (!counter) res = march(Tp0, 0);
@@ -266,6 +403,19 @@ export function mdModule(p, S0, ov = {}) {
     }
     if (!ok) for (let it = 0; it < 12; it++) { t1 = solve1(g, Tp0, Tf0, 1e-10); g(t1); if (Math.abs(res.Nsum - Ntot) <= 1e-10 * Math.abs(res.Nsum) + 1e-16) break; Ntot = res.Nsum; }
     Tout = t1;
+    if (Math.abs(res.TcEnd - Tp0) > 1e-6) { // thermal pinch at the feed inlet: the cold stream leaves in equilibrium with the entering feed and no outlet temperature that a number can hold reaches the cold inlet.
+      // Start from the last outlet temperature below the pinch and find the idle length next to the feed inlet that closes the balance.
+      for (let pass = 0; pass < 8; pass++) {
+        const gg = (T, a = 0) => { shots++; res = march(T, Ntot, a); return res.TcEnd - Tp0; };
+        let lo = Tp0, hi = Tf0 + 1, found = Math.abs(gg(lo)) <= 1e-9;
+        for (let i = 0; i < 70 && !found && hi - lo > 4 * Number.EPSILON * Math.abs(hi); i++) { const mid = 0.5 * (lo + hi), gm = gg(mid); if (Math.abs(gm) <= 1e-9) { lo = mid; found = true; } else if (gm < 0) lo = mid; else hi = mid; }
+        let a = 0;
+        if (!found && gg(lo) < 0) a = solve1((x) => gg(lo, x), 0, c.L, 1e-13 * c.L);
+        gg(lo, a); Tout = lo;
+        if (Math.abs(res.Nsum - Ntot) <= 1e-10 * Math.abs(res.Nsum) + 1e-16) break;
+        Ntot = res.Nsum;
+      }
+    }
   }
   const coldIn = counter ? res.TcEnd : Tp0, coldOut = counter ? Tout : res.TcEnd, mcOut = type === 'dcmd' ? mc0 + res.Nsum : mc0;
   // energy accounting per metre of width (W/m)
@@ -279,17 +429,20 @@ export function mdModule(p, S0, ov = {}) {
   if (type === 'vmd') Wpump += (0.005 * res.Nsum * 287.05 * K(Tp0) * Math.log(101325 / c.Pv)) / 0.4 + ((res.lat / (cp(Tp0, 0) * 8)) / 998) * 5e4 / (q.etaPump / 100); // vacuum pump for leaked air + condenser cooling-water pumping
   return { c, q, N, segs: res.segs, flux, fluxLMH: flux * 3600, Nsum: res.Nsum, mf0, mc0, S0, Sout: res.Sout, TfOut: res.TfOut, coldIn, coldOut, eta: res.qsum > 0 ? res.lat / res.qsum : 0, tpc: sum(res.segs.map((s) => s.tpc)) / res.segs.length,
     cpc: Math.max(...res.segs.map((s) => s.Sm / s.S)), Qsens, Qin, Qrec, gor: (res.Nsum * lam) / Qin, stec: Qin / res.Nsum / 3.6e6 * 1000, Wpump, sec: Wpump / res.Nsum / 3.6e6 * 1000, recovery: res.Nsum / mf0, counter, shots, dpF,
-    balance: { in: HfIn - res.Hf, out: type === 'vmd' ? res.qsum + sum(res.segs.map((s) => s.N * hL(s.Tfm, 0))) * dA : Hcold + res.Hd }, matchErr: counter ? Math.abs(res.TcEnd - Tp0) : 0, SmMax: Math.max(...res.segs.map((s) => s.Sm)) };
+    balance: { in: HfIn - res.Hf, out: type === 'vmd' ? res.qsum + res.Hv : Hcold + res.Hd }, matchErr: counter ? Math.abs(res.TcEnd - Tp0) : 0, idle: res.idle, cut: res.cut, SmMax: Math.max(...res.segs.map((s) => s.Sm)) };
 }
+
+/** Highest loop recovery of an MD plant for a feed of salinity S (g/kg): the loop (bleed) salinity S/(1 − recovery) must stay below the 330 g/kg ceiling of the property model (salt saturation). */
+export const S_LOOP_MAX = 330, mdRecLimit = (S) => clamp(1 - S / S_LOOP_MAX, 0, 0.95);
 
 /** MD plant sizing for a make-up feed Qf (m³/h) and loop recovery: the modules see the bleed (loop) salinity. */
 export function simulateMD(v, ov = {}) {
-  const p = { ...v, ...ov }, ions = scaleIons(cloneIons(p.ions), p.salinityFactor ?? 1), tdsF = tds(ions), Sfeed = salinityFromTDS(tdsF, 25), rec = clamp(p.mdRec / 100, 0, 0.95);
-  const Sloop = Math.min(Sfeed / (1 - rec), 330), m = mdModule(p, rec > 0 ? Sloop : Sfeed), make = (p.Qf * density(25, Sfeed)) / 3600, prod = rec > 0 ? rec * make : m.recovery * make; // kg/s
+  const p = { ...v, ...ov }, ions = scaleIons(cloneIons(p.ions), p.salinityFactor ?? 1), tdsF = tds(ions), Sfeed = salinityFromTDS(tdsF, 25), recAsk = clamp(p.mdRec / 100, 0, 0.95), rec = Math.min(recAsk, mdRecLimit(Sfeed)); // the loop cannot be concentrated beyond the salinity ceiling: that caps the recovery
+  const Sloop = rec > 0 ? Sfeed / (1 - rec) : Sfeed, m = mdModule(p, rec > 0 ? Sloop : Sfeed), make = (p.Qf * density(25, Sfeed)) / 3600, prod = rec > 0 ? rec * make : m.recovery * make; // kg/s
   const width = rec > 0 ? prod / Math.max(m.Nsum, 1e-12) : make / m.mf0, area = width * m.c.L, Qheat = m.Qin * width + (rec > 0 ? make * cp(p.T, Sfeed) * Math.max(0, m.TfOut - p.T) * (m.q.recover ? 0.3 : 1) : 0);
   const gamma = surfaceTension(p.Tf, p.gammaF), lep = liquidEntryPressure(p.rMax * 1e-6, p.theta, gamma, p.lepB);
   const cfw = m.SmMax / Math.max(Sfeed, 1e-9), sat = { nacl: m.SmMax / 264, gypsum: (ions.Ca * ions.SO4 * cfw * cfw) / (421 * 2776 * 3.3 * 3.3) }; // screening: standard seawater reaches gypsum saturation near a concentration factor of 3.3
-  return { p, ions, tdsF, Sfeed, Sloop, rec, m, make, prod, width, area, Qheat, lep, gamma, sat, sth: Qheat / prod / 3.6e6 * 1000, sel: (m.Wpump * width) / prod / 3.6e6 * 1000, gor: (prod * latentHeat(0.5 * (p.Tf + p.Tp))) / Qheat,
+  return { p, ions, tdsF, Sfeed, Sloop, rec, recAsk, m, make, prod, width, area, Qheat, lep, gamma, sat, sth: Qheat / prod / 3.6e6 * 1000, sel: (m.Wpump * width) / prod / 3.6e6 * 1000, gor: (prod * latentHeat(0.5 * (p.Tf + p.Tp))) / Qheat,
     brine: make - prod, Sbrine: rec > 0 ? Sloop : m.Sout, recOverall: prod / make, recirc: width * m.mf0 };
 }
 
@@ -297,6 +450,7 @@ export function simulateMD(v, ov = {}) {
 const wSat = (T, P = 101325) => (0.622 * psat(T)) / (P - psat(T)), hAir = (T) => CPA * T + wSat(T) * (H0V + CPV * T); // saturated moist air, per kg dry air
 /** Closed-air, open-water, water-heated HDH cycle with component effectiveness (energy-based definition). */
 export function simulateHDH(v) {
+  if (!(v.Ttop >= v.T + 10)) throw new Error(`The top seawater temperature (${fmt(v.Ttop, 3)} °C) must be at least 10 K above the seawater feed (${fmt(v.T, 3)} °C) for the air to pick up moisture in the humidifier. Raise the top temperature to at least ${fmt(Math.ceil(v.T + 10), 3)} °C or use colder feed.`);
   const T0 = v.T, T2 = v.Ttop, S = salinityFromTDS(tds(scaleIons(cloneIons(v.ions), v.salinityFactor ?? 1)), T0), mw = (v.Qf * density(T0, S)) / 3600, ma = mw / v.MR, eD = v.effD / 100, eH = v.effH / 100, hw = (T) => hL(T, S);
   const F = ([Ta1, Ta2]) => {
     const pw = ma * (wSat(Ta2) - wSat(Ta1)), dHa = ma * (hAir(Ta2) - hAir(Ta1));
@@ -660,6 +814,30 @@ export function simulateMDC(v, ov = {}) {
 
 // ---- dynamic operation: batch concentration with fouling, scaling, wetting and membrane hydration --------------------------
 /**
+ * RK4 over n output steps with up to 40 sub-steps chosen from rate(y) (1/h, the draw-down of the tank towards its cut-off level) at the start
+ * of each output step. rhs(h, y) receives the sub-step h so that relaxations faster than the step (deposit removal, wetting, hydration) can be
+ * taken to their quasi-steady value within one step instead of being integrated unstably.
+ * until(a, b) returns the fraction of a sub-step from state a to b at which an event ends the process (a tank reaching its cut-off level);
+ * the step is cut there, so that nothing is drawn from an empty tank and the accumulated totals stay consistent.
+ */
+function rk4Stepped(rhs, y0, tEnd, n, rate, until) {
+  const t = [0], ys = [[...y0]], dt = tEnd / n, ax = (a, b, c) => a.map((q, i) => q + c * b[i]);
+  let y = [...y0];
+  for (let k = 0; k < n; k++) {
+    const sub = clamp(Math.ceil((dt * rate(y)) / 0.25) || 1, 1, 40), h = dt / sub;
+    for (let j = 0; j < sub; j++) {
+      const k1 = rhs(h, y), k2 = rhs(h, ax(y, k1, h / 2)), k3 = rhs(h, ax(y, k2, h / 2)), k4 = rhs(h, ax(y, k3, h));
+      let yn = y.map((q, i) => q + (h / 6) * (k1[i] + 2 * k2[i] + 2 * k3[i] + k4[i]));
+      const fr = until ? until(y, yn) : 1;
+      if (fr < 1) yn = y.map((q, i) => q + fr * (yn[i] - q));
+      y = yn;
+    }
+    t.push((k + 1) * dt); ys.push([...y]);
+  }
+  return { t, y: ys };
+}
+
+/**
  * Batch MD of a feed tank through the installed membrane area (time in hours):
  *   dM/dt = −(N + J_leak)·A,  N = f_mod·(1 − φ_s)(1 − x_w)·N_local(T_f, S, h_f′),  1/h_f′ = 1/h_f + δ_d/k_d,
  *   deposit dm_d/dt = c_fou·N/ρ − k_rem·m_d,  scale dm_s/dt = k_sc·(Ω_wall − 1)₊²,  φ_s = m_s/(m_s + m_b),
@@ -676,8 +854,12 @@ export function dynamicMD(v, r) {
     const omega = Math.max(lo.Sm / saltSolubility(lo.Tfm), gyp0 * (lo.Sm / Math.max(S0, 1e-9)) ** 2);
     return { M, S, md, ms, xw, theta, N, leak, xeq, omega, lo, phi };
   };
-  const rhs = (t, y) => { const s = at(y), lk = s.leak * A * 3600; return [-s.N * A * 3600 - lk, (-lk * s.S) / 1000, (p.cFou * s.N * 3600) / density(25, 0) - p.kRem * s.md, p.kScaleMD * Math.max(0, s.omega - 1) ** 2, Math.max(0, s.xeq - s.xw) / Math.max(p.tauWet, 1e-3), s.N * A * 3600, (lk * s.S) / 1000, lk]; };
-  const y0 = [M0, (M0 * S0) / 1000, 0, 0, clamp(p.wet0 / 100, 0, 1), 0, 0, 0], sol = rk4(rhs, y0, 0, tEnd, n), rows = sol.y.map((y, k) => ({ t: sol.t[k], ...at(y), prod: y[5] + y[7], y }));
+  const rhs = (h, y) => { // h: step of the integrator; a deposit removal or wetting lag faster than the step goes to its quasi-steady value within one step
+    const s = at(y), lk = s.leak * A * 3600, src = (p.cFou * s.N * 3600) / density(25, 0), dep = p.kRem * h > 1 ? (src / p.kRem - s.md) / h : src - p.kRem * s.md;
+    return [-s.N * A * 3600 - lk, (-lk * s.S) / 1000, dep, p.kScaleMD * Math.max(0, s.omega - 1) ** 2, Math.max(0, s.xeq - s.xw) / Math.max(p.tauWet, 1e-3, h), s.N * A * 3600, (lk * s.S) / 1000, lk];
+  };
+  const rate = (y) => { const q = at(y); return Math.max(((q.N + q.leak) * A * 3600) / Math.max(y[0] - 0.05 * M0, 1e-6 * M0), (p.kScaleMD * Math.max(0, q.omega - 1) ** 2) / mB); };
+  const y0 = [M0, (M0 * S0) / 1000, 0, 0, clamp(p.wet0 / 100, 0, 1), 0, 0, 0], sol = rk4Stepped(rhs, y0, tEnd, n, rate, (a, b) => (b[0] < 0.05 * M0 && a[0] > b[0] ? clamp((a[0] - 0.05 * M0) / (a[0] - b[0]), 0, 1) : 1)), rows = sol.y.map((y, k) => ({ t: sol.t[k], ...at(y), prod: y[5] + y[7], y }));
   const tdsP = rows.map((q) => { const w = q.N + q.leak; return w > 0 ? (1e3 * q.leak * q.S) / w : 0; }), first = (f) => { const k = rows.findIndex(f); return k < 0 ? null : rows[k].t; }, e = rows[rows.length - 1];
   return { rows, tdsP, M0, S0, A, fmod, sg, flux0: rows[0].N * 3600, fluxEnd: e.N * 3600, decline: rows[0].N > 0 ? 1 - e.N / rows[0].N : 0, tWet: first((q) => q.xw > 0.01), tSat: first((q) => q.omega >= 1), cf: e.S / S0, recovery: e.prod / M0, product: e.prod,
     tdsMix: e.prod > 0 ? (1e6 * e.y[6]) / e.prod : 0, saltBal: { in: (M0 * S0) / 1000, out: e.y[1] + e.y[6] }, waterBal: { in: M0, out: e.y[0] + e.y[5] + e.y[7] } };
@@ -690,8 +872,12 @@ export function dynamicMD(v, r) {
 export function dynamicFO(v, ov = {}) {
   const p = { ...v, ...ov }, A = p.areaFO, VF0 = p.batchVol, VD0 = p.drawVol, n = clamp(Math.round(p.ntDyn), 20, 2000), mu = viscosity(p.T, 0), h0 = clamp((p.hydration ?? 100) / 100, 0.2, 1), d = DRAWS[p.draw] || DRAWS.nacl;
   const at = (y) => { const VF = Math.max(y[0], 0.02 * VF0), VD = Math.max(y[1], 1e-9), h = clamp(y[5], 0.2, 1), s = foSetup(p, { hydration: 100 * h }), m = { ...s.m, A: 1 / (1 / s.m.A + mu * Math.max(y[4], 0)) }, st = { f: VF0 / VF, cFd: Math.max(y[3], 0) / VF, cD: Math.max(y[2], 0) / VD }, fl = y[0] > 0.03 * VF0 ? foFlux(st, m) : { Jw: 0, Js: 0 }; return { VF, VD, h, st, fl, s }; };
-  const rhs = (t, y) => { const q = at(y), jw = q.fl.Jw * A * 3600, js = q.fl.Js * A * 3600; return [-jw, jw, -js, js, p.alphaCake * 1e13 * (p.cFou / 1000) * q.fl.Jw * 3600 - p.kRem * Math.max(y[4], 0), (1 - q.h) / Math.max(p.tauHyd, 1e-3)]; };
-  const y0 = [VF0, VD0, VD0 * p.cDraw * 1000, 0, 0, h0], sol = rk4(rhs, y0, 0, p.tDyn, n), rows = sol.y.map((y, k) => ({ t: sol.t[k], ...at(y), Rc: Math.max(y[4], 0), y })), e = rows[rows.length - 1];
+  const rhs = (h, y) => { // h: step of the integrator; cake removal or wet-out faster than the step goes to its quasi-steady value within one step
+    const q = at(y), jw = q.fl.Jw * A * 3600, js = q.fl.Js * A * 3600, src = p.alphaCake * 1e13 * (p.cFou / 1000) * q.fl.Jw * 3600, Rc = Math.max(y[4], 0);
+    return [-jw, jw, -js, js, p.kRem * h > 1 ? (src / p.kRem - Rc) / h : src - p.kRem * Rc, (1 - q.h) / Math.max(p.tauHyd, 1e-3, h)];
+  };
+  const rate = (y) => { const q = at(y), jw = q.fl.Jw * A * 3600; return Math.max(jw / Math.max(y[0] - 0.03 * VF0, 1e-6 * VF0), jw / Math.max(y[1], 1e-9), (Math.abs(q.fl.Js) * A * 3600) / Math.max(y[2], 1e-12)); };
+  const y0 = [VF0, VD0, VD0 * p.cDraw * 1000, 0, 0, h0], sol = rk4Stepped(rhs, y0, p.tDyn, n, rate, (a, b) => (b[0] < 0.03 * VF0 && a[0] > b[0] ? clamp((a[0] - 0.03 * VF0) / (a[0] - b[0]), 0, 1) : 1)), rows = sol.y.map((y, k) => ({ t: sol.t[k], ...at(y), Rc: Math.max(y[4], 0), y })), e = rows[rows.length - 1];
   return { rows, VF0, VD0, A, d, flux0: rows[0].fl.Jw * 3.6e6, fluxEnd: e.fl.Jw * 3.6e6, fluxMax: Math.max(...rows.map((q) => q.fl.Jw)) * 3.6e6, recovery: 1 - e.y[0] / VF0, cDend: e.st.cD / 1000, cf: e.st.f, soluteLoss: (e.y[3] * d.M) / 1000, waterBal: { in: VF0 + VD0, out: e.y[0] + e.y[1] }, soluteBal: { in: VD0 * p.cDraw * 1000, out: e.y[2] + e.y[3] } };
 }
 
@@ -717,17 +903,17 @@ export function hypervolume2(pts, fx, fy, refX, refY) {
  * A coarse grid of full module solutions is kept as backdrop; the Pareto front itself is searched with NSGA-II (suite 11) over the continuous variables
  * and merged with the grid, so it is never worse than the grid front. Deterministic for a given seed.
  */
-export function paretoDesigns(v, S, md, { pop = 16, gens = 5, seed = 3 } = {}) {
-  const grid = [], ga = [];
+export function paretoDesigns(v, S, md, { pop = 16, gens = 5, seed = 3, budget = 2.5e5 } = {}) {
+  const grid = [], ga = [], w0 = work.flux, spent = () => work.flux - w0 > budget; // stiff operating regions make every module solve expensive: the search stops at a fixed amount of work
   let evalMD = null, evalFO = null, lo, hi, dec;
   if (md) {
     const Sm = v.mdRec > 0 ? Math.min(S / (1 - clamp(v.mdRec / 100, 0, 0.95)), 330) : S, Tlo = Math.min(Math.max(v.Tp + 13, 45), 86);
-    evalMD = (Tf, u, L) => { try { const m = mdModule(v, Sm, { Tf, uFm: u, uPm: u, Lmd: L, nSeg: 8 }); if (m.fluxLMH > 0 && Number.isFinite(m.stec) && Number.isFinite(m.sec)) return { a: Tf, b: u, c: L, flux: m.fluxLMH, en: m.stec, aux: m.sec }; } catch { /* infeasible point */ } return null; };
+    evalMD = (Tf, u, L) => { if (spent()) return null; try { const m = mdModule(v, Sm, { Tf, uFm: u, uPm: u, Lmd: L, nSeg: 8 }); if (m.fluxLMH > 0 && Number.isFinite(m.stec) && Number.isFinite(m.sec)) return { a: Tf, b: u, c: L, flux: m.fluxLMH, en: m.stec, aux: m.sec }; } catch { /* infeasible point */ } return null; };
     for (const Tf of [50, 60, 70, 80, 88].filter((t) => t > v.Tp + 12)) for (const u of [0.08, 0.15, 0.3, 0.6]) for (const L of [0.5, 1, 2.5]) { const q = evalMD(Tf, u, L); if (q) grid.push(q); }
     lo = [Tlo, Math.log(0.08), Math.log(0.5)]; hi = [88, Math.log(0.6), Math.log(2.5)]; dec = (x) => evalMD(x[0], Math.exp(x[1]), Math.exp(x[2]));
   } else {
     const d = DRAWS[v.draw] || DRAWS.nacl, cHi = Math.min(d.sol, Math.max(3, 2 * v.cDraw));
-    evalFO = (cD, u) => { try { const r = simulateFO(v, { cDraw: cD, uF: u, uD: u, nSeg: 8 }), Vw = r.tot.Vw * 3600; if (!(Vw > 0)) return null; const reg = regeneration(r, { ...v, cDraw: cD }), en = r.Ppump / 1000 / Vw + reg.elec + 0.1 * reg.heat; if (Number.isFinite(en)) return { a: cD, b: u, c: r.dilution, flux: r.JwLMH, en, aux: r.srsf }; } catch { /* infeasible point */ } return null; };
+    evalFO = (cD, u) => { if (spent()) return null; try { const r = simulateFO(v, { cDraw: cD, uF: u, uD: u, nSeg: 8 }), Vw = r.tot.Vw * 3600; if (!(Vw > 0)) return null; const reg = regeneration(r, { ...v, cDraw: cD }), en = r.Ppump / 1000 / Vw + reg.elec + 0.1 * reg.heat; if (Number.isFinite(en)) return { a: cD, b: u, c: r.dilution, flux: r.JwLMH, en, aux: r.srsf }; } catch { /* infeasible point */ } return null; };
     for (const cD of linspace(0.4, cHi, 6)) for (const u of [5, 10, 20, 35]) { const q = evalFO(cD, u); if (q) grid.push(q); }
     lo = [0.4, Math.log(5)]; hi = [Math.max(cHi, 0.41), Math.log(35)]; dec = (x) => evalFO(x[0], Math.exp(x[1]));
   }
@@ -737,7 +923,7 @@ export function paretoDesigns(v, S, md, { pop = 16, gens = 5, seed = 3 } = {}) {
     void res;
   }
   const all = [...grid, ...ga], fx = (q) => q.flux, fy = (q) => q.en, refX = 0, refY = 1.05 * Math.max(...all.map(fy), 1e-9);
-  return { grid, ga, all, evals, seed, gridFront: paretoFront(grid, fx, fy).front.length, hvGrid: hypervolume2(grid, fx, fy, refX, refY), hvAll: hypervolume2(all, fx, fy, refX, refY) };
+  return { grid, ga, all, evals, seed, truncated: spent(), workUsed: work.flux - w0, gridFront: paretoFront(grid, fx, fy).front.length, hvGrid: hypervolume2(grid, fx, fy, refX, refY), hvAll: hypervolume2(all, fx, fy, refX, refY) };
 }
 /**
  * Grey-box (physics-informed) correction of the mechanistic flux: ln(J_measured / J_model) = β₀ + β₁x₁ + β₂x₂ fitted by ridge regression,
@@ -819,19 +1005,19 @@ const suite = {
     { group: 'Process and feed', help: 'Which process is solved and what water it treats.', fields: [
       { key: 'process', label: 'Process', type: 'select', value: 'fo', options: [{ value: 'fo', label: 'Forward osmosis (FO)' }, { value: 'pro', label: 'Pressure-retarded osmosis (PRO)' }, { value: 'md', label: 'Membrane distillation (MD)' }, { value: 'fo_ro', label: 'Hybrid: FO + RO draw regeneration' }, { value: 'ro_md', label: 'Hybrid: RO + MD brine concentration' }, { value: 'fo_md', label: 'Hybrid: FO + MD draw regeneration' }, { value: 'ed_fo', label: 'Hybrid: FO + electrodialysis draw regeneration' }, { value: 'md_cr', label: 'Hybrid: MD + crystalliser (zero liquid discharge)' }, { value: 'hdh', label: 'Humidification–dehumidification (HDH)' }, { value: 'cdi', label: 'Capacitive deionisation — porous-electrode model' }, { value: 'cdi_ro', label: 'Hybrid: RO + capacitive-deionisation polishing' }], help: 'Each process shows its own inputs. The examples load realistic settings.' },
       { key: 'ions', label: 'Feed-water analysis (mg/L)', type: 'ions', value: WATERS.brackish.ions, help: 'Feed to the FO membrane, the MD loop or, in the RO–MD hybrid, the RO feed.' },
-      { key: 'salinityFactor', label: 'Salinity multiplier', unit: '×', value: 1, min: 0.01, max: 8, help: 'Scales the whole analysis — convenient for sensitivity runs.' },
-      { key: 'Qf', label: 'Feed flow', unit: 'm³/h', value: 50, min: 0.01, max: 1e5, help: 'FO: feed entering the module. MD and HDH: make-up feed. RO–MD: feed to the RO.' },
-      { key: 'T', label: 'Feed supply temperature', unit: '°C', value: 25, min: 5, max: 45, help: 'FO operating temperature; for MD and HDH the temperature of the cold make-up.' },
+      { key: 'salinityFactor', label: 'Salinity multiplier', unit: '×', value: 1, min: 0.01, max: 8, typical: [0.1, 2], help: 'Scales the whole analysis — convenient for sensitivity runs.' },
+      { key: 'Qf', label: 'Feed flow', unit: 'm³/h', value: 50, min: 0.01, max: 1e5, typical: [1, 5000], help: 'FO: feed entering the module. MD and HDH: make-up feed. RO–MD: feed to the RO.' },
+      { key: 'T', label: 'Feed supply temperature', unit: '°C', value: 25, min: 5, max: 45, typical: [10, 35], help: 'FO operating temperature; for MD and HDH the temperature of the cold make-up.' },
       { key: 'pH', label: 'Feed pH', unit: '', value: 7.6, min: 2, max: 12, help: 'Passed on with the product and concentrate streams.' },
     ] },
     { group: 'Forward osmosis', showIf: isFO, help: 'Draw solution, module and flow arrangement.', fields: [
       { key: 'draw', label: 'Draw solute', type: 'select', value: 'nacl', options: Object.entries(DRAWS).map(([k, d]) => ({ value: k, label: d.name })), help: 'Sets osmotic pressure, diffusivity (ICP) and reverse leakage.' },
-      { key: 'cDraw', label: 'Draw concentration at inlet', unit: 'mol/L', value: 1, min: 0.05, max: 6, help: 'Must give an osmotic pressure well above that of the concentrated feed.' },
-      { key: 'Qd', label: 'Draw flow at inlet', unit: 'm³/h', value: 25, min: 0.01, max: 1e5, help: 'A larger draw flow is diluted less and keeps the driving force.' },
-      { key: 'areaFO', label: 'Membrane area', unit: 'm²', value: 2500, min: 0.01, max: 1e6, help: 'Total active area of the FO modules.' },
+      { key: 'cDraw', label: 'Draw concentration at inlet', unit: 'mol/L', value: 1, min: 0.05, max: 6, typical: [0.5, 3], help: 'Must give an osmotic pressure well above that of the concentrated feed.' },
+      { key: 'Qd', label: 'Draw flow at inlet', unit: 'm³/h', value: 25, min: 0.01, max: 1e5, typical: [0.5, 5000], help: 'A larger draw flow is diluted less and keeps the driving force.' },
+      { key: 'areaFO', label: 'Membrane area', unit: 'm²', value: 2500, min: 0.01, max: 1e6, typical: [50, 50000], help: 'Total active area of the FO modules.' },
       { key: 'orient', label: 'Membrane orientation', type: 'select', value: 'alfs', options: [{ value: 'alfs', label: 'Active layer facing feed (FO mode)' }, { value: 'alds', label: 'Active layer facing draw (PRO mode)' }], showIf: (v) => v.process !== 'pro', help: 'FO mode suffers dilutive ICP on the draw side; PRO mode gives higher flux but fouls the support.' },
       { key: 'flow', label: 'Flow arrangement', type: 'select', value: 'counter', options: [{ value: 'counter', label: 'Counter-current' }, { value: 'co', label: 'Co-current' }], help: 'Counter-current keeps a more uniform driving force.' },
-      { key: 'dPfeed', label: 'Hydraulic pressure on the feed side (pressure-assisted FO)', unit: 'bar', value: 0, min: 0, max: 20, showIf: (v) => v.process !== 'pro', help: 'Adds to the osmotic driving force: J_w = A·(Δπ_eff + ΔP). 0 = ordinary FO.' },
+      { key: 'dPfeed', label: 'Hydraulic pressure on the feed side (pressure-assisted FO)', unit: 'bar', value: 0, min: 0, max: 10, typical: [0, 6], showIf: (v) => v.process !== 'pro', help: 'Adds to the osmotic driving force: J_w = A·(Δπ_eff + ΔP). 0 = ordinary FO; FO membranes and their supports tolerate only a few bar.' },
       { key: 'edTarget', label: 'Product TDS after electrodialysis', unit: 'mg/L', value: 500, min: 20, max: 5000, showIf: (v) => v.process === 'ed_fo', help: 'Target salinity of the electrodialysis diluate, which is the product water.' },
       { key: 'dPpro', label: 'Hydraulic pressure on the draw side', unit: 'bar', value: 12, min: 0, max: 80, showIf: (v) => v.process === 'pro', help: 'Power density peaks near half of the osmotic-pressure difference.' },
       { key: 'etaTurb', label: 'Turbine / pressure-exchanger efficiency', unit: '%', value: 88, min: 30, max: 98, showIf: (v) => v.process === 'pro', help: 'Conversion of the pressurised permeate into electricity.' },
@@ -840,23 +1026,23 @@ const suite = {
     { group: 'Membrane distillation', showIf: isMD, help: 'Configuration, temperatures and module.', fields: [
       { key: 'mdType', label: 'Configuration', type: 'select', value: 'dcmd', options: [{ value: 'dcmd', label: 'Direct contact (DCMD)' }, { value: 'agmd', label: 'Air gap (AGMD)' }, { value: 'vmd', label: 'Vacuum (VMD)' }, { value: 'sgmd', label: 'Sweeping gas (SGMD)' }], help: 'DCMD gives the highest flux; AGMD the best heat economy; VMD removes conduction losses.' },
       { key: 'Tf', label: 'Hot-feed inlet temperature', unit: '°C', value: 60, min: 30, max: 95, typical: [50, 85], help: 'Vapour pressure — and flux — rise exponentially with this temperature.' },
-      { key: 'Tp', label: 'Coolant / permeate inlet temperature', unit: '°C', value: 20, min: 2, max: 60, help: 'Cold-side inlet (sweep-gas inlet for SGMD, condenser coolant for VMD).' },
-      { key: 'mdRec', label: 'Water recovery of the MD loop', unit: '%', value: 0, min: 0, max: 95, help: '0 = single pass through the module. Above 0 the feed is recirculated (feed-and-bleed) and the modules see the concentrated loop salinity.' },
-      { key: 'uFm', label: 'Feed velocity', unit: 'm/s', value: 0.25, min: 0.01, max: 2, help: 'Cross-flow velocity in the hot channel.' },
+      { key: 'Tp', label: 'Coolant / permeate inlet temperature', unit: '°C', value: 20, min: 2, max: 60, typical: [10, 30], help: 'Cold-side inlet (sweep-gas inlet for SGMD, condenser coolant for VMD).' },
+      { key: 'mdRec', label: 'Water recovery of the MD loop', unit: '%', value: 0, min: 0, max: 95, typical: [0, 80], help: '0 = single pass through the module. Above 0 the feed is recirculated (feed-and-bleed) and the modules see the concentrated loop salinity.' },
+      { key: 'uFm', label: 'Feed velocity', unit: 'm/s', value: 0.25, min: 0.01, max: 2, typical: [0.05, 0.5], help: 'Cross-flow velocity in the hot channel.' },
       { key: 'uPm', label: 'Coolant / permeate velocity', unit: 'm/s', value: 0.25, min: 0.01, max: 2, showIf: mdIs('dcmd', 'agmd'), help: 'Cross-flow velocity in the cold channel.' },
       { key: 'Lmd', label: 'Channel length', unit: 'm', value: 1, min: 0.05, max: 12, help: 'Longer channels recover more heat but lose driving force.' },
       { key: 'hF', label: 'Channel height', unit: 'mm', value: 2, min: 0.5, max: 10, help: 'Height of the feed and coolant channels.' },
       { key: 'flowMD', label: 'Flow arrangement', type: 'select', value: 'counter', options: [{ value: 'counter', label: 'Counter-current' }, { value: 'co', label: 'Co-current' }], showIf: mdIs('dcmd', 'agmd'), help: 'Counter-current keeps the temperature difference along the module. Sweeping-gas and vacuum modules are solved co-currently.' },
       { key: 'gapMD', label: 'Air-gap width', unit: 'mm', value: 2, min: 0.3, max: 10, showIf: mdIs('agmd'), help: 'Stagnant air between membrane and condensing plate.' },
       { key: 'Pvac', label: 'Permeate-side absolute pressure', unit: 'kPa', value: 6, min: 0.8, max: 60, showIf: mdIs('vmd'), help: 'Must be below the feed vapour pressure and above the condenser saturation pressure.' },
-      { key: 'uGas', label: 'Sweep-gas velocity', unit: 'm/s', value: 2, min: 0.1, max: 15, showIf: mdIs('sgmd'), help: 'Air velocity in the permeate channel.' },
+      { key: 'uGas', label: 'Sweep-gas velocity', unit: 'm/s', value: 2, min: 0.1, max: 15, typical: [1, 5], showIf: mdIs('sgmd'), help: 'Air velocity in the permeate channel.' },
       { key: 'rhGas', label: 'Sweep-gas inlet humidity', unit: '%', value: 30, min: 0, max: 100, showIf: mdIs('sgmd'), help: 'Relative humidity of the gas entering at the coolant temperature.' },
       { key: 'recover', label: 'Heat recovery', type: 'bool', value: true, showIf: mdIs('dcmd', 'agmd'), help: 'DCMD: external exchanger between warm permeate and returning feed. AGMD: the coolant is the feed itself.' },
       { key: 'effHX', label: 'Heat-recovery exchanger effectiveness', unit: '%', value: 80, min: 0, max: 97, showIf: (v) => isMD(v) && v.mdType === 'dcmd' && v.recover, help: 'Effectiveness of the external exchanger.' },
     ] },
     { group: 'RO stage of the hybrid', showIf: (v) => v.process === 'ro_md' || v.process === 'fo_ro' || v.process === 'cdi_ro', help: 'The reverse-osmosis step is solved with the element-by-element model of suite 1.', fields: [
-      { key: 'roRec', label: 'RO recovery', unit: '%', value: 45, min: 10, max: 85, showIf: (v) => v.process === 'ro_md' || v.process === 'cdi_ro', help: 'Recovery of the seawater or brackish RO ahead of the MD brine concentrator.' },
-      { key: 'roFlux', label: 'RO design flux', unit: 'L/m²·h', value: 14, min: 5, max: 35, help: 'Average flux used to size the RO array.' },
+      { key: 'roRec', label: 'RO recovery', unit: '%', value: 45, min: 10, max: 85, typical: [35, 75], showIf: (v) => v.process === 'ro_md' || v.process === 'cdi_ro', help: 'Recovery of the seawater or brackish RO ahead of the MD brine concentrator.' },
+      { key: 'roFlux', label: 'RO design flux', unit: 'L/m²·h', value: 14, min: 5, max: 35, typical: [12, 30], help: 'Average flux used to size the RO array.' },
     ] },
     { group: 'Crystalliser of the MD loop', showIf: (v) => v.process === 'md_cr', help: 'Mixed-suspension mixed-product-removal crystalliser fed by the saturated MD loop.', fields: [
       { key: 'Tcr', label: 'Crystalliser temperature', unit: '°C', value: 40, min: 10, max: 80, help: 'Sets the solubility of the loop; keep it below the MD feed temperature so that the membrane sees undersaturated brine.' },
@@ -866,9 +1052,9 @@ const suite = {
     ] },
     { group: 'Capacitive deionisation cell', showIf: isCDI, help: 'Pair of porous carbon electrodes with a flow-by spacer; in the RO hybrid it polishes the RO permeate.', fields: [
       { key: 'cdiMode', label: 'Electrical boundary condition', type: 'select', value: 'cv', options: [{ value: 'cv', label: 'Prescribed voltage (constant voltage)' }, { value: 'cc', label: 'Prescribed current (constant current, voltage-limited)' }], help: 'Constant voltage charges fastest; constant current gives a steady effluent concentration.' },
-      { key: 'cdiV', label: 'Charging voltage', unit: 'V', value: 1.2, min: 0.2, max: 1.6, help: 'Cell voltage (upper limit in constant-current operation). Keep below about 1.23 V.' },
+      { key: 'cdiV', label: 'Charging voltage', unit: 'V', value: 1.2, min: 0.2, max: 1.6, typical: [0.8, 1.4], help: 'Cell voltage (upper limit in constant-current operation). Keep below about 1.23 V.' },
       { key: 'cdiI', label: 'Charging / discharging current density', unit: 'A/m²', value: 15, min: 0.5, max: 500, showIf: (v) => v.cdiMode === 'cc', help: 'Per m² of cell area.' },
-      { key: 'cdiVdis', label: 'Discharge voltage', unit: 'V', value: 0, min: 0, max: 1, help: '0 V = short-circuit regeneration.' },
+      { key: 'cdiVdis', label: 'Discharge voltage', unit: 'V', value: 0, min: 0, max: 1, typical: [0, 0.3], help: '0 V = short-circuit regeneration.' },
       { key: 'cdiTc', label: 'Charging (adsorption) time', unit: 'min', value: 10, min: 0.2, max: 120, help: 'Half-cycle producing desalinated water.' },
       { key: 'cdiTd', label: 'Discharge (desorption) time', unit: 'min', value: 10, min: 0.2, max: 120, help: 'Half-cycle producing concentrate.' },
       { key: 'cdiQ', label: 'Flow per cell area', unit: 'L/m²·min', value: 0.3, min: 0.05, max: 20, help: 'Spacer throughput.' },
@@ -876,7 +1062,7 @@ const suite = {
       { key: 'cdiRecov', label: 'Energy recovered on discharge', unit: '%', value: 0, min: 0, max: 95, help: 'Share of the discharge energy returned by the power electronics.' },
     ] },
     { group: 'Humidification–dehumidification', showIf: (v) => v.process === 'hdh', help: 'Closed-air, open-water cycle with a seawater heater.', fields: [
-      { key: 'Ttop', label: 'Top seawater temperature', unit: '°C', value: 75, min: 45, max: 95, help: 'Seawater temperature leaving the heater and entering the humidifier.' },
+      { key: 'Ttop', label: 'Top seawater temperature', unit: '°C', value: 75, min: 45, max: 95, typical: [60, 90], help: 'Seawater temperature leaving the heater and entering the humidifier.' },
       { key: 'MR', label: 'Seawater-to-dry-air mass ratio', unit: '–', value: 3, min: 0.5, max: 12, help: 'The gain-output ratio peaks where the heat capacities of the two streams balance.' },
       { key: 'effH', label: 'Humidifier effectiveness', unit: '%', value: 85, min: 40, max: 98, help: 'Energy-based effectiveness.' },
       { key: 'effD', label: 'Dehumidifier effectiveness', unit: '%', value: 85, min: 40, max: 98, help: 'Energy-based effectiveness.' },
@@ -891,8 +1077,8 @@ const suite = {
       { key: 'Qwh', label: 'Waste heat available', unit: 'kW', value: 2000, min: 1, max: 1e7, showIf: (v) => v.source === 'waste', help: 'Heat that can be extracted from the stream.' },
     ] },
     { group: 'FO membrane and transport model', tab: 'setup', showIf: isFO, help: 'Solution–diffusion parameters and polarisation correlations.', fields: [
-      { key: 'AFO', label: 'Water permeability A (25 °C)', unit: 'L/m²·h·bar', value: 2.2, min: 0.1, max: 12, help: 'Thin-film composite FO membranes: 1–5; cellulose triacetate: 0.4–0.8.' },
-      { key: 'BFO', label: 'Salt permeability B, NaCl (25 °C)', unit: 'L/m²·h', value: 0.45, min: 0.005, max: 10, help: 'Other solutes are scaled from it with the library ratio.' },
+      { key: 'AFO', label: 'Water permeability A (25 °C)', unit: 'L/m²·h·bar', value: 2.2, min: 0.1, max: 12, typical: [0.5, 5], help: 'Thin-film composite FO membranes: 1–5; cellulose triacetate: 0.4–0.8.' },
+      { key: 'BFO', label: 'Salt permeability B, NaCl (25 °C)', unit: 'L/m²·h', value: 0.45, min: 0.005, max: 10, typical: [0.05, 2], help: 'Other solutes are scaled from it with the library ratio.' },
       { key: 'Sfo', label: 'Structural parameter S', unit: 'µm', value: 400, min: 0, max: 5000, typical: [200, 800], help: 'S = thickness × tortuosity ÷ porosity of the support layer; it controls internal polarisation.' },
       { key: 'hydration', label: 'Support-layer hydration (initial)', unit: '% of pore volume wetted', value: 100, min: 20, max: 100, help: 'A hydrophobic support that is not fully wetted has fewer open pores: S_eff = S ÷ hydration. In the batch simulation this is the initial condition and the support wets out with time.' },
       { key: 'uF', label: 'Feed-channel velocity', unit: 'cm/s', value: 15, min: 0.5, max: 100, help: 'Sets the external mass-transfer coefficient on the feed side.' },
@@ -941,7 +1127,7 @@ const suite = {
       { key: 'cdiCst', label: 'Stern-layer capacitance', unit: 'F/m²', value: 0.2, min: 0.02, max: 2, help: 'Compact-layer capacitance in series with the diffuse (Gouy–Chapman) layer.' },
       { key: 'cdiHsp', label: 'Spacer thickness', unit: 'µm', value: 200, min: 30, max: 2000, help: 'Flow channel between the electrodes (porosity 0.7).' },
       { key: 'cdiRc', label: 'Contact and lead resistance', unit: 'Ω·cm²', value: 10, min: 0, max: 500, help: 'Electronic resistances of the cell.' },
-      { key: 'cdiQ0', label: 'Initial electrode charge', unit: '% of equilibrium charge', value: 0, min: 0, max: 100, help: 'Initial condition of the first cycle: 0 = fully discharged electrodes.' },
+      { key: 'cdiQ0', label: 'Initial electrode charge', unit: '% of equilibrium charge', value: 0, min: 0, max: 100, typical: [0, 20], help: 'Initial condition of the first cycle: 0 = fully discharged electrodes.' },
       { key: 'lgQm', label: 'Langmuir adsorption capacity', unit: 'mg NaCl per g', value: 1, min: 0, max: 30, help: 'Non-electrostatic (physical) adsorption capacity of the carbon.' },
       { key: 'lgK', label: 'Langmuir constant K', unit: 'm³/mol', value: 0.05, min: 0.0001, max: 10, help: 'Equilibrium coverage θ = K·c / (1 + K·c).' },
       { key: 'lgKa', label: 'Langmuir rate constant', unit: '1/min', value: 0.5, min: 0.001, max: 60, help: 'dθ/dt = k·[K·c·(1 − θ) − θ].' },
@@ -1180,31 +1366,77 @@ const suite = {
     const gbT = greyBox(GB_FO.map((q) => ({ ...q, Jw: 1.2 * (q.cDraw * 10 + q.uF) })), (q) => q.cDraw * 10 + q.uF, (q) => [Math.log(q.cDraw), Math.log(q.uF / 15)], 1e-9);
     add('Grey-box correction recovers a uniform 20 % bias', Math.log(1.2), gbT.beta[0], 1e-6, 'Data = 1.2 × model: β₀ = ln 1.2, β₁ = β₂ = 0, leave-one-out error ≈ 0');
     add('Grey-box correction leaves a perfect model unchanged', 1, greyBox(GB_FO.map((q) => ({ ...q, Jw: q.cDraw * 10 + q.uF })), (q) => q.cDraw * 10 + q.uF, (q) => [Math.log(q.cDraw), Math.log(q.uF / 15)]).factor({ cDraw: 1.3, uF: 12 }), 1e-9, 'Correction factor at an arbitrary point');
+    // ---- stress cases: seeded random designs over the whole input range (the multi-objective search is left out: it only repeats the same engine many times)
+    const st = stressCases(suite, 60, 20268, { pareto: false });
+    add('Stress cases: random designs across the input ranges solve cleanly or are rejected with an explanation', 0, st.fails.length, 0, `${st.n} seeded cases over all processes: ${st.solved} solved with finite results, closed balances and no negative flow, area or energy; ${st.rejected} rejected with a message that names the input to change${st.fails.length ? `; first failure (case ${st.fails[0].k}): ${st.fails[0].why}` : ''}`);
+    add('Stress cases: a meaningful share of the sampled designs is feasible', 1, st.solved >= 0.3 * st.n ? 1 : 0, 0, `${st.solved} of ${st.n} sampled designs solve; the rest are infeasible combinations that are rejected`);
     return C;
   },
 };
 
 // ---- result builders ----------------------------------------------------------------------------------------
+/**
+ * RO block of a hybrid for a permeate duty Qp (m³/h): elements per vessel matched to the duty, so that a small block is not a full
+ * vessel at a fraction of its design flux. Less than half an element lies below the range of the element-by-element RO model.
+ */
+function roBlock(Qp, flux) {
+  const d = defaultsOf(roSuite), q1 = (flux * d.area) / 1000, need = Qp / q1, below = !(need >= 0.5);
+  return { q1, need, below, elements: below ? 1 : clamp(Math.ceil(need / Math.ceil(need / d.elements) - 1e-9), 1, d.elements) };
+}
+const roBelow = (Qp, flux, what, fix) => new Error(`${what} would produce only ${fmt(Qp, 3)} m³/h, below the range of the RO model: one spiral-wound element delivers about ${fmt(roBlock(Qp, flux).q1, 3)} m³/h at ${fmt(flux, 3)} L/m²·h. ${fix}`);
+
+/**
+ * Closed draw loop: at steady state the regeneration step takes out exactly the water that FO adds. limits(r) gives the share of the diluted
+ * draw that must be removed (need) and the most the regeneration step can remove (lim). If the step is at its limit the loop cannot hold
+ * the specified draw strength: it settles at the weaker draw that can still be regenerated, and that draw sets the FO flux.
+ */
+function settleDrawLoop(v, r0, limits) {
+  const l0 = limits(r0);
+  if (!(r0.tot.Vw > 1e-6 * r0.QF0) || l0.need <= l0.lim * (1 + 1e-9)) return { p: v, r: r0, l: l0, limited: null };
+  const g = (c) => { const l = limits(simulateFO(v, { cDraw: c })); return l.need - l.lim; }, cLo = 1e-3 * v.cDraw;
+  if (!(g(cLo) < 0)) { // even an almost fully diluted draw takes up more water than can be removed again: no steady state exists
+    const q = simulateFO(v, { cDraw: cLo }), V = q.tot.Vw * 3600;
+    throw new Error(`The draw loop cannot reach a steady state: the FO membrane transfers ${fmt(V, 3)} m³/h into only ${fmt(v.Qd, 3)} m³/h of draw even when the draw is almost fully diluted${v.dPfeed > 0 ? ' (the pressure on the feed side alone drives this flux)' : ''}, and the regeneration step can remove at most ${fmt(100 * l0.lim, 3)} % of the diluted draw. Raise the draw flow to at least ${fmt((V * (1 - l0.lim)) / l0.lim, 3)} m³/h, or reduce the FO membrane area${v.dPfeed > 0 ? ' or the pressure on the feed side' : ''}.`);
+  }
+  const cLoop = brent(g, cLo, v.cDraw, 1e-7 * v.cDraw, 40) * (1 - 1e-6), p = { ...v, cDraw: cLoop }, r = simulateFO(p); // just on the feasible side of the limit
+  return { p, r, l: limits(r), limited: { c: cLoop, J0: r0.JwLMH, V0: r0.tot.Vw * 3600, need0: l0.need, lim0: l0.lim } };
+}
+
+/** Counter-current flow: the integration starts from the guessed draw outlet and must arrive at the specified draw inlet — the independent check of the module solution. */
+const foClosure = (r) => (r.p.flow === 'counter' ? [{ name: 'Draw inlet reached by the counter-current integration (m³/h)', in: r.QD0 * 3600, out: r.drawInEnd.Q * 3600 }, { name: 'Draw-inlet solute reached by the integration (mol/s)', in: r.QD0 * r.cD0, out: r.drawInEnd.n }] : []);
+
+/** Warnings on the state of the FO module: idle area beyond the pinch, exhausted feed, solute cross-over, closure of the counter-current solution. */
+function foModuleWarnings(r, p, W) {
+  if (r.idle > 0.002 && r.tot.Vw > 0) W.push({ level: 'warn', msg: `Membrane area beyond the osmotic-equilibrium pinch: ${fmt(100 * r.idle, 3)} % of the area is idle. About ${fmt(r.area * (1 - r.idle), 3)} m² does all the work — reduce the area, or raise the draw flow or concentration to use more of it.` });
+  if (r.spent) W.push({ level: 'warn', msg: 'The feed is extracted almost completely before the end of the module; the remaining membrane area has nothing left to treat. Reduce the area or raise the feed flow.' });
+  const cross = 1 - r.feedOut.nf / r.QF0;
+  if (cross > 0.2) W.push({ level: 'warn', msg: `${fmt(100 * cross, 3)} % of the feed solutes diffuse through the membrane into the draw at this area-to-flow ratio. The model treats the draw as free of feed solutes (no back-diffusion), so results are indicative only — use less area per m³/h of feed or a membrane with a lower solute permeability B.` });
+  if (!r.conv) throw new Error(`The counter-current module balance cannot be closed for this combination: ${fmt(p.Qd, 3)} m³/h of draw against ${fmt(p.Qf, 3)} m³/h of feed on ${fmt(r.area, 3)} m² dilutes the draw so abruptly near its inlet that the two-point solution is not resolved (draw-inlet mismatch ${fmt(100 * r.closure, 2)} %). Raise the draw flow, reduce the membrane area${p.dPfeed > 0 ? ' or the pressure on the feed side' : ''}, or select co-current flow.`);
+}
+
 function runFO(v) {
-  const r = simulateFO(v), p = v, W = [], d = r.d, pro = r.pro, hybrid = p.process === 'fo_ro', T = r.T, N = r.N;
+  const hybrid = v.process === 'fo_ro', W = [], st = hybrid ? settleDrawLoop(v, simulateFO(v), (q) => ({ need: q.tot.Vw / q.drawOut.Q, lim: 0.85 })) : null;
+  const r = st ? st.r : simulateFO(v), p = st ? st.p : v, d = r.d, pro = r.pro, T = r.T, N = r.N;
+  if (st?.limited) W.push({ level: 'warn', msg: `Reverse osmosis can recover at most 85 % of the diluted draw, not the ${fmt(100 * st.limited.need0, 3)} % needed to return it at ${fmt(v.cDraw, 3)} mol/L. The draw loop therefore settles at ${fmt(st.limited.c, 3)} mol/L and the FO flux falls from ${fmt(st.limited.J0, 3)} to ${fmt(r.JwLMH, 3)} L/m²·h. Raise the draw flow to about ${fmt((st.limited.V0 * 0.15) / 0.85, 3)} m³/h or reduce the FO membrane area.` });
   const coupon = foFlux({ f: 1, cFd: 0, cD: r.cD0 }, r.m), ideal = r.m.A * (coupon.piDb - coupon.piFb - r.m.dP);
   if (r.tot.Vw <= 1e-12) W.push({ level: 'bad', msg: `No water flux: the draw osmotic pressure (${fmt(coupon.piDb / 1e5, 3)} bar) does not exceed the feed osmotic pressure (${fmt(coupon.piFb / 1e5, 3)} bar)${pro ? ' plus the applied pressure' : ''}. Raise the draw concentration.` });
   if (p.cDraw > d.sol) W.push({ level: 'bad', msg: `${p.cDraw} mol/L exceeds the solubility of ${d.name} (about ${d.sol} mol/L).` });
-  if (r.segs.some((g) => g.Jw <= 1e-9 * (coupon.Jw + 1e-30)) && r.tot.Vw > 0) W.push({ level: 'warn', msg: 'Osmotic equilibrium is reached inside the module: part of the membrane area is idle. Reduce the area or raise the draw flow.' });
+  foModuleWarnings(r, p, W);
   if (r.recovery > 0.85) W.push({ level: 'warn', msg: `Feed recovery of ${fmt(100 * r.recovery, 3)} % concentrates the feed ${fmt(r.fOut, 3)}-fold — check scaling of the feed concentrate in suite 2.` });
   if (r.srsf > 1 && !pro) W.push({ level: 'warn', msg: `Specific reverse solute flux is ${fmt(r.srsf, 3)} g per litre of water — draw-solute make-up and feed contamination will be significant.` });
-  if (!r.conv) W.push({ level: 'warn', msg: 'The counter-current iteration did not fully converge.' });
   const reg = pro ? null : hybrid ? null : regeneration(r, p);
   if (reg && !reg.feasible) W.push({ level: 'bad', msg: p.regen === 'ro' ? `Regenerating this draw by RO needs about ${fmt(reg.P, 3)} bar, above the 83 bar rating of seawater elements — use a weaker draw, a thermal method or high-pressure / osmotically assisted RO.` : `Thermolytic stripping only applies to ammonium bicarbonate draws, not to ${d.name}.` });
   // hybrid: RO regeneration with the element-by-element model of suite 1
   let ro = null, roErr = null;
   if (hybrid) {
     {
-      const da = drawAsIons(p.draw, r.cDout, T), ionsD = da.ions, rec = clamp(r.tot.Vw / r.drawOut.Q, 0.05, 0.85);
-      try { ro = simulateRO({ ...defaultsOf(roSuite), ions: ionsD, Qf: r.drawOut.Q * 3600, T, pH: 7, recovery: 100 * rec, targetFlux: p.roFlux, design: 'auto', mode: 'recovery', nSeg: 2 }); } catch (e) { roErr = e.message; }
+      // the RO takes out exactly the water FO added; when the draw is diluted by less than 5 % a side stream at 5 % recovery is enough
+      const da = drawAsIons(p.draw, r.cDout, T), ionsD = da.ions, need = r.tot.Vw / r.drawOut.Q, rec = Math.max(Math.min(need, 0.85), 0.05), Qro = need >= 0.05 ? r.drawOut.Q * 3600 : (r.tot.Vw * 3600) / 0.05, blk = roBlock(r.tot.Vw * 3600, p.roFlux);
+      if (blk.below) { roErr = 'range'; if (r.tot.Vw > 1e-12) W.push({ level: 'bad', msg: `${roBelow(r.tot.Vw * 3600, p.roFlux, 'The regeneration RO', 'The forward-osmosis step is shown without it — raise the draw flow and concentration, the feed flow or the FO membrane area so that more water is transferred.').message}` }); }
+      else try { ro = simulateRO({ ...defaultsOf(roSuite), ions: ionsD, Qf: Qro, T, pH: 7, recovery: 100 * rec, targetFlux: p.roFlux, design: 'auto', mode: 'recovery', nSeg: 2, elements: blk.elements }); if (!(ro.product.Q > 0) || !Number.isFinite(ro.power)) { ro = null; roErr = 'no permeate is produced at this draw strength'; } } catch (e) { roErr = e.message; }
       if (da.equivalent && !roErr) W.push({ level: 'info', msg: `${d.name} carries no ions: the regeneration RO is solved for the osmotically equivalent NaCl solution (${fmt((da.cEq * 58.44) / 1000, 3)} g/L, same osmotic pressure). Pressure, area and energy carry over; the permeate salinity shown is that equivalent and is an upper bound, because RO rejects the larger sugar molecule better than NaCl.` });
     }
-    if (roErr) W.push({ level: 'bad', msg: `RO regeneration of the diluted draw could not be solved: ${roErr}` });
+    if (roErr === 'range') { /* reported above */ } else if (roErr) W.push({ level: 'bad', msg: `RO regeneration of the diluted draw could not be solved (${roErr}). Lower the draw concentration.` });
     else if (ro.p1.Pf > ro.cfg.M.pmax) W.push({ level: 'bad', msg: `The regeneration RO needs ${fmt(ro.p1.Pf, 3)} bar, above the ${ro.cfg.M.pmax} bar element rating — lower the draw concentration.` });
   }
   if (!W.some((w) => w.level !== 'info')) W.unshift({ level: 'info', msg: pro ? 'PRO module solved; water and solute balances close.' : 'FO module solved; water and solute balances close.' });
@@ -1230,6 +1462,7 @@ function runFO(v) {
   if (pro) {
     const dpi = (coupon.piDb - coupon.piFb) / 1e5, Pb = linspace(0, Math.max(dpi, 1), 25), wd = Pb.map((P) => tryOr(() => flux({}, r.cD0, P * 1e5).Jw * P * 1e5, 0));
     plots.push({ type: 'line', title: 'PRO power density versus applied pressure (module inlet)', xlabel: 'Hydraulic pressure difference (bar)', ylabel: 'W/m² · L/m²·h', series: [{ name: 'Power density (W/m²)', x: Pb, y: wd }, { name: 'Water flux (L/m²·h)', x: Pb, y: Pb.map((P) => tryOr(() => flux({}, r.cD0, P * 1e5).Jw * 3.6e6, 0)) }, { name: 'Ideal membrane: A·ΔP·(Δπ − ΔP) (W/m²)', x: Pb, y: Pb.map((P) => r.m.A * P * 1e5 * Math.max(0, dpi - P) * 1e5), dash: true }], vlines: [{ x: p.dPpro, label: 'operating' }, { x: dpi / 2, label: 'Δπ/2' }] });
+    if (r.tot.Vw > 0 && turb < r.Ppump / 1000) W.push({ level: 'warn', msg: `Pumping the two streams takes ${fmt(r.Ppump / 1000, 3)} kW, more than the ${fmt(turb, 3)} kW the turbine recovers: the plant is a net consumer of power (negative net power and energy per m³). Lower the cross-flow velocities or the channel length, or operate nearer Δπ/2.` });
     if (r.powerDensity < 5) W.push({ level: 'info', msg: `Average power density is ${fmt(r.powerDensity, 3)} W/m²; about 5 W/m² is the usual threshold for economic PRO.` });
   }
   const kpis = [
@@ -1264,14 +1497,24 @@ function runFO(v) {
       'Send the feed concentrate to suite 2 (Brine chemistry) for scaling, and compare the cost of water with direct RO in suite 13.',
     ].filter(Boolean),
     plots: clean(plots), tables,
-    balances: [{ name: 'Water (m³/h)', in: (r.QF0 + r.QD0) * 3600, out: (r.feedOut.Q + r.drawOut.Q) * 3600 }, { name: 'Draw solute (mol/s)', in: r.QD0 * r.cD0, out: r.drawOut.n + r.feedOut.nd }, { name: 'Feed solutes (factor·m³/h)', in: r.QF0 * 3600, out: (r.feedOut.nf + r.drawOut.nf) * 3600 }],
+    balances: [{ name: 'Water (m³/h)', in: (r.QF0 + r.QD0) * 3600, out: (r.feedOut.Q + r.drawOut.Q) * 3600 }, { name: 'Draw solute (mol/s)', in: r.QD0 * r.cD0, out: r.drawOut.n + r.feedOut.nd }, { name: 'Feed solutes (factor·m³/h)', in: r.QF0 * 3600, out: (r.feedOut.nf + r.drawOut.nf) * 3600 }, ...foClosure(r)],
     outputs: { flux: r.JwLMH, secThermal: secT, secElec: pro ? -(turb - r.Ppump / 1000) / Math.max(Vw, 1e-12) : secE, area: r.area + (ro ? ro.area : 0), recovery: hybrid ? prodQ / p.Qf : r.recovery, reverseSoluteFlux: r.JsGMH, powerDensity: r.powerDensity, process: p.process,
       streams: { product: stream(prodQ, T, 7, prodIons), concentrate: stream(r.feedOut.Q * 3600, T, p.pH, feedOutIons) } },
   };
 }
 
+/** Membrane distillation needs a vapour-pressure difference from the hot to the cold side: without one the design is rejected with the temperatures that would work. */
+function mdGuard(m, p, S, what = 'feed') {
+  if (m.Nsum > 0 && Number.isFinite(m.Nsum) && Number.isFinite(m.Qin) && m.Qin > 0) return;
+  const c = m.c, vmd = c.type === 'vmd', pCold = vmd ? c.Pv : c.type === 'sgmd' ? (p.rhGas / 100) * psat(p.Tp) : psat(p.Tp), Smod = Math.min(S, 350);
+  const Teq = psatSeawater(99, Smod) <= pCold ? 99 : psatSeawater(1, Smod) >= pCold ? 1 : brent((T) => psatSeawater(T, Smod) - pCold, 1, 99, 1e-6, 100); // hot-side temperature with the same vapour pressure as the cold side
+  throw new Error(`No vapour crosses the membrane: at ${fmt(p.Tf, 3)} °C the ${what} (${fmt(S, 3)} g/kg) has no higher vapour pressure than the ${vmd ? `${fmt(p.Pvac, 3)} kPa vacuum side` : c.type === 'sgmd' ? `sweep gas at ${fmt(p.Tp, 3)} °C` : `cold side at ${fmt(p.Tp, 3)} °C`}. Raise the hot-feed temperature to at least ${fmt(Math.min(95, Math.ceil(Teq + 10)), 3)} °C (the driving force appears above ${fmt(Teq, 3)} °C)${vmd ? ' or lower the permeate pressure' : ' or lower the cold-side temperature'}.`);
+}
+
 function mdWarnings(r, p, W) {
   const m = r.m, c = m.c, dg = m.segs[0].dg, margin = r.lep / 1e5 - p.pFeed;
+  if (m.idle > 0.002) W.push({ level: 'warn', msg: `${fmt(100 * m.idle, 3)} % of the membrane length is idle: ${c.type === 'sgmd' ? 'the sweep gas is saturated at the feed temperature' : c.type === 'vmd' ? 'the feed has cooled to the saturation temperature of the vacuum side' : 'the cold stream has reached the temperature of the feed (thermal pinch)'} and no vapour crosses the rest${m.cut ? ' (the small residual flux that only follows the slowly cooling feed is neglected)' : ''}. Shorten the module or raise the ${c.type === 'sgmd' ? 'gas velocity' : c.type === 'vmd' ? 'feed velocity' : 'cold-side velocity'}.` });
+  if (r.recAsk > r.rec + 1e-9) W.push({ level: 'warn', msg: `The loop recovery is limited to ${fmt(100 * r.rec, 3)} % instead of the ${fmt(100 * r.recAsk, 3)} % asked for: beyond it the loop would exceed ${S_LOOP_MAX} g/kg, where salt crystallises. Use the MD + crystalliser process for higher recoveries.` });
   if (margin < 0) W.push({ level: 'bad', msg: `Wetting: the feed pressure (${p.pFeed} bar) exceeds the liquid-entry pressure of ${fmt(r.lep / 1e5, 3)} bar — brine will penetrate the pores.` });
   else if (margin < 1) W.push({ level: 'warn', msg: `Wetting margin is only ${fmt(margin, 2)} bar (liquid-entry pressure ${fmt(r.lep / 1e5, 3)} bar) — smaller pores, a more hydrophobic surface or a lower feed pressure are advisable.` });
   if (r.sat.nacl >= 1) W.push({ level: 'bad', msg: `The membrane-surface salinity (${fmt(m.SmMax, 3)} g/kg) reaches NaCl saturation: crystals will form on the membrane (MD-crystalliser regime) and promote wetting.` });
@@ -1311,6 +1554,7 @@ function mdTables(r, p) {
 
 function runMD(v) {
   const r = simulateMD(v), p = v, W = [], m = r.m, T = p.T;
+  mdGuard(m, p, r.rec > 0 ? r.Sloop : r.Sfeed);
   mdWarnings(r, p, W);
   const Qp = (r.prod * 3600) / density(25, 0), Qb = (r.brine * 3600) / density(25, r.Sbrine), hs = heatSource(p, r.Qheat / 1000, p.Tf, W), name = { dcmd: 'DCMD', agmd: 'AGMD', vmd: 'VMD', sgmd: 'SGMD' }[m.c.type];
   const tables = [{ title: 'Plant summary', columns: ['Quantity', 'Value', 'Unit'], rows: [['Make-up feed', p.Qf, 'm³/h'], ['Distillate', Qp, 'm³/h'], ['Brine', Qb, 'm³/h'], ['Brine salinity', r.Sbrine, 'g/kg'], ['Recirculating feed flow', (r.recirc * 3600) / density(p.Tf, r.Sloop), 'm³/h'], ['Membrane area', r.area, 'm²'], ['Total channel width', r.width, 'm'], ['Single-pass recovery of the module', 100 * m.recovery, '%'], ['Feed outlet temperature', m.TfOut, '°C'], ['Cold-stream outlet temperature', m.coldOut, '°C'], ['Heat supplied', r.Qheat / 1000, 'kW'], ['Heat recovered internally', (m.Qrec * r.width) / 1000, 'kW'], ['Pumping power', (m.Wpump * r.width) / 1000, 'kW']] }, ...mdTables(r, p)];
@@ -1342,10 +1586,13 @@ function runMD(v) {
 function runROMD(v) {
   const p = v, W = [], ionsF = scaleIons(cloneIons(p.ions), p.salinityFactor ?? 1);
   let ro;
-  try { ro = simulateRO({ ...defaultsOf(roSuite), ions: ionsF, Qf: p.Qf, T: p.T, pH: p.pH, recovery: p.roRec, targetFlux: p.roFlux, design: 'auto', mode: 'recovery', nSeg: 2 }); }
+  const blk = roBlock((p.Qf * p.roRec) / 100, p.roFlux);
+  if (blk.below) throw roBelow((p.Qf * p.roRec) / 100, p.roFlux, 'The RO stage', `Raise the feed flow to at least ${fmt(Math.ceil((1e3 * 0.5 * blk.q1 * 100) / p.roRec) / 1e3, 3)} m³/h or lower the RO design flux.`);
+  try { ro = simulateRO({ ...defaultsOf(roSuite), ions: ionsF, Qf: p.Qf, T: p.T, pH: p.pH, recovery: p.roRec, targetFlux: p.roFlux, design: 'auto', mode: 'recovery', nSeg: 2, elements: blk.elements }); }
   catch (e) { throw new Error(`The RO stage could not be solved at ${p.roRec} % recovery: ${e.message}`); }
   if (ro.p1.Pf > ro.cfg.M.pmax) W.push({ level: 'bad', msg: `RO feed pressure ${fmt(ro.p1.Pf, 3)} bar exceeds the ${ro.cfg.M.pmax} bar element rating — lower the RO recovery and let the MD stage do more.` });
   const mdRec = p.mdRec > 0 ? p.mdRec : 50, r = simulateMD({ ...p, ions: ro.conc.ions, salinityFactor: 1, Qf: ro.conc.Q, mdRec }), m = r.m;
+  mdGuard(m, p, r.rec > 0 ? r.Sloop : r.Sfeed, 'RO brine in the MD loop');
   mdWarnings(r, { ...p, mdRec }, W);
   const QpMD = (r.prod * 3600) / density(25, 0), Qb = (r.brine * 3600) / density(25, r.Sbrine), Qp = ro.product.Q + QpMD, hs = heatSource(p, r.Qheat / 1000, p.Tf, W), Pmd = (m.Wpump * r.width) / 1000;
   const prodIons = scaleIons(ro.product.ions, ro.product.Q / Qp), secE = (ro.power + Pmd) / Qp, secT = r.Qheat / 1000 / Qp, rec = Qp / p.Qf;
@@ -1357,7 +1604,7 @@ function runROMD(v) {
     ...mdTables(r, p),
   ];
   if (hs) tables.push({ title: hs.title, columns: ['Quantity', 'Value'], rows: hs.rows, note: hs.note });
-  const recs = [30, 45, 60, 75].filter((x) => x !== mdRec).concat(mdRec).sort((a, b) => a - b), sw = recs.map((x) => { try { const q = simulateMD({ ...p, ions: ro.conc.ions, salinityFactor: 1, Qf: ro.conc.Q, mdRec: x, nSeg: Math.min(p.nSeg, 8) }); return [x, 100 * (ro.product.Q + (q.prod * 3600) / 997) / p.Qf, q.m.fluxLMH, q.Sbrine]; } catch { return [x, NaN, NaN, NaN]; } });
+  const recs = p._lean ? [mdRec] : [30, 45, 60, 75].filter((x) => x !== mdRec).concat(mdRec).sort((a, b) => a - b), sw = recs.map((x) => { try { const q = simulateMD({ ...p, ions: ro.conc.ions, salinityFactor: 1, Qf: ro.conc.Q, mdRec: x, nSeg: Math.min(p.nSeg, 8) }); return [x, 100 * (ro.product.Q + (q.prod * 3600) / 997) / p.Qf, q.m.fluxLMH, q.Sbrine]; } catch { return [x, NaN, NaN, NaN]; } });
   return {
     summary: `RO recovers ${fmt(100 * ro.overallRec, 3)} % at ${fmt(ro.p1.Pf, 3)} bar and MD concentrates its brine by a further ${fmt(100 * r.recOverall, 3)} %, for an overall recovery of ${fmt(100 * rec, 3)} % (${fmt(Qp, 4)} m³/h) using ${fmt(secE, 3)} kWh/m³ of electricity and ${fmt(secT, 3)} kWh/m³ of heat; final brine ${fmt(r.Sbrine, 3)} g/kg.`,
     warnings: W,
@@ -1411,6 +1658,15 @@ function runHDH(v) {
 }
 
 // ---- result builders of the emerging processes, hybrid chains and optional modules -----------------------------------------
+/** A capacitive cycle must charge above its discharge voltage and, as reported, remove salt and consume energy; otherwise the inputs are rejected with the way out. */
+function cdiCheck(p) {
+  if (p.cdiVdis >= p.cdiV) throw new Error(`The discharge voltage (${fmt(p.cdiVdis, 3)} V) must be below the charging voltage (${fmt(p.cdiV, 3)} V), otherwise the cell would take up salt while "discharging". Lower the discharge voltage below ${fmt(p.cdiV, 3)} V (0 V is usual) or raise the charging voltage.`);
+}
+function cdiGuard(r, p) {
+  if (r.salt > 0 && r.charge > 0 && r.Enet >= 0 && Number.isFinite(r.sec)) return;
+  throw new Error(`The last simulated cycle releases salt or returns energy instead of desalinating: the electrodes start with ${fmt(p.cdiQ0, 3)} % of their equilibrium charge and ${fmt(p.lgTheta0, 3)} % adsorption coverage, and ${Math.round(p.cdiCycles)} cycle${Math.round(p.cdiCycles) > 1 ? 's are' : ' is'} not enough to reach the periodic state. Simulate more cycles, lengthen the charging step, or lower the initial electrode charge and coverage.`);
+}
+
 function cdiResult(r, p, W, name = 'CDI') {
   const kpis = [], plots = [], tables = [], Vt = (R * K(r.T)) / F, psiD = Vt * r.pdOf(r.sigmaEnd[0], r.cEnd), stern = (r.sigmaEnd[0] * F) / p.cdiCst;
   if (p.cdiV > 1.23) W.push({ level: 'warn', msg: 'Charging above 1.23 V risks water electrolysis and carbon oxidation.' });
@@ -1437,9 +1693,12 @@ function cdiResult(r, p, W, name = 'CDI') {
 }
 
 function runCDI(v) {
-  const p = v, W = [], ions = scaleIons(cloneIons(p.ions), p.salinityFactor ?? 1), c0 = eqConc(ions), r = simulatePorousCDI(p, c0), q = cdiResult(r, p, W, 'CDI'), qA = p.cdiQ / 1000 / 60, cell = p.Qf / 3600 / qA / r.waterRec;
+  cdiCheck(v);
+  const p = v, W = [], ions = scaleIons(cloneIons(p.ions), p.salinityFactor ?? 1), c0 = eqConc(ions), r = simulatePorousCDI(p, c0);
+  cdiGuard(r, p);
+  const q = cdiResult(r, p, W, 'CDI'), qA = p.cdiQ / 1000 / 60, cell = p.Qf / 3600 / qA / r.waterRec;
   if (!W.length) W.push({ level: 'info', msg: 'Porous-electrode model solved; salt and charge balances close.' });
-  const Vs = linspace(0.4, 1.4, 5), sw = Vs.map((V) => { try { const s = simulatePorousCDI(p, c0, { cdiV: V, cdiNx: Math.min(p.cdiNx, 5), cdiCycles: 1, cdiNt: 30 }); return [s.sac, 100 * s.eff, s.sec]; } catch { return [NaN, NaN, NaN]; } });
+  const Vs = p._lean ? [] : linspace(0.4, 1.4, 5), sw = Vs.map((V) => { try { const s = simulatePorousCDI(p, c0, { cdiV: V, cdiNx: Math.min(p.cdiNx, 5), cdiCycles: 1, cdiNt: 30 }); return [s.sac, 100 * s.eff, s.sec]; } catch { return [NaN, NaN, NaN]; } });
   const ionsP = scaleIons(ions, r.cAvg / c0), ionsC = scaleIons(ions, 1 + (1 - r.cAvg / c0) * (p.cdiTc / p.cdiTd));
   return {
     summary: `The capacitive-deionisation cell removes ${fmt(100 * r.removal, 3)} % of the salt (${fmt(tds(ions), 4)} → ${fmt(tds(ionsP), 4)} mg/L) with ${fmt(r.sac, 3)} mg/g per cycle at ${fmt(100 * r.eff, 3)} % charge efficiency and ${fmt(r.sec, 3)} kWh/m³; ${fmt(cell, 4)} m² of cell area treat ${fmt(p.Qf, 3)} m³/h.`,
@@ -1453,12 +1712,17 @@ function runCDI(v) {
 }
 
 function runCDIRO(v) {
+  cdiCheck(v);
   const p = v, W = [], ionsF = scaleIons(cloneIons(p.ions), p.salinityFactor ?? 1);
   let ro;
-  try { ro = simulateRO({ ...defaultsOf(roSuite), ions: ionsF, Qf: p.Qf, T: p.T, pH: p.pH, recovery: p.roRec, targetFlux: p.roFlux, design: 'auto', mode: 'recovery', nSeg: 2 }); }
+  const blk = roBlock((p.Qf * p.roRec) / 100, p.roFlux);
+  if (blk.below) throw roBelow((p.Qf * p.roRec) / 100, p.roFlux, 'The RO stage', `Raise the feed flow to at least ${fmt(Math.ceil((1e3 * 0.5 * blk.q1 * 100) / p.roRec) / 1e3, 3)} m³/h or lower the RO design flux.`);
+  try { ro = simulateRO({ ...defaultsOf(roSuite), ions: ionsF, Qf: p.Qf, T: p.T, pH: p.pH, recovery: p.roRec, targetFlux: p.roFlux, design: 'auto', mode: 'recovery', nSeg: 2, elements: blk.elements }); }
   catch (e) { throw new Error(`The RO stage could not be solved at ${p.roRec} % recovery: ${e.message}`); }
   if (ro.p1.Pf > ro.cfg.M.pmax) W.push({ level: 'bad', msg: `RO feed pressure ${fmt(ro.p1.Pf, 3)} bar exceeds the ${ro.cfg.M.pmax} bar element rating — lower the RO recovery.` });
-  const c0 = Math.max(eqConc(ro.product.ions), 1e-3), r = simulatePorousCDI(p, c0), q = cdiResult(r, p, W, 'CDI polishing'), qA = p.cdiQ / 1000 / 60, Qcdi = ro.product.Q * r.waterRec, cell = ro.product.Q / 3600 / qA, Pcdi = r.sec * Qcdi;
+  const c0 = Math.max(eqConc(ro.product.ions), 1e-3), r = simulatePorousCDI(p, c0);
+  cdiGuard(r, p);
+  const q = cdiResult(r, p, W, 'CDI polishing'), qA = p.cdiQ / 1000 / 60, Qcdi = ro.product.Q * r.waterRec, cell = ro.product.Q / 3600 / qA, Pcdi = r.sec * Qcdi;
   const ionsP = scaleIons(ro.product.ions, r.cAvg / c0), secE = (ro.power + Pcdi) / Qcdi, rec = Qcdi / p.Qf;
   if (!W.length) W.push({ level: 'info', msg: 'RO and the capacitive polishing step solved; balances close.' });
   return {
@@ -1475,7 +1739,12 @@ function runCDIRO(v) {
 
 /** FO followed by a second process that re-concentrates the diluted draw and delivers the product: membrane distillation or electrodialysis. */
 function runFOChain(v) {
-  const p = v, W = [], r = simulateFO(p), d = r.d, T = r.T, Vw = r.tot.Vw * 3600, Qdil = r.drawOut.Q * 3600, md = p.process === 'fo_md';
+  const md = v.process === 'fo_md', W = [];
+  // share of the diluted draw (by mass) that the regeneration step must remove to return the draw at its inlet strength, and the most MD can remove
+  const loop = (rr) => { const S = salinityFromTDS(tds(drawAsIons(v.draw, rr.cDout, rr.T).ions), 25); return { need: (rr.tot.Vw * density(25, 0)) / (rr.drawOut.Q * density(25, S)), lim: mdRecLimit(S), S }; };
+  const st = md ? settleDrawLoop(v, simulateFO(v), loop) : null, p = st ? st.p : v, r = st ? st.r : simulateFO(v);
+  if (st?.limited) W.push({ level: 'warn', msg: `Membrane distillation can remove at most ${fmt(100 * st.limited.lim0, 3)} % of the diluted draw (${st.limited.lim0 < 0.95 ? `the regenerated draw would otherwise exceed ${S_LOOP_MAX} g/kg` : 'loop recovery limit'}), not the ${fmt(100 * st.limited.need0, 3)} % needed to return it at ${fmt(v.cDraw, 3)} mol/L. The draw loop therefore settles at ${fmt(st.limited.c, 3)} mol/L and the FO flux falls from ${fmt(st.limited.J0, 3)} to ${fmt(r.JwLMH, 3)} L/m²·h. Raise the draw flow to about ${fmt((st.limited.V0 * (1 - st.limited.lim0)) / st.limited.lim0, 3)} m³/h or reduce the FO membrane area.` });
+  const d = r.d, T = r.T, Vw = r.tot.Vw * 3600, Qdil = r.drawOut.Q * 3600;
   if (!(Vw > 1e-6 * Math.max(p.Qf, 1e-9))) { // nothing for the downstream step to treat: show the FO step on its own instead of failing
     const res = runFO({ ...v, process: 'fo' });
     res.warnings = [{ level: 'bad', msg: `Practically no water crosses the FO membrane (${fmt(Math.max(Vw, 0), 3)} m³/h), so the ${md ? 'membrane-distillation' : 'electrodialysis'} step of the hybrid has nothing to recover. The forward-osmosis step is shown on its own — raise the draw concentration or the membrane area.` }, ...res.warnings.filter((w) => w.level !== 'info' || !/module solved/.test(w.msg))];
@@ -1488,16 +1757,17 @@ function runFOChain(v) {
     res.outputs = { ...res.outputs, process: 'fo (electrodialysis not applicable to a non-ionic draw)' };
     return res;
   }
-  if (!r.conv) W.push({ level: 'warn', msg: 'The counter-current FO iteration did not fully converge.' });
+  foModuleWarnings(r, p, W);
   const da = drawAsIons(p.draw, r.cDout, T);
   if (da.equivalent) W.push({ level: 'info', msg: `${d.name} carries no ions: membrane distillation is solved for the osmotically equivalent NaCl solution (${fmt((da.cEq * 58.44) / 1000, 3)} g/L), which has the same water activity and therefore the same vapour-pressure lowering. The sugar is non-volatile and stays in the draw loop; its higher viscosity is not included.` });
-  const ionsD = da.ions, frac = clamp(Vw / Qdil, 0.02, 0.97), eFO = r.Ppump / 1000, fracM = clamp((Vw * density(25, 0)) / (Qdil * density(25, salinityFromTDS(tds(ionsD), 25))), 0.02, 0.95); // mass fraction of the diluted draw that is the transferred water
+  const ionsD = da.ions, frac = clamp(Vw / Qdil, 0.02, 0.97), eFO = r.Ppump / 1000, fracM = Math.min((Vw * density(25, 0)) / (Qdil * density(25, salinityFromTDS(tds(ionsD), 25))), 0.95); // mass fraction of the diluted draw that is the transferred water
   const feedOutIons = scaleIons(r.ions, r.fOut); if (d.ions) for (const [k, m] of Object.entries(d.ions)) feedOutIons[k] = (feedOutIons[k] || 0) + m * (r.feedOut.nd / r.feedOut.Q);
   const common = { xs: r.segs.map((g) => g.x) }, foPlot = { type: 'line', title: 'FO water flux and osmotic pressures along the module', xlabel: 'Position along the feed path (fraction)', ylabel: 'L/m²·h · bar', series: [{ name: 'Water flux (L/m²·h)', x: common.xs, y: r.segs.map((g) => g.Jw * 3.6e6) }, { name: 'Draw osmotic pressure, bulk (bar)', x: common.xs, y: r.segs.map((g) => g.piDb / 1e5) }, { name: 'Feed osmotic pressure, bulk (bar)', x: common.xs, y: r.segs.map((g) => g.piFb / 1e5) }] };
   const foK = [{ label: 'FO water flux', value: r.JwLMH, unit: 'L/m²·h' }, { label: 'Water transferred by FO', value: Vw, unit: 'm³/h' }, { label: 'FO feed recovery', value: 100 * r.recovery, unit: '%' }, { label: 'Draw dilution factor', value: r.dilution, unit: '×' }, { label: 'Reverse solute flux', value: r.JsGMH, unit: 'g/m²·h' }];
-  const foBal = [{ name: 'FO water (m³/h)', in: (r.QF0 + r.QD0) * 3600, out: (r.feedOut.Q + r.drawOut.Q) * 3600 }, { name: 'FO draw solute (mol/s)', in: r.QD0 * r.cD0, out: r.drawOut.n + r.feedOut.nd }];
+  const foBal = [{ name: 'FO water (m³/h)', in: (r.QF0 + r.QD0) * 3600, out: (r.feedOut.Q + r.drawOut.Q) * 3600 }, { name: 'FO draw solute (mol/s)', in: r.QD0 * r.cD0, out: r.drawOut.n + r.feedOut.nd }, ...foClosure(r)];
   if (md) {
     const q = simulateMD({ ...p, ions: ionsD, salinityFactor: 1, Qf: Qdil, mdRec: 100 * fracM }), m = q.m, Qp = (q.prod * 3600) / density(25, 0), Pmd = (m.Wpump * q.width) / 1000, hs = heatSource(p, q.Qheat / 1000, p.Tf, W);
+    mdGuard(m, p, q.Sloop, 'diluted draw in the MD loop');
     mdWarnings(q, { ...p, mdRec: 100 * fracM }, W);
     const tables = [{ title: 'Contribution of each process', columns: ['Process', 'Role', 'Water handled (m³/h)', 'Membrane area (m²)', 'Flux (L/m²·h)', 'Electricity (kW)', 'Heat (kW)', 'Electricity (kWh per m³ product)', 'Heat (kWh per m³ product)'],
       rows: [['Forward osmosis', `Draws ${fmt(100 * r.recovery, 3)} % of the feed into the draw`, Vw, r.area, r.JwLMH, eFO, 0, eFO / Qp, 0], ['Membrane distillation', `Re-concentrates the draw from ${fmt(r.cDout / 1000, 3)} to ${fmt(p.cDraw, 3)} mol/L`, Qp, q.area, m.fluxLMH, Pmd, q.Qheat / 1000, Pmd / Qp, q.sth], ['Hybrid total', `Overall recovery ${fmt((100 * Qp) / p.Qf, 3)} %`, Qp, r.area + q.area, null, eFO + Pmd, q.Qheat / 1000, (eFO + Pmd) / Qp, q.sth]], note: 'The MD distillate is the product; the MD concentrate returns to the FO as regenerated draw. The FO membrane keeps foulants and scalants away from the MD membrane.' }, ...mdTables(q, p)];
@@ -1512,10 +1782,10 @@ function runFOChain(v) {
       outputs: { flux: r.JwLMH, secThermal: q.sth, secElec: (eFO + Pmd) / Qp, area: r.area + q.area, recovery: Qp / p.Qf, heat: q.Qheat / 1000, power: eFO + Pmd, process: 'fo-md', streams: { product: stream(Qp, m.coldOut, 6.5, cloneIons({})), concentrate: stream(r.feedOut.Q * 3600, T, p.pH, feedOutIons) } },
     };
   }
-  let ed;
+  let ed = null;
   try { ed = simulateED({ ...defaultsOf(edSuite), ions: ionsD, Qp: Vw, T, pH: 7, mode: 'design', targetTDS: p.edTarget, recovery: clamp(100 * frac, 30, 97), maxStages: 16, nSeg: 6, edr: false }, { tol: 1e-5 }); }
-  catch (e) { throw new Error(`Electrodialysis of the diluted draw could not be solved: ${e.message}`); }
-  if (![ed.sec, ed.tdsP, ed.Qprod, ed.area, ed.Pel, ed.eff].every(Number.isFinite) || !(ed.Qprod > 0)) { // the diluted draw is outside what an ED stack can treat: show the FO step alone
+  catch { ed = null; } // no stack design exists for this stream: handled below like any other case without an electrodialysis solution
+  if (!ed || ![ed.sec, ed.tdsP, ed.Qprod, ed.area, ed.Pel, ed.eff].every(Number.isFinite) || !(ed.Qprod > 0)) { // the diluted draw is outside what an ED stack can treat: show the FO step alone
     const res = runFO({ ...v, process: 'fo' });
     res.warnings = [{ level: 'bad', msg: `Electrodialysis has no solution for the diluted draw (${fmt(tds(ionsD) / 1000, 3)} g/L): this hybrid needs a dilute draw, below about 0.3 mol/L. The forward-osmosis step is shown on its own.` }, ...res.warnings.filter((w) => w.level !== 'info' || !/module solved/.test(w.msg))];
     res.outputs = { ...res.outputs, process: 'fo (electrodialysis step has no solution)' };
@@ -1540,7 +1810,9 @@ function runFOChain(v) {
 }
 
 function runMDC(v) {
-  const p = v, W = [], r = simulateMDC(p), m = r.m, cr = r.cr, Qp = (r.prod * 3600) / density(25, 0), hs = heatSource(p, r.Qheat / 1000, p.Tf, W), margin = r.lep / 1e5 - p.pFeed;
+  const p = v, W = [], r = simulateMDC(p), m = r.m;
+  mdGuard(m, p, r.Sloop, 'saturated brine of the MD loop');
+  const cr = r.cr, Qp = (r.prod * 3600) / density(25, 0), hs = heatSource(p, r.Qheat / 1000, p.Tf, W), margin = r.lep / 1e5 - p.pFeed;
   if (!(r.solids > 0)) W.push({ level: 'bad', msg: `No crystals form: the bleed of ${p.bleed} % carries away all the salt and keeps the loop at ${fmt(r.Sloop, 4)} g/kg, below saturation. Lower the bleed.` });
   if (r.wallSat >= 1) W.push({ level: 'warn', msg: `The membrane surface is ${fmt(100 * (r.wallSat - 1), 3)} % above saturation at the feed temperature: crystals will also grow on the membrane. Raise the cross-flow velocity or the temperature difference between loop and crystalliser.` });
   if (margin < 1) W.push({ level: margin < 0 ? 'bad' : 'warn', msg: `Wetting margin is ${fmt(margin, 2)} bar (liquid-entry pressure ${fmt(r.lep / 1e5, 3)} bar); saturated brine and crystals promote wetting.` });
@@ -1632,6 +1904,7 @@ function addExtras(res, v) {
   // ---- multi-objective sweep
   if (v.pareto && (v.process === 'md' || v.process === 'fo')) {
     const po = paretoDesigns(v, S, md), pts = po.all;
+    if (po.truncated) W.push({ level: 'info', msg: `The multi-objective search was stopped after ${po.evals} designs: in this operating region (${md ? 'a stream that runs into equilibrium with the other inside the module' : 'osmotic equilibrium inside the module'}) every module solution is expensive. The front shown is that of the designs evaluated so far.` });
     if (pts.length > 2) {
       const pf = paretoFront(pts, (q) => q.flux, (q) => q.en), kn = pf.knee, unit = md ? 'kWh heat per m³' : 'kWh-equivalent per m³';
       K.push({ label: 'Pareto-optimal designs', value: pf.front.length, unit: `of ${pts.length}`, help: `${po.grid.length} grid designs (backdrop) + ${po.ga.length} designs of the NSGA-II search (${po.evals} model evaluations, seed ${po.seed}); hypervolume ${fmt(po.hvGrid, 4)} → ${fmt(po.hvAll, 4)}` }, { label: 'Knee of the Pareto front: flux', value: kn.flux, unit: 'L/m²·h', help: md ? `Hot feed ${fmt(kn.a, 3)} °C, velocity ${fmt(kn.b, 3)} m/s, channel length ${fmt(kn.c, 3)} m` : `Draw ${fmt(kn.a, 3)} mol/L, velocity ${fmt(kn.b, 3)} cm/s` }, { label: 'Knee of the Pareto front: energy', value: kn.en, unit: unit });

@@ -23,6 +23,8 @@ const tFromH = (h, S) => { let T = h / cp(40, S); for (let i = 0; i < 14; i++) {
 export const uEvaporator = (T) => 1e3 * (1.9695 + 1.2057e-2 * T - 8.5989e-5 * T * T + 2.5651e-7 * T ** 3);
 export const uCondenser = (T) => 1e3 * (1.7194 + 3.2063e-3 * T + 1.5971e-5 * T * T - 1.9918e-7 * T ** 3);
 const fouled = (U, o) => 1 / (1 / (U * o.fU) + o.Rf);
+/** Error for a design that cannot be built with the present inputs; `kind` selects the search for a feasible neighbour. */
+const infeasible = (msg, kind) => Object.assign(new Error(msg), { infeasible: true, kind });
 
 const MOLAL_W = 55.508; // mol of water per kg
 /** Moles of dissolved ions per kg of water for sea-salt of salinity S (g/kg). */
@@ -89,17 +91,28 @@ function effect(q, F, hf, Bin, Xin, hbin, T, Xf, o, Vg) {
     V = Vn;
   }
   B = m - V; X = salt / B; be = bpeOf(T, X, o); Tv = T - be; hv = hV(Tv) + CPV * be; hb = hL(T, X);
-  return { V, B, X, be, Tv, hv, hb };
+  return { V, B, X, be, Tv, hv, hb, cap: V >= Vmax * (1 - 1e-12) };
+}
+
+/**
+ * One effect of a parallel/cross-feed train: the feed rate is the one that lets the brine leave at the design salinity Xt, so the
+ * salt and enthalpy balances are linear in the feed F and the vapour V (no iteration, no salinity limit to guard).
+ */
+function effectEven(q, hf, Bin, Xin, hbin, T, Xf, Xt, o) {
+  const be = bpeOf(T, Xt, o), Tv = T - be, hv = hV(Tv) + CPV * be, hb = hL(T, Xt), a = 1 - Xf / Xt, b = Bin * (1 - Xin / Xt); // salt: V = a·F + b
+  const F = Math.max(0, (q + Bin * hbin - b * hv - (Bin - b) * hb) / (a * hv + (1 - a) * hb - hf)), V = a * F + b, B = F + Bin - V;
+  return { F, V, B, X: B > 0 ? (F * Xf + Bin * Xin) / B : Xt, be, Tv, hv, hb, cap: false };
 }
 
 /** March once through the train for given heating duty, temperature differences and feed temperatures. */
 function medPass(c, s) {
-  const N = c.N, o = c.o, r = { T: [], Tv: [], Tc: [], Th: [], V: [], fl: [], Vt: [], hm: [], X: [], B: [], q: [], be: [], dl: [], qloss: 0, Ts: s.Ts };
+  const N = c.N, o = c.o, r = { T: [], Tv: [], Tc: [], Th: [], V: [], fl: [], Vt: [], hm: [], X: [], B: [], q: [], be: [], dl: [], mh: [], Fi: [], qloss: 0, Ts: s.Ts, cap: -1 };
   let Tcp = s.Ts, Bin = 0, Xin = c.Xf, hbin = 0, Dacc = s.Mev, hD = hL(s.Ts), mprev = 0, hprev = 0;
   for (let i = 0; i < N; i++) {
     const T = Tcp - s.dT[i], qg = i === 0 ? s.Q1 : mprev * (hprev - hL(Tcp)), q = qg * (1 - c.loss);
     r.qloss += qg - q;
-    const e = effect(q, c.Fi[i], hL(s.tf[i], c.Xf), Bin, Xin, hbin, T, c.Xf, o, s.Vg?.[i]), dl = vapourLoss(e.Tv, o), Tc = e.Tv - dl;
+    const hf = hL(s.tf[i], c.Xf), e = c.even ? effectEven(q, hf, Bin, Xin, hbin, T, c.Xf, c.Xb, o) : effect(q, c.Fi[i], hf, Bin, Xin, hbin, T, c.Xf, o, s.Vg?.[i]), dl = vapourLoss(e.Tv, o), Tc = e.Tv - dl;
+    r.Fi.push(c.even ? e.F : c.Fi[i]);
     let f = 0;
     if (i > 0) { // distillate flash box: condensate of the previous effect's vapour joins the accumulated distillate
       const C = r.Vt[i - 1] - (i - 1 === c.nEnt ? s.Mev : 0), m = Dacc + C, H = Dacc * hD + C * hL(Tcp);
@@ -109,6 +122,7 @@ function medPass(c, s) {
     const Vt = e.V + f, hm = (e.V * e.hv + f * hV(e.Tv)) / Vt;
     r.T.push(T); r.Th.push(Tcp); r.Tv.push(e.Tv); r.Tc.push(Tc); r.V.push(e.V); r.fl.push(f); r.Vt.push(Vt); r.hm.push(hm); r.X.push(e.X); r.B.push(e.B); r.q.push(q); r.be.push(e.be); r.dl.push(dl);
     mprev = Vt - (i === c.nEnt ? s.Mev : 0) - (i < N - 1 ? s.qph[i] / (hm - hL(Tc)) : 0); hprev = hm;
+    r.mh.push(mprev); if (e.cap && r.cap < 0) r.cap = i; // vapour passed on as heating steam (to the next effect or the final condenser); first effect at the salt cap
     Tcp = Tc; Bin = e.B; Xin = e.X; hbin = e.hb;
   }
   const L = N - 1, mc = r.Vt[L] - (L === c.nEnt ? s.Mev : 0);
@@ -131,8 +145,9 @@ function compressor(r, Ts, c) {
  * Flows in kg/s, temperatures in °C, salinities in g/kg, heat in W.
  */
 export function solveMED(c) {
-  const N = c.N, mvc = c.proc === 'mvc', tvc = c.proc === 'tvc', forward = c.arr === 'forward' && !mvc, F = c.F;
-  const cc = { ...c, Fi: forward ? [F, ...fill(N - 1, 0)] : fill(N, F / N), nEnt: tvc ? clamp(c.nEnt, 0, N - 1) : -1 }, tol = c.tol || 1e-10, maxIt = c.maxIt || 250;
+  const N = c.N, mvc = c.proc === 'mvc', tvc = c.proc === 'tvc', forward = c.arr === 'forward' && !mvc;
+  let F = c.F;
+  const cc = { ...c, even: !forward && c.Xb > c.Xf, Fi: forward ? [F, ...fill(N - 1, 0)] : fill(N, F / N), nEnt: tvc ? clamp(c.nEnt, 0, N - 1) : -1 }, tol = c.tol || 1e-10, maxIt = c.maxIt || 250;
   let dT = c.dT0 ? [...c.dT0] : fill(N, mvc ? c.dTm : Math.max(0.5, (c.Ts - c.Tn) / N - 1.1));
   let Ts = mvc ? c.T1 + dT[0] : c.Ts, tf = fill(N, mvc ? c.T1 - 4 : c.Tn - 6), qph = fill(N, 0), Mev = 0, Q1 = 0, Qaux = 0, TfM = c.T1 - 4;
   let r = null, ej = null, comp = null, pre = { Mcw: 0, Tf0: tf[0], hx: [] }, conv = false, it = 0;
@@ -155,26 +170,34 @@ export function solveMED(c) {
     } else Q1 = xv;
     return (lastPass = medPass(cc, { Ts, dT, tf, qph, Q1, Mev, Vg: lastPass?.V }));
   };
-  let slope = 0, lastPass = null, errOuter = ws ? 1e-3 : 1;
+  let slope = 0, lastPass = null, errOuter = ws ? 1e-3 : 1, floored = 0;
   for (; it < maxIt; it++) {
     // inner secant: distillate target at frozen temperatures (production is almost linear in x)
     let x0 = x, r0 = pass(x0), x1;
     r = r0;
     const tolIn = clamp(1e-3 * errOuter, 1e-12, 1e-6) * c.MdT; // loose while the outer loop is far from converged
-    for (let k = 0; k < 8 && Math.abs(r.Md - c.MdT) > tolIn; k++) {
+    let lo = null, hi = null; // closest points below and above the target: production rises with x, so they bracket the root
+    const mark = (xv, rv) => { const g = rv.Md - c.MdT; if (g < 0) { if (!lo || xv > lo.x) lo = { x: xv, g }; } else if (g > 0 && (!hi || xv < hi.x)) hi = { x: xv, g }; };
+    mark(x0, r0);
+    for (let k = 0; k < (lo && hi ? 60 : 8) && Math.abs(r.Md - c.MdT) > tolIn; k++) {
       x1 = slope > 0 ? x0 + (c.MdT - r0.Md) / slope : mvc ? x0 + 0.01 * c.MdT * latentHeat(Ts) : x0 * clamp(c.MdT / r0.Md || 1.5, 0.3, 3);
       if (!mvc && !(x1 > 0)) x1 = 0.5 * x0;
+      if (lo && hi && (!(x1 > lo.x && x1 < hi.x) || k >= 6)) x1 = lo.x + (hi.x - lo.x) * (k % 3 === 2 ? 0.5 : clamp(-lo.g / (hi.g - lo.g), 0.05, 0.95)); // the secant left the bracket (a salinity limit flattens the curve): false position with bisection steps
       if (x1 === x0) break;
       const r1 = pass(x1), sl = (r1.Md - r0.Md) / (x1 - x0);
       if (Number.isFinite(sl) && sl > 0) slope = sl;
-      x0 = x1; r0 = r1; r = r1;
+      x0 = x1; r0 = r1; r = r1; mark(x1, r1);
     }
     let err = Math.abs(r.Md - c.MdT) / c.MdT + Math.abs(x0 - x) / (Math.abs(x0) + (mvc ? c.MdT * 1e5 : 1e-30));
     x = x0;
-    if (!forward && N > 1) { // distribute the feed in proportion to the vapour boiled so every effect concentrates alike
-      const Vs = sum(r.V.map((q) => Math.max(q, 0))), Fn = r.V.map((q, i) => 0.3 * cc.Fi[i] + 0.7 * F * Math.max(Math.max(q, 0) / Vs, 0.2 / N)), Fs = sum(Fn);
-      err = Math.max(err, ...Fn.map((q, i) => Math.abs((q * F) / Fs - cc.Fi[i]) / F));
-      cc.Fi = Fn.map((q) => (q * F) / Fs);
+    if (cc.even) { // parallel / cross feed: every effect takes the feed that concentrates it to the design brine salinity
+      const Fs = sum(r.Fi);
+      err = Math.max(err, ...r.Fi.map((q, i) => Math.abs(q - cc.Fi[i]) / Fs));
+      cc.Fi = [...r.Fi]; F = cc.F = Fs;
+    } else if (c.Xb > c.Xf) { // forward feed: the vented vapour is boiled as well, so the feed follows the gross vapour and the blow-down leaves at the design salinity
+      const Fg = ((c.MdT + Math.max(0, r.vent)) * c.Xb) / (c.Xb - c.Xf);
+      err = Math.max(err, Math.abs(Fg - F) / F);
+      cc.Fi = cc.Fi.map((q) => (q * Fg) / F); F = cc.F = Fg;
     }
     if (c.areaMode === 'equalArea' && N > 1) {
       const Am = sum(r.A) / N, S = sum(dT);
@@ -210,10 +233,23 @@ export function solveMED(c) {
     }
     errOuter = err;
     if (err < tol && it > 1) { conv = true; break; }
+    if (!mvc && Math.min(...dT) <= 0.0501) { if (++floored > 15) break; } else floored = 0; // the temperature losses use up the whole window: no design exists
   }
   if (c.warm) { if (conv) Object.assign(c.warm, { key: wKey, dT: [...dT], tf: [...tf], qph: [...qph], Fi: [...cc.Fi], F, x, MdT: c.MdT, fz: { ...fz } }); else c.warm.key = ''; }
-  if (!conv && !r.T.every((T) => T > c.Tsw - 5 && T < 200)) throw new Error('The effect train could not be solved for these inputs — the temperature window is too narrow for this number of effects' + (tvc ? ' or the ejector suction point leaves too little vapour for the downstream effects.' : '.'));
-  if (!mvc && r.Tc[N - 1] - c.ttdCond <= c.Tsw + 0.3) throw new Error(`The last-effect vapour condenses at ${fmt(r.Tc[N - 1], 3)} °C, too close to the ${fmt(c.Tsw, 3)} °C seawater for the final condenser. Raise the last-effect temperature or lower the condenser approach.`);
+  // ---- a design that cannot be built is reported as such, never returned with open balances
+  const L = N - 1, finite = [x, r.Md, Q1, ...r.T, ...r.V, ...r.A, ...dT].every(Number.isFinite), lossK = sum(r.be.slice(0, L)) + sum(r.dl.slice(0, L)), fewer = N > 1 ? 'use fewer effects' : 'widen the temperature window';
+  if (!finite || (!conv && Math.min(...dT) <= 0.0501)) {
+    if (mvc) throw infeasible(`The vapour-compression train cannot be solved: with ${N} effect${N > 1 ? 's' : ''} and a condensing − boiling difference of ${fmt(c.dTm, 3)} K the last effect would have to run below the ${fmt(c.Tsw, 3)} °C seawater. Use fewer effects, a smaller temperature difference or a higher first-effect temperature.`, 'window');
+    throw infeasible(`The ${fmt(c.Ts - c.Tn, 3)} K between the heating steam (${fmt(c.Ts, 4)} °C) and the last effect (${fmt(c.Tn, 4)} °C) cannot drive ${N} effects: boiling-point elevation and demister/line losses alone take about ${fmt(lossK, 3)} K at ${fmt(c.Xb, 3)} g/kg. Raise the heating-steam temperature, lower the last-effect temperature, ${fewer} or lower the maximum brine salinity.`, 'window');
+  }
+  if (mvc && r.T[L] < c.Tsw + 1) throw infeasible(`With ${N} effects and a condensing − boiling difference of ${fmt(c.dTm, 3)} K the last effect would run at ${fmt(r.T[L], 3)} °C, not above the ${fmt(c.Tsw, 3)} °C seawater that feeds it. Use fewer effects, a smaller temperature difference or a higher first-effect temperature.`, 'window');
+  if (r.cap >= 0) throw infeasible(`The brine of effect ${r.cap + 1} would be concentrated beyond 280 g/kg, where salt crystallises. Lower the maximum brine salinity or ${fewer}.`, 'salt');
+  const iDry = r.V.findIndex((q) => !(q > 0)), iHeat = r.mh.findIndex((q) => !(q > 0));
+  if (tvc && iHeat === cc.nEnt) throw infeasible(`The thermo-compressor would entrain ${fmt(Mev, 3)} kg/s from effect ${cc.nEnt + 1}, which produces only ${fmt(r.Vt[cc.nEnt], 3)} kg/s of vapour, so nothing is left to heat the ${cc.nEnt < L ? 'next effect' : 'final condenser'}. Take the suction from a colder effect (larger suction-effect number) so that less vapour is entrained per kg of motive steam, or use fewer effects.`, 'ejector');
+  if (iDry >= 0 || iHeat >= 0) { const k = iDry >= 0 ? iDry : iHeat + 1; throw infeasible(`Effect ${Math.min(k, L) + 1} would receive no heating vapour or boil nothing: ${forward && !c.preheat ? 'in forward feed without preheaters the cold feed absorbs the heat of the first effect. Enable the feed preheaters, choose parallel feed or use fewer effects.' : 'the vapour of the effect before it is used up elsewhere. Use fewer effects or a wider temperature window.'}`, 'dry'); }
+  if (!conv) throw infeasible(mvc ? `The vapour-compression heat balance did not converge for ${N} effect${N > 1 ? 's' : ''} at ${fmt(c.T1, 3)} °C with a ${fmt(c.dTm, 3)} K temperature difference. Use fewer effects, a larger temperature difference or a higher first-effect temperature.`
+    : `The effect-by-effect iteration did not settle for ${N} effects between ${fmt(c.Ts, 4)} °C and ${fmt(c.Tn, 4)} °C (smallest driving temperature difference ${fmt(Math.min(...dT), 2)} K). Widen the temperature window, ${fewer} or select the equal-temperature-difference sizing.`, 'converge');
+  if (!mvc && r.Tc[L] - c.ttdCond <= c.Tsw + 0.3) throw infeasible(`The last-effect vapour condenses at ${fmt(r.Tc[L], 3)} °C, too close to the ${fmt(c.Tsw, 3)} °C seawater for the final condenser with a ${fmt(c.ttdCond, 2)} K approach. Raise the last-effect temperature to at least ${fmt(Math.ceil(c.Tsw + c.ttdCond + (c.Tn - r.Tc[L]) + 1), 3)} °C or reduce the condenser approach.`, 'condenser');
   return { ...r, c: cc, dT, Ts, tf, qph, Q1, ej, comp, pre, converged: conv, iterations: it, forward, TfM, Qaux };
 }
 
@@ -242,6 +278,10 @@ function preheatTrain(c, r, forward, Mev) {
 /** Stage-by-stage MSF (c.type 'br' brine recirculation with nRej heat-rejection stages, 'ot' once-through). */
 export function solveMSF(c) {
   const N = c.N, o = c.o, br = c.type === 'br', nRej = br ? clamp(c.nRej, 1, N - 1) : 0, nRec = N - nRej, dTs = (c.TBT - c.Tn) / N;
+  if (!(dTs >= 0.5)) { // every stage needs a temperature drop that exceeds its non-equilibrium and demister losses
+    const nMax = Math.floor((c.TBT - c.Tn) / 0.5);
+    throw infeasible(`The flashing range between the top brine temperature (${fmt(c.TBT, 4)} °C) and the last stage (${fmt(c.Tn, 4)} °C) is ${fmt(Math.max(0, c.TBT - c.Tn), 3)} K; ${N} stages need at least ${fmt(0.5 * N, 3)} K (0.5 K per stage). Raise the top brine temperature to at least ${fmt(Math.ceil(c.Tn + 0.5 * N), 4)} °C or lower the last-stage temperature to ${fmt(Math.floor(c.TBT - 0.5 * N), 4)} °C or less${nMax >= 3 ? `, or use at most ${nMax} stages` : ''}.`, 'order');
+  }
   const T = Array.from({ length: N + 1 }, (_, i) => c.TBT - i * dTs);
   const Mf0 = br ? (c.MdT * c.Xb) / (c.Xb - c.Xf) : 0;
   let Mr = c.MdT / (1 - Math.exp((-cp(75, c.Xf) * (c.TBT - c.Tn)) / latentHeat(75))), st, Xr = c.Xf, conv = false;
@@ -272,6 +312,8 @@ export function solveMSF(c) {
     if (Math.abs(st.Md - c.MdT) < 1e-11 * c.MdT) { conv = true; break; }
     Mr *= c.MdT / st.Md;
   }
+  if (!conv || ![Mr, st.Md, ...st.X, ...st.Tv].every(Number.isFinite)) throw infeasible(`The stage-by-stage flashing balance did not converge for ${N} stages between ${fmt(c.TBT, 4)} °C and ${fmt(c.Tn, 4)} °C. Widen the flashing range (higher top brine temperature or lower last-stage temperature) or use fewer stages.`, 'converge');
+  if (br && Mr < Mf0 * (1 + 1e-9)) throw infeasible(`The brine recirculation (${fmt(Mr, 4)} kg/s) would be smaller than the make-up feed (${fmt(Mf0, 4)} kg/s) needed to hold the blow-down at ${fmt(c.Xb, 3)} g/kg. Raise the maximum brine salinity, reduce the flashing range or choose the once-through arrangement.`, 'recycle');
   const Mf = br ? Mf0 : Mr, Mb = Mf - st.Md, Xb = st.X[N - 1];
   // tube side, cold end first
   const t = fill(N + 2, c.Tsw);
@@ -279,7 +321,7 @@ export function solveMSF(c) {
   if (br) {
     const Qrej = sum(st.Qc.slice(nRec)), h0 = hL(c.Tsw, c.Xf);
     tout = st.Tv[nRec] - c.ttdRej;
-    if (tout <= c.Tsw + 0.2) throw new Error(`Heat-rejection stages run at ${fmt(st.Tv[nRec], 3)} °C, too close to the ${fmt(c.Tsw, 3)} °C seawater. Raise the last-stage temperature or lower the rejection approach.`);
+    if (tout <= c.Tsw + 0.2) throw infeasible(`The heat-rejection stages condense at ${fmt(st.Tv[nRec], 3)} °C, too close to the ${fmt(c.Tsw, 3)} °C seawater for a ${fmt(c.ttdRej, 2)} K approach. Raise the last-stage temperature, reduce the rejection approach or use fewer rejection stages.`, 'reject');
     Mrej = Qrej / (hL(tout, c.Xf) - h0);
     if (Mrej < Mf) { Mrej = Mf; tout = tFromH(h0 + Qrej / Mf, c.Xf); }
     Mcw = Mrej - Mf;
@@ -298,7 +340,7 @@ export function solveMSF(c) {
     stages.push({ i, rec, Tin: T[i - 1], T: T[i], Tv: st.Tv[i - 1], P: psat(st.Tv[i - 1]), B: st.B[i - 1], X: st.X[i - 1], D: st.D[i - 1], Dacc: st.Dacc[i - 1], be: st.be[i - 1], nea: st.nea[i - 1], dl: st.dl[i - 1], tin, tout: t[i], ttd: st.Tv[i - 1] - t[i], U, A: hx.area, Q: st.Qc[i - 1], ntu: hx.ntu, eff: hx.eff, m });
   }
   const bad = stages.find((s) => s.ttd <= 0.05);
-  if (bad) throw new Error(`Stage ${bad.i}: the tube-side brine (${fmt(bad.tout, 4)} °C) is not colder than the condensing vapour (${fmt(bad.Tv, 4)} °C). Add stages, widen the flashing range or raise the last-stage temperature.`);
+  if (bad) throw infeasible(`Stage ${bad.i}: the tube-side brine (${fmt(bad.tout, 4)} °C) is not colder than the condensing vapour (${fmt(bad.Tv, 4)} °C), so the stage cannot recover its heat. Add stages, raise the top brine temperature or raise the last-stage temperature.`, 'stage');
   const heater = condenserHX('Brine heater', c.Tsteam, Mr, Xr, t[1], T[0], fouled(uCondenser(c.Tsteam), o), c.nSeg);
   return { c, N, nRec, nRej, dTs, T, t, stages, Mr, Xr, Mf, Mb, Xb, Md: st.Md, Mcw, Mrej, tout, Tr, Qh, Qin, Ms: Qin / latentHeat(c.Tsteam), heater, converged: conv, Td: st.Tv[N - 1] };
 }
@@ -322,7 +364,8 @@ export function simulateThermal(v, ov = {}) {
   let pumps = {};
   if (proc === 'msf') {
     const N = Math.max(2, Math.round(p.Nst)), Tsteam = p.TBT + p.dTsteam;
-    const m = solveMSF({ N, nRej: Math.round(p.nRej), type: p.msfType, TBT: p.TBT, Tn: p.TnMsf, Tsw: T0, Xf, Xb: Math.max(p.Xb, Xf * 1.25), MdT, ttdRej: p.ttdRej, Tsteam, loss, o, nSeg });
+    let m;
+    try { m = solveMSF({ N, nRej: Math.round(p.nRej), type: p.msfType, TBT: p.TBT, Tn: p.TnMsf, Tsw: T0, Xf, Xb: Math.max(p.Xb, Xf * 1.25), MdT, ttdRej: p.ttdRej, Tsteam, loss, o, nSeg }); } catch (e) { throw e.infeasible && !ov.fast && !ov.probe && !p._lean ? withHint(e, p, ov) : e; }
     Object.assign(R, { m, N, Md: m.Md * (1 - vent), Mf: m.Mf, Mb: m.Mb, Xb: m.Xb, Mcw: m.Mcw, Ms: m.Ms, Qin: m.Qin, Tsteam, Ttop: p.TBT, Tlast: p.TnMsf, Tprod: m.Td, Tbrine: p.TnMsf, Tcw: m.tout, converged: m.converged });
     R.Qcond = sum(m.stages.filter((s) => !s.rec).map((s) => s.Q));
     R.areaEvap = sum(m.stages.map((s) => s.A)); R.areaAux = m.heater.area;
@@ -334,31 +377,44 @@ export function simulateThermal(v, ov = {}) {
       ['Flashing, BPE, NEA, demisters', sum(m.stages.map((s) => Iq(s.Q, 0.5 * (s.Tin + s.T), s.Tv, T0)))], ['Cooling-water reject', exL(m.Mcw, m.tout, T0)], ['Brine and distillate discharge', exL(m.Mb, p.TnMsf, T0) + exL(m.Md, m.Td, T0)]];
     R.balance = { massIn: m.Mf + m.Mcw, massOut: m.Md + m.Mb + m.Mcw, saltIn: m.Mf * Xf, saltOut: m.Mb * m.Xb, eIn: m.Qh + (m.Mf + m.Mcw) * hL(T0, Xf), eOut: m.Md * hL(m.Td) + m.Mb * hL(p.TnMsf, m.Xb) + m.Mcw * hL(m.tout, Xf) };
   } else {
-    const mvc = proc === 'mvc', tvc = proc === 'medtvc', N = Math.max(1, Math.round(mvc ? p.Nmvc : p.N)), Xb = Math.max(p.Xb, Xf * 1.25), F = (MdT * Xb) / (Xb - Xf);
-    const c = { proc: mvc ? 'mvc' : tvc ? 'tvc' : 'med', N, arr: p.arr, F, Xf, Tsw: T0, MdT, Ts: p.Ts, Tn: Math.min(p.Tn, p.Ts - 0.8 * N - 1), T1: p.Tmvc, dTm: p.dTmvc, preheat: !!p.preheat, ttdPh: p.ttdPh, ttdCond: p.ttdCond, loss, vent, o,
+    const mvc = proc === 'mvc', tvc = proc === 'medtvc', N = Math.max(1, Math.round(mvc ? p.Nmvc : p.N)), Xb = Math.max(p.Xb, Xf * 1.25), F0 = (MdT * Xb) / (Xb - Xf);
+    const c = { proc: mvc ? 'mvc' : tvc ? 'tvc' : 'med', N, arr: p.arr, F: F0, Xf, Xb, Tsw: T0, MdT, Ts: p.Ts, Tn: p.Tn, T1: p.Tmvc, dTm: p.dTmvc, preheat: !!p.preheat, ttdPh: p.ttdPh, ttdCond: p.ttdCond, loss, vent, o,
       areaMode: ov.areaMode || ((p.areaMode === 'equalArea' || p.areaMode === 'flux') && !ov.fast ? p.areaMode : 'equalDT'), Ades: ov.Ades, dT0: ov.dT0, tol: ov.fast ? 3e-7 : 1e-10, maxIt: ov.fast ? 60 : 250, warm: ov.warm, Pm: p.Pm * 1e5, nEnt: (Math.round(p.nEnt) > 0 ? Math.round(p.nEnt) : N) - 1, etaIs: p.etaIs / 100 };
-    const r = solveMED(c), L = N - 1, Md = r.Md, Mb = r.B[L], Tprod = tFromH(mvc ? (r.Dacc * r.hD + r.cond * hL(r.Ts)) / Md : (r.Dacc * r.hD + r.cond * hL(r.Tc[L])) / Md, 0);
+    if (!mvc && p.Tn > p.Ts - 0.8 * N - 1) { // each effect needs roughly 0.8 K for boiling-point elevation, demister and a minimum driving force
+      const nMax = Math.floor((p.Ts - p.Tn - 1) / 0.8);
+      throw infeasible(`The last-effect temperature (${fmt(p.Tn, 4)} °C) must lie at least ${fmt(0.8 * N + 1, 3)} K below the heating steam (${fmt(p.Ts, 4)} °C) for ${N} effect${N > 1 ? 's' : ''}. Lower the last-effect temperature to ${fmt(Math.floor(10 * (p.Ts - 0.8 * N - 1)) / 10, 4)} °C or less, or raise the heating-steam temperature to at least ${fmt(Math.ceil(10 * (p.Tn + 0.8 * N + 1)) / 10, 4)} °C${nMax >= 1 && nMax < N ? `, or use at most ${nMax} effect${nMax > 1 ? 's' : ''}` : ''}.`, 'order');
+    }
+    if (tvc && tsat(p.Pm * 1e5) < p.Ts + 5) throw infeasible(`Motive steam at ${fmt(p.Pm, 3)} bar condenses at ${fmt(tsat(p.Pm * 1e5), 4)} °C and cannot compress vapour to the ${fmt(p.Ts, 4)} °C heating-steam level. Raise the motive-steam pressure to at least ${fmt(Math.ceil(psat(p.Ts + 5) / 1e4) / 10, 3)} bar or lower the heating-steam temperature.`, 'order');
+    let r;
+    try { r = solveMED(c); } catch (e) { throw e.infeasible && !ov.fast && !ov.probe && !p._lean ? withHint(e, p, ov) : e; }
+    const F = r.c.F, L = N - 1, Md = r.Md, Mb = r.B[L], Tprod = tFromH(mvc ? (r.Dacc * r.hD + r.cond * hL(r.Ts)) / Md : (r.Dacc * r.hD + r.cond * hL(r.Tc[L])) / Md, 0);
     Object.assign(R, { r, N, Md, Mf: F, Mb, Xb: r.X[L], Mcw: 0, Ttop: r.T[0], Tlast: r.T[L], Tsteam: r.Ts, Tprod, Tbrine: r.T[L], Tcw: T0, Qcond: 0, converged: r.converged, areaEvap: sum(r.A), areaAux: 0 });
     const effEx = sum(r.q.map((q, i) => Iq(q, r.Th[i], r.T[i], T0))), lossEx = sum(r.Vt.map((m, i) => Iq(m * latentHeat(r.Tv[i]), r.T[i], r.Tc[i], T0)));
     if (mvc) {
       const cm = r.comp, Wsh = r.cond * cm.w, hProd = (r.Dacc * r.hD + r.cond * hL(r.Ts)) / Md, hB = hL(r.T[L], r.X[L]), dHf = F * (hL(r.TfM, Xf) - hL(T0, Xf));
       // feed preheater: product and brine cooled to a common outlet temperature To against the incoming feed
       const g = (To) => Md * (hProd - hL(To, 0)) + Mb * (hB - hL(To, r.X[L])) - dHf;
-      let To = T0 + Math.min(p.ttdCond, 0.5 * (r.T[L] - T0)), Qfeed = 0;
-      if (g(To) >= 0) To = brent(g, To, r.T[L], 1e-10); else Qfeed = -g(To);
+      let To = T0 + Math.min(p.ttdCond, 0.5 * (r.T[L] - T0)), ToB = To, Qfeed = 0;
+      if (g(To) < 0) Qfeed = -g(To);
+      else if (g(r.T[L]) <= 0) To = ToB = brent(g, To, r.T[L], 1e-10);
+      else { // the feed cannot take up even the heat of the distillate cooled to the last-effect temperature: the brine by-passes the preheater and the distillate leaves warmer
+        const gD = (t) => Md * (hProd - hL(t, 0)) - dHf;
+        ToB = r.T[L]; To = gD(Tprod) < 0 ? brent(gD, r.T[L], Tprod, 1e-10) : Tprod;
+      }
       const Qaux = r.Qaux + Qfeed;
-      const qD = Md * (hProd - hL(To, 0)), qB = Mb * (hB - hL(To, r.X[L])), U = p.Uph * 1000 * o.fU, aHot = Math.max(0.05, (Md * Tprod + Mb * r.T[L]) / (Md + Mb) - r.TfM); // both feed branches leave with the same hot-end approach
-      const cex = (name, q, Th) => {
-        const l = lmtd(aHot, To - T0), A = q / (U * l), rise = Th - aHot - T0, Cmin = q / Math.max(Th - To, rise, 1e-9);
-        return { name, duty: q, area: A, lmtd: l, U, ntu: (U * A) / Cmin, eff: Math.max(Th - To, rise) / (Th - T0), tin: T0, tout: Th - aHot, Th };
+      const qD = Md * (hProd - hL(To, 0)), qB = Mb * (hB - hL(ToB, r.X[L])), U = p.Uph * 1000 * o.fU, aHot = Math.max(0.05, (Md * Tprod + Mb * r.T[L]) / (Md + Mb) - r.TfM); // both feed branches leave with the same hot-end approach
+      const cex = (name, q, Th, Tout) => {
+        if (!(q > 1e-9 * (Wsh + 1))) return { name, duty: 0, area: 0, lmtd: 0, U, ntu: 0, eff: 0, tin: T0, tout: T0, Th }; // branch not in service
+        const l = lmtd(aHot, Tout - T0), A = q / (U * l), rise = Th - aHot - T0, Cmin = q / Math.max(Th - Tout, rise, 1e-9);
+        return { name, duty: q, area: A, lmtd: l, U, ntu: (U * A) / Cmin, eff: Math.max(Th - Tout, rise) / (Th - T0), tin: T0, tout: Th - aHot, Th };
       };
-      R.hx = [cex('Feed preheater · distillate side', qD, Tprod), cex('Feed preheater · brine side', qB, r.T[L])];
-      Object.assign(R, { Ms: 0, Qin: Qaux, Wcomp: Wsh / ((p.etaMotor / 100) * 0.98), Wshaft: Wsh, To, Qaux, Tprod: To, Tbrine: To, comp: cm, areaAux: sum(R.hx.map((x) => x.area)) });
+      R.hx = [cex('Feed preheater · distillate side', qD, Tprod, To), cex('Feed preheater · brine side', qB, r.T[L], ToB)];
+      Object.assign(R, { Ms: 0, Qin: Qaux, Wcomp: Wsh / ((p.etaMotor / 100) * 0.98), Wshaft: Wsh, To, Qaux, Tprod: To, Tbrine: ToB, comp: cm, areaAux: sum(R.hx.map((x) => x.area)) });
       R.exIn = Wsh + Qaux * (1 - K(T0) / K(r.Ts));
       R.ex = [['Evaporator tubes (ΔT)', effEx], ['BPE, demister and line losses', lossEx], ['Compressor', K(T0) * r.cond * (CPV * Math.log(K(cm.T2) / K(cm.T1)) - RW * Math.log(cm.ratio))],
-        ['Feed preheater', Iq(qD, 0.5 * (Tprod + To), 0.5 * (T0 + Tprod - aHot), T0) + Iq(qB, 0.5 * (r.T[L] + To), 0.5 * (T0 + r.T[L] - aHot), T0)], ['Brine and distillate discharge', exL(Mb, To, T0) + exL(Md, To, T0)]];
-      R.balance = { massIn: F, massOut: Md + Mb + r.vent, saltIn: F * Xf, saltOut: Mb * r.X[L], eIn: Wsh + Qaux + F * hL(T0, Xf), eOut: Md * hL(To, 0) + Mb * hL(To, r.X[L]) + r.vent * r.hm[L] + r.qloss };
-      pumps = { 'Feed supply': (F * p.dpSea * 1e5) / (rhoS * eP), 'Distillate': (Md * p.dpProd * 1e5) / (RHO_REF * eP), 'Brine blowdown': (Mb * p.dpBrine * 1e5) / (density(To, R.Xb) * eP) };
+        ['Feed preheater', Iq(qD, 0.5 * (Tprod + To), 0.5 * (T0 + Tprod - aHot), T0) + Iq(qB, 0.5 * (r.T[L] + ToB), 0.5 * (T0 + r.T[L] - aHot), T0)], ['Brine and distillate discharge', exL(Mb, ToB, T0) + exL(Md, To, T0)]];
+      R.balance = { massIn: F, massOut: Md + Mb + r.vent, saltIn: F * Xf, saltOut: Mb * r.X[L], eIn: Wsh + Qaux + F * hL(T0, Xf), eOut: Md * hL(To, 0) + Mb * hL(ToB, r.X[L]) + r.vent * r.hm[L] + r.qloss };
+      pumps = { 'Feed supply': (F * p.dpSea * 1e5) / (rhoS * eP), 'Distillate': (Md * p.dpProd * 1e5) / (RHO_REF * eP), 'Brine blowdown': (Mb * p.dpBrine * 1e5) / (density(ToB, R.Xb) * eP) };
     } else {
       const pre = r.pre, Uc = fouled(uCondenser(r.Tc[L]), o);
       R.Mcw = pre.Mcw; R.Qcond = r.Qc; R.Tcw = pre.Tf0;
@@ -500,14 +556,17 @@ export function exergoEconomics(R, p, wc = waterCost(R, p)) {
   const CF = wc.Cheat + wc.Cel, ExF = R.exTot / 1000, cF = CF / ExF, ExP = R.wMin * R.Qd, Z = wc.Zcap + wc.Zom; // $/h, kW, $/kWh
   const comps = R.ex.map(([k, e]) => [k, e / 1000]), other = comps.find((c) => c[0].startsWith('Other'));
   if (other) { other[0] = 'Other (flash boxes, mixing, heat loss)'; other[1] = Math.max(0, other[1] - ExP); }
-  comps.push(['Auxiliaries and unallocated remainder (pumps, vacuum system)', ExF - ExP - sum(comps.map((c) => c[1]))]);
+  // the itemised destructions are mean-temperature estimates; the total (fuel − product) is exact. When the estimates add up to more than the total they are scaled to it.
+  const itemised = sum(comps.map((c) => c[1])), overshoot = itemised > ExF - ExP ? itemised / (ExF - ExP) - 1 : 0;
+  if (overshoot > 0) for (const c of comps) c[1] *= (ExF - ExP) / itemised;
+  comps.push(['Auxiliaries and unallocated remainder (pumps, vacuum system)', overshoot > 0 ? 0 : ExF - ExP - itemised]);
   const aux = Math.max(R.areaAux, 0), w = {}; // capital weights ($ of installed equipment) per component
   if (R.proc === 'msf') { w['Stage condensers (ΔT)'] = wc.capSurf * (R.areaEvap / R.area); w['Brine heater'] = wc.capSurf * (aux / R.area); }
   else if (R.proc === 'mvc') { w['Evaporator tubes (ΔT)'] = wc.capSurf * (R.areaEvap / R.area); w['Feed preheater'] = wc.capSurf * (aux / R.area); w['Compressor'] = wc.capComp; }
   else { const ac = R.hx[0]?.area || 0; w['Effect tubes (ΔT)'] = wc.capSurf * (R.areaEvap / R.area); w['Final condenser'] = wc.capSurf * (ac / R.area); w['Feed preheaters'] = wc.capSurf * (Math.max(0, aux - ac) / R.area); }
   const rows = comps.map(([k, e]) => { const Zk = (Z * (w[k] || 0)) / wc.capex, CD = cF * e; return { name: k, ExD: e, CD, Z: Zk, f: Zk + CD > 0 ? Zk / (Zk + Math.max(CD, 0)) : 0, share: e / ExF }; });
   const CP = CF + Z, cP = CP / ExP;
-  return { CF, ExF, cF, ExP, Z, rows, CP, cP, r: cF > 0 ? (cP - cF) / cF : 0, CDtot: sum(rows.map((q) => q.CD)), perM3: CP / R.Qd, closure: (sum(rows.map((q) => q.CD + q.Z)) + cF * ExP - CP) / CP };
+  return { CF, ExF, cF, ExP, Z, rows, overshoot, CP, cP, r: cF > 0 ? (cP - cF) / cF : 0, CDtot: sum(rows.map((q) => q.CD)), perM3: CP / R.Qd, closure: (sum(rows.map((q) => q.CD + q.Z)) + cF * ExP - CP) / CP };
 }
 
 /**
@@ -517,7 +576,9 @@ export function exergoEconomics(R, p, wc = waterCost(R, p)) {
 export function hybridRO(R, p, tdsD, ionsF) {
   const share = clamp(p.roShare / 100, 0.02, 0.98), rec = clamp(p.roRec / 100, 0.1, 0.85), Qf = (R.Qd * share) / (1 - share) / rec, rhoS = density(R.T0, R.Xf);
   const Qrej = (R.Mcw * 3600) / density(R.Tcw, R.Xf), warm = p.roFeed === 'reject' ? Math.min(Qf, Qrej) : 0, Tro = clamp((warm * R.Tcw + (Qf - warm) * R.T0) / Qf, 1, 45);
-  const roAt = (T) => simulateRO({ ...defaultsOf(roSuite), ions: ionsF, salinityFactor: 1, Qf, T, pH: 8.1, recovery: 100 * rec, targetFlux: p.roFlux, design: 'auto', mode: 'recovery', nSeg: 2 });
+  const size = roBlockSize(R.Qd, p); // elements per vessel follow the duty, so that a small block is not a full seven-element vessel at a fraction of its design flux
+  if (size.below) throw infeasible(size.msg, 'range');
+  const roAt = (T) => simulateRO({ ...defaultsOf(roSuite), ions: ionsF, salinityFactor: 1, Qf, T, pH: 8.1, recovery: 100 * rec, targetFlux: p.roFlux, design: 'auto', mode: 'recovery', nSeg: 2, elements: size.elements });
   const ro = roAt(Tro), cold = warm > 0 && Tro > R.T0 + 0.5 ? roAt(clamp(R.T0, 1, 45)) : null, Qp = ro.product.Q, tdsP = tds(ro.product.ions), Qtot = R.Qd + Qp;
   const QfTh = (R.Mf * 3600) / rhoS, intakeTh = ((R.Mf + R.Mcw) * 3600) / rhoS, intake = intakeTh + Qf - warm, Qb = (R.Mb * 3600) / density(R.Tbrine, R.Xb), tdsB = tdsFromSalinity(R.Xb, R.Tbrine), tdsC = tds(ro.conc.ions);
   return { ro, cold, share: Qp / Qtot, rec, Qf, Tro, warm, Qrej, Qp, tdsP, tdsD, Qtot, tdsBlend: (R.Qd * tdsD + Qp * tdsP) / Qtot, ionsBlend: Object.fromEntries(ION_IDS.map((k) => [k, (R.Qd * (ionsF[k] || 0) * (tdsD / Math.max(tds(ionsF), 1e-9)) + Qp * (ro.product.ions[k] || 0)) / Qtot])),
@@ -525,9 +586,19 @@ export function hybridRO(R, p, tdsD, ionsF) {
     secEl: (R.Wel / 1000 + ro.power) / Qtot, secTh: R.Qin / 1000 / Qtot, secEq: (R.sEq * R.Qd + ro.power) / Qtot, overPressure: ro.p1.Pf > ro.cfg.M.pmax };
 }
 
+/**
+ * Size of the RO block of a hybrid for a thermal capacity Qd (m³/h): elements needed at the design flux and elements per vessel.
+ * The RO engine works with whole spiral-wound elements; a block that needs less than half an element lies below the range of the model.
+ */
+export function roBlockSize(Qd, p) {
+  const d = defaultsOf(roSuite), share = clamp(p.roShare / 100, 0.02, 0.98), Qp = (Qd * share) / (1 - share), q1 = (p.roFlux * d.area) / 1000, need = Qp / q1; // q1: permeate of one element at the design flux, m³/h
+  const elements = clamp(Math.ceil(need / Math.ceil(need / d.elements) - 1e-9), 1, d.elements), below = need < 0.5;
+  return { Qp, q1, need, elements, below, msg: below ? `The RO block of the hybrid would produce only ${fmt(Qp * 24, 3)} m³/d, below the range of the RO model: one spiral-wound element delivers about ${fmt(q1 * 24, 3)} m³/d at ${fmt(p.roFlux, 3)} L/m²·h. Raise the RO share to at least ${fmt(Math.ceil((1000 * 0.5 * q1) / (Qd + 0.5 * q1)) / 10, 3)} % or the distillate capacity to at least ${fmt(Math.ceil((0.5 * q1 * (1 - share) * 24) / share), 3)} m³/d, or switch the hybrid off.` : '' };
+}
+
 /** Grid of fast re-designs over the two main design variables of the selected process (number of effects/stages × top temperature, or MVC temperature × ΔT). */
-export function designGrid(v, N = Math.max(1, Math.round(v.proc === 'msf' ? v.Nst : v.proc === 'mvc' ? v.Nmvc : v.N))) {
-  const p = v, proc = p.proc;
+export function designGrid(v, N = Math.max(1, Math.round(v.proc === 'msf' ? v.Nst : v.proc === 'mvc' ? v.Nmvc : v.N)), empty = false) {
+  const p = v, proc = p.proc, tryRun = empty ? () => null : tryRunFull; // empty: axes only, no re-designs
   if (proc === 'msf') {
     const xs = [12, 16, 20, 24, 28, 32].filter((n) => n > p.nRej + 1), ys = linspace(88, 118, 6);
     return { xs, ys, x0: N, y0: p.TBT, xlabel: 'Number of stages', ylabel: 'Top brine temperature (°C)', title: 'Performance ratio versus stage count and top brine temperature', zlabel: 'Performance ratio', zunit: 'kg/2326 kJ', cmap: 'viridis', metric: (q) => q.PR, integerX: true, make: (n, T) => tryRun(p, { Nst: n, TBT: T, fast: true }), cells: ys.map((T) => xs.map((n) => tryRun(p, { Nst: n, TBT: T, fast: true }))) };
@@ -568,7 +639,24 @@ export function optimiseDesign(grid, p, tLim, gridOpt) {
 }
 const defaultsOf = (s) => Object.fromEntries(s.inputs.flatMap((g) => g.fields).map((f) => [f.key, f.value]));
 const isMed = (v) => v.proc === 'med' || v.proc === 'medtvc', PROC = { med: 'MED', medtvc: 'MED-TVC', msf: 'MSF', mvc: 'MVC' };
-const tryRun = (v, ov) => { try { const q = simulateThermal(v, ov); return q.converged ? q : null; } catch { return null; } };
+/** Adds the nearest design that does solve (same inputs except one) to the message of an infeasibility error. */
+function withHint(e, p, ov) {
+  const ok = (o) => { try { return simulateThermal(p, { ...ov, ...o, probe: true, fast: true }).converged; } catch { return false; } };
+  const N = Math.max(1, Math.round(p.proc === 'msf' ? p.Nst : p.proc === 'mvc' ? p.Nmvc : p.N)), nKey = p.proc === 'msf' ? 'Nst' : p.proc === 'mvc' ? 'Nmvc' : 'N', unit = p.proc === 'msf' ? 'stages' : 'effects', hints = [];
+  const withN = (n) => ({ [nKey]: n, ...(p.proc === 'medtvc' && p.nEnt > 0 ? { nEnt: Math.max(1, Math.min(Math.round(p.nEnt), n)) } : {}) });
+  if (e.kind === 'ejector') { for (let k = Math.round(p.nEnt) + 1; k <= N; k++) if (ok({ nEnt: k })) { hints.push(`suction from effect ${k}`); break; } }
+  if (e.kind === 'stage') { for (const n of [N + 2, N + 4, N + 8, N + 12].filter((q) => q <= 45)) if (ok({ Nst: n })) { hints.push(`${n} stages`); break; } for (const d of [3, 6, 10, 15]) if (p.TBT + d <= 125 && ok({ TBT: p.TBT + d })) { hints.push(`a top brine temperature of ${fmt(p.TBT + d, 4)} °C`); break; } }
+  if (e.kind === 'reject') for (const d of [1, 2, 3, 5, 8, 12]) if (p.TnMsf + d <= 60 && ok({ TnMsf: p.TnMsf + d })) { hints.push(`a last-stage temperature of ${fmt(p.TnMsf + d, 4)} °C`); break; }
+  if (['window', 'converge', 'dry', 'salt', 'ejector'].includes(e.kind) && N > 1 && !hints.length) { // largest smaller train that solves (feasibility grows as effects are removed)
+    let lo = 0, hi = N - 1;
+    if (ok(withN(hi))) lo = hi; else if (ok(withN(1))) { lo = 1; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (ok(withN(m))) lo = m; else hi = m; } }
+    if (lo >= 1) hints.push(`${lo} ${lo > 1 ? unit : unit.slice(0, -1)}`);
+  }
+  if (e.kind === 'window' && p.proc !== 'mvc') for (const d of [3, 6, 10, 15, 25, 40]) if (p.Ts + d <= 130 && ok({ Ts: p.Ts + d })) { hints.push(`a heating-steam temperature of ${fmt(p.Ts + d, 4)} °C`); break; }
+  if (e.kind === 'salt' || e.kind === 'window') for (const x of [0.8, 0.6, 0.45]) if (p.Xb * x > 1.3 * p.Xf && p.Xb * x >= 40 && ok({ Xb: Math.round(p.Xb * x) })) { hints.push(`a maximum brine salinity of ${Math.round(p.Xb * x)} g/kg`); break; }
+  return hints.length ? infeasible(`${e.message} A design with ${hints.join(', or with ')} (other inputs unchanged) can be solved.`, e.kind) : e;
+}
+const tryRunFull = (v, ov) => { try { const q = simulateThermal(v, ov); return q.converged ? q : null; } catch { return null; } }, tryRun = tryRunFull;
 const nz = (x) => (Number.isFinite(x) ? x : null);
 
 const suite = {
@@ -596,7 +684,7 @@ const suite = {
       { key: 'ions', label: 'Feed-water analysis (mg/L)', type: 'ions', value: WATERS.seawater.ions, help: 'Sets the ion ratios of the brine and distillate streams passed to other suites; the salinity below sets the total.' },
       { key: 'Xf', label: 'Feed salinity', unit: 'g/kg', value: 36, min: 1, max: 120, typical: [30, 70], help: 'Total dissolved salts per kg of feed.' },
       { key: 'Tsw', label: 'Seawater temperature', unit: '°C', value: 26, min: 2, max: 40, typical: [12, 35], help: 'Cooling-water and feed inlet temperature; also the dead state of the exergy analysis.' },
-      { key: 'Xb', label: 'Maximum brine salinity', unit: 'g/kg', value: 60, min: 5, max: 250, typical: [50, 72], help: 'Blow-down salinity; with the feed salinity it fixes the recovery.', showIf: (v) => !(v.proc === 'msf' && v.msfType === 'ot') },
+      { key: 'Xb', label: 'Maximum brine salinity', unit: 'g/kg', value: 60, min: 5, max: 200, typical: [50, 72], help: 'Blow-down salinity; with the feed salinity it fixes the recovery. Above about 160 g/kg the seawater property correlations are extrapolated; 200 g/kg is the limit of the model.', showIf: (v) => !(v.proc === 'msf' && v.msfType === 'ot') },
     ] },
     { group: 'Multi-effect train', help: 'Temperature window and arrangement of the effects.', showIf: isMed, fields: [
       { key: 'N', label: 'Number of effects', unit: '', value: 10, min: 1, max: 24, step: 1, typical: [4, 16], help: 'More effects re-use the latent heat more often (higher GOR) but need more area.' },
@@ -610,23 +698,23 @@ const suite = {
     { group: 'Multi-stage flash', showIf: (v) => v.proc === 'msf', fields: [
       { key: 'msfType', label: 'Configuration', type: 'select', value: 'br', options: [{ value: 'br', label: 'Brine recirculation (heat recovery + heat rejection)' }, { value: 'ot', label: 'Once-through' }], help: 'Brine recirculation re-uses most of the flashed brine and rejects heat in the last stages; once-through passes the feed a single time.' },
       { key: 'Nst', label: 'Number of stages', unit: '', value: 24, min: 3, max: 45, step: 1, typical: [16, 28], help: 'Total number of flashing stages (heat recovery plus heat rejection).' },
-      { key: 'nRej', label: 'Heat-rejection stages', unit: '', value: 3, min: 1, max: 6, step: 1, showIf: (v) => v.msfType === 'br', help: 'Stages cooled by seawater instead of recirculating brine.' },
+      { key: 'nRej', label: 'Heat-rejection stages', unit: '', value: 3, min: 1, max: 6, typical: [2, 4], step: 1, showIf: (v) => v.msfType === 'br', help: 'Stages cooled by seawater instead of recirculating brine.' },
       { key: 'TBT', label: 'Top brine temperature', unit: '°C', value: 110, min: 60, max: 125, typical: [90, 112], help: 'Brine temperature leaving the brine heater; limited by the scale-control method.' },
       { key: 'TnMsf', label: 'Last-stage brine temperature', unit: '°C', value: 40, min: 25, max: 60, typical: [35, 42], help: 'Brine temperature in the last, coldest stage.' },
-      { key: 'dTsteam', label: 'Heating steam above top brine temperature', unit: 'K', value: 7, min: 2, max: 30, help: 'Condensing-steam temperature in the brine heater minus the top brine temperature.' },
+      { key: 'dTsteam', label: 'Heating steam above top brine temperature', unit: 'K', value: 7, min: 2, max: 30, typical: [5, 10], help: 'Condensing-steam temperature in the brine heater minus the top brine temperature.' },
     ] },
     { group: 'Mechanical vapour compression', showIf: (v) => v.proc === 'mvc', fields: [
-      { key: 'Nmvc', label: 'Number of effects', unit: '', value: 1, min: 1, max: 6, step: 1, help: 'Effects in series between the compressor discharge and suction.' },
+      { key: 'Nmvc', label: 'Number of effects', unit: '', value: 1, min: 1, max: 6, typical: [1, 4], step: 1, help: 'Effects in series between the compressor discharge and suction.' },
       { key: 'Tmvc', label: 'First-effect brine temperature', unit: '°C', value: 60, min: 40, max: 100, typical: [50, 70], help: 'Boiling temperature of the brine in the first effect.' },
       { key: 'dTmvc', label: 'Condensing − boiling temperature difference', unit: 'K', value: 2.5, min: 0.8, max: 8, typical: [1.5, 4], help: 'Smaller differences save compressor power but need more evaporator area.' },
-      { key: 'etaIs', label: 'Compressor isentropic efficiency', unit: '%', value: 76, min: 40, max: 92, help: 'Ratio of isentropic to actual compression work.' },
-      { key: 'etaMotor', label: 'Motor + drive efficiency', unit: '%', value: 94, min: 60, max: 99, help: 'Electric motor, drive and gearbox combined.' },
-      { key: 'Uph', label: 'Feed-preheater overall U', unit: 'kW/m²·K', value: 1.8, min: 0.3, max: 6, help: 'Plate exchangers recovering heat from product and brine.' },
+      { key: 'etaIs', label: 'Compressor isentropic efficiency', unit: '%', value: 76, min: 40, max: 92, typical: [70, 85], help: 'Ratio of isentropic to actual compression work.' },
+      { key: 'etaMotor', label: 'Motor + drive efficiency', unit: '%', value: 94, min: 60, max: 99, typical: [92, 97], help: 'Electric motor, drive and gearbox combined.' },
+      { key: 'Uph', label: 'Feed-preheater overall U', unit: 'kW/m²·K', value: 1.8, min: 0.3, max: 6, typical: [1.2, 3], help: 'Plate exchangers recovering heat from product and brine.' },
     ] },
     { group: 'Heat source', help: 'Where the heat comes from and how it is valued.', fields: [
       { key: 'source', label: 'Heat source', type: 'select', value: 'steam', options: [{ value: 'steam', label: 'Boiler or turbine-extraction steam' }, { value: 'cogen', label: 'Power-plant cogeneration (turbine extraction, lost-work allocation)' }, { value: 'mhp', label: 'Mechanical (electric) heat pump on the rejected heat' }, { value: 'ahp', label: 'Absorption heat pump on the rejected heat' }, { value: 'solar', label: 'Solar-thermal collector field' }, { value: 'waste', label: 'Industrial waste-heat stream' }], help: 'Adds the matching integration model to the results: turbine-extraction cogeneration, a heat pump that upgrades the condenser heat, a solar field or a waste-heat match.' },
       { key: 'Pthr', label: 'Turbine throttle pressure (saturated steam)', unit: 'bar', value: 40, min: 3, max: 45, showIf: (v) => v.source === 'cogen', help: 'Saturated steam at this pressure expands in the turbine; the heating steam is extracted at the pressure the desalination plant needs. Property correlations limit the model to 45 bar.' },
-      { key: 'Ppp', label: 'Gross power without extraction', unit: 'MW', value: 300, min: 1, max: 3000, showIf: (v) => v.source === 'cogen', help: 'Rating of the steam turbine when all steam expands to the condenser.' },
+      { key: 'Ppp', label: 'Gross power without extraction', unit: 'MW', value: 300, min: 1, max: 3000, typical: [50, 1500], showIf: (v) => v.source === 'cogen', help: 'Rating of the steam turbine when all steam expands to the condenser.' },
       { key: 'etaBoiler', label: 'Boiler efficiency', unit: '%', value: 90, min: 50, max: 99, showIf: (v) => v.source === 'cogen', help: 'Fuel heat converted into steam enthalpy.' },
       { key: 'hpEta', label: 'Heat-pump second-law efficiency', unit: '%', value: 55, min: 10, max: 100, showIf: (v) => v.source === 'mhp' || v.source === 'ahp', help: 'Mechanical: share of the Carnot COP reached. Absorption: share of the reversible three-temperature gain (COP − 1) reached. 100 % gives the thermodynamic limit.' },
       { key: 'hpApproach', label: 'Heat-pump exchanger approach', unit: 'K', value: 3, min: 0, max: 15, showIf: (v) => v.source === 'mhp' || v.source === 'ahp', help: 'Temperature difference in the heat-pump evaporator and condenser/absorber.' },
@@ -642,12 +730,12 @@ const suite = {
     ] },
     { group: 'Heat-transfer model', tab: 'setup', help: 'How the heat-transfer areas are obtained.', fields: [
       { key: 'areaMode', label: 'Effect sizing rule', type: 'select', value: 'equalArea', options: [{ value: 'equalArea', label: 'Equal area in every effect (iterated)' }, { value: 'equalDT', label: 'Equal temperature difference in every effect' }, { value: 'flux', label: 'Equal heat flux in every effect (prescribed-flux condition)' }], showIf: (v) => v.proc !== 'msf', help: 'Equal-area designs are the industrial standard; the temperature differences are iterated until all areas match. The heat-flux option instead imposes the same heat flux q″ = U·ΔT on every effect.' },
-      { key: 'fU', label: 'Heat-transfer coefficient multiplier', unit: '×', value: 1, min: 0.3, max: 2, help: 'Scales the published U(T) correlations. Calibrate against plant data.' },
-      { key: 'Rf', label: 'Additional fouling resistance', unit: 'm²·K/kW', value: 0.03, min: 0, max: 0.5, help: 'Added in series to the correlation value: 1/U = 1/U₀ + R_f.' },
-      { key: 'heatLoss', label: 'Heat loss to surroundings', unit: '% of duty', value: 1, min: 0, max: 15, help: 'Share of every effect or brine-heater duty lost through the insulation.' },
-      { key: 'ttdCond', label: 'Final-condenser / feed-heater approach', unit: 'K', value: 3, min: 0.5, max: 15, showIf: (v) => v.proc !== 'msf', help: 'Condensing temperature minus seawater outlet temperature. For MVC: minimum approach of the feed preheater.' },
-      { key: 'ttdPh', label: 'Feed-preheater terminal difference', unit: 'K', value: 3, min: 0.5, max: 15, showIf: (v) => isMed(v) && v.preheat, help: 'Condensing vapour temperature minus feed outlet temperature of each preheater.' },
-      { key: 'ttdRej', label: 'Heat-rejection terminal difference', unit: 'K', value: 3, min: 0.5, max: 15, showIf: (v) => v.proc === 'msf' && v.msfType === 'br', help: 'Condensing temperature of the first rejection stage minus the seawater leaving it.' },
+      { key: 'fU', label: 'Heat-transfer coefficient multiplier', unit: '×', value: 1, min: 0.3, max: 2, typical: [0.7, 1.2], help: 'Scales the published U(T) correlations. Calibrate against plant data.' },
+      { key: 'Rf', label: 'Additional fouling resistance', unit: 'm²·K/kW', value: 0.03, min: 0, max: 0.5, typical: [0, 0.09], help: 'Added in series to the correlation value: 1/U = 1/U₀ + R_f.' },
+      { key: 'heatLoss', label: 'Heat loss to surroundings', unit: '% of duty', value: 1, min: 0, max: 15, typical: [0.5, 3], help: 'Share of every effect or brine-heater duty lost through the insulation.' },
+      { key: 'ttdCond', label: 'Final-condenser / feed-heater approach', unit: 'K', value: 3, min: 0.5, max: 15, typical: [2, 5], showIf: (v) => v.proc !== 'msf', help: 'Condensing temperature minus seawater outlet temperature. For MVC: minimum approach of the feed preheater.' },
+      { key: 'ttdPh', label: 'Feed-preheater terminal difference', unit: 'K', value: 3, min: 0.5, max: 15, typical: [2, 5], showIf: (v) => isMed(v) && v.preheat, help: 'Condensing vapour temperature minus feed outlet temperature of each preheater.' },
+      { key: 'ttdRej', label: 'Heat-rejection terminal difference', unit: 'K', value: 3, min: 0.5, max: 15, typical: [2, 5], showIf: (v) => v.proc === 'msf' && v.msfType === 'br', help: 'Condensing temperature of the first rejection stage minus the seawater leaving it.' },
     ] },
     { group: 'Temperature losses and venting', tab: 'setup', help: 'Thermodynamic penalties between boiling brine and condensing vapour.', fields: [
       { key: 'bpeModel', label: 'Boiling-point-elevation basis', type: 'select', value: 'corr', options: [{ value: 'corr', label: 'Seawater correlation (Sharqawy)' }, { value: 'activity', label: 'Raoult’s law with water activity (osmotic coefficient)' }, { value: 'ideal', label: 'Raoult’s law, ideal (water mole fraction)' }], help: 'Raoult’s law: the brine boils where a_w·p_sat(T) equals the stage pressure. All three bases are always compared in the results; this choice selects the one used in the balances.' },
@@ -661,7 +749,7 @@ const suite = {
       { key: 'dw', label: 'Demister wire diameter', unit: 'mm', value: 0.28, min: 0.2, max: 0.32, help: 'Mesh wire diameter (correlation range 0.2–0.32 mm).' },
       { key: 'thick', label: 'Demister thickness', unit: 'mm', value: 150, min: 50, max: 300, help: 'Thickness of the demister pad.' },
       { key: 'linePct', label: 'Vapour-line pressure drop', unit: '% of stage pressure', value: 0.5, min: 0, max: 5, help: 'Friction loss of the vapour between demister and condensing surface.' },
-      { key: 'ventPct', label: 'Vapour lost with vented gases', unit: '% of condensed vapour', value: 0.5, min: 0, max: 5, help: 'Vapour leaving the cold end with the non-condensable gases through the vacuum system.' },
+      { key: 'ventPct', label: 'Vapour lost with vented gases', unit: '% of condensed vapour', value: 0.5, min: 0, max: 5, typical: [0.2, 1], help: 'Vapour leaving the cold end with the non-condensable gases through the vacuum system.' },
       { key: 'carry', label: 'Brine carry-over through demisters', unit: 'mg brine per kg vapour', value: 150, min: 0, max: 5000, help: 'Sets the distillate salinity.' },
     ] },
     { group: 'Scale limits', tab: 'setup', fields: [
@@ -683,9 +771,9 @@ const suite = {
     ] },
     { group: 'Hybrid with reverse osmosis', tab: 'setup', help: 'MED–RO / MSF–RO (or MVC–RO) plant: a reverse-osmosis block shares the seawater intake and the two products are blended.', fields: [
       { key: 'hybrid', label: 'Plant configuration', type: 'select', value: 'none', options: [{ value: 'none', label: 'Thermal plant only' }, { value: 'ro', label: 'Thermal + RO hybrid with product blending' }], help: 'The RO block is solved element by element with the engine of suite 1 (default seawater membrane, automatic array sizing).' },
-      { key: 'roShare', label: 'RO share of the total product', unit: '%', value: 50, min: 5, max: 95, showIf: (v) => v.hybrid === 'ro', help: 'The thermal capacity above stays as entered; the RO block is sized to supply this share of the blended product.' },
-      { key: 'roRec', label: 'RO recovery', unit: '%', value: 42, min: 10, max: 85, showIf: (v) => v.hybrid === 'ro', help: 'Permeate ÷ RO feed.' },
-      { key: 'roFlux', label: 'RO design flux', unit: 'L/m²·h', value: 14, min: 5, max: 35, showIf: (v) => v.hybrid === 'ro', help: 'Average flux used to size the RO array.' },
+      { key: 'roShare', label: 'RO share of the total product', unit: '%', value: 50, min: 5, max: 95, typical: [20, 80], showIf: (v) => v.hybrid === 'ro', help: 'The thermal capacity above stays as entered; the RO block is sized to supply this share of the blended product.' },
+      { key: 'roRec', label: 'RO recovery', unit: '%', value: 42, min: 10, max: 85, typical: [35, 50], showIf: (v) => v.hybrid === 'ro', help: 'Permeate ÷ RO feed.' },
+      { key: 'roFlux', label: 'RO design flux', unit: 'L/m²·h', value: 14, min: 5, max: 35, typical: [12, 17], showIf: (v) => v.hybrid === 'ro', help: 'Average flux used to size the RO array.' },
       { key: 'roFeed', label: 'RO feed taken from', type: 'select', value: 'reject', options: [{ value: 'reject', label: 'Warm cooling-water reject of the thermal block' }, { value: 'intake', label: 'Cold seawater from the shared intake' }], showIf: (v) => v.hybrid === 'ro', help: 'Feeding the RO with the warm reject saves intake flow and lowers the RO pressure.' },
       { key: 'tdsLimit', label: 'Blended-product TDS limit', unit: 'mg/L', value: 500, min: 20, max: 2000, showIf: (v) => v.hybrid === 'ro', help: 'Blending with distillate lets a single-pass RO meet this limit.' },
     ] },
@@ -729,6 +817,8 @@ const suite = {
   ],
 
   run(v) {
+    if (v.hybrid === 'ro') { const size = roBlockSize(v.Md / 24, v); if (size.below) throw infeasible(size.msg, 'range'); } // lower limit of the RO model, stated before anything is solved
+    const lean = v._lean === true, tryRun = lean ? () => null : tryRunFull; // lean (stress cases): the design is solved and reported in full, the sweeps and maps around it are skipped
     const R = simulateThermal(v), p = v, W = [], proc = R.proc, msf = proc === 'msf', mvc = proc === 'mvc', N = R.N, name = PROC[proc];
     const m = R.m, r = R.r, kgh = 3.6; // kg/s → t/h
     // ---- limits and warnings
@@ -779,6 +869,7 @@ const suite = {
         ['Equivalent electricity of the water, lost work + auxiliaries (kWh/m³)', (cg.Wlost + R.Wel) / 1000 / R.Qd]);
       srcNote = 'Saturated-steam Rankine expansion with the turbine efficiency entered under “Heat source”: s_g = ∫c_p dT/T + λ/T fixes the wet-steam states; the water is charged the turbine work its extraction steam would still have produced down to the condenser. For an ideal turbine that work equals the Carnot value of the heat plus the exergy of the hot condensate, which returns to the boiler and is credited in the fuel heat.';
       if (!cg.feasible) W.push({ level: 'bad', msg: cg.clipped ? `The plant needs heat at ${fmt(Tsup, 3)} °C, which is not below the ${fmt(cg.T1, 3)} °C throttle steam — raise the throttle pressure.` : `The extraction (${fmt(cg.mExt, 3)} kg/s) exceeds the turbine steam flow (${fmt(cg.m0, 3)} kg/s) — the power plant is too small for this water capacity.` });
+      if (cg.feasible && cg.Pexport < 0) W.push({ level: 'warn', msg: `The desalination plant uses ${fmt(R.Wel / 1e6, 3)} MW of electricity but the power plant has only ${fmt(cg.Pnet / 1e6, 3)} MW left after the steam extraction: the station is a net importer of ${fmt(-cg.Pexport / 1e6, 3)} MW and the power-to-water ratio is negative. Raise the gross power-plant output to at least ${fmt(Math.ceil((cg.Pgross - cg.Pexport) / 1e5) / 10, 3)} MW.` });
       extraKpis.push({ label: 'Power lost by steam extraction', value: cg.Wlost / 1e6, unit: 'MW', status: cg.feasible ? 'ok' : 'bad' }, { label: 'Equivalent electricity (lost work)', value: (cg.Wlost + R.Wel) / 1000 / R.Qd, unit: 'kWh/m³', help: 'Turbine work lost by the extraction plus auxiliaries, per m³ of distillate' }, { label: 'Power-to-water ratio', value: cg.Pexport / 1e6 / mig, unit: 'MW/MIGD' }, { label: 'Energy-utilisation factor', value: cg.euf, unit: '–', help: '(Net power + process heat) ÷ fuel heat' });
       const Te = linspace(Math.min(cg.Tc + 8, cg.T1 - 10), Math.min(130, cg.T1 - 5), 9), cc = Te.map((T) => cogeneration(1e6, T, 0, p));
       extraPlots.push({ type: 'line', title: 'Cogeneration: turbine work lost per unit of extracted heat', xlabel: 'Extraction (heating-steam) temperature (°C)', ylabel: 'kWh of power per kWh of heat', series: [{ name: 'Lost work ÷ heat (turbine model)', x: Te, y: cc.map((q) => q.lostPerHeat), mode: 'both' }, { name: 'Reversible limit: Carnot factor + condensate exergy', x: Te, y: cc.map((q) => q.carnot + q.condensate), dash: true }], vlines: [{ x: cg.Te, label: 'this plant' }], note: 'Low-temperature processes (MED) take steam that has already done most of its work; MSF and TVC motive steam cost more power.' });
@@ -813,7 +904,7 @@ const suite = {
     if (msf) part = loads.map((L) => { const q = tryRun(base, { TBT: p.TnMsf + ((p.TBT - p.TnMsf) * L) / 100, fast: true }); return q ? [L, q.PR, (100 * q.areaEvap) / R.areaEvap, p.TnMsf + ((p.TBT - p.TnMsf) * L) / 100, q.sTh] : [L, null, null, null, null]; });
     else part = loads.map((L) => { const q = tryRun(base, { Md: (p.Md * L) / 100, areaMode: 'rating', Ades: r.A, dT0: r.dT.map((d) => (d * L) / 100), fast: true }); return q ? [L, mvc ? q.sEl : q.GOR, q.Tsteam, q.Ttop, mvc ? q.comp.ratio : q.sTh] : [L, null, null, null, null]; });
     // 2-D sensitivity map (grid of fast re-designs) and its use for the cost-optimal design
-    const grid = designGrid(base, N), field = { type: 'field', title: grid.title, xlabel: grid.xlabel, ylabel: grid.ylabel, zlabel: grid.zlabel, zunit: grid.zunit, x: grid.xs, y: grid.ys, z: grid.cells.map((row) => row.map((q) => (q ? nz(grid.metric(q)) : null))), cmap: grid.cmap, contours: 8, markers: [{ x: grid.x0, y: grid.y0, label: 'design' }] };
+    const grid = designGrid(base, N, lean), field = { type: 'field', title: grid.title, xlabel: grid.xlabel, ylabel: grid.ylabel, zlabel: grid.zlabel, zunit: grid.zunit, x: grid.xs, y: grid.ys, z: grid.cells.map((row) => row.map((q) => (q ? nz(grid.metric(q)) : null))), cmap: grid.cmap, contours: 8, markers: [{ x: grid.x0, y: grid.y0, label: 'design' }] };
     // repair isolated gaps of the map so that colour scaling stays finite
     const zf = field.z.flat().filter((x) => x !== null), zMean = zf.length ? sum(zf) / zf.length : 0;
     field.z = field.z.map((row) => row.map((x) => (x === null ? zMean : x)));
@@ -827,7 +918,7 @@ const suite = {
     if (!opt.best.base && opt.saving > 0.03) W.push({ level: 'info', msg: `Process optimisation: the design map holds a cheaper design (${fmt(opt.best.cost, 3)} instead of ${fmt(waterCost(R, p).total, 3)} $/m³) at ${grid.xlabel.toLowerCase()} ${fmt(opt.best.x, 3)} and ${grid.ylabel.toLowerCase()} ${fmt(opt.best.y, 3)}.` });
 
     let su = null, tSim = p.tEnd;
-    if (p.transient) for (let k = 0; k < 4; k++) { su = startUp(R, { ...p, tEnd: tSim }); if (su.t95 !== null) break; if (k < 3) tSim *= 2; }
+    if (p.transient) for (let k = 0; k < (lean ? 1 : 4); k++) { su = startUp(R, { ...p, tEnd: tSim }); if (su.t95 !== null) break; if (k < 3) tSim *= 2; }
     if (su && su.t95 === null) W.push({ level: 'info', msg: `Start-up does not reach 95 % of the design temperature rise within ${fmt(tSim, 3)} h.` });
     const sd = su ? startUp(R, { ...p, tEnd: tSim }, true) : null;
     if (su && su.t95 !== null && tSim > p.tEnd) W.push({ level: 'info', msg: `The start-up simulation was extended to ${fmt(tSim, 3)} h so that the plant reaches its design temperatures.` });
@@ -843,11 +934,12 @@ const suite = {
     // ---- thermal + RO hybrid
     let hy = null;
     if (p.hybrid === 'ro') {
-      try { hy = hybridRO(R, p, tdsD, ionsF); } catch (e) { W.push({ level: 'bad', msg: `The RO block of the hybrid could not be solved at ${p.roRec} % recovery: ${e.message}` }); }
+      try { hy = hybridRO(R, p, tdsD, ionsF); } catch (e) { W.push({ level: 'bad', msg: e.infeasible ? e.message : `The RO block of the hybrid could not be solved at ${fmt(p.roRec, 3)} % recovery (${e.message}). Lower the RO recovery.` }); }
     }
     if (hy) {
       const ro = hy.ro, hn = `${name}–RO`;
       if (hy.overPressure) W.push({ level: 'bad', msg: `The RO block needs ${fmt(ro.p1.Pf, 3)} bar, above the ${ro.cfg.M.pmax} bar element rating — lower the RO recovery.` });
+      if (Math.abs(ro.overallRec - hy.rec) > 0.01) W.push({ level: 'warn', msg: `The RO block reaches ${fmt(100 * ro.overallRec, 3)} % recovery instead of the ${fmt(100 * hy.rec, 3)} % asked for — at this salinity the pressure limit of the elements is reached. Lower the RO recovery.` });
       if (hy.Tro > 40) W.push({ level: 'warn', msg: `The RO feed is ${fmt(hy.Tro, 3)} °C; most elements are limited to 40–45 °C — blend in cold seawater.` });
       if (hy.tdsBlend > p.tdsLimit) W.push({ level: 'warn', msg: `The blended product has ${fmt(hy.tdsBlend, 3)} mg/L, above the ${p.tdsLimit} mg/L limit — lower the RO share or add a second pass.` });
       else W.push({ level: 'info', msg: `${hn} hybrid: ${fmt(100 * hy.share, 3)} % of the product comes from single-pass RO (${fmt(hy.tdsP, 3)} mg/L) and blends with distillate to ${fmt(hy.tdsBlend, 3)} mg/L.` });
@@ -920,7 +1012,7 @@ const suite = {
       note: 'Cost = annualised capital of the heat-transfer surface (× installation factor) + heat + electricity + O&M + chemicals. The design-map optimum is a grid search over equal-ΔT re-designs within the scale limit' + (p.source === 'mhp' || p.source === 'ahp' ? '; the heat and electricity rows include the heat pump (its driving heat is priced like the heating steam, the heat-pump equipment itself is not costed), the map optimum does not.' : '.') });
     tables.push({ title: 'Exergy–economic analysis (cost rates per component)', columns: ['Component', 'Exergy destroyed (kW)', 'Share of fuel exergy (%)', 'Cost of destruction Ċ_D ($/h)', 'Capital + O&M rate Ż ($/h)', 'Ċ_D + Ż ($/h)', 'Exergoeconomic factor f (%)'],
       rows: [...xe.rows.map((q) => [q.name, q.ExD, 100 * q.share, q.CD, q.Z, q.CD + q.Z, 100 * q.f]), ['Product: minimum work of separation', xe.ExP, (100 * xe.ExP) / xe.ExF, xe.cF * xe.ExP, 0, xe.cF * xe.ExP, null], ['Fuel (heat + electricity) / total', xe.ExF, 100, xe.CF, xe.Z, xe.CP, null]],
-      note: `Fuel exergy cost c_F = ${fmt(xe.cF, 3)} $/kWh, product exergy cost c_P = (Ċ_F + Ż)/Ėx_P = ${fmt(xe.cP, 3)} $/kWh, relative cost difference ${fmt(xe.r, 3)}. A low f means the component’s cost is dominated by irreversibility (spend capital there); a high f means capital dominates.` });
+      note: `Fuel exergy cost c_F = ${fmt(xe.cF, 3)} $/kWh, product exergy cost c_P = (Ċ_F + Ż)/Ėx_P = ${fmt(xe.cP, 3)} $/kWh, relative cost difference ${fmt(xe.r, 3)}. A low f means the component’s cost is dominated by irreversibility (spend capital there); a high f means capital dominates.${xe.overshoot > 0 ? ` The component estimates (mean-temperature formulas) added up to ${fmt(100 * xe.overshoot, 2)} % more than the exact total of fuel minus product exergy and were scaled to it.` : ''}` });
     if (su && su.vap.mTot > 0) tables.push({ title: 'Vapour inventories (initial condition and design state)', columns: [unit, 'Vapour-space volume (m³)', 'Design vapour temperature (°C)', 'Design pressure (kPa)', 'Vapour mass at cold start (kg)', 'Vapour mass at design (kg)'],
       rows: [...xs.map((n, i) => [n, su.vap.vol[i], su.vap.TvDes[i], psat(su.vap.TvDes[i]) / 1000, su.vap.m0[i], su.vap.mDes[i]]), ['Total', sum(su.vap.vol), null, null, sum(su.vap.m0), su.vap.mTot]], note: `Initial condition: every vapour space is saturated at the ${fmt(p.Tsw, 3)} °C seawater temperature (vacuum already pulled). The vapour space adds its latent and sensible capacity V·(λ·dρ_v/dT + ρ_v·c_p) to each effect/stage of the start-up model.` });
 
@@ -1072,9 +1164,64 @@ const suite = {
     add('MED–RO hybrid: RO water balance closes and the RO share is met', 0, Math.abs(hyM.Qf - hyM.Qp - hyM.ro.conc.Q) / hyM.Qf + Math.abs(hyM.share - 0.5), 1e-3, 'Feed = permeate + concentrate; RO supplies 50 % of the blend');
     add('MSF–RO hybrid: combined energy lies between the two processes', 1, hyS.secEq < msfV.sEq && hyS.secEq > hyS.ro.sec && hyS.recFeed > msfV.rec === (hyS.ro.overallRec > msfV.rec) ? 1 : 0, 0, `${fmt(hyS.secEq, 3)} kWh/m³ equivalent for the blend versus ${fmt(msfV.sEq, 3)} (MSF) and ${fmt(hyS.ro.sec, 3)} (RO)`);
     add('Warm reject feed lowers the RO pressure', 1, hyM.cold && hyM.ro.p1.Pf < hyM.cold.p1.Pf && hyM.Tro > med.T0 ? 1 : 0, 0, `${fmt(hyM.ro.p1.Pf, 3)} bar at ${fmt(hyM.Tro, 3)} °C versus ${fmt(hyM.cold?.p1.Pf ?? 0, 3)} bar on cold seawater`);
+    // ---- stress cases: seeded random designs over the whole input range
+    const st = stressCases(suite, 60, 20260);
+    add('Stress cases: random designs across the input ranges solve cleanly or are rejected with an explanation', 0, st.fails.length, 0, `${st.n} seeded cases: ${st.solved} solved with finite results, closed balances and no negative flow, area or energy; ${st.rejected} rejected with a message that names the input to change${st.fails.length ? `; first failure (case ${st.fails[0].k}): ${st.fails[0].why}` : ''}`);
+    add('Stress cases: a meaningful share of the sampled designs is feasible', 1, st.solved >= 0.15 * st.n ? 1 : 0, 0, `${st.solved} of ${st.n} sampled designs solve; the rest are infeasible combinations that are rejected`);
     return C;
   },
 };
+
+/**
+ * Seeded stress cases: random designs over the declared input ranges (log-uniform where a range spans decades, range ends included),
+ * select and yes/no inputs rotated so that their values meet in changing combinations. Every case must either solve — no NaN, Infinity
+ * or undefined anywhere in the result, every reported balance closed to 1e-3, no negative flow, area or energy — or be rejected with
+ * an Error whose message says in plain language what to change. Returns { n, solved, rejected, fails: [{ k, why, values }] }.
+ */
+export function stressCases(suiteDef, n = 60, seed = 1, fixed = {}) {
+  const groups = suiteDef.inputs, fields = groups.flatMap((g) => g.fields.map((fl) => ({ ...fl, g }))), base = Object.fromEntries(fields.map((fl) => [fl.key, fl.type === 'ions' || fl.type === 'table' ? JSON.parse(JSON.stringify(fl.value)) : fl.value ?? null]));
+  const g = rng(seed), cats = fields.filter((fl) => (fl.type === 'select' || fl.type === 'bool') && !(fl.key in fixed)), out = { n, solved: 0, rejected: 0, fails: [] };
+  const bad = (x, path, acc, depth = 0) => { // non-finite numbers, undefined and their printed forms
+    if (acc.length > 3 || depth > 8 || x === null) return;
+    if (typeof x === 'number') { if (!Number.isFinite(x)) acc.push(`${path} = ${x}`); } else if (x === undefined) acc.push(`${path} undefined`);
+    else if (typeof x === 'string') { if (/\b(NaN|undefined|Infinity)\b/.test(x)) acc.push(`${path}: "${x.slice(0, 60)}"`); }
+    else if (Array.isArray(x) || ArrayBuffer.isView(x)) for (let i = 0; i < x.length; i++) bad(x[i], `${path}[${i}]`, acc, depth + 1);
+    else if (typeof x === 'object') for (const k of Object.keys(x)) if (!k.startsWith('_')) bad(x[k], `${path}.${k}`, acc, depth + 1);
+  };
+  const signed = /net|power-to-water|powerToWater|energy per m³ of permeate|npv|irr|lsi|index|change|°C|temperature|potential|voltage/i, sized = /^(m²|m³\/h|m³\/d|kW|MW|kWh\/m³|kg\/s|kg\/h|t\/h|t\/d|L\/m²·h|%|bar|mg\/L|g\/kg)$/;
+  for (let k = 0; k < n; k++) {
+    const ov = { ...fixed };
+    cats.forEach((fl, i) => { const vals = fl.type === 'bool' ? [false, true] : fl.options.map((o) => o.value); ov[fl.key] = vals[(k * (i + 1) + Math.floor(k / vals.length) * i + g.int(vals.length) * (k % 3 === 0 ? 1 : 0)) % vals.length]; });
+    for (const fl of fields) {
+      if (fl.type || fl.key in fixed || !Number.isFinite(fl.min) || !Number.isFinite(fl.max)) continue;
+      const vis = { ...base, ...ov }, u = g.uniform(), e = g.uniform();
+      if ((fl.g.showIf && !fl.g.showIf(vis)) || (fl.showIf && !fl.showIf(vis))) continue;
+      const hi = fl.g.tab === 'mesh' ? fl.min + 0.03 * (fl.max - fl.min) : fl.max; // discretisation inputs stay at the coarse end to keep the check fast
+      const x = e < 0.1 ? fl.min : e < 0.2 ? hi : e < 0.3 ? fl.value : fl.min > 0 && hi / fl.min >= 100 ? fl.min * (hi / fl.min) ** u : fl.min + u * (hi - fl.min);
+      ov[fl.key] = fl.step === 1 ? Math.round(x) : x;
+    }
+    const why = [];
+    let res = null;
+    try { res = suiteDef.run({ ...JSON.parse(JSON.stringify(base)), ...ov, _lean: true }, undefined); }
+    catch (err) {
+      const m = String(err?.message || '');
+      if (err?.constructor !== Error || m.length < 40 || /NaN|undefined|Infinity|not a function|Cannot read|is not (a|an|iterable|defined)|brent|bracket/i.test(m) || !/raise|lower|reduce|increase|use |choose|select|switch|simulate|shorten|lengthen|enable|add |take /i.test(m)) why.push(`unexplained error: ${m.slice(0, 120)}`);
+      else out.rejected++;
+    }
+    if (res && typeof res.then === 'function') res = null; // asynchronous variants are not part of this check
+    if (res) {
+      bad({ kpis: res.kpis, tables: (res.tables || []).map((t) => t.rows), outputs: res.outputs, balances: res.balances, summary: res.summary, warnings: res.warnings }, 'result', why);
+      for (const pl of res.plots || []) bad(pl.type === 'field' ? pl.z : (pl.series || []).map((q) => [q.x, q.y, q.values].filter(Boolean)), `plot "${pl.title}"`, why);
+      for (const b of res.balances || []) if (!(Math.abs(b.in - b.out) <= 1e-3 * Math.max(1, Math.abs(b.in)))) why.push(`balance "${b.name}" open: ${b.in} vs ${b.out}`);
+      for (const q of res.kpis || []) if (typeof q.value === 'number' && q.value < -1e-9 && sized.test(q.unit || '') && !signed.test(q.label)) why.push(`negative ${q.label}: ${q.value}`);
+      const neg = (o, path) => { for (const [key, val] of Object.entries(o || {})) { if (typeof val === 'number') { if (val < -1e-9 && !signed.test(key) && !/^(T|P|pH)$/.test(key) && !(key === 'secElec' && /pro/.test(res.outputs.process || ''))) why.push(`negative output ${path}${key}: ${val}`); } else if (val && typeof val === 'object' && !Array.isArray(val)) neg(val, `${path}${key}.`); } };
+      neg(res.outputs, '');
+      if (!why.length) out.solved++;
+    }
+    if (why.length) out.fails.push({ k, why: why.slice(0, 3).join('; '), values: ov });
+  }
+  return out;
+}
 
 /** Synthetic plant data: the model with slightly different true parameters plus deterministic noise. */
 function synth(seed, pts) {
