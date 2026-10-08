@@ -53,7 +53,11 @@ export async function searchPlace(q) {
 }
 
 // Indicative industrial electricity tariff ($/kWh) and grid carbon intensity (kgCO₂/kWh) by country.
-// These are bundled planning defaults — every value is editable in the economics suite.
+// These are hand-entered planning defaults — every value is editable in the economics suite. The grid-carbon
+// figure is replaced by the Our World in Data series (live, or the copy in the built-in atlas) whenever that is
+// available; the tariff stays as the indicative value because the only open global tariff series (World Bank,
+// 2019, small-business connection) is older and not an industrial rate — it is used for countries missing here.
+// CURRENCY is a quick table for the common cases; the built-in atlas carries the full ISO 4217 list.
 const ENERGY = {
   AE: [0.08, 0.40], SA: [0.05, 0.57], QA: [0.04, 0.49], KW: [0.03, 0.57], BH: [0.07, 0.49], OM: [0.06, 0.44], IL: [0.11, 0.45], EG: [0.05, 0.43], MA: [0.10, 0.62], DZ: [0.04, 0.48], TN: [0.09, 0.47], LY: [0.03, 0.55],
   ES: [0.13, 0.17], IT: [0.20, 0.30], GR: [0.16, 0.34], CY: [0.24, 0.60], MT: [0.15, 0.39], TR: [0.10, 0.42], PT: [0.13, 0.15], FR: [0.14, 0.06], GB: [0.24, 0.21], DE: [0.20, 0.36], NL: [0.17, 0.27],
@@ -167,7 +171,10 @@ const connectors = {
     return { data };
   },
   async fx(lat, lon, site) {
-    const cur = site.data?.currency || CURRENCY[site.countryCode] || 'USD';
+    let cur = CURRENCY[site.countryCode] || site.data?.currency || 'USD';
+    if (site.countryCode && !CURRENCY[site.countryCode]) { // not in the short table above: the bundled ISO 4217 list knows every country
+      try { cur = (await (await loadAtlas()).atlasNational(site.countryCode))?.currency || cur; } catch { /* keep the default */ }
+    }
     const j = await getJSON('https://open.er-api.com/v6/latest/USD');
     const rate = num(j?.rates?.[cur]);
     if (rate === null) throw new Error('Currency not listed');
@@ -202,22 +209,190 @@ function keyOf(id, lat, lon, site) {
   return `${id}:${Math.round(lat * r)}:${Math.round(lon * r)}`;
 }
 
+// ---- built-in world atlas -----------------------------------------------------------------------------
+// When a live source cannot be reached (no connection, a blocked host, a service that is down) the fields
+// it would have supplied are answered from data bundled with the app: js/data/atlas_*.js, built from open
+// global data sets by tools/atlas_build.py. Those modules are large, so they are imported only when needed.
+let atlasLib = null;
+/** The look-up module of the built-in atlas (js/data/atlas_lookup.js), loaded on first use. */
+export const loadAtlas = () => (atlasLib ??= import('../data/atlas_lookup.js').catch((e) => { atlasLib = null; throw e; }));
+
+/** Fields by which a source counts as "answered by the atlas", and the atlas data set that stands in for it. */
+const ATLAS_SOURCE = {
+  place: ['nations', ['country']], economy: ['nations', ['inflation', 'lendingRate', 'gdpPerCapita', 'waterStress', 'renewableElectricity', 'electricityPriceWB', 'freshwaterPerCapita', 'safeWaterAccess']],
+  fx: ['fx', ['fxPerUSD']], energy: ['nations', ['gridCarbon', 'renewableShare']], weather: ['climate', ['airTemp', 'windSpeed', 'ghiDaily', 'elevation']],
+  marine: ['coast', ['tideRange', 'waveHeight', 'currentSpeed', 'tide', 'sst']], bathy: ['relief', ['bathy', 'depth']], salinity: ['ocean', ['salinity', 'salinityMonthly']], climate: ['climate', ['ghiAnnual', 'windAnnual', 'airTempAnnual']],
+};
+/** Plain-language name of every site-data field the atlas can supply (used for labels and the notice on the site page). */
+export const ATLAS_LABELS = {
+  country: 'country', currency: 'currency', electricityPrice: 'electricity price', inflation: 'inflation', lendingRate: 'lending rate', gdpPerCapita: 'GDP per capita', waterStress: 'water stress', renewableElectricity: 'renewable electricity (World Bank)',
+  electricityPriceWB: 'business electricity tariff', freshwaterPerCapita: 'freshwater per capita', safeWaterAccess: 'safe water access', fxPerUSD: 'exchange rate', gridCarbon: 'grid carbon', renewableShare: 'renewable share',
+  salinity: 'salinity', salinityMonthly: 'monthly salinity', sstMonthly: 'monthly sea temperature', sst: 'sea temperature', bathy: 'seabed and terrain grid', depth: 'water depth', maxDepthNearby: 'deepest point nearby', elevation: 'land elevation',
+  tideRange: 'tidal range', tide: 'tide series', currentSpeed: 'mean current', currentMax: 'peak current', currentDir: 'current direction', waveHeight: 'wave height', wavePeriod: 'wave period', waveDir: 'wave direction',
+  ghiAnnual: 'solar resource', ghiDaily: 'solar resource', windAnnual: 'long-term wind', airTempAnnual: 'long-term air temperature', airTemp: 'air temperature', windSpeed: 'wind speed',
+};
+const month = () => new Date().getUTCMonth();
+
+/**
+ * Fill every site-data field that is still missing from the built-in atlas. Live values are never overwritten.
+ *   site    { lat, lon, data, country, countryCode, name }  — changed in place
+ *   status  per-source status of the live fetch; sources answered by the atlas get { atlas: true, message: 'built-in atlas (yyyy-mm)' }
+ *   ctx     { mark: Map(field -> atlas data set), notes: {}, done: Set(source ids that have settled), vintage: {} }
+ * A field is filled only once every live source that could still deliver it has settled (ctx.done; default: all).
+ * Afterwards site.data.atlasFields lists the fields taken from the atlas, site.data.atlasVintage the dates of the
+ * bundled data sets in use and site.data.atlasNotes any caveat per field.
+ */
+export async function atlasFill(site, status = {}, ctx = {}) {
+  const d = (site.data ??= {}), { lat, lon } = site;
+  const mark = (ctx.mark ??= new Map()), notes = (ctx.notes ??= {}), done = (ctx.done ??= new Set(SOURCES.map((x) => x.id))), vintage = (ctx.vintage ??= {});
+  const ready = (...ids) => ids.every((id) => done.has(id)), missing = (...keys) => keys.some((k) => d[k] == null);
+  const put = (set, k, v, note) => { if (v == null || (d[k] != null && !mark.has(k))) return; d[k] = v; mark.set(k, set); if (note) notes[k] = note; else delete notes[k]; };
+  let A = null;
+  try { A = await loadAtlas(); } catch { /* the atlas modules could not be loaded: the small table shipped with the core is used below */ }
+  const part = async (fn) => { try { await fn(); } catch { /* this data set is unavailable; the others still apply */ } };
+  if (A) {
+    await part(async () => { // country and national figures
+      if (!ready('place')) return;
+      if (!site.countryCode) { const p = await A.atlasPlace(lat, lon); if (p) { site.country = p.country; site.countryCode = p.countryCode; mark.set('country', 'nations'); if (p.offshoreKm > 0) notes.country = `nearest country, ${p.offshoreKm} km from its outline`; } }
+      if (!site.countryCode) return;
+      const eco = ['inflation', 'lendingRate', 'gdpPerCapita', 'waterStress', 'renewableElectricity', 'freshwaterPerCapita', 'safeWaterAccess', 'electricityPriceWB'];
+      const wantEco = ready('economy') && missing(...eco), wantEn = ready('energy') && (!d.gridCarbonLive || missing('renewableShare')), wantFx = ready('fx') && missing('fxPerUSD');
+      if (!wantEco && !wantEn && !wantFx && !missing('currency', 'electricityPrice')) return;
+      const n = await A.atlasNational(site.countryCode);
+      if (!n) return;
+      if (!site.country) site.country = n.countryName;
+      if (n.currency && (d.currency == null || (d.currency === 'USD' && !CURRENCY[site.countryCode] && !status.fx?.ok))) { d.currency = n.currency; mark.set('currency', 'nations'); }
+      if (wantEco) { for (const k of eco) { put('nations', k, n[k]); if (mark.has(k)) d[k + 'Year'] = n[k + 'Year']; } d.iso3 ??= n.iso3; }
+      if (wantEn) {
+        if (!d.gridCarbonLive && n.gridCarbon != null) { d.gridCarbon = n.gridCarbon; d.gridCarbonYear = n.gridCarbonYear; mark.set('gridCarbon', 'nations'); }
+        put('nations', 'renewableShare', n.renewableShare); if (mark.has('renewableShare')) d.renewableShareYear = n.renewableShareYear;
+      }
+      if (wantFx) { const r = d.currency === n.currency ? n : await A.atlasRate(d.currency); if (r?.fxPerUSD > 0) { put('fx', 'fxPerUSD', r.fxPerUSD); if (mark.has('fxPerUSD')) d.fxDate = r.fxDate; } }
+      const e = ENERGY[site.countryCode];
+      if (e) { put('nations', 'electricityPrice', e[0], 'indicative industrial tariff (hand-entered planning default)'); if (ready('energy') && d.gridCarbon == null) put('nations', 'gridCarbon', e[1], 'indicative planning default'); }
+      else if (ready('economy') && mark.has('electricityPriceWB')) put('nations', 'electricityPrice', d.electricityPriceWB, `World Bank business tariff, ${d.electricityPriceWBYear}`);
+    });
+    await part(async () => { // sea-surface salinity and temperature
+      const wantS = ready('salinity') && missing('salinity', 'salinityMonthly', 'sstMonthly'), wantT = ready('salinity', 'marine') && missing('sst');
+      if (!wantS && !wantT) return;
+      const o = await A.atlasOcean(lat, lon);
+      if (!o) return;
+      const note = o.oceanCellKm > 0 ? `nearest sea cell, ${o.oceanCellKm} km away` : '';
+      if (wantS) { put('ocean', 'salinity', o.salinity, note); if (mark.has('salinity')) { d.salinityMin = o.salinityMin; d.salinityMax = o.salinityMax; } put('ocean', 'salinityMonthly', o.salinityMonthly); put('ocean', 'sstMonthly', o.sstMonthly); }
+      if (wantT && (d.sstMonthly || o.sstMonthly)) { const own = mark.has('sstMonthly') || d.sstMonthly == null, m = own ? o.sstMonthly : d.sstMonthly; put(own ? 'ocean' : 'derived', 'sst', m[month()], 'climatological mean for this month'); if (mark.has('sst')) { d.sstMin = Math.min(...m); d.sstMax = Math.max(...m); } }
+    });
+    await part(async () => { // seabed and terrain
+      const wantB = ready('bathy') && missing('bathy', 'depth'), wantE = ready('bathy', 'weather') && missing('elevation');
+      if (!wantB && !wantE) return;
+      const r = await A.atlasRelief(lat, lon);
+      if (wantB) {
+        put('relief', 'bathy', r.bathy, 'coarse grid (about 5 km at the coast)'); put('relief', 'depth', r.depth, r.depthEstimated || '');
+        if (mark.has('depth')) { d.elevationRelief = r.elevationRelief; d.seaFraction = r.seaFraction; d.depthEstimated = r.depthEstimated || 'built-in atlas relief'; }
+        put('relief', 'maxDepthNearby', r.maxDepthNearby, 'within about 50 km');
+      }
+      if (wantE) put('relief', 'elevation', r.elevation);
+    });
+    await part(async () => { // tides, currents, waves
+      if (!ready('marine') || !missing('tideRange', 'tide', 'currentSpeed', 'waveHeight', 'wavePeriod')) return;
+      const c = await A.atlasCoast(lat, lon);
+      if (!c) return;
+      const near = c.coastPointKm != null ? `, model point ${c.coastPointKm} km away` : '';
+      put('coast', 'tideRange', c.tideRange, `typical range ${c.seaPeriod}${near}`);
+      if (mark.has('tideRange')) { d.tideSpring = c.tideSpring; d.tideNeap = c.tideNeap; }
+      if (d.tide == null || mark.has('tide')) { put('coast', 'tide', c.tide, 'synthetic: harmonic prediction from five tidal constituents'); if (mark.has('tide')) d.seaLevelMean = 0; }
+      put('coast', 'currentSpeed', c.currentSpeed, `mean ${c.seaPeriod}`); put('coast', 'currentMax', c.currentMax, `99th percentile ${c.seaPeriod}`); put('coast', 'currentDir', c.currentDir, 'predominant direction');
+      const wn = c.wavePointKm != null ? `, model point ${c.wavePointKm} km away` : '';
+      put('coast', 'waveHeight', c.waveHeight, `annual mean ${c.wavePeriodOfRecord.slice(0, 4)}${wn}`);
+      if (mark.has('waveHeight')) { d.waveHeightP95 = c.waveHeightP95; d.waveHeightMax = c.waveHeightMax; d.waveHeightMonthly = c.waveHeightMonthly; d.wavePeriodStorm = c.wavePeriodStorm; }
+      put('coast', 'wavePeriod', c.wavePeriod, 'annual mean'); put('coast', 'waveDir', c.waveDir, 'predominant direction');
+    });
+    await part(async () => { // long-term solar, wind, air temperature
+      const wantC = ready('climate') && missing('ghiAnnual', 'windAnnual', 'airTempAnnual'), wantW = ready('climate', 'weather') && missing('airTemp', 'windSpeed', 'ghiDaily');
+      if (!wantC && !wantW) return;
+      const c = await A.atlasClimate(lat, lon);
+      if (!c) return;
+      if (wantC) for (const k of ['ghiAnnual', 'ghiMonthly', 'windAnnual', 'windMonthly', 'airTempAnnual', 'airTempMonthly']) put('climate', k, c[k], k.endsWith('Annual') ? `long-term mean ${c.climatePeriod}` : '');
+      if (wantW) {
+        const own = (k) => (mark.has(k) || d[k] == null ? 'climate' : 'derived'), at = d.airTempMonthly || c.airTempMonthly, wm = d.windMonthly || c.windMonthly;
+        if (at) put(own('airTempMonthly'), 'airTemp', at[month()], 'long-term mean for this month'); if (wm) put(own('windMonthly'), 'windSpeed', wm[month()], 'long-term mean for this month');
+        put(own('ghiAnnual'), 'ghiDaily', d.ghiAnnual ?? c.ghiAnnual, 'long-term mean');
+      }
+    });
+  }
+  // last resort (also when the atlas modules are unavailable): the small table shipped with the core
+  if (ready('salinity') && d.salinity == null) {
+    const at = A ? null : atlasSite(lat, lon), reg = regionalSalinity(lat, lon), enclosed = reg !== 35.5 && reg !== 34.3;
+    put('core', 'salinity', at && !enclosed ? at.salinity : reg, at && !enclosed ? 'coarse 4° table' : 'regional estimate');
+    if (at) { put('core', 'salinityMonthly', at.salinityMonthly); put('core', 'sstMonthly', at.sstMonthly); if (ready('marine')) put('core', 'sst', at.sst, 'coarse 4° table'); }
+    else if (d.sstMonthly && d.salinityMonthly == null) put('core', 'salinityMonthly', new Array(12).fill(d.salinity), 'regional estimate, no seasonal cycle');
+  }
+  if (ready('climate', 'weather') && d.ghiAnnual == null && d.ghiDaily == null) put('core', 'ghiDaily', solarEstimate(lat), 'estimate from latitude');
+  // dates of the bundled data, and the per-source status
+  const sets = new Set(mark.values());
+  if (A) for (const s of sets) if (s !== 'core' && s !== 'derived' && vintage[s] === undefined) Object.assign(vintage, await A.atlasVintage([s === 'fx' ? 'nations' : s]).catch(() => ({})));
+  for (const k of [...mark.keys()]) if (mark.get(k) === 'derived') mark.delete(k); // computed from live climatology: not atlas data
+  for (const [id, [set, keys]] of Object.entries(ATLAS_SOURCE)) {
+    const st = status[id];
+    if (!st || st.ok || st.atlas || !keys.some((k) => mark.has(k))) continue;
+    status[id] = { ok: false, atlas: true, message: `built-in atlas (${vintage[set] || vintage.nations || 'bundled'})`, reason: st.message, at: st.at };
+    ctx.onStatus?.(id, 'atlas', status[id].message);
+  }
+  atlasStamp(site, ctx);
+  return site;
+}
+/** Write the atlas book-keeping (atlasFields, atlasNotes, atlasVintage and the older flags) into site.data. */
+function atlasStamp(site, ctx) {
+  const d = site.data, mark = ctx.mark, sets = new Set(mark.values());
+  d.atlasFields = [...mark.keys()].sort();
+  d.atlasNotes = Object.fromEntries(Object.entries(ctx.notes).filter(([k]) => mark.has(k)));
+  const v = Object.fromEntries(Object.entries(ctx.vintage || {}).filter(([k]) => sets.has(k) || (k === 'seaPeriod' || k === 'wavePeriod' ? sets.has('coast') : k === 'climatePeriod' ? sets.has('climate') : false)));
+  if (Object.keys(v).length) d.atlasVintage = v; else delete d.atlasVintage;
+  d.atlas = mark.size > 0; d.salinityEstimated = mark.has('salinity'); d.sstEstimated = mark.has('sst'); d.solarEstimated = mark.get('ghiDaily') === 'core';
+  if (!mark.has('depth')) delete d.depthEstimated;
+}
+/**
+ * Merge a fresh fetch into the stored data of the same place: fresh live values replace anything, but a fresh
+ * atlas value never replaces a stored live one. Returns the merged data object (with a consistent atlasFields).
+ */
+export function mergeSiteData(old = {}, fresh = {}) {
+  const oldAtlas = new Set(old.atlasFields || []), newAtlas = new Set(fresh.atlasFields || []), out = { ...old }, fields = new Set();
+  for (const k of oldAtlas) if (old[k] != null) fields.add(k);
+  for (const [k, v] of Object.entries(fresh)) {
+    if (v === null || v === undefined || k.startsWith('atlas')) continue;
+    if (newAtlas.has(k) && old[k] != null && !oldAtlas.has(k)) continue; // stored live value stays
+    out[k] = v; if (newAtlas.has(k)) fields.add(k); else fields.delete(k);
+  }
+  out.atlasFields = [...fields].sort();
+  out.atlasNotes = Object.fromEntries(Object.entries({ ...(old.atlasNotes || {}), ...(fresh.atlasNotes || {}) }).filter(([k]) => fields.has(k)));
+  out.atlasVintage = { ...(old.atlasVintage || {}), ...(fresh.atlasVintage || {}) }; if (!fields.size) delete out.atlasVintage;
+  out.atlas = fields.size > 0; out.salinityEstimated = fields.has('salinity'); out.sstEstimated = fields.has('sst'); out.solarEstimated = fields.has('ghiDaily') && fresh.solarEstimated === true;
+  if (!fields.has('depth')) delete out.depthEstimated;
+  return out;
+}
+
 /**
  * Pull everything for one location, as fast as the sources allow:
  *  - every connector starts at once (national data start the moment the country is known);
  *  - answers already on the device are used immediately;
- *  - onData(site) is called after each answer so the page fills in progressively instead of waiting for the slowest source.
- * Returns { meta, data, status: { id: { ok, message, at, cached } } }.
+ *  - onData(site) is called after each answer so the page fills in progressively instead of waiting for the slowest source;
+ *  - whatever a source fails to deliver is filled from the built-in atlas (atlasFill), field by field, and listed in
+ *    data.atlasFields; a live answer always replaces an atlas value.
+ * opt: { fresh: ignore the device cache, atlasOnly: do not use the network at all }.
+ * Returns { meta, data, status: { id: { ok, message, at, cached, atlas } } }.
  */
 export async function fetchSite(lat, lon, onStatus = () => {}, onData = () => {}, opt = {}) {
   const { fresh = false } = opt;
   lat = clamp(+lat, -90, 90); lon = ((((+lon + 180) % 360) + 360) % 360) - 180;
   const site = { lat, lon, data: {}, name: '', country: '', countryCode: '' }, status = {};
-  const snapshot = () => ({ ...site, data: { ...site.data }, status: { ...status }, fetchedAt: new Date().toISOString() });
-  const absorb = (r) => { for (const [k, v] of Object.entries(r.data || {})) if (v !== null && v !== undefined) site.data[k] = v; if (r.meta) Object.assign(site, r.meta); };
+  const ctx = { mark: new Map(), notes: {}, done: new Set(), vintage: {}, onStatus };
+  const snapshot = () => { atlasStamp(site, ctx); return { ...site, data: { ...site.data }, status: { ...status }, fetchedAt: new Date().toISOString() }; };
+  const absorb = (r) => { // live (or stored live) answer: it replaces any atlas value of the same field
+    for (const [k, v] of Object.entries(r.data || {})) if (v !== null && v !== undefined) { site.data[k] = v; ctx.mark.delete(k); }
+    if (r.meta) { Object.assign(site, r.meta); if (r.meta.countryCode) ctx.mark.delete('country'); }
+  };
   const run = async (id) => {
     const key = keyOf(id, lat, lon, site), hit = !fresh && key ? cacheGet(key, TTL[id]) : null;
-    if (hit) { absorb(hit.v); status[id] = { ok: true, message: 'Live', at: new Date(hit.t).toISOString(), cached: true }; onStatus(id, 'ok', 'Live'); onData(snapshot()); return; }
+    if (hit) { absorb(hit.v); ctx.done.add(id); status[id] = { ok: true, message: 'Live', at: new Date(hit.t).toISOString(), cached: true }; onStatus(id, 'ok', 'Live'); finish(); onData(snapshot()); return; }
     onStatus(id, 'loading');
     try {
       const r = await connectors[id](lat, lon, site);
@@ -229,33 +404,31 @@ export async function fetchSite(lat, lon, onStatus = () => {}, onData = () => {}
       if (stale) { absorb(stale.v); status[id] = { ok: true, message: 'Stored copy', at: new Date(stale.t).toISOString(), cached: true }; }
       else status[id] = { ok: false, message: e.name === 'AbortError' ? 'Timed out' : txt(e.message || 'Unavailable', 90), at: new Date().toISOString() };
     }
+    ctx.done.add(id);
     onStatus(id, status[id].ok ? 'ok' : 'fail', status[id].message);
+    if (!status[id].ok) await atlasFill(site, status, ctx); // stand in for this source straight away (the country, in particular, unlocks the national sources)
     finish(); onData(snapshot());
   };
-  const finish = () => {
-    const d = site.data;
-    const at = d.salinity == null || d.sst == null ? atlasSite(lat, lon) : null;
-    const reg = regionalSalinity(lat, lon), enclosed = reg !== 35.5 && reg !== 34.3; // enclosed seas are finer than the atlas grid: the regional value wins there
-    if (d.salinity == null) { d.salinity = at && !enclosed ? at.salinity : reg; d.salinityEstimated = true; if (at) { d.salinityMonthly ??= at.salinityMonthly; d.sstMonthly ??= at.sstMonthly; d.atlas = true; } } else if (status.salinity?.ok) d.salinityEstimated = false;
-    if (d.sst == null && at) { d.sst = at.sst; d.sstMin ??= at.sstMin; d.sstMax ??= at.sstMax; d.sstEstimated = true; d.atlas = true; }
-    if (d.ghiAnnual == null && d.ghiDaily == null) { d.ghiDaily = solarEstimate(lat); d.solarEstimated = true; }
-    if (d.sst == null && d.sstMonthly) d.sst = d.sstMonthly[new Date().getUTCMonth()] || null;
-    if (d.ghiAnnual != null) d.ghiDaily = d.ghiAnnual; // the long-term mean is the better design basis than this week's weather
-    if (d.electricityPrice == null && d.electricityPriceWB != null) d.electricityPrice = d.electricityPriceWB;
+  const finish = () => { // values derived from other fields
+    const d = site.data, mk = ctx.mark, derive = (k, from, v) => { d[k] = v; if (mk.has(from)) mk.set(k, mk.get(from)); else mk.delete(k); };
+    if (d.sst == null && d.sstMonthly && d.sstMonthly[month()]) derive('sst', 'sstMonthly', d.sstMonthly[month()]);
+    if (d.ghiAnnual != null && (d.ghiDaily == null || mk.has('ghiDaily') || !mk.has('ghiAnnual'))) derive('ghiDaily', 'ghiAnnual', d.ghiAnnual); // the long-term mean is the better design basis than this week's weather
+    if (d.electricityPrice == null && d.electricityPriceWB != null) derive('electricityPrice', 'electricityPriceWB', d.electricityPriceWB);
   };
   if (opt.atlasOnly) { // no network at all: answer from the built-in atlas
-    for (const src of SOURCES) { status[src.id] = { ok: false, message: 'No connection', at: new Date().toISOString() }; onStatus(src.id, 'fail', 'No connection'); }
-    finish(); return snapshot();
+    for (const src of SOURCES) { status[src.id] = { ok: false, message: 'No connection', at: new Date().toISOString() }; ctx.done.add(src.id); onStatus(src.id, 'fail', 'No connection'); }
+    await atlasFill(site, status, ctx); finish();
+    return snapshot();
   }
   const national = run('place').then(() => Promise.all([run('fx'), run('economy').then(() => run('energy'))])); // these need the country
   await Promise.all([national, ...['weather', 'marine', 'bathy', 'salinity', 'climate'].map(run)]);
-  finish();
+  await atlasFill(site, status, ctx); finish();
   return snapshot();
 }
 
 /**
- * Built-in atlas value for a point: nearest ocean cell of the bundled 4° climatology (searched outwards up to
- * three cells). Returns null far inland. Used whenever the live services cannot be reached.
+ * Coarse stand-by value for a point: nearest ocean cell of the 4° climatology shipped with the core (searched outwards
+ * up to three cells). Returns null far inland. Used only if the modules of the full built-in atlas cannot be loaded.
  */
 export function atlasSite(lat, lon) {
   const A = ATLAS, i0 = Math.round((lat - A.lat0) / A.step), j0 = Math.round((((lon - A.lon0) % 360) + 360) % 360 / A.step);
@@ -274,10 +447,10 @@ export function atlasSite(lat, lon) {
   const sstMonthly = Array.from({ length: 12 }, (_, m) => +(t0 + ta * Math.cos((2 * Math.PI * (m - tp)) / 12)).toFixed(2));
   return { salinity: A.sal[k] / 10, sst: sstMonthly[month], sstMin: +(t0 - ta).toFixed(2), sstMax: +(t0 + ta).toFixed(2), sstMonthly, salinityMonthly: new Array(12).fill(A.sal[k] / 10) };
 }
-/** Clear-sky-based estimate of the long-term mean solar irradiation (kWh/m²·d) from latitude alone. */
+/** Clear-sky-based estimate of the long-term mean solar irradiation (kWh/m²·d) from latitude alone (used outside the atlas grid, beyond 60° S / 80° N). */
 export const solarEstimate = (lat) => +clamp(6.4 * Math.cos((Math.abs(lat) * Math.PI) / 180) ** 1.15 + 0.6, 1.5, 6.8).toFixed(2);
 
-/** Coarse regional climatology used only when the live salinity service cannot be reached. */
+/** Regional salinity estimate, used only where neither the live service nor the built-in atlas has a value (e.g. the Caspian Sea, far inland). */
 export function regionalSalinity(lat, lon) {
   const box = (a, b, c, d) => lat >= a && lat <= b && lon >= c && lon <= d;
   if (box(23.5, 30.5, 47.5, 56.5)) return 42;

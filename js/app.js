@@ -5,7 +5,7 @@ import { store } from './core/store.js';
 import { SUITES, byId, loadSuite, downstream } from './suites/index.js';
 import { renderSuite } from './core/suiteview.js';
 import { home, casePage, sitePage, portalPage, chainPage, appPage } from './pages/pages.js';
-import { fetchSite } from './core/live.js';
+import { fetchSite, mergeSiteData } from './core/live.js';
 import { APP, ARCHIVE_SOURCE } from './data/app.js';
 import { advisorPage } from './core/advisorview.js';
 import { buildId } from './core/build.js';
@@ -118,7 +118,7 @@ async function refreshSite() {
   const s = store.case.site;
   if (!navigator.onLine || s.lat === null || s.lon === null || !s.fetchedAt) return;
   if (Date.now() - new Date(s.fetchedAt) < 6 * 3600e3) return;
-  try { const fresh = await fetchSite(s.lat, s.lon); if (Object.values(fresh.status).some((x) => x.ok)) { store.setSite({ ...fresh, data: { ...s.data, ...fresh.data }, name: fresh.name || s.name }); if (current() === 'site') route(); } } catch { /* stay on stored data */ }
+  try { const fresh = await fetchSite(s.lat, s.lon); if (Object.values(fresh.status).some((x) => x.ok)) { store.setSite({ ...fresh, data: mergeSiteData(s.data, fresh.data), name: fresh.name || s.name }); if (current() === 'site') route(); } } catch { /* stay on stored data */ }
 }
 
 async function setupServiceWorker() {
