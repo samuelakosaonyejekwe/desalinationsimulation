@@ -147,7 +147,8 @@ function refreshArchiveCopy() {
     // The Archive answers repeat requests for one address with its existing capture for some hours, so each build is also
     // captured under its own address (?v=<build>), which is always new to the Archive.
     const ask = (u) => fetch('https://web.archive.org/save/' + u, { mode: 'no-cors', credentials: 'omit', referrerPolicy: 'no-referrer', cache: 'no-store' });
-    ask(ARCHIVE_SOURCE + '?v=' + version).then(() => ask(ARCHIVE_SOURCE)).catch(() => store.pref('archived', ''));
+    // the plain address is what the Install & offline page links to (through the Archive's list of captures), so it is asked for first
+    ask(ARCHIVE_SOURCE).then(() => ask(ARCHIVE_SOURCE + '?v=' + version)).catch(() => store.pref('archived', ''));
   } catch { /* storage or network unavailable: try again on a later visit */ }
 }
 

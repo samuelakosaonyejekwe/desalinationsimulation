@@ -11,7 +11,7 @@ import { plotCard } from '../core/plot.js';
 import { fmt } from '../core/num.js';
 import { summarize, WATERS, cloneIons, ION_IDS, IONS } from '../core/water.js';
 import { download, readTable, extOf, checkFile } from '../core/io.js';
-import { MIRRORS, APP } from '../data/app.js';
+import { MIRRORS, APP, ARCHIVE_SOURCE } from '../data/app.js';
 import { LAND } from '../data/atlas.js';
 
 const card = (...kids) => h('section', { class: 'card' }, ...kids);
@@ -366,13 +366,26 @@ export function appPage(root, app) {
     for (const el of mirrorBox.children) {
       const url = el.dataset.url;
       const arch = el.dataset.kind === 'archive';
+      let archUrl = url;
       try {
         const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 12000);
-        if (arch) { await fetch(url, { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'no-cors' }); clearTimeout(tm); el.className = 'source ok'; el.lastChild.textContent = 'reachable'; }
+        if (arch) {
+          // The Archive is asked which capture is its latest (its "most recent" address can answer from a stale cache), and the link is
+          // pointed at exactly that capture; its time is compared with the build time of the primary address to say whether it is current.
+          let ts = '', built = 0;
+          try { const j = await (await fetch('https://archive.org/wayback/available?url=' + encodeURIComponent(ARCHIVE_SOURCE), { signal: ctl.signal, cache: 'no-store', credentials: 'omit' })).json(); ts = String(j?.archived_snapshots?.closest?.timestamp || '').replace(/\D/g, '').slice(0, 14); } catch { ts = ''; }
+          try { const v = await (await fetch(ARCHIVE_SOURCE.replace(/[^/]*$/, 'version.json?t=') + Date.now(), { signal: ctl.signal, cache: 'no-store', credentials: 'omit' })).json(); built = Date.parse(v.built) || 0; } catch { built = 0; }
+          if (ts.length === 14) {
+            const when = Date.UTC(+ts.slice(0, 4), +ts.slice(4, 6) - 1, +ts.slice(6, 8), +ts.slice(8, 10), +ts.slice(10, 12), +ts.slice(12, 14));
+            archUrl = `https://web.archive.org/web/${ts}id_/${ARCHIVE_SOURCE}`;
+            el.className = 'source ok'; el.lastChild.textContent = `captured ${new Date(when).toLocaleString()}` + (built ? (when >= built - 60e3 ? ' · holds the current build' : ' · holds an earlier build; a new capture has been requested') : '');
+          } else { await fetch(url, { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'no-cors' }); el.className = 'source ok'; el.lastChild.textContent = 'reachable'; }
+          clearTimeout(tm);
+        }
         else { const r = await fetch(url + 'version.json?t=' + Date.now(), { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'cors' }); clearTimeout(tm); const j = await r.json(); el.className = 'source ok'; el.lastChild.textContent = `online · build ${String(j.version).slice(0, 12)}`; }
       }
       catch { el.className = 'source fail'; el.lastChild.textContent = navigator.onLine ? 'not reachable from this network' : 'offline'; }
-      el.append(h('a', { class: 'btn mini', href: arch ? url + (app.version && app.version !== 'single-file' ? '?v=' + app.version : '') : url + 'index.html', rel: 'noopener', title: arch ? 'Opens the capture of this build if the Archive holds one, otherwise its most recent capture' : null }, 'Open'));
+      el.append(h('a', { class: 'btn mini', href: arch ? archUrl : url + 'index.html', rel: 'noopener', title: arch ? 'Opens the latest capture held by the Archive' : null }, 'Open'));
     }
   };
   const paintStorage = async () => {
