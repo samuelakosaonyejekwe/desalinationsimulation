@@ -497,6 +497,8 @@ export async function solveChannel(o, ctx) {
     }
   }
   const exC = (i, jf) => { if (jf <= 0 || jf >= ny) return 0; const i0 = i > 0 ? i - 1 : 0, i1 = i < nx ? i : nx - 1; return 0.25 * (exy[(jf - 1) * nx + i0] + exy[(jf - 1) * nx + i1] + exy[jf * nx + i0] + exy[jf * nx + i1]); };
+  // options read once: the hot loops below then see plain numbers and flags instead of the caller's option object, whose layout differs from call to call
+  const perIn = o.inlet === 'periodic', turbOn = !!o.turb, porK = o.porous ? o.porous.K : 0, porCF = o.porous ? o.porous.cF : 0, pTolS = o.pTol ?? 0.02, pIterS = o.pIter ?? 60;
   const asmT = (phi, dc, inVal, kWall, sch, dcy = dc) => { // dcy: separate diffusivity across the gap (anisotropic gradient diffusion of the stress model)
     for (let j = 0; j < ny; j++) for (let k = 0; k <= nx; k++) {
       const q = j * (nx + 1) + k, R = j * nx + k, Lc = R - 1;
@@ -513,7 +515,7 @@ export async function solveChannel(o, ctx) {
       if (wallB !== 'sym' && !wfB[i] && !solid[i]) St.Dy[i] = (mu * dx) / (0.5 * dy[0]);
       if (wallT !== 'sym' && !wfT[i] && !solid[(ny - 1) * nx + i]) St.Dy[ny * nx + i] = (mu * dx) / (0.5 * dy[ny - 1]);
     }
-    for (let j = 0; j < ny; j++) { St.bW[j] = o.inlet === 'periodic' ? phi[j * nx + nx - 1] : inVal; St.bE[j] = phi[j * nx + nx - 1]; }
+    for (let j = 0; j < ny; j++) { St.bW[j] = perIn ? phi[j * nx + nx - 1] : inVal; St.bE[j] = phi[j * nx + nx - 1]; }
     assemble(St, phi, sch);
   };
   const turbStep = () => {
@@ -716,12 +718,11 @@ export async function solveChannel(o, ctx) {
   const uPrev = new Float64Array(u.length);
   let un = null, vn = null;
 
-  /** One SIMPLE(C) iteration. rdt = ρ/Δt for time-accurate steps (0 for steady relaxation). */
-  const iterate = (rdt) => {
-    const al = rdt ? 1 : aU, turb = !!o.turb, cr = cv * rho * 0.5;
+  // One SIMPLE(C) iteration in three stages (u momentum, v momentum, outlet and pressure correction), each a function of its own so that it is compiled separately.
     // Time-accurate steps are stabilised by the inertia term ρ/Δt alone. Where the step is so long that this term adds less than 10 % to
     // the diagonal (creeping flow, cells far finer than the time step resolves) the iteration is under-relaxed by that amount instead.
-    const aT = 1.1;
+  const uMom = (rdt) => {
+    const al = rdt ? 1 : aU, turb = turbOn, cr = cv * rho * 0.5, aT = 1.1;
     // ---- u momentum (the laminar conductances are constant and were set once)
     for (let j = 0; j < ny; j++) { const cj = cr * dy[j]; for (let k = 1, q = j * (nu1 + 1) + 1, a = j * nu1; k <= nx; k++, q++, a++) Su.Fx[q] = cj * (u[a] + u[a + 1]); }
     for (let jf = 0; jf <= ny; jf++) { const cx = cr * dx; for (let i = 1, q = jf * nu1 + 1, a = jf * nx; i < nx; i++, q++, a++) Su.Fy[q] = cx * (v[a] + v[a + 1]); }
@@ -744,7 +745,7 @@ export async function solveChannel(o, ctx) {
       let ap = Su.aP[k];
       if (por && (por[j * nx + i - 1] || por[j * nx + i])) {
         const vm = 0.25 * (v[j * nx + i - 1] + v[j * nx + i] + v[(j + 1) * nx + i - 1] + v[(j + 1) * nx + i]);
-        ap += (mu / o.porous.K + (rho * o.porous.cF * Math.hypot(u[k], vm)) / Math.sqrt(o.porous.K)) * vol;
+        ap += (mu / porK + (rho * porCF * Math.hypot(u[k], vm)) / Math.sqrt(porK)) * vol;
       }
       if (rdt) { const a0 = ap; ap += rdt * vol; Su.b[k] += rdt * vol * un[k]; if (ap < aT * a0) { Su.b[k] += (aT * a0 - ap) * u[k]; ap = aT * a0; } }
       ap /= al;
@@ -756,6 +757,10 @@ export async function solveChannel(o, ctx) {
     uPrev.set(u); // previous iterate, for the change norm
     lineSolve(Su, u, 1);
     for (let k = 0; k < u.length; k++) { const d = Math.abs(u[k] - uPrev[k]); if (d > dUmax) dUmax = d; }
+    return dUmax;
+  };
+  const vMom = (rdt) => {
+    const al = rdt ? 1 : aU, turb = turbOn, cr = cv * rho * 0.5, aT = 1.1;
     // ---- v momentum
     for (let jf = 1; jf < ny; jf++) { const ca = cr * dy[jf - 1], cb = cr * dy[jf]; for (let k = 0, q = jf * (nx + 1), a = (jf - 1) * nu1; k <= nx; k++, q++, a++) Sv.Fx[q] = ca * u[a] + cb * u[a + nu1]; }
     for (let jj = 1; jj <= ny; jj++) { const cx = cr * dx; for (let i = 0, q = jj * nx; i < nx; i++, q++) Sv.Fy[q] = cx * (v[q - nx] + v[q]); }
@@ -763,7 +768,7 @@ export async function solveChannel(o, ctx) {
       for (let jf = 1; jf < ny; jf++) for (let k = 0; k <= nx; k++) { const q = jf * (nx + 1) + k; Sv.Dx[q] = muCorner(k, jf) * gxv[q]; }
       for (let jj = 1; jj <= ny; jj++) for (let i = 0; i < nx; i++) { const q = jj * nx + i; Sv.Dy[q] = mue[(jj - 1) * nx + i] * gyv[q]; }
     }
-    for (let jf = 0; jf <= ny; jf++) { Sv.bW[jf] = o.inlet === 'periodic' ? v[jf * nx + nx - 1] : 0; Sv.bE[jf] = v[jf * nx + nx - 1]; }
+    for (let jf = 0; jf <= ny; jf++) { Sv.bW[jf] = perIn ? v[jf * nx + nx - 1] : 0; Sv.bE[jf] = v[jf * nx + nx - 1]; }
     assemble(Sv, v, scheme);
     for (let jf = 0; jf <= ny; jf++) for (let i = 0; i < nx; i++) {
       const k = jf * nx + i;
@@ -772,7 +777,7 @@ export async function solveChannel(o, ctx) {
       let ap = Sv.aP[k];
       if (por && (por[(jf - 1) * nx + i] || por[jf * nx + i])) {
         const um = 0.25 * (u[(jf - 1) * nu1 + i] + u[(jf - 1) * nu1 + i + 1] + u[jf * nu1 + i] + u[jf * nu1 + i + 1]);
-        ap += (mu / o.porous.K + (rho * o.porous.cF * Math.hypot(um, v[k])) / Math.sqrt(o.porous.K)) * vol;
+        ap += (mu / porK + (rho * porCF * Math.hypot(um, v[k])) / Math.sqrt(porK)) * vol;
       }
       if (rdt) { const a0 = ap; ap += rdt * vol; Sv.b[k] += rdt * vol * vn[k]; if (ap < aT * a0) { Sv.b[k] += (aT * a0 - ap) * v[k]; ap = aT * a0; } }
       ap /= al;
@@ -782,6 +787,8 @@ export async function solveChannel(o, ctx) {
       Sv.aP[k] = ap; dv[k] = dx / (simplec ? Math.max(ap - nb, 0.05 * ap) : ap);
     }
     lineSolve(Sv, v, 1);
+  };
+  const pCorr = () => {
     // ---- outlet: zero streamwise gradient, scaled to global continuity
     let Qperm = 0, Qo = 0;
     for (let i = 0; i < nx; i++) Qperm += (v[ny * nx + i] - v[i]) * dx;
@@ -805,7 +812,7 @@ export async function solveChannel(o, ctx) {
     for (let j = 0; j < ny; j++) if (du[j * nu1 + nx - 1] > 0) { dOut += du[j * nu1 + nx - 1] / dy[j]; mOut++; }
     dOut = mOut ? dOut / mOut : 1 / (rho * Uref);
     for (let j = 0; j < ny; j++) { const P = j * nx + nx - 1; du[j * nu1 + nx] = solid[P] ? 0 : dOut * dy[j]; pD[P] += rho * du[j * nu1 + nx] * dy[j]; }
-    if (Bs) Bs.solve(pE, pN, pD, rhs, pp, o.pTol ?? 0.02, o.pIter ?? 60, true); else { pp.fill(0); pcg5(nx, ny, pE, pN, pD, rhs, pp, o.pTol ?? 0.02, o.pIter ?? 60, Wcg); }
+    if (Bs) Bs.solve(pE, pN, pD, rhs, pp, pTolS, pIterS, true); else { pp.fill(0); pcg5(nx, ny, pE, pN, pD, rhs, pp, pTolS, pIterS, Wcg); }
     for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) {
       if (solid[P]) continue;
       p[P] += aPr * pp[P];
@@ -813,13 +820,15 @@ export async function solveChannel(o, ctx) {
       if (j < ny - 1 && !vblk[P + nx]) v[P + nx] += dv[P + nx] * (pp[P] - pp[P + nx]);
       if (i === nx - 1) u[j * nu1 + nx] += du[j * nu1 + nx] * pp[P];
     }
-    if (o.inlet === 'periodic') { // recycle the outlet-plane profile to the inlet (fully developed / periodic flow)
+    if (perIn) { // recycle the outlet-plane profile to the inlet (fully developed / periodic flow)
       let q = 0;
       for (let j = 0; j < ny; j++) q += (solid[j * nx] ? 0 : Math.max(0, u[j * nu1 + nx - 1])) * dy[j];
       if (q > 1e-30) for (let j = 0; j < ny; j++) u[j * nu1] = solid[j * nx] ? 0 : 0.5 * u[j * nu1] + (0.5 * Math.max(0, u[j * nu1 + nx - 1]) * Qin) / q;
     }
-    return { mass: res / (rho * Math.abs(Qin) || 1e-30), dU: dUmax / Uref };
+    return res;
   };
+  /** One SIMPLE(C) iteration. rdt = ρ/Δt for time-accurate steps (0 for steady relaxation). */
+  const iterate = (rdt) => { const dUmax = uMom(rdt); vMom(rdt); const res = pCorr(); return { mass: res / (rho * Math.abs(Qin) || 1e-30), dU: dUmax / Uref }; };
 
   // ---- scalar transport (salt concentration c in kg/m³, temperature in °C)
   const Sc = stencil(nx, ny), fixS = solid;
@@ -1769,6 +1778,7 @@ export async function twoPhase2D(o, ctx) {
   const props = () => {
     for (let P = 0; P < n; P++) { const c = a[P] < 0 ? 0 : a[P] > 1 ? 1 : a[P]; rho[P] = rB + (rA - rB) * c; mu[P] = harm ? 1 / (c / mA + (1 - c) / mB) : mB + (mA - mB) * c; }
   };
+  const smoothN = o.smooth ?? 2, stTolO = o.stTol ?? 1e-6, pTolO = o.pTol ?? 1e-9, reinitN = o.reinit ?? 2; // options read once, outside the stages of the step
   const curvature = () => {
     if (!(sig > 0)) return;
     if (ls) { // κ = −∇·(∇φ/|∇φ|) by central differences (mirror boundaries)
@@ -1782,7 +1792,7 @@ export async function twoPhase2D(o, ctx) {
       return;
     }
     at.set(a);
-    for (let pass = 0; pass < (o.smooth ?? 2); pass++) { // α̃: repeated 1-2-1 ⊗ 1-2-1 filter (mirror boundaries)
+    for (let pass = 0; pass < smoothN; pass++) { // α̃: repeated 1-2-1 ⊗ 1-2-1 filter (mirror boundaries)
       for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { const im = i > 0 ? 1 : 0, ip = i < nx - 1 ? 1 : 0; an[P] = 0.25 * (at[P - im] + 2 * at[P] + at[P + ip]); }
       for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { const jm = j > 0 ? nx : 0, jp = j < ny - 1 ? nx : 0; at[P] = 0.25 * (an[P - jm] + 2 * an[P] + an[P + jp]); }
     }
@@ -1887,7 +1897,7 @@ export async function twoPhase2D(o, ctx) {
       if (j > 0) x -= kqc[j * nc1 + i] * (us[k + 1 - nu1] + us[k + 1] - us[k - 1 - nu1] - us[k - 1]);
       cgB[k] = cgM[k] * us[k] + rxy * x;
     }
-    stIters += cgLat(nu1, ny, us, o.stTol ?? 1e-6, 400);
+    stIters += cgLat(nu1, ny, us, stTolO, 400);
     // v component: north–south fluxes at the cell centres, east–west fluxes at the corners
     cgM.fill(0); cgE.fill(0); cgN.fill(0);
     for (let j = 1; j < ny; j++) for (let i = 0; i < nx; i++) {
@@ -1904,7 +1914,7 @@ export async function twoPhase2D(o, ctx) {
       if (i > 0) x -= kqc[j * nc1 + i] * (vs[k + nx - 1] + vs[k + nx] - vs[k - nx - 1] - vs[k - nx]);
       cgB[k] = cgM[k] * vs[k] + rxy * x;
     }
-    stIters += cgLat(nx, ny + 1, vs, o.stTol ?? 1e-6, 400);
+    stIters += cgLat(nx, ny + 1, vs, stTolO, 400);
   };
   let pIters = 0;
   const project = (dt) => { // ∇·((1/ρ)∇p) = ∇·u*/Δt, zero normal velocity on the box
@@ -1923,7 +1933,7 @@ export async function twoPhase2D(o, ctx) {
     if (flow) { for (let j = 0; j < ny; j++) { const P = j * nx + nx - 1; if (!(solid && solid[P])) pD[P] += dy / (dx * rho[P]); } } // pressure outlet: p = 0 one cell beyond the last column
     else if (solid) { let P0 = 0; while (P0 < n - 1 && solid[P0]) P0++; pD[P0] += pE[P0] + pN[P0] + 1e-30; }
     else pD[0] += pE[0] + pN[0]; // reference pressure: removes the null space of the all-Neumann problem
-    const r = Bs ? Bs.solve(pE, pN, pD, rhs, p, o.pTol ?? 1e-9, 200) : pcg5(nx, ny, pE, pN, pD, rhs, p, o.pTol ?? 1e-9, 2000, Wcg);
+    const r = Bs ? Bs.solve(pE, pN, pD, rhs, p, pTolO, 200) : pcg5(nx, ny, pE, pN, pD, rhs, p, pTolO, 2000, Wcg);
     pIters += r.iters;
     if (!msk) {
       for (let j = 0; j < ny; j++) for (let i = 1; i < nx; i++) { const P = j * nx + i; u[j * nu1 + i] = us[j * nu1 + i] - (dt * 2 * (p[P] - p[P - 1])) / (dx * (rho[P - 1] + rho[P])); }
@@ -2028,7 +2038,7 @@ export async function twoPhase2D(o, ctx) {
     rhsLS(phi, p1); for (let P = 0; P < n; P++) p2[P] = phi[P] + dt * p1[P];
     rhsLS(p2, an); for (let P = 0; P < n; P++) phi[P] += 0.5 * dt * (p1[P] + an[P]);
     if (solid !== null) fillS(phi);
-    redistance(o.reinit ?? 2); massFix();
+    redistance(reinitN); massFix();
     if (solid !== null) fillS(phi);
     for (let P = 0; P < n; P++) a[P] = heavi(phi[P]);
   };
@@ -2069,6 +2079,7 @@ export async function twoPhase2D(o, ctx) {
   // Step cap: maxSteps always; beyond it the run continues while the projected wall-clock time of the whole run stays within o.timeBudget seconds.
   const clock = () => (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000, wall0 = clock(), budget = o.timeBudget > 0 ? o.timeBudget : 0;
   let more = budget > 0;
+  await (async () => { // the time loop as a function of its own, so that a long run compiles this loop and not the whole solver around it
   while (t < tEnd * (1 - 1e-12) && (steps < maxSteps || (more && steps < 100 * maxSteps))) {
     if (budget > 0 && steps >= maxSteps && steps % 50 === 0) { more = ((clock() - wall0) * tEnd) / Math.max(t, 1e-300) <= budget; if (!more) break; }
     let vmax = 1e-300;
@@ -2084,6 +2095,7 @@ export async function twoPhase2D(o, ctx) {
     while (snapK < snapT.length && t >= snapT[snapK] * (1 - 1e-12)) { snaps.push({ t, a: Float64Array.from(a) }); snapK++; }
     if (steps % 20 === 0) { ctx?.progress?.(Math.min(0.98, t / tEnd), `Two-phase flow: t = ${t.toExponential(2)} s of ${tEnd.toExponential(2)} s (step ${steps})`); if (ctx?.tick) await ctx.tick(); }
   }
+  })();
   props();
   // pressure jump across the interface: mean pressure inside phase A minus mean pressure in phase B (hydrostatic part removed)
   let pa = 0, na = 0, pb = 0, nb = 0;
@@ -2225,10 +2237,12 @@ export async function twoFluid2D(o, ctx) {
     Hc = ((rd + m) * r1 + am * m * r2) / det; Hd = (m * r1 + a11 * r2) / det;
     Bc = ((rd + m) * ac + am * m) / det; Bd = (m + ac * rc) / det;
   };
-  const step = (dt) => {
-    faceAlpha(dt);
-    for (let P = 0; P < n; P++) { frc[P] = 1 - al[P]; frd[P] = al[P] > 1e-6 ? al[P] : 1e-6; }
-    // ---- x faces
+  // The step is written as separate stages, so that each is compiled on its own (and only the stage concerned again when a case exercises a branch for the first time).
+    const jx = (k) => (1 - afx[k]) * tuc[k] + afx[k] * tud[k], jy = (k) => (1 - afy[k]) * tvc[k] + afy[k] * tvd[k];
+    // a face flux is scaled by the room left in the receiving cell and by the content of the donor cell (positivity)
+    const room = (P) => (inn[P] > 0 ? Math.min(1, (Math.max(0, aMax - al[P]) * dx * dy) / inn[P]) : 1), have = (P) => (out[P] > al[P] * dx * dy ? (al[P] * dx * dy) / out[P] : 1);
+  const flx = f(7); // of the current step: dispersed phase in and out, continuous phase in and out, clipped, captured, captured on solids
+  const momX = (dt) => { // ---- x faces
     for (let j = 0; j < ny; j++) for (let i = 1; i <= nx; i++) {
       const k = j * nu1 + i, P = j * nx + i;
       if (bu !== null && bu[k]) { tuc[k] = 0; tud[k] = 0; bcx[k] = 0; bdx[k] = 0; continue; }
@@ -2254,7 +2268,8 @@ export async function twoFluid2D(o, ctx) {
       tuc[k] = Hc; tud[k] = Hd; bcx[k] = Bc; bdx[k] = Bd;
     }
     if (flow) for (let j = 0; j < ny; j++) { const q = bu !== null && bu[j * nu1] ? 0 : Uin; tuc[j * nu1] = q; tud[j * nu1] = q; }
-    // ---- y faces
+  };
+  const momY = (dt) => { // ---- y faces
     for (let j = 1; j < ny; j++) for (let i = 0; i < nx; i++) {
       const k = j * nx + i, am = 0.5 * (al[k - nx] + al[k]), ac = 1 - am;
       if (bv !== null && bv[k]) { tvc[k] = 0; tvd[k] = 0; bcy[k] = 0; bdy[k] = 0; continue; }
@@ -2274,8 +2289,8 @@ export async function twoFluid2D(o, ctx) {
       couple(am, pc, pd, kDrag(Math.hypot(ur, vd[k] - vc[k]), ac, am), dt, Dtd > 0 ? (al[k] - al[k - nx]) / dy : 0, gdy);
       tvc[k] = Hc; tvd[k] = Hd; bcy[k] = Bc; bdy[k] = Bd;
     }
-    // ---- shared pressure from the mixture volume balance ∇·(α_c u_c + α_d u_d) = 0
-    const jx = (k) => (1 - afx[k]) * tuc[k] + afx[k] * tud[k], jy = (k) => (1 - afy[k]) * tvc[k] + afy[k] * tvd[k];
+  };
+  const press = (dt) => { // ---- shared pressure from the mixture volume balance ∇·(α_c u_c + α_d u_d) = 0
     for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) {
       const ke = j * nu1 + i + 1, kn = P + nx;
       pE[P] = i < nx - 1 ? (dt * ((1 - afx[ke]) * bcx[ke] + afx[ke] * bdx[ke]) * dy) / dx : 0;
@@ -2293,7 +2308,8 @@ export async function twoFluid2D(o, ctx) {
       const gp = (p[P] - p[P - 1]) / dx; uc[k] = tuc[k] - dt * bcx[k] * gp; ud[k] = tud[k] - dt * bdx[k] * gp;
     }
     for (let j = 1; j < ny; j++) for (let i = 0; i < nx; i++) { const k = j * nx + i, gp = (p[k] - p[k - nx]) / dy; vc[k] = tvc[k] - dt * bcy[k] * gp; vd[k] = tvd[k] - dt * bdy[k] * gp; }
-    // ---- dispersed-phase continuity in flux form, limited so that no cell exceeds the packing fraction
+  };
+  const advA = (dt) => { // ---- dispersed-phase continuity in flux form, limited so that no cell exceeds the packing fraction
     inn.fill(0); out.fill(0);
     for (let j = 0; j < ny; j++) for (let i = 0; i <= nx; i++) {
       const k = j * nu1 + i, P = j * nx + i, w = ud[k];
@@ -2307,8 +2323,6 @@ export async function twoFluid2D(o, ctx) {
       const k = j * nx + i, w = vd[k], F = ((w >= 0 ? 1 : -1) !== sgy[k] ? (w >= 0 ? al[k - nx] : al[k]) : afy[k]) * w * dt * dx; Fy[k] = F;
       if (F > 0) { inn[k] += F; out[k - nx] += F; } else if (F < 0) { inn[k - nx] -= F; out[k] -= F; }
     }
-    // a face flux is scaled by the room left in the receiving cell and by the content of the donor cell (positivity)
-    const room = (P) => (inn[P] > 0 ? Math.min(1, (Math.max(0, aMax - al[P]) * dx * dy) / inn[P]) : 1), have = (P) => (out[P] > al[P] * dx * dy ? (al[P] * dx * dy) / out[P] : 1);
     for (let j = 0; j < ny; j++) for (let i = 1; i < nx; i++) { const k = j * nu1 + i, P = j * nx + i; Fx[k] *= Fx[k] > 0 ? Math.min(room(P), have(P - 1)) : Math.min(room(P - 1), have(P)); }
     if (flow) for (let j = 0; j < ny; j++) { if (Fx[j * nu1] > 0) Fx[j * nu1] *= room(j * nx); else Fx[j * nu1] *= have(j * nx); if (Fx[j * nu1 + nx] > 0) Fx[j * nu1 + nx] *= have(j * nx + nx - 1); }
     for (let j = 1; j < ny; j++) for (let i = 0; i < nx; i++) { const k = j * nx + i; Fy[k] *= Fy[k] > 0 ? Math.min(room(k), have(k - nx)) : Math.min(room(k - nx), have(k)); }
@@ -2318,6 +2332,10 @@ export async function twoFluid2D(o, ctx) {
       if (q < 0) { clip -= q; al[P] = 0; } else al[P] = q;
     }
     if (flow) for (let j = 0; j < ny; j++) { qIn += Fx[j * nu1]; qOut += Fx[j * nu1 + nx]; const ki = j * nu1, ko = ki + nx; cIn += ((1 - afx[ki]) * uc[ki] + afx[ki] * ud[ki]) * dt * dy - Fx[ki]; cOut += ((1 - afx[ko]) * uc[ko] + afx[ko] * ud[ko]) * dt * dy - Fx[ko]; } // continuous phase = mixture volume flux of the pressure equation − dispersed flux actually transported
+    flx[0] = qIn; flx[1] = qOut; flx[2] = cIn; flx[3] = cOut; flx[4] = clip * dx * dy;
+  };
+  const depOn = !!o.deposit;
+  const capt = (dt) => {
     let dep = 0;
     if (cap) { // capture split by mechanism on walls and solid faces (see capF)
       let dW = 0, dS = 0; const gm = Math.hypot(gdx, gdy);
@@ -2337,17 +2355,23 @@ export async function twoFluid2D(o, ctx) {
         al[P] -= d; depM[o4] += sc2 * wSet; depM[o4 + 1] += sc2 * wImp; depM[o4 + 2] += sc2 * wInt; depM[o4 + 3] += sc2 * kd;
         if (sol) dS += d; else dW += d;
       }
-      return { qIn, qOut, cIn, cOut, clip: clip * dx * dy, dep: (dW + dS) * dx * dy, depS: dS * dx * dy };
+      flx[5] = (dW + dS) * dx * dy; flx[6] = dS * dx * dy; return;
     }
-    if (o.deposit && gdy !== 0 && ny > 1) { // capture on the wall the dispersed phase moves toward
+    if (depOn && gdy !== 0 && ny > 1) { // capture on the wall the dispersed phase moves toward
       const jw = gdy < 0 ? 0 : ny - 1, jf = gdy < 0 ? 1 : ny - 1;
       // with obstacles the liquid is deflected toward and along the walls and carries the dispersed phase with it without depositing it:
       // there the capture uses the velocity of the dispersed phase relative to the liquid (its settling or rise velocity) instead of its own
       for (let i = 0; i < nx; i++) { const P = jw * nx + i, w = solid !== null ? vd[jf * nx + i] - vc[jf * nx + i] : vd[jf * nx + i]; if (solid !== null && solid[P]) continue; if (gdy < 0 ? w < 0 : w > 0) { const d = al[P] * Math.min(1, (Math.abs(w) * dt) / dy); al[P] -= d; dep += d; } }
     }
     let depS = 0;
-    if (o.deposit) for (const [P, kf] of capS) { const w = vd[kf] - vc[kf]; if (gdy < 0 ? w < 0 : w > 0) { const d = al[P] * Math.min(1, (Math.abs(w) * dt) / dy); al[P] -= d; depS += d; } } // capture on the solid surfaces that face the settling (or rising) phase
-    return { qIn, qOut, cIn, cOut, clip: clip * dx * dy, dep: (dep + depS) * dx * dy, depS: depS * dx * dy };
+    if (depOn) for (const [P, kf] of capS) { const w = vd[kf] - vc[kf]; if (gdy < 0 ? w < 0 : w > 0) { const d = al[P] * Math.min(1, (Math.abs(w) * dt) / dy); al[P] -= d; depS += d; } } // capture on the solid surfaces that face the settling (or rising) phase
+    flx[5] = (dep + depS) * dx * dy; flx[6] = depS * dx * dy;
+  };
+  const step = (dt) => {
+    faceAlpha(dt);
+    for (let P = 0; P < n; P++) { frc[P] = 1 - al[P]; frd[P] = al[P] > 1e-6 ? al[P] : 1e-6; }
+    momX(dt); momY(dt); press(dt); advA(dt); capt(dt);
+    return { qIn: flx[0], qOut: flx[1], cIn: flx[2], cOut: flx[3], clip: flx[4], dep: flx[5], depS: flx[6] };
   };
   const hist = { t: [], vol: [], front: [], slip: [], amax: [], dIn: [], dOut: [], cIn: [], cOut: [], umax: [], dep: [], depS: [], dp: [] };
   const a0m = typeof o.alpha0 === 'number' ? o.alpha0 : 0, gdir = Math.abs(gy) >= Math.abs(gx) ? 1 : 0;
@@ -2376,6 +2400,7 @@ export async function twoFluid2D(o, ctx) {
   const ut = terminalSN(dP, rc, rd, muc, Math.hypot(gx, gy)), cfl = o.cfl ?? 0.3, dtV = Math.min((0.2 * h * h) / nuc, Dtd > 0 ? (0.2 * h * h) / Dtd : Infinity, o.dtMax ?? Infinity);
   let t = 0, steps = 0, um = diag(0);
   const tEnd = o.tEnd, maxSteps = o.maxSteps ?? 20000, every = Math.max(1, o.sample ?? 1);
+  await (async () => { // the time loop as a function of its own, so that a long run compiles this loop and not the whole solver around it
   while (t < tEnd * (1 - 1e-12) && steps < maxSteps) {
     const dt = Math.min(dtV, (cfl * h) / Math.max(um, ut, Math.abs(Uin), 1e-12), tEnd - t);
     const r = step(dt);
@@ -2386,6 +2411,7 @@ export async function twoFluid2D(o, ctx) {
     if (!Number.isFinite(um)) throw new Error('The two-fluid solution diverged. Refine the grid or lower the CFL number.');
     if (steps % 25 === 0) { ctx?.progress?.(Math.min(0.98, t / tEnd), `Two-fluid model: t = ${t.toExponential(2)} s of ${tEnd.toExponential(2)} s (step ${steps})`); if (ctx?.tick) await ctx.tick(); }
   }
+  })();
   let div = 0; // residual of the mixture volume balance with the face fractions of the last step
   for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) {
     const ke = j * nu1 + i + 1, kn = P + nx, q = (k, a, b) => (1 - afx[k]) * a[k] + afx[k] * b[k], r = (k, a, b) => (k < nx || k >= ny * nx ? 0 : (1 - afy[k]) * a[k] + afy[k] * b[k]);
