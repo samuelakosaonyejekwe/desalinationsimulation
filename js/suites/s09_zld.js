@@ -8,7 +8,7 @@
 import { brent, clamp, linspace, sum, rng, rk45, interp1, gci } from '../core/num.js';
 import { psat, tsat, latentHeat, cp, viscosity, R, KELVIN } from '../core/props.js';
 import { IONS, ION_IDS, WATERS, scaleIons } from '../core/water.js';
-import { MINERALS, EVAPORITE_MINERALS, REAGENTS, ACTIVITY_MODELS, makeSolution, equilibrate, precipitateSolution, doseSolution, solutionToIons, saturationIndex, componentIndex } from './s02_chem.js';
+import { MINERALS, EVAPORITE_MINERALS, REAGENTS, ACTIVITY_MODELS, makeSolution, equilibrate, precipitateSolution, doseSolution, solutionToIons, saturationIndex, componentIndex, kieseriteCaveat } from './s02_chem.js';
 import { solveChannel, buildMask, pcg5, yGrid } from './s04_cfd.js';
 
 /** Number formatting of the shared toolbox (fmt of num.js: significant digits, thousands separators), without the locale machinery. */
@@ -1031,6 +1031,8 @@ const suite = {
     if (r.cxSolids.halite > 0 && r.main === 'halite' && r.purity < v.purityMin / 100 && cx.on && v.purge < 60) {
       try { for (let p = Math.ceil(v.purge) + 1, n = 0; p <= 60 && n < 8; p += p < v.purge + 6 ? 1 : 3, n++) { const q = simulateZLD({ ...v, purge: p }); if (q.main === 'halite' && q.purity >= v.purityMin / 100) { purgeFix = { purge: p, purity: q.purity, prod: q.prod }; break; } } } catch { purgeFix = null; }
     }
+    // kieserite above 80 °C: the solubility constant rests on one compiled measured series; say so wherever it decides the cake
+    if (v.chemT === 'unit' && v.model === 'pitzer' && (r.cxSolids.kieserite > 0 || r.purity < v.purityMin / 100)) { const kc = kieseriteCaveat(Math.max(cx.on ? v.Tcx : 0, 0)); if (kc) W.push({ level: 'info', msg: kc.text }); }
     if (!cx.on && v.purge < 100) W.push({ level: 'info', msg: 'The crystallizer is idle: the brine concentrator already reaches the requested end point.' });
     const rev = sum(r.salts.map((s) => td(s.kg) * s.value)), energyCost = 24 * (r.kWe * v.elecPrice + (r.kWt * v.steamPrice) / 1000);
     const reagCost = 24 * sum(Object.entries(r.reagents).map(([k, kg]) => (kg / 1000) * ({ naoh: 450, lime: 130, soda: 280, hcl: 180 }[k] || 0)));
