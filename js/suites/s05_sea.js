@@ -1074,27 +1074,33 @@ export function frontSpeed(hist, f0 = 0.3, f1 = 1) {
  * the barotropic time-mean transport split over the layers plus the zero-sum deviation, so the layer volumes follow the
  * free surface exactly. Baroclinic pressure gradient: density-Jacobian form on σ-layers, exact for a density that varies
  * linearly with z; dens() should return the anomaly from a horizontally uniform reference profile, which is then
- * balanced identically. Tracers: flux-form finite volumes, van Leer limited fluxes (first-order upwind next to thin
+ * balanced identically. Tracers: flux-form finite volumes, limited fluxes (first-order upwind next to thin
  * water), implicit vertical diffusion, sub-cycled to the layer Courant number. Vertical mixing: 'pp' — neutral
  * parabolic profile κ u* z (1 − z/D) from the bottom and wind friction velocities, damped by the Richardson-number
  * functions of Pacanowski & Philander (ppMixing) — or 'const'. Bottom drag: quadratic law on the velocity of the bottom
  * layer with C_b = (κ / ln(z_1/z₀))², or the constant Cd when z0 = 0; slip = true removes it.
  * Momentum advection: momentum-conserving form with van Leer limited face values (madv: 'upwind' for first order); the implicit
  * vertical advection carries its limited second-order part as an explicit correction.
+ * Shear-scaled horizontal viscosity (reGrid = Re_Δ, default 3, 0 = off): ν_H = w·ΔU·Δ/Re_Δ in flux form, added to nuH, with ΔU half the
+ * velocity range over the water column, Δ the cell size in the direction of the flux and w = min(1, (2Fr²)²), Fr² = (2ΔU)²/(g′D), g′ from
+ * the density range of the column, so that it acts only where the shear across a density interface approaches the limit of stability
+ * of hydrostatic layered flow (ΔU² = g′D for two layers); there the interface otherwise breaks up at the grid scale and the limited
+ * transport mixes it. Capped at 0.2/(Δt(1/Δx² + 1/Δy²)). Grid Reynolds numbers below about 10 keep this spurious mixing small
+ * (Ilıcak, Adcroft, Griffies & Hallberg 2012, Ocean Modelling 45–46). Tracer limiter tlim: 'mc' (default), 'vanleer', 'superbee'.
  * Near-field inflow (coupling to an integral jet model at the end of its near field): inflow = { Q, S, u, v, eff, cols }.
  * Each column { P, w, src: [{ k, f }], sink: [{ k, f }] } (Σw = 1, Σf = 1) receives the near-field water S·Q·w in its
  * source layers and gives up the entrained water (S − 1)·Q·w from its sink layers, so the net volume source is the effluent Q·w.
  * The near-field water carries, for every tracer m, the effluent value eff[m] diluted with the entrained water at the concentration
  * found in the sink layers (re-entrainment included): the content added to the domain is exactly Q·eff[m] per second. It enters
  * with the horizontal velocity (u, v): the momentum cells of the source layers relax toward it at the rate inflow ÷ cell volume.
- * o = { nx, ny, nz, dx, dy, zb, land, sigma, hmin, f, rho0, Cd, z0, slip, turb, nu, Kv, nu0, nuH, Kh, madv, dens, refDensity, inflow,
+ * o = { nx, ny, nz, dx, dy, zb, land, sigma, hmin, f, rho0, Cd, z0, slip, turb, nu, Kv, nu0, nuH, Kh, madv, reGrid, tlim, dens, refDensity, inflow,
  *       tracers: [{ c0, src: [{ P, k, rate }], open, diffH }], sw: { eta0, x0, y0, bc, ext, pat, tau, theta, dtMax } }.
  */
 export function hydro3D(o) {
   const { nx, ny, dx, dy, zb } = o, K = Math.max(2, Math.round(o.nz)), n = nx * ny, nu1 = nx + 1, NU = nu1 * ny, NV = nx * (ny + 1), A = dx * dy, f64 = (m) => new Float64Array(m);
   const land = o.land || new Uint8Array(n), hmin = o.hmin ?? 0.05, hThin = o.hThin ?? Math.max(4 * hmin, 0.3), f = o.f || 0, rho0 = o.rho0 ?? 1025, gr = G / rho0, VK = 0.41;
   const Cd = o.Cd ?? 0.0025, z0 = o.z0 ?? 0, slip = !!o.slip, pp = (o.turb || 'pp') === 'pp', nuB = o.nu ?? 1e-4, KvB = o.Kv ?? (pp ? 1e-5 : nuB), nu0 = o.nu0 ?? 0, nuConv = o.nuConv ?? 1e-2, nuH = o.nuH ?? 0, Kh = o.Kh ?? 0, cfl = o.cfl ?? 0.6;
-  const dens = o.dens || (() => 0), refD = o.refDensity || null, tvd = (o.madv || 'tvd') !== 'upwind';
+  const dens = o.dens || (() => 0), refD = o.refDensity || null, tvd = (o.madv || 'tvd') !== 'upwind', reG = (o.reGrid ?? 3) > 0 ? o.reGrid ?? 3 : 0, dUu = reG ? f64(NU) : null, dUv = reG ? f64(NV) : null, gpD = reG ? f64(n) : null;
   const ds = f64(K), sc = f64(K), sf = f64(K + 1), rds = f64(K), rdc = f64(K + 1);
   { const w = Array.isArray(o.sigma) && o.sigma.length === K ? o.sigma : null; let s = 0; for (let k = 0; k < K; k++) s += w ? w[k] : 1; for (let k = 0; k < K; k++) { ds[k] = (w ? w[k] : 1) / s; sf[k + 1] = sf[k] + ds[k]; sc[k] = sf[k] + 0.5 * ds[k]; } sf[K] = 1; for (let k = 0; k < K; k++) { rds[k] = 1 / ds[k]; if (k) rdc[k] = 1 / (sc[k] - sc[k - 1]); } }
   const Fu = f64(NU), Fv = f64(NV), swo = o.sw || {};
@@ -1110,6 +1116,8 @@ export function hydro3D(o) {
   const meta = (o.tracers || []).map((t) => ({ src: (t.src || []).map((s) => ({ idx: s.k * n + s.P, rate: s.rate })), open: typeof t.open === 'function' ? t.open : ((val) => () => val)(t.open ?? 0), diffH: t.diffH !== false && Kh > 0, injected: 0, out: 0, inn: 0 }));
   const cdBot = (h1) => (slip ? 0 : z0 > 0 ? Math.min((VK / Math.log(Math.max((0.5 * h1) / z0, 1.5))) ** 2, 0.05) : Cd);
   const lim = (d1, d2) => (d1 * d2 > 0 ? (d1 * d2) / (d1 + d2) : 0);
+  // tracer limiter (half the limited slope × cell width): monotonised central (default), superbee, van Leer; φ ≤ 2 and φ ≤ 2r for all three
+  const tl = o.tlim || 'mc', limT = tl === 'superbee' ? (d1, d2) => { if (!(d1 * d2 > 0)) return 0; const s = d1 < 0 ? -1 : 1, a = s * d1, b = s * d2, m1 = 2 * a < b ? 2 * a : b, m2 = a < 2 * b ? a : 2 * b; return 0.5 * s * (m1 > m2 ? m1 : m2); } : tl === 'mc' ? (d1, d2) => { if (!(d1 * d2 > 0)) return 0; const s = d1 < 0 ? -1 : 1, a = s * d1, b = s * d2, c = 0.25 * (a + b); return s * (a < b ? (a < c ? a : c) : b < c ? b : c); } : lim;
   if (inf) inf.wSum = inf.cols.reduce((a, c) => a + c.w, 0);
   const M = { nx, ny, nz: K, dx, dy, sw, u, v, W, rho, tr, ds, sc, sf, nuI, KvI, t: 0, steps: 0, subSteps: 0, uMax: 0, vMax: 0, drho: 0, meta, land, zb };
   { let lo = Infinity, hi = -Infinity; for (let k = 0; k < K; k++) for (let P = 0; P < n; P++) if (!land[P] && sw.h[P] > hmin) { const r = dens(tr, k * n + P, zb[P] + sc[k] * sw.h[P]); if (r < lo) lo = r; if (r > hi) hi = r; } M.drho = hi > lo ? hi - lo : 0; }
@@ -1123,7 +1131,12 @@ export function hydro3D(o) {
     const h = sw.h, eta = sw.eta, a = ax ? v : u, b = ax ? u : v, NA = ax ? NV : NU, NB = ax ? NU : NV, Ga = ax ? Gv : Gu, Fa = ax ? Fv : Fu, gam = ax ? gamV : gamU, ty = ax ? tyV : tyU, ab = ax ? sw.v : sw.u, bb = ax ? sw.u : sw.v, dd = ax ? dy : dx, rd = 1 / dd;
     const sA = ax ? nx : 1, sT = ax ? 1 : nu1; // stride along and across the component on its own face lattice
     const sgA = inf ? (ax ? sgV : sgU) : null, sgW = inf ? (ax ? inf.v || 0 : inf.u || 0) : 0; // momentum of the near-field inflow: relaxation rate σ = q/V toward its velocity
-    const Qa = ax ? Qy : Qx, Qb = ax ? Qx : Qy;
+    const Qa = ax ? Qy : Qx, Qb = ax ? Qx : Qy, dU = ax ? dUv : dUu, dT = ax ? dx : dy, cA = reG ? 1 / (reG * dd) : 0, cT = reG ? 1 / (reG * dT) : 0, nuM = reG ? 0.2 / (dt * (1 / (dx * dx) + 1 / (dy * dy))) : 0, mA = nuM * rd * rd, mT = nuM / (dT * dT);
+    if (reG) for (let j = 0, q = 0; j < (ax ? ny + 1 : ny); j++) for (let i = 0; i < (ax ? nx : nu1); i++, q++) { // ΔU = half the velocity range over the column, weighted with min(1, (2Fr²)²), Fr² = (2ΔU)² ÷ g′D of the adjoining columns
+      let lo = a[q], hi = lo; for (let k = 1; k < K; k++) { const x = a[k * NA + q]; if (x < lo) lo = x; else if (x > hi) hi = x; }
+      const R = ax ? (j < ny ? q : q - nx) : i < nx ? j * nx + i : j * nx + i - 1, L = ax ? (j > 0 ? q - nx : q) : i > 0 ? j * nx + i - 1 : j * nx + i, gd = gpD[L] > gpD[R] ? gpD[L] : gpD[R], d = hi - lo, fr = gd > 0 ? (2 * d * d) / gd : 0;
+      dU[q] = 0.5 * d * (fr < 1 ? fr * fr : 1);
+    }
     for (let j = ax ? 1 : 0; j < ny; j++) for (let i = ax ? 0 : 1; i < nx; i++) {
       const q = ax ? j * nx + i : j * nu1 + i, R = j * nx + i, L = ax ? R - nx : R - 1;
       Fa[q] = 0; ty[q] = 0; gam[q] = 0;
@@ -1150,6 +1163,12 @@ export function hydro3D(o) {
           g = -(qp * fe - qm2 * fw - aq * (qp - qm2) + qtp * fn - qtm * fs - aq * (qtp - qtm)) * rds[k] * rV;
         } else g = -(qp * (qp > 0 ? aq : a[o1 + sA]) - qm2 * (qm2 > 0 ? a[o1 - sA] : aq) - aq * (qp - qm2) + qtp * (qtp > 0 || !hasP ? aq : a[o1 + sT]) - qtm * (qtm > 0 && hasM ? a[o1 - sT] : aq) - aq * (qtp - qtm)) * rds[k] * rV;
         if (nuH > 0) g += nuH * ((a[o1 + sA] - 2 * aq + a[o1 - sA]) * rd * rd + ((hasP && ty[q + sT] ? a[o1 + sT] - aq : 0) - (hasM && ty[q - sT] ? aq - a[o1 - sT] : 0)) / ((ax ? dx : dy) ** 2));
+        if (reG) { // shear-scaled horizontal viscosity ΔU·Δ/Re_Δ in flux form (ΔU: velocity range over the water column, mean of the two faces a side joins)
+          const d0 = dU[q]; let e = (d0 + dU[q + sA]) * cA, w = (d0 + dU[q - sA]) * cA; if (e > mA) e = mA; if (w > mA) w = mA;
+          g += e * (a[o1 + sA] - aq) - w * (aq - a[o1 - sA]);
+          if (hasP && ty[q + sT]) { let c = (d0 + dU[q + sT]) * cT; if (c > mT) c = mT; g += c * (a[o1 + sT] - aq); }
+          if (hasM && ty[q - sT]) { let c = (d0 + dU[q - sT]) * cT; if (c > mT) c = mT; g -= c * (aq - a[o1 - sT]); }
+        }
         if (!thin) { const kR = k * n + R, kL = k * n + L; g -= grd * (Ip[kR] - Ip[kL] + 0.5 * (rho[kL] + rho[kR]) * (dzb + sc[k] * dhh)); }
         Fs += ds[k] * g;
         if (sgA !== null && sgA[o1] > 0) Fs += ds[k] * sgA[o1] * (sgW - aq);
@@ -1216,8 +1235,8 @@ export function hydro3D(o) {
           if (F === 0 && !(dif && tyU[q] === 2)) continue;
           const R = kn + c0 + i, L = R - 1, cl = c[L], cr = c[R];
           let cf;
-          if (F >= 0) { cf = cl; if (i > 1 && thick[c0 + i - 1] && thick[c0 + i - 2]) cf += lim(cl - c[L - 1], cr - cl); }
-          else { cf = cr; if (i < nx - 1 && thick[c0 + i] && thick[c0 + i + 1]) cf += lim(cr - c[R + 1], cl - cr); }
+          if (F >= 0) { cf = cl; if (i > 1 && thick[c0 + i - 1] && thick[c0 + i - 2]) cf += limT(cl - c[L - 1], cr - cl); }
+          else { cf = cr; if (i < nx - 1 && thick[c0 + i] && thick[c0 + i + 1]) cf += limT(cr - c[R + 1], cl - cr); }
           let fl = F * cf;
           if (dif && tyU[q] === 2) fl -= ((Kh * dk * Math.min(Dn[c0 + i - 1], Dn[c0 + i]) * dy) / dx) * (cr - cl);
           acc[L] -= fl; acc[R] += fl;
@@ -1232,8 +1251,8 @@ export function hydro3D(o) {
         if (F === 0 && !(dif && tyV[q] === 2)) continue;
         const R = kn + q, L = R - nx, cl = c[L], cr = c[R];
         let cf;
-        if (F >= 0) { cf = cl; if (j > 1 && thick[q - nx] && thick[q - 2 * nx]) cf += lim(cl - c[L - nx], cr - cl); }
-        else { cf = cr; if (j < ny - 1 && thick[q] && thick[q + nx]) cf += lim(cr - c[R + nx], cl - cr); }
+        if (F >= 0) { cf = cl; if (j > 1 && thick[q - nx] && thick[q - 2 * nx]) cf += limT(cl - c[L - nx], cr - cl); }
+        else { cf = cr; if (j < ny - 1 && thick[q] && thick[q + nx]) cf += limT(cr - c[R + nx], cl - cr); }
         let fl = F * cf;
         if (dif && tyV[q] === 2) fl -= ((Kh * dk * Math.min(Dn[q - nx], Dn[q]) * dx) / dy) * (cr - cl);
         acc[L] -= fl; acc[R] += fl;
@@ -1269,8 +1288,8 @@ export function hydro3D(o) {
         const x = k * n + P, top = k === K - 1, wup = top ? 0 : W[x + n], dzu = top ? 0 : (A * KvI[x + n]) / ((sc[k + 1] - sc[k]) * db);
         let lo = dts * dzl, up = dts * dzu, dg = A * ds[k] * db + lo + up, rhs = A * ds[k] * da * c[x] + dts * acc[x];
         if (expl) {
-          if (wlo !== 0) { const d = wlo > 0 ? k - 1 : k, xd = d * n + P; let cf = c[xd]; if (wlo > 0) { if (d > 0) cf += lim(cf - c[xd - n], c[x] - cf); } else if (d < K - 1) cf += lim(cf - c[xd + n], c[x - n] - cf); rhs += dts * wlo * cf; }
-          if (wup !== 0) { const d = wup > 0 ? k : k + 1, xd = d * n + P; let cf = c[xd]; if (wup > 0) { if (d > 0) cf += lim(cf - c[xd - n], c[x + n] - cf); } else if (d < K - 1) cf += lim(cf - c[xd + n], c[x] - cf); rhs -= dts * wup * cf; }
+          if (wlo !== 0) { const d = wlo > 0 ? k - 1 : k, xd = d * n + P; let cf = c[xd]; if (wlo > 0) { if (d > 0) cf += limT(cf - c[xd - n], c[x] - cf); } else if (d < K - 1) cf += limT(cf - c[xd + n], c[x - n] - cf); rhs += dts * wlo * cf; }
+          if (wup !== 0) { const d = wup > 0 ? k : k + 1, xd = d * n + P; let cf = c[xd]; if (wup > 0) { if (d > 0) cf += limT(cf - c[xd - n], c[x + n] - cf); } else if (d < K - 1) cf += limT(cf - c[xd + n], c[x] - cf); rhs -= dts * wup * cf; }
         } else { if (wlo > 0) lo += dts * wlo; else dg -= dts * wlo; if (wup > 0) dg += dts * wup; else up -= dts * wup; }
         ta[k] = lo; tb[k] = dg; tc[k] = up; td[k] = rhs;
         dzl = dzu; wlo = wup;
@@ -1288,9 +1307,11 @@ export function hydro3D(o) {
     let rlo = Infinity, rhi = -Infinity;
     for (let P = 0; P < n; P++) {
       Do[P] = h[P];
-      if (land[P] || !(h[P] > hmin)) { for (let k = 0; k < K; k++) { rho[k * n + P] = 0; Ip[k * n + P] = 0; } continue; }
+      if (land[P] || !(h[P] > hmin)) { for (let k = 0; k < K; k++) { rho[k * n + P] = 0; Ip[k * n + P] = 0; } if (reG) gpD[P] = 0; continue; }
       const D = h[P], zbP = zb[P];
-      for (let k = 0; k < K; k++) { const x = k * n + P, r = dens(tr, x, zbP + sc[k] * D); rho[x] = r; if (r < rlo) rlo = r; if (r > rhi) rhi = r; }
+      let cl = Infinity, ch = -Infinity;
+      for (let k = 0; k < K; k++) { const x = k * n + P, r = dens(tr, x, zbP + sc[k] * D); rho[x] = r; if (r < cl) cl = r; if (r > ch) ch = r; }
+      if (cl < rlo) rlo = cl; if (ch > rhi) rhi = ch; if (reG) gpD[P] = gr * (ch - cl) * D;
       const xt = (K - 1) * n + P, rs = rho[xt] + ((rho[xt] - rho[xt - n]) * (1 - sc[K - 1])) / (sc[K - 1] - sc[K - 2]);
       let I = 0.5 * (rs + rho[xt]) * (1 - sc[K - 1]) * D; Ip[xt] = I;
       for (let k = K - 2; k >= 0; k--) { const x = k * n + P; I += 0.5 * (rho[x] + rho[x + n]) * (sc[k + 1] - sc[k]) * D; Ip[x] = I; }
@@ -1559,14 +1580,16 @@ const suite = {
       { key: 'windStress', label: 'Wind stress on the sea surface', type: 'bool', value: true, showIf: isFS, help: 'Surface stress ρ_air C_d W² from the wind inputs (replaces the empirical wind-drift factor).' },
     ] },
     { group: 'Hydrodynamics: three-dimensional hydrostatic model', tab: 'setup', help: 'Optional three-dimensional solution of the hydrostatic Boussinesq (primitive) equations on terrain-following σ-layers with a free surface: the brine is injected in the bottom layers at the end of the near field and spreads under the baroclinic pressure gradient of the equation of state, the tide, the wind and bottom friction. The run adds true three-dimensional views of the plume (plan maps at three levels, vertical sections, threshold volume) and compliance metrics from the 3-D field. The open-boundary condition, initial sea level, tidal phase lag, latitude, minimum depth and wind-stress switch of the shallow-water group above apply to this model as well (they appear there when this option is on).', fields: [
-      { key: 'h3d', label: 'Solve the three-dimensional hydrostatic equations (σ-layers, free surface)', type: 'bool', value: false, help: 'Runs after the far field on its own grid; about 20 s at the default 40 × 30 × 8 cells and three tidal cycles.' },
+      { key: 'h3d', label: 'Solve the three-dimensional hydrostatic equations (σ-layers, free surface)', type: 'bool', value: false, help: 'Runs after the far field on its own grid; about half a minute at the default 40 × 30 × 12 cells and three tidal cycles.' },
       F('h3nx', 'Cells east–west (3-D grid)', '', 40, 12, 100, 'The 3-D model covers the far-field domain on its own, usually coarser, horizontal grid.', { showIf: is3D, step: 1 }),
       F('h3ny', 'Cells north–south (3-D grid)', '', 30, 10, 80, '', { showIf: is3D, step: 1 }),
-      F('h3nz', 'σ-layers over the depth', '', 8, 3, 24, 'Every water column is divided into this number of layers, so the layers thin toward the shore.', { showIf: is3D, step: 1 }),
+      F('h3nz', 'σ-layers over the depth', '', 12, 3, 24, 'Every water column is divided into this number of layers, so the layers thin toward the shore. More layers carry a dense current faster and with less numerical mixing: in the lock-exchange check the front runs at 0.83, 0.87, 0.92 and 0.95 of the theoretical speed with 6, 8, 12 and 24 layers. Run time grows in proportion.', { showIf: is3D, step: 1 }),
       SEL('h3Sigma', 'Layer distribution', 'uniform', [['uniform', 'Equal fractions of the depth'], ['bed', 'Refined toward the seabed (bottom layer one third of the top layer)']], 'Bed refinement resolves a thin dense layer with the same number of layers.', { showIf: is3D }),
       SEL('h3Turb', 'Vertical mixing', 'pp', [['pp', 'Richardson-number closure (Pacanowski–Philander) on a parabolic neutral profile'], ['const', 'Constant eddy viscosity and diffusivity']], 'The neutral profile κ u* z (1 − z/D) follows the bottom and wind friction velocities; stable stratification at the top of the brine layer damps it.', { showIf: is3D }),
       F('h3Nu', 'Background vertical eddy viscosity', 'm²/s', 1e-4, 1e-6, 1e-1, 'Added to the closure value (the background diffusivity is one tenth of it); the constant option uses it for both.', { showIf: is3D }),
       F('h3Kh', 'Horizontal eddy viscosity and diffusivity along the layers', 'm²/s', 0.2, 0, 50, 'Turbulent mixing only: the shear dispersion contained in the 2-D dispersion coefficient is resolved by the layers.', { showIf: is3D }),
+      F('h3Re', 'Grid Reynolds number of the shear-scaled horizontal viscosity', '–', 3, 0, 50, 'Adds the horizontal viscosity ΔU·Δ/Re_Δ (ΔU: half the velocity range over the water column, Δ: cell size) where the shear across a density interface approaches the limit of stability ΔU² ≈ g′D of hydrostatic layered flow; it removes the grid-scale break-up of the interface that otherwise mixes a density front numerically. 0 switches it off; values below about 10 keep the spurious mixing small (Ilıcak et al. 2012).', { showIf: is3D }),
+      SEL('h3Lim', 'Limiter of the tracer transport', 'mc', [['mc', 'Monotonised central (sharper fronts)'], ['vanleer', 'van Leer (smoother)'], ['superbee', 'Superbee (most compressive; steepens smooth gradients)']], 'All three keep the brine fraction within its bounds and conserve it exactly; they differ in how sharp a front stays.', { showIf: is3D }),
       SEL('h3Src', 'Coupling of the near field to the 3-D model', 'coupled', [['coupled', 'Volume, salt and momentum at the end of the near field (entrained water withdrawn over the jet height)'], ['volume', 'Volume and salt, no jet momentum'], ['tracer', 'Salt only (tracer source in the bottom layers, no volume or momentum)']], 'Standard near-field → far-field hand-off: the jets entrain (S − 1)·Q of ambient water over their rise height and deliver S·Q of diluted water into the bottom layer at the end of the near field, moving in the discharge direction with the horizontal momentum the integral jet model has at impact. The brine added to the model is exactly the effluent flow in all three options.', { showIf: is3D }),
     ] },
     { group: 'Waves: wave-action balance', tab: 'setup', help: 'Refraction, shoaling and depth-limited breaking of a monochromatic wave over the bathymetry, Doppler shift and refraction by the tidal current, wave-induced mixing and the radiation-stress-driven longshore current.', fields: [
@@ -1631,7 +1654,7 @@ const suite = {
     { name: 'Single-port outfall on a steep coast, strong tide', values: { design: 'manual', nPorts: 1, dPort: 280, theta: 45, Qb: 1200, depth: 18, slope: 4, uM2: 0.6, uS2: 0.2, bayAmp: 60, Lx: 5000, Ly: 2500, inX: 700, inY: -200, receptors: [{ name: 'Kelp bed', x: 500, y: -250, thr: 0.5 }, { name: 'Offshore reef', x: -600, y: 300, thr: 0.3 }] } },
     { name: 'Stratified summer case, fully mixed far field with particles', values: { dS: 0.6, dT: 4, layer: 'mixed', disp: 'okubo', particles: true, windSpeed: 9, windFactor: 1.2 } },
     { name: 'Free-surface hydrodynamics, waves, heat exchange and a hydrostatic bottom-current slice', values: { hydro: 'sw', waveModel: 'action', heat: true, vslice: true, vsModel: 'hydro', vsTurb: 'pp', Tb: 30, nx: 60, ny: 44, nCycles: 2 } },
-    { name: 'Three-dimensional hydrostatic model: brine plume on σ-layers with 3-D views', values: { h3d: true, h3nx: 32, h3ny: 24, h3nz: 6, nCycles: 2 } },
+    { name: 'Three-dimensional hydrostatic model: brine plume on σ-layers with 3-D views', values: { h3d: true, h3nx: 32, h3ny: 24, h3nz: 12, nCycles: 2 } },
     { name: 'Thermal-plant brine in shallow water — jets reach the surface (problem case)', values: { design: 'manual', nPorts: 12, dPort: 200, spacing: 4, Qb: 6000, Sb: 52, Tb: 32, cCl: 0.1, depth: 9, disp: 'const', K0: 1.5 } },
   ],
 
@@ -1803,7 +1826,7 @@ const suite = {
       }
       const tracers = [{ c0: 0, src: inflow ? [] : src3, open: 0 }];
       if (strat) tracers.push({ c0: (q, k, z) => Sz(z), open: Sz, diffH: false }, { c0: (q, k, z) => Tz(z), open: Tz, diffH: false });
-      const M = hydro3D({ nx: n3x, ny: n3y, nz: K3, dx: g3.dx, dy: g3.dy, zb: g3.zb, land: land3, sigma, hmin: hmin3, f: fC, rho0: P.rhoA, Cd: v.Cd, z0: depth * Math.exp(-1 - 0.41 / Math.sqrt(v.Cd)), turb: v.h3Turb, nu: clamp(v.h3Nu, 1e-6, 1e-1), Kv: v.h3Turb === 'const' ? clamp(v.h3Nu, 1e-6, 1e-1) : 0.1 * clamp(v.h3Nu, 1e-6, 1e-1), Kh: clamp(v.h3Kh, 0, 50), nuH: clamp(v.h3Kh, 0, 50), dens: dens3, refDensity: strat ? refD3 : null, tracers, inflow,
+      const M = hydro3D({ nx: n3x, ny: n3y, nz: K3, dx: g3.dx, dy: g3.dy, zb: g3.zb, land: land3, sigma, hmin: hmin3, f: fC, rho0: P.rhoA, Cd: v.Cd, z0: depth * Math.exp(-1 - 0.41 / Math.sqrt(v.Cd)), turb: v.h3Turb, nu: clamp(v.h3Nu, 1e-6, 1e-1), Kv: v.h3Turb === 'const' ? clamp(v.h3Nu, 1e-6, 1e-1) : 0.1 * clamp(v.h3Nu, 1e-6, 1e-1), Kh: clamp(v.h3Kh, 0, 50), nuH: clamp(v.h3Kh, 0, 50), dens: dens3, reGrid: clamp(v.h3Re ?? 3, 0, 50), tlim: v.h3Lim || 'mc', refDensity: strat ? refD3 : null, tracers, inflow,
         sw: { eta0: v.eta0, x0: g3.x0, y0: g3.y0, bc: { W: v.swBC, E: v.swBC, S: v.swBC, N: v.swBC }, ext: tide ? ext : null, pat: { au: fl3.basis[0].u, av: fl3.basis[0].v, bu: fl3.basis[1].u, bv: fl3.basis[1].v }, tau: [tw[0], tw[1]] } });
       const b3 = M.tr[0], A3 = g3.dx * g3.dy, sE = Math.abs(dSb), thr3 = v.thrArea / Math.max(sE, 1e-12), lim3 = P.limit / Math.max(sE, 1e-12), V0 = M.sw.volume();
       const samp = (a, k, x, y) => { // bilinear over wet cells of layer k
@@ -2024,7 +2047,7 @@ const suite = {
         note: 'The 3-D column is evaluated from the three-dimensional field (near-bed layer for the seabed criteria, all layers for the volumes); the 2-D column repeats the bottom-layer far-field model for comparison. The regulatory assessment above uses, for each criterion, the larger of the layer-model and 3-D values. The cells of the 3-D grid are larger than the near field, so concentrations within about one cell of the source are cell averages.' });
       tables.push({ title: 'Three-dimensional hydrostatic model: set-up and numerics', columns: ['Item', 'Value'], rows: [
         ['Equations', 'Hydrostatic Boussinesq primitive equations, free surface, σ-layers'], ['Grid (cells east–west × north–south × layers)', `${n3x} × ${n3y} × ${K3}`], ['Cell size (m)', `${fmt(g3.dx, 3)} × ${fmt(g3.dy, 3)}`], ['Layer thickness at the outfall, bed / surface (m)', `${fmt(M.ds[0] * g3.H[g3.jo * n3x + g3.io], 3)} / ${fmt(M.ds[K3 - 1] * g3.H[g3.jo * n3x + g3.io], 3)}`],
-        ['Open-boundary condition (barotropic mode)', v.swBC === 'flather' ? 'Flather (elevation + current, radiating)' : v.swBC === 'elev' ? 'Clamped tidal elevation' : 'Radiation (no tidal forcing)'], ['Vertical mixing', v.h3Turb === 'pp' ? 'Parabolic neutral profile with Pacanowski–Philander Richardson-number damping' : 'Constant coefficients'], ['Active scalars', h3.strat ? 'Brine fraction, ambient salinity, ambient temperature (3 tracers)' : 'Brine fraction (salinity and temperature excess follow from it in a uniform ambient)'],
+        ['Open-boundary condition (barotropic mode)', v.swBC === 'flather' ? 'Flather (elevation + current, radiating)' : v.swBC === 'elev' ? 'Clamped tidal elevation' : 'Radiation (no tidal forcing)'], ['Vertical mixing', v.h3Turb === 'pp' ? 'Parabolic neutral profile with Pacanowski–Philander Richardson-number damping' : 'Constant coefficients'], ['Tracer limiter · grid Reynolds number of the shear-scaled horizontal viscosity', `${{ mc: 'monotonised central', vanleer: 'van Leer', superbee: 'superbee' }[v.h3Lim] || 'monotonised central'} · ${clamp(v.h3Re ?? 3, 0, 50) > 0 ? fmt(clamp(v.h3Re ?? 3, 0, 50), 3) : 'off'}`], ['Active scalars', h3.strat ? 'Brine fraction, ambient salinity, ambient temperature (3 tracers)' : 'Brine fraction (salinity and temperature excess follow from it in a uniform ambient)'],
         ['Roughness length z₀ of the log-law bottom drag (mm)', 1000 * h3.z0], ['Coriolis parameter f (1/s)', h3.fC], ['Wind stress (N/m²)', Math.hypot(h3.tw[0], h3.tw[1]) * P.rhoA], ['Near-field coupling', h3.cpl === 'coupled' ? 'volume, salt and momentum' : h3.cpl === 'volume' ? 'volume and salt' : 'salt only (tracer source)'], ['Time steps', M.steps], ['Time step, smallest / largest (s)', `${fmt(h3.dtMin, 3)} / ${fmt(h3.dtMaxU, 3)}`], ['Tracer sub-steps per step', M.steps ? M.subSteps / M.steps : 0], ['Source cells × layers', h3.src3.length],
         ['Tidal range at the outfall, computed (m)', rng3], ['Peak near-bed / surface current at the outfall (m/s)', `${fmt(Math.max(0, ...ser3.ub.slice(k0)), 3)} / ${fmt(Math.max(0, ...ser3.us.slice(k0)), 3)}`], ['Bed step ÷ bottom-layer thickness at the source (hydrostatic-consistency number)', rHC],
         ['Brine balance error (relative)', bal3.injected > 0 ? (M.mass(0) + bal3.out - bal3.inn - bal3.injected) / bal3.injected : 0], ['Water-volume balance error (relative)', (Vend - vIn3) / Math.max(h3.V0, 1)], ['Run time of the 3-D model (s)', h3.wall]],
@@ -2351,23 +2374,36 @@ const suite = {
     // ---- three-dimensional hydrostatic model
     {
       const flat3 = (m, h0) => new Float64Array(m).fill(-h0);
-      { // full-depth lock exchange in a closed flat channel, at two vertical resolutions
-        const lx = 80, Hl = 10, Ll = 4000, dxl = Ll / lx, drho = 1, Ub = 0.5 * Math.sqrt(((G * drho) / 1000) * Hl), got = {};
-        for (const lz of [12, 24]) {
-          const M = hydro3D({ nx: lx, ny: 3, nz: lz, dx: dxl, dy: dxl, zb: flat3(3 * lx, Hl), slip: true, turb: 'const', nu: 1e-4, Kv: 0, rho0: 1000, dens: (tr, x) => drho * tr[0][x], tracers: [{ c0: (P) => (P % lx < lx / 2 ? 1 : 0) }] }), m0 = M.mass(0), ts = [], xf = [], tE = (0.35 * Ll) / Ub;
-          while (M.t < tE) { M.step(Math.min(M.dtStable(), 20)); let x = 0; for (let i = lx - 1; i >= 0; i--) { const a = M.tr[0][lx + i]; if (a > 0.5) { const b = i < lx - 1 ? M.tr[0][lx + i + 1] : 0; x = (i + 0.5) * dxl + (dxl * (a - 0.5)) / Math.max(a - b, 1e-12); break; } } ts.push(M.t); xf.push(x); }
-          let st = 0, sx = 0, stt = 0, stx = 0, m = 0, cmin = 0, cmax = 1; for (let k = Math.floor(0.3 * ts.length); k < ts.length; k++) { st += ts[k]; sx += xf[k]; stt += ts[k] * ts[k]; stx += ts[k] * xf[k]; m++; }
-          for (const c of M.tr[0]) { if (c < cmin) cmin = c; if (c > cmax) cmax = c; }
-          got[lz] = (m * stx - st * sx) / (m * stt - st * st);
-          if (lz === 12) {
+      { // full-depth lock exchange in a closed flat channel, at two vertical resolutions, and with the former scheme
+        const lx = 80, Hl = 10, Ll = 4000, dxl = Ll / lx, drho = 1, cg = Math.sqrt(((G * drho) / 1000) * Hl), Ub = 0.5 * cg, got = {}, mixed = {}, n3 = 3 * lx;
+        const fitV = (ts, xf) => { let st = 0, sx = 0, stt = 0, stx = 0, m = 0; for (let k = Math.floor(0.3 * ts.length); k < ts.length; k++) { st += ts[k]; sx += xf[k]; stt += ts[k] * ts[k]; stx += ts[k] * xf[k]; m++; } return (m * stx - st * sx) / (m * stt - st * st); };
+        for (const [id, lz, ex] of [['12', 12, {}], ['24', 24, {}], ['old', 12, { reGrid: 0, tlim: 'vanleer' }]]) {
+          const M = hydro3D({ nx: lx, ny: 3, nz: lz, dx: dxl, dy: dxl, zb: flat3(3 * lx, Hl), slip: true, turb: 'const', nu: 1e-4, Kv: 0, rho0: 1000, dens: (tr, x) => drho * tr[0][x], tracers: [{ c0: (P) => (P % lx < lx / 2 ? 1 : 0) }], ...ex }), m0 = M.mass(0), ts = [], xf = [], tE = (0.35 * Ll) / Ub, c = M.tr[0];
+          // front: foremost column whose dense-water thickness ∫ c dz exceeds 10 % of the depth, interpolated between the columns
+          while (M.t < tE) { M.step(Math.min(M.dtStable(), 20)); let x = 0, th1 = 0; for (let i = lx - 1; i >= 0; i--) { let th = 0; for (let k = 0; k < lz; k++) th += c[k * n3 + lx + i] * M.ds[k]; if (th > 0.1) { x = (i + 0.5) * dxl + (dxl * (th - 0.1)) / Math.max(th - th1, 1e-12); break; } th1 = th; } ts.push(M.t); xf.push(x); }
+          let cmin = 0, cmax = 1, mx = 0; for (const q of c) { if (q < cmin) cmin = q; if (q > cmax) cmax = q; if (q > 0.1 && q < 0.9) mx++; }
+          got[id] = fitV(ts, xf); mixed[id] = mx / c.length;
+          if (id === '12') {
             add('3-D hydrostatic model: tracer mass conserved in the lock exchange', 0, M.mass(0) / m0 - 1, 1e-11, 'Σ c·V over all layers, relative change — flux-form transport on the moving σ-layers');
-            add('3-D hydrostatic model: limited transport creates no new extrema', 0, Math.max(-cmin, cmax - 1), 1e-9, 'Overshoot of the brine fraction beyond its initial range 0…1 (van Leer limiter)');
+            add('3-D hydrostatic model: limited transport creates no new extrema', 0, Math.max(-cmin, cmax - 1), 1e-9, 'Overshoot of the brine fraction beyond its initial range 0…1 (monotonised-central limiter)');
           }
         }
         const refL = 'Reference: Benjamin (1968), u_f = ½√(g′H), the energy-conserving value for a full-depth lock exchange (confirmed by Shin, Dalziel & Linden 2004); currents that mix at the head run at 0.44–0.48 √(g′H)';
-        add('3-D hydrostatic model: lock-exchange front speed, 80 × 3 × 24 cells', Ub, got[24], 0.08 * Ub, `${refL}. Dense front along the free-slip bed, least-squares slope over the last 70 % of the run (front travel 124 H), 24 σ-layers: ${fmt(got[24] / Ub, 3)} of the reference = ${fmt(got[24] / Math.sqrt(((G * drho) / 1000) * Hl), 3)} √(g′H); tolerance 8 %`);
-        add('3-D hydrostatic model: lock-exchange front speed, 80 × 3 × 12 cells', Ub, got[12], 0.12 * Ub, `Same case with 12 σ-layers: ${fmt(got[12] / Ub, 3)} of the reference = ${fmt(got[12] / Math.sqrt(((G * drho) / 1000) * Hl), 3)} √(g′H); tolerance 12 %. The deficit is set by the vertical resolution of the head, where the dense water that overruns the front is lifted and mixed over one layer: 0.795, 0.886, 0.926 and 0.939 of the reference with 6, 12, 24 and 48 layers, i.e. the model converges to about 0.47 √(g′H), inside the range of currents with a mixing head and 5–6 % below the energy-conserving value. Horizontal refinement (40 to 320 cells), the time step, second- instead of first-order momentum advection and the viscosity floor change the value by less than 1 %`);
+        add('3-D hydrostatic model: lock-exchange front speed, 80 × 3 × 24 cells', Ub, got[24], 0.05 * Ub, `${refL}. Front = foremost column with a dense-water thickness above 10 % of the depth, least-squares slope over the last 70 % of the run (front travel 124 H), 24 σ-layers: ${fmt(got[24] / Ub, 3)} of the reference = ${fmt(got[24] / cg, 3)} √(g′H); tolerance 5 %`);
+        add('3-D hydrostatic model: lock-exchange front speed, 80 × 3 × 12 cells', Ub, got[12], 0.09 * Ub, `Same case with 12 σ-layers: ${fmt(got[12] / Ub, 3)} of the reference = ${fmt(got[12] / cg, 3)} √(g′H); tolerance 9 %. Series with 6, 8, 12, 24 and 48 layers: 0.829, 0.873, 0.916, 0.953 and 0.965 of the reference (0.794, 0.841, 0.886, 0.926, 0.939 with the former scheme). The remaining deficit is set by the thickness of the layer on the bed, in which the nose of the current runs: with 6 layers, thin bed and surface layers (σ-thicknesses 0.1, 0.1, 0.3, 0.3, 0.1, 0.1) give 0.852 and thick ones (0.3, 0.1, 0.1, 0.1, 0.1, 0.3) 0.731`);
         add('3-D hydrostatic model: the front speed converges upward with the number of layers', 1, got[24] > got[12] && got[24] < Ub ? 1 : 0, 0, `${fmt(got[12] / Ub, 4)} → ${fmt(got[24] / Ub, 4)} of ½√(g′H) from 12 to 24 layers`);
+        add('3-D hydrostatic model: shear-scaled horizontal viscosity removes the grid-scale mixing at the interface', 1, got[12] > got.old && mixed[12] < 0.8 * mixed.old ? 1 : 0, 0, `12 layers: front speed ${fmt(got.old / Ub, 3)} → ${fmt(got[12] / Ub, 3)} of the reference and share of the water with a brine fraction between 0.1 and 0.9 ${fmt(100 * mixed.old, 3)} % → ${fmt(100 * mixed[12], 3)} % when the horizontal viscosity ΔU·Δ/Re_Δ (ΔU = half the velocity range over the water column, Re_Δ = 3, active where (2ΔU)² approaches g′D) and the monotonised-central limiter replace no horizontal viscosity and the van Leer limiter. The shear across the interface equals √(g′H), the limit of stability of the hydrostatic two-layer flow, so without horizontal friction it breaks up at the grid scale and the interface thickens to about a third of the depth at every vertical resolution; the limiter, the time step and the vertical viscosity floor each change the speed by less than 1 %`);
+        { // independent solution: two-layer rigid-lid shallow-water equations in conservation form (units H = g′ = 1), local Lax–Friedrichs
+          const N = 400, dxq = 2 / N, e = new Float64Array(N + 1), w = new Float64Array(N), fe = new Float64Array(N + 1), fw = new Float64Array(N + 1), ts = [], xs = [], f1 = (a, q) => q * a * (1 - a), f2 = (a, q) => 0.5 * q * q * (1 - 2 * a) + a;
+          for (let i = 0; i < N / 2; i++) e[i] = 1;
+          for (let t = 0; t < 1.2;) {
+            const dtq = 0.4 * dxq;
+            for (let i = 1; i < N; i++) { fe[i] = 0.5 * (f1(e[i - 1], w[i - 1]) + f1(e[i], w[i])) - 0.5 * (e[i] - e[i - 1]); fw[i] = 0.5 * (f2(e[i - 1], w[i - 1]) + f2(e[i], w[i])) - 0.5 * (w[i] - w[i - 1]); }
+            for (let i = 0; i < N; i++) { e[i] -= (dtq / dxq) * (fe[i + 1] - fe[i]); if (i > 0 && i < N - 1) w[i] -= (dtq / dxq) * (fw[i + 1] - fw[i]); }
+            t += dtq; let x = 0; for (let i = N - 1; i >= 0; i--) if (e[i] > 0.25) { x = (i + 0.5) * dxq + (dxq * (e[i] - 0.25)) / Math.max(e[i] - e[i + 1], 1e-12); break; } ts.push(t); xs.push(x);
+          }
+          add('Two-layer hydrostatic lock exchange (independent 1-D solution): front speed', (2 / 3) * Math.sqrt(2 / 3), fitV(ts, xs), 0.01, `Rigid-lid Boussinesq two-layer shallow-water equations ∂η/∂t + ∂[vη(1 − η)]/∂x = 0, ∂v/∂t + ∂[½v²(1 − 2η) + η]/∂x = 0 (η lower-layer thickness ÷ H, v velocity difference ÷ √(g′H)), 400 cells. With these jump conditions the front is the fastest admissible shock, height H/3 and speed (2/3)√(2/3) = 0.544 √(g′H), followed by an expansion to the half-depth state v = 1; Benjamin's front condition without dissipation gives 0.5. The hydrostatic equations therefore fix the front speed only together with a front condition: the 3-D model, whose momentum-conserving front dissipates energy, has a head of 0.36–0.39 H followed by the same sloping interface and runs at ${fmt(got[24] / cg, 3)} √(g′H) with 24 layers`);
+        }
       }
       { // near-field → far-field coupling: volume, salt and momentum of the near-field water in a closed basin at rest
         const ix = 31, iy = 21, iz = 8, n2 = ix * iy, Pc = 10 * ix + 15, Qe = 1, Sd = 20, tI = 3600;

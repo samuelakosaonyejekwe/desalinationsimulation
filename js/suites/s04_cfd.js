@@ -1706,9 +1706,15 @@ const up3 = (c, m1, m2, p1v, p2v, has2m, has2p, vel, d) => (vel >= 0 ? (has2m ? 
  *               that the phase volume is restored (mass correction); α = smoothed Heaviside, κ from φ.
  * o = { nx, ny, W, Hh, rhoA, rhoB, muA, muB, sigma, gx, gy, sd(x, y) (> 0 inside phase A), tEnd, slipSide, slipTB,
  *       cfl, muMix: 'arith' | 'harm', maxSteps, u0(x, y), v0(x, y), snaps: [times at which α is stored],
- *       solid: Uint8Array(nx·ny) blocked cells, flow: { uin: number | [ny], alphaIn(t, y) }, rhoRef }.
+ *       solid: Uint8Array(nx·ny) blocked cells, flow: { uin: number | [ny], alphaIn(t, y), phiIn(t, x, y) }, rhoRef, probeI }.
+ * flow.alphaIn is the phase-A fraction of the inflow (volume of fluid); flow.phiIn the signed distance (> 0 in phase A) of the phase
+ * arriving through the inlet, evaluated at the ghost positions x < 0 (level set: inflow boundary value of φ; the volume carried in is counted
+ * with alphaIn, or with the smoothed Heaviside of phiIn at x = 0 when alphaIn is not given, and the volume correction holds the level set to it). probeI: column whose phase-A fraction is recorded in hist.probe.
  * Without `flow` the box is closed, with free-slip or no-slip side and top/bottom walls; with it x = 0 is a velocity inlet and x = W a
  * pressure outlet (channel flow carrying the second phase). Blocked cells are no-slip solids (spacer filaments, imported sections).
+ * surfaceTension: 'semi' adds the semi-implicit Laplace–Beltrami term (see stImplicit) and sets the capillary step to stFactor (default 5) times
+ * √(ρ̄h³/2πσ) instead of half of it; stTheta (default 1) weights the term. timeBudget (s): the run may exceed maxSteps while the projected
+ * wall-clock time of the whole run stays within it.
  */
 export async function twoPhase2D(o, ctx) {
   const nx = o.nx, ny = o.ny, W = o.W, Hh = o.Hh, dx = W / nx, dy = Hh / ny, n = nx * ny, nu1 = nx + 1, ls = o.method === 'ls', h = Math.min(dx, dy);
@@ -1724,7 +1730,7 @@ export async function twoPhase2D(o, ctx) {
   // that a uniform outlet pressure is the right condition; solids are no-slip (mirror ghost values), the phase fraction and the level
   // set are extended into them from the neighbouring fluid, which is a contact angle of 90° as on the tank walls.
   const solid = o.solid && o.solid.some((q) => q) ? o.solid : null, flow = o.flow || null, msk = !!(solid || flow), rr = flow ? o.rhoRef ?? rB : 0;
-  const bu = solid ? new Uint8Array(nu1 * ny) : null, bv = solid ? new Uint8Array(nx * (ny + 1)) : null, uinF = flow ? Float64Array.from({ length: ny }, (_, j) => (solid && solid[j * nx] ? 0 : typeof flow.uin === 'number' ? flow.uin : flow.uin[j])) : null, aInF = flow && typeof flow.alphaIn === 'function' ? flow.alphaIn : null;
+  const bu = solid ? new Uint8Array(nu1 * ny) : null, bv = solid ? new Uint8Array(nx * (ny + 1)) : null, uinF = flow ? Float64Array.from({ length: ny }, (_, j) => (solid && solid[j * nx] ? 0 : typeof flow.uin === 'number' ? flow.uin : flow.uin[j])) : null, aInF = flow && typeof flow.alphaIn === 'function' ? flow.alphaIn : null, pInF = flow && ls && typeof flow.phiIn === 'function' ? flow.phiIn : null, g1 = pInF ? f(ny) : null, g2 = pInF ? f(ny) : null;
   if (solid) {
     for (let j = 0; j < ny; j++) for (let i = 1; i < nx; i++) bu[j * nu1 + i] = solid[j * nx + i - 1] || solid[j * nx + i] ? 1 : 0;
     for (let j = 1; j < ny; j++) for (let i = 0; i < nx; i++) bv[j * nx + i] = solid[(j - 1) * nx + i] || solid[j * nx + i] ? 1 : 0;
@@ -1822,6 +1828,83 @@ export async function twoPhase2D(o, ctx) {
       vis += (te - tw) / dx;
       vs[k] = c + dt * (-(ub * dvdx + c * dvdy) + vis / rf + (rr ? gy * (1 - rr / rf) : gy) + (sig > 0 ? (sig * kFace(k - nx, k) * (a[k] - a[k - nx])) / (dy * rf) : 0));
     }
+    if (semi) stImplicit(dt);
+  };
+  // Semi-implicit surface tension (Bänsch 2001; Hysing 2006; finite-volume CSF form of Raessi, Bussmann & Mostaghimi 2009): the curvature force at
+  // the new time level is σκⁿ⁺¹n δ ≈ σκⁿ n δ + Δt σ δ Δ_s u, Δ_s = ∇·(P∇), P = I − n nᵀ (Laplace–Beltrami operator on the interface). The second
+  // term is added to the provisional velocity: ρ u* − θ Δt² σ ∇·(δP∇u*) = ρ u_e, with u_e the explicit result (which holds σκⁿ∇α), δP = (|e|²I − e eᵀ)/|e|
+  // from the gradient e of the smoothed fraction at the cell centres and corners. The diagonal part of P is solved implicitly per velocity component
+  // (symmetric positive definite five-point system, Jacobi-preconditioned conjugate gradients), the mixed-derivative part is taken from u_e, which is
+  // stable for the positive semi-definite P. This removes the capillary-wave limit Δt < √(ρ̄h³/2πσ) of the explicit force; the scheme is first order
+  // in time for capillary motion and damps a capillary mode of angular frequency ω at the rate θω²Δt/2.
+  const semi = sig > 0 && o.surfaceTension === 'semi', stTh = o.stTheta ?? 1, nc1 = nx + 1;
+  const kcx = semi ? f(n) : null, kcy = semi ? f(n) : null, kcc = semi ? f(n) : null, kqx = semi ? f(nc1 * (ny + 1)) : null, kqy = semi ? f(nc1 * (ny + 1)) : null, kqc = semi ? f(nc1 * (ny + 1)) : null;
+  const cgE = semi ? f(nu1 * (ny + 1)) : null, cgN = semi ? f(nu1 * (ny + 1)) : null, cgM = semi ? f(nu1 * (ny + 1)) : null, cgB = semi ? f(nu1 * (ny + 1)) : null, cgR = semi ? f(nu1 * (ny + 1)) : null, cgZ = semi ? f(nu1 * (ny + 1)) : null, cgP = semi ? f(nu1 * (ny + 1)) : null, cgQ = semi ? f(nu1 * (ny + 1)) : null, cgD = semi ? f(nu1 * (ny + 1)) : null;
+  let stIters = 0;
+  /** Solves (M + L) x = b on a lattice of nI × nJ points: M diagonal (0 marks a fixed point, x = b), L the graph Laplacian with the couplings cE (to i + 1) and cN (to j + 1). */
+  const cgLat = (nI, nJ, x, tol, maxIt) => {
+    const N = nI * nJ, mul = (xx, y) => { for (let j = 0, k = 0; j < nJ; j++) for (let i = 0; i < nI; i++, k++) { if (!(cgM[k] > 0)) { y[k] = 0; continue; } let q = cgM[k] * xx[k]; const e = cgE[k], w = i > 0 ? cgE[k - 1] : 0, nn = cgN[k], ss = j > 0 ? cgN[k - nI] : 0; if (e !== 0) q += e * (xx[k] - xx[k + 1]); if (w !== 0) q += w * (xx[k] - xx[k - 1]); if (nn !== 0) q += nn * (xx[k] - xx[k + nI]); if (ss !== 0) q += ss * (xx[k] - xx[k - nI]); y[k] = q; } };
+    for (let j = 0, k = 0; j < nJ; j++) for (let i = 0; i < nI; i++, k++) cgD[k] = cgM[k] > 0 ? 1 / (cgM[k] + cgE[k] + (i > 0 ? cgE[k - 1] : 0) + cgN[k] + (j > 0 ? cgN[k - nI] : 0)) : 0;
+    mul(x, cgQ); let rz = 0, b2 = 0;
+    for (let k = 0; k < N; k++) { if (!(cgM[k] > 0)) { cgR[k] = 0; cgP[k] = 0; continue; } const r = cgB[k] - cgQ[k]; cgR[k] = r; cgZ[k] = r * cgD[k]; cgP[k] = cgZ[k]; rz += r * cgZ[k]; b2 += cgB[k] * cgB[k] * cgD[k]; }
+    let it = 0;
+    for (; it < maxIt && rz > tol * tol * b2 && rz > 1e-300; it++) {
+      mul(cgP, cgQ); let pq = 0; for (let k = 0; k < N; k++) pq += cgP[k] * cgQ[k];
+      const al = rz / pq; let rz2 = 0;
+      for (let k = 0; k < N; k++) { x[k] += al * cgP[k]; const r = cgR[k] - al * cgQ[k]; cgR[k] = r; const z = r * cgD[k]; cgZ[k] = z; rz2 += r * z; }
+      const be = rz2 / rz; rz = rz2;
+      for (let k = 0; k < N; k++) cgP[k] = cgZ[k] + be * cgP[k];
+    }
+    return it;
+  };
+  const stImplicit = (dt) => {
+    const g = ls ? a : at, c = stTh * dt * dt * sig, tiny = 1e-9 / h;
+    let any = false;
+    for (let jf = 0; jf <= ny; jf++) for (let i = 0; i <= nx; i++) { // δP at the cell corners
+      const i0 = i > 0 ? i - 1 : 0, i1 = i < nx ? i : nx - 1, j0 = jf > 0 ? jf - 1 : 0, j1 = jf < ny ? jf : ny - 1, a00 = g[j0 * nx + i0], a10 = g[j0 * nx + i1], a01 = g[j1 * nx + i0], a11 = g[j1 * nx + i1];
+      const ex = (a10 + a11 - a00 - a01) / (2 * dx), ey = (a01 + a11 - a00 - a10) / (2 * dy), m = Math.hypot(ex, ey), q = jf * nc1 + i;
+      if (m > tiny) { kqx[q] = (ey * ey) / m; kqy[q] = (ex * ex) / m; kqc[q] = (-ex * ey) / m; any = true; } else { kqx[q] = 0; kqy[q] = 0; kqc[q] = 0; }
+    }
+    if (!any) return;
+    for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { // δP at the cell centres
+      const im = i > 0 ? 1 : 0, ip = i < nx - 1 ? 1 : 0, jm = j > 0 ? nx : 0, jp = j < ny - 1 ? nx : 0, ex = (g[P + ip] - g[P - im]) / (2 * dx), ey = (g[P + jp] - g[P - jm]) / (2 * dy), m = Math.hypot(ex, ey);
+      if (m > tiny) { kcx[P] = (ey * ey) / m; kcy[P] = (ex * ex) / m; kcc[P] = (-ex * ey) / m; } else { kcx[P] = 0; kcy[P] = 0; kcc[P] = 0; }
+    }
+    const rx2 = c / (dx * dx), ry2 = c / (dy * dy), rxy = c / (4 * dx * dy);
+    // u component: east–west fluxes at the cell centres, north–south fluxes at the corners
+    cgM.fill(0); cgE.fill(0); cgN.fill(0);
+    for (let j = 0; j < ny; j++) for (let i = 1; i < nx; i++) {
+      const k = j * nu1 + i, P = j * nx + i; if (bu !== null && bu[k]) continue;
+      cgM[k] = 0.5 * (rho[P - 1] + rho[P]);
+      if (i < nx - 1 && !(bu !== null && bu[k + 1])) cgE[k] = rx2 * kcx[P];
+      if (j < ny - 1 && !(bu !== null && bu[k + nu1])) cgN[k] = ry2 * kqx[(j + 1) * nc1 + i];
+    }
+    for (let j = 0; j < ny; j++) for (let i = 1; i < nx; i++) {
+      const k = j * nu1 + i, P = j * nx + i; if (!(cgM[k] > 0)) { cgB[k] = us[k]; continue; }
+      const jn = j < ny - 1 ? nu1 : 0, js = j > 0 ? nu1 : 0;
+      let x = kcc[P] * (us[k + jn] + us[k + 1 + jn] - us[k - js] - us[k + 1 - js]) - kcc[P - 1] * (us[k - 1 + jn] + us[k + jn] - us[k - 1 - js] - us[k - js]);
+      if (j < ny - 1) x += kqc[(j + 1) * nc1 + i] * (us[k + 1] + us[k + 1 + nu1] - us[k - 1] - us[k - 1 + nu1]);
+      if (j > 0) x -= kqc[j * nc1 + i] * (us[k + 1 - nu1] + us[k + 1] - us[k - 1 - nu1] - us[k - 1]);
+      cgB[k] = cgM[k] * us[k] + rxy * x;
+    }
+    stIters += cgLat(nu1, ny, us, o.stTol ?? 1e-6, 400);
+    // v component: north–south fluxes at the cell centres, east–west fluxes at the corners
+    cgM.fill(0); cgE.fill(0); cgN.fill(0);
+    for (let j = 1; j < ny; j++) for (let i = 0; i < nx; i++) {
+      const k = j * nx + i; if (bv !== null && bv[k]) continue;
+      cgM[k] = 0.5 * (rho[k - nx] + rho[k]);
+      if (i < nx - 1 && !(bv !== null && bv[k + 1])) cgE[k] = rx2 * kqy[j * nc1 + i + 1];
+      if (j < ny - 1 && !(bv !== null && bv[k + nx])) cgN[k] = ry2 * kcy[k];
+    }
+    for (let j = 1; j < ny; j++) for (let i = 0; i < nx; i++) {
+      const k = j * nx + i; if (!(cgM[k] > 0)) { cgB[k] = vs[k]; continue; }
+      const ie = i < nx - 1 ? 1 : 0, iw = i > 0 ? 1 : 0;
+      let x = kcc[k] * (vs[k + ie] + vs[k + nx + ie] - vs[k - iw] - vs[k + nx - iw]) - kcc[k - nx] * (vs[k - nx + ie] + vs[k + ie] - vs[k - nx - iw] - vs[k - iw]);
+      if (i < nx - 1) x += kqc[j * nc1 + i + 1] * (vs[k + nx] + vs[k + nx + 1] - vs[k - nx] - vs[k - nx + 1]);
+      if (i > 0) x -= kqc[j * nc1 + i] * (vs[k + nx - 1] + vs[k + nx] - vs[k - nx - 1] - vs[k - nx]);
+      cgB[k] = cgM[k] * vs[k] + rxy * x;
+    }
+    stIters += cgLat(nx, ny + 1, vs, o.stTol ?? 1e-6, 400);
   };
   let pIters = 0;
   const project = (dt) => { // ∇·((1/ρ)∇p) = ∇·u*/Δt, zero normal velocity on the box
@@ -1852,7 +1935,7 @@ export async function twoPhase2D(o, ctx) {
     if (flow) for (let j = 0; j < ny; j++) { const k = j * nu1, P = j * nx + nx - 1; u[k] = us[k]; u[k + nx] = solid && solid[P] ? 0 : us[k + nx] + (dt * p[P]) / (dx * rho[P]); }
   };
   let volIn = 0, volOut = 0, tNow = 0; // phase-A volume carried in through the inlet and out through the outlet
-  const aInNow = (j) => (aInF ? clamp(aInF(tNow, (j + 0.5) * dy), 0, 1) : 0);
+  const aInNow = (j) => (aInF ? clamp(aInF(tNow, (j + 0.5) * dy), 0, 1) : pInF ? heavi(pInF(tNow, 0, (j + 0.5) * dy)) : 0);
   // THINC/WLIC volume-fraction fluxes (Xiao et al. 2005; Yokoi 2007)
   const BETA = 3.5, CB = Math.cosh(BETA), SB = Math.sinh(BETA);
   const thinc = (aC, aM, aPl, c, wgt) => {
@@ -1907,7 +1990,8 @@ export async function twoPhase2D(o, ctx) {
       const jm = j > 0 ? nx : 0, jp = j < ny - 1 ? nx : 0, jmm = j > 1 ? 2 * nx : jm, jpp = j < ny - 2 ? 2 * nx : jp;
       for (let i = 0; i < nx; i++, P++) {
         const im = i > 0 ? 1 : 0, ip = i < nx - 1 ? 1 : 0, imm = i > 1 ? 2 : im, ipp = i < nx - 2 ? 2 : ip, c = ff[P];
-        const ex = ucc[P] >= 0 ? (2 * ff[P + ip] + 3 * c - 6 * ff[P - im] + ff[P - imm]) / (6 * dx) : -(2 * ff[P - im] + 3 * c - 6 * ff[P + ip] + ff[P + ipp]) / (6 * dx);
+        const fm = i > 0 || g1 === null ? ff[P - im] : g1[j], fmm = i > 1 || g1 === null ? ff[P - imm] : i === 1 ? g1[j] : g2[j]; // inflow boundary values of φ in the two ghost columns
+        const ex = ucc[P] >= 0 ? (2 * ff[P + ip] + 3 * c - 6 * fm + fmm) / (6 * dx) : -(2 * fm + 3 * c - 6 * ff[P + ip] + ff[P + ipp]) / (6 * dx);
         const ey = vcc[P] >= 0 ? (2 * ff[P + jp] + 3 * c - 6 * ff[P - jm] + ff[P - jmm]) / (6 * dy) : -(2 * ff[P - jm] + 3 * c - 6 * ff[P + jp] + ff[P + jpp]) / (6 * dy);
         r[P] = -(ucc[P] * ex + vcc[P] * ey);
       }
@@ -1917,7 +2001,7 @@ export async function twoPhase2D(o, ctx) {
     for (let P = 0; P < n; P++) p3[P] = phi[P] / Math.sqrt(phi[P] * phi[P] + h * h);
     for (let it = 0; it < its; it++) {
       for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) {
-        const c = phi[P], a1 = i > 0 ? (c - phi[P - 1]) / dx : 0, b1 = i < nx - 1 ? (phi[P + 1] - c) / dx : 0, c1 = j > 0 ? (c - phi[P - nx]) / dy : 0, d1 = j < ny - 1 ? (phi[P + nx] - c) / dy : 0, s = p3[P];
+        const c = phi[P], a1 = i > 0 ? (c - phi[P - 1]) / dx : g1 !== null ? (c - g1[j]) / dx : 0, b1 = i < nx - 1 ? (phi[P + 1] - c) / dx : 0, c1 = j > 0 ? (c - phi[P - nx]) / dy : 0, d1 = j < ny - 1 ? (phi[P + nx] - c) / dy : 0, s = p3[P];
         const g2 = s > 0 ? Math.max(Math.max(a1, 0) ** 2, Math.min(b1, 0) ** 2) + Math.max(Math.max(c1, 0) ** 2, Math.min(d1, 0) ** 2) : Math.max(Math.min(a1, 0) ** 2, Math.max(b1, 0) ** 2) + Math.max(Math.min(c1, 0) ** 2, Math.max(d1, 0) ** 2);
         p1[P] = c - 0.3 * h * s * (Math.sqrt(g2) - 1);
       }
@@ -1940,6 +2024,7 @@ export async function twoPhase2D(o, ctx) {
     if (!ls) { if (s % 2) { sweepY(dt, true); sweepX(dt, false); } else { sweepX(dt, true); sweepY(dt, false); } for (let P = 0; P < n; P++) a[P] = a[P] < 0 ? 0 : a[P] > 1 ? 1 : a[P]; if (solid !== null) fillS(a); return; }
     if (flow) for (let j = 0; j < ny; j++) { const ui = u[j * nu1], ue = u[j * nu1 + nx]; if (ui > 0) volIn += ui * dt * dy * aInNow(j); if (ue > 0 && !(solid !== null && solid[j * nx + nx - 1])) volOut += ue * dt * dy * a[j * nx + nx - 1]; }
     for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { ucc[P] = 0.5 * (u[j * nu1 + i] + u[j * nu1 + i + 1]); vcc[P] = 0.5 * (v[P] + v[P + nx]); }
+    if (g1 !== null) for (let j = 0; j < ny; j++) { const y = (j + 0.5) * dy; g1[j] = pInF(tNow, -0.5 * dx, y); g2[j] = pInF(tNow, -1.5 * dx, y); }
     rhsLS(phi, p1); for (let P = 0; P < n; P++) p2[P] = phi[P] + dt * p1[P];
     rhsLS(p2, an); for (let P = 0; P < n; P++) phi[P] += 0.5 * dt * (p1[P] + an[P]);
     if (solid !== null) fillS(phi);
@@ -1949,8 +2034,10 @@ export async function twoPhase2D(o, ctx) {
   };
   // time step: convective, capillary (Brackbill), viscous and gravity-wave limits
   const nuMax = Math.max(mA / rA, mB / rB), dtCap = sig > 0 ? Math.sqrt(((rA + rB) * h ** 3) / (4 * Math.PI * sig)) : Infinity, gm = Math.hypot(gx, gy);
-  const dtFix = Math.min(0.5 * dtCap, (0.2 * h * h) / nuMax, gm > 0 ? 0.25 * Math.sqrt(h / gm) : Infinity, o.dtMax ?? Infinity), cfl = o.cfl ?? 0.25;
-  const hist = { t: [], vol: [], xc: [], yc: [], vr: [], umax: [], hL: [], hR: [], xf: [], circ: [], ke: [], inn: [], out: [], dp: [], xLead: [], xTrail: [], tauMean: [], tauMax: [] };
+  const dtST = semi ? clamp(o.stFactor ?? 5, 0.5, 20) * dtCap : 0.5 * dtCap, dtVis = (0.2 * h * h) / nuMax, dtGr = gm > 0 ? 0.25 * Math.sqrt(h / gm) : Infinity;
+  const dtFix = Math.min(dtST, dtVis, dtGr, o.dtMax ?? Infinity), cfl = o.cfl ?? 0.25, dtLimit = dtFix === dtST ? 'surface tension' : dtFix === dtVis ? 'viscosity' : dtFix === dtGr ? 'gravity waves' : 'the largest step allowed';
+  const hist = { t: [], vol: [], xc: [], yc: [], vr: [], umax: [], hL: [], hR: [], xf: [], circ: [], ke: [], inn: [], out: [], dp: [], xLead: [], xTrail: [], tauMean: [], tauMax: [], probe: [] };
+  const pI = flow && Number.isInteger(o.probeI) ? clamp(o.probeI, 0, nx - 1) : -1;
   const diag = (t) => {
     let s = 0, sx = 0, sy = 0, sv = 0, um = 0, per = 0, ke = 0, hL = 0, hR = 0, xf = 0;
     for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) {
@@ -1971,6 +2058,7 @@ export async function twoPhase2D(o, ctx) {
       let ts = 0, tm = 0, tn = 0; // shear stress on the channel walls from the wall-adjacent cells
       for (let i = 0; i < nx; i++) for (const j of [0, ny - 1]) { const P = j * nx + i; if (solid !== null && solid[P]) continue; const tw = (mu[P] * Math.abs(0.5 * (u[j * nu1 + i] + u[j * nu1 + i + 1]))) / (0.5 * dy); ts += tw; tn++; if (tw > tm) tm = tw; }
       hist.tauMean.push(tn ? ts / tn : 0); hist.tauMax.push(tm);
+      if (pI >= 0) { let q = 0, m = 0; for (let j = 0; j < ny; j++) { const P = j * nx + pI; if (!(solid !== null && solid[P])) { q += a[P]; m++; } } hist.probe.push(m ? q / m : 0); }
       hist.inn.push(volIn); hist.out.push(volOut); hist.dp.push((na2 ? pa2 / na2 : 0) - (nb2 ? pb2 / nb2 : 0)); hist.xLead.push(xl); hist.xTrail.push(xt < 0 ? 0 : xt);
     }
     return Math.sqrt(um);
@@ -1978,7 +2066,11 @@ export async function twoPhase2D(o, ctx) {
   let t = 0, steps = 0, um = diag(0), amin = 0, amax = 1;
   const maxSteps = o.maxSteps ?? 20000, tEnd = o.tEnd, snapT = (o.snaps || []).filter((x) => x > 0 && x < tEnd).sort((x, y) => x - y), snaps = [];
   let snapK = 0;
-  while (t < tEnd * (1 - 1e-12) && steps < maxSteps) {
+  // Step cap: maxSteps always; beyond it the run continues while the projected wall-clock time of the whole run stays within o.timeBudget seconds.
+  const clock = () => (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000, wall0 = clock(), budget = o.timeBudget > 0 ? o.timeBudget : 0;
+  let more = budget > 0;
+  while (t < tEnd * (1 - 1e-12) && (steps < maxSteps || (more && steps < 100 * maxSteps))) {
+    if (budget > 0 && steps >= maxSteps && steps % 50 === 0) { more = ((clock() - wall0) * tEnd) / Math.max(t, 1e-300) <= budget; if (!more) break; }
     let vmax = 1e-300;
     for (let k = 0; k < u.length; k++) { const q = Math.abs(u[k]) / dx; if (q > vmax) vmax = q; }
     for (let k = 0; k < v.length; k++) { const q = Math.abs(v[k]) / dy; if (q > vmax) vmax = q; }
@@ -1998,7 +2090,7 @@ export async function twoPhase2D(o, ctx) {
   for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { if (solid !== null && solid[P]) continue; const q = p[P] - rB * (gx * (i + 0.5) * dx + gy * (j + 0.5) * dy); if (a[P] > 0.999) { pa += q; na++; } else if (a[P] < 0.001) { pb += q; nb++; } }
   let div = 0;
   for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { if (solid !== null && solid[P]) continue; div = Math.max(div, Math.abs((u[j * nu1 + i + 1] - u[j * nu1 + i]) / dx + (v[P + nx] - v[P]) / dy)); }
-  return { nx, ny, dx, dy, W, Hh, a, phi, u, v, p, rho, kap, hist, snaps, t, steps, vol0, vol: hist.vol[hist.vol.length - 1], dpJump: na && nb ? pa / na - pb / nb : 0, umax: um, div, pIters, pFactors: Bs ? Bs.factors : 0, lsShift, done: t >= tEnd * (1 - 1e-9), method: ls ? 'ls' : 'vof', dtFix, solid, volIn, volOut, through: !!flow };
+  return { nx, ny, dx, dy, W, Hh, a, phi, u, v, p, rho, kap, hist, snaps, t, steps, vol0, vol: hist.vol[hist.vol.length - 1], dpJump: na && nb ? pa / na - pb / nb : 0, umax: um, div, pIters, pFactors: Bs ? Bs.factors : 0, lsShift, done: t >= tEnd * (1 - 1e-9), method: ls ? 'ls' : 'vof', dtFix, solid, volIn, volOut, through: !!flow, dtLimit, dtCap, semi, stIters, wall: clock() - wall0, stepsNeeded: t > 0 ? Math.ceil((steps * tEnd) / t) : Infinity };
 }
 
 /** Schiller–Naumann drag coefficient times the particle Reynolds number, C_D·Re = 24 (1 + 0.15 Re^0.687) (0.44 Re above Re = 1000). */
@@ -2029,6 +2121,8 @@ export function terminalSN(d, rhoC, rhoD, muC, g = 9.80665) {
  * x = L a pressure outlet. Walls: no-slip (or free-slip) for the continuous phase, free-slip for the dispersed phase.
  * deposit = true lets the dispersed phase leave through the wall it settles (or rises) onto, at its wall-normal velocity one
  * face inside; the same volume of continuous phase takes its place, so the mixture volume flux through the wall stays zero.
+ * capture = { stick, rP, T | Db, diffusion, lenSolid } (with deposit) replaces that by the capture on every wall and solid face split into
+ * settling, inertial impaction, interception and Brownian diffusion (see capF); the result then carries capture.{wall, solid}.{mechanism}.
  */
 export async function twoFluid2D(o, ctx) {
   const nx = o.nx, ny = o.ny, L = o.L, H = o.H, dx = L / nx, dy = H / ny, n = nx * ny, nu1 = nx + 1, h = Math.min(dx, dy);
@@ -2052,6 +2146,46 @@ export async function twoFluid2D(o, ctx) {
       if (solid[P]) continue;
       if (gdy < 0 ? j > 0 && solid[P - nx] && j < ny - 1 && !solid[P + nx] : j < ny - 1 && solid[P + nx] && j > 0 && !solid[P - nx]) capS.push([P, gdy < 0 ? P + nx : P]);
     }
+  }
+  // Capture by mechanism (o.capture, with o.deposit): every fluid cell next to a channel wall or a solid face is a sink of the dispersed phase,
+  //   settling:             the velocity of the dispersed phase relative to the liquid toward a surface that gravity drives it onto, one face inside,
+  //                         up to the terminal velocity along the normal (a larger slip is inertial lag, which belongs to the next mechanism);
+  //   inertial impaction:   the dispersed phase keeps its own momentum, so where the liquid is deflected it arrives one face inside (distance Δ) with
+  //                         the velocity v0 toward the surface; over the last cell the liquid slows down as u_n = b y, b = u_n(Δ)/Δ, and the particle
+  //                         obeys τÿ + ẏ + b y = 0 (τ = ρ_d/k′ from the drag law). Its velocity on arrival is the capture velocity; it is zero when the
+  //                         particle is stopped first, which for small v0 is the case below the critical inertia 4bτ = 1 (critical Stokes number);
+  //   interception:         particles whose centres pass within one radius r_p of the surface touch it. Sub-grid model: next to a no-slip surface the
+  //                         liquid velocity toward it grows as (distance)², u_n(y) = u_n(Δ)(y/Δ)² (continuity with a linear tangential profile), so the
+  //                         volume flux of centres through y = r_p is α u_n(Δ)(r_p/Δ)², u_n(Δ) the liquid velocity toward the surface one face inside;
+  //   diffusion (Brownian): mass-transfer coefficient of the Lévêque boundary layer, k = 0.538 (γ D²/x)^⅓ on the channel walls (x from the inlet) and
+  //                         its mean 0.807 (γ D²/ℓ)^⅓ over a solid of length ℓ, γ the local wall shear rate, D = k_B T/(3π μ d) (Stokes–Einstein).
+  // Velocities are taken along the normal of the surface (for solids from the blocked-cell indicator, so that flow along a staircase flank is not
+  // counted as approach), and the flux through a face is weighted with the cosine between the two normals. Each contribution is multiplied by the
+  // sticking probability. capF: [cell, axis, sign toward the surface, opposite face, solid?, x, surface normal x, y].
+  /** Velocity at which a particle that is a distance D from a surface and moves toward it at v0 arrives there, in a liquid that approaches the surface at b·y
+   *  (stagnation flow) with the relaxation time tau: τÿ + ẏ + b y = 0, y(0) = D, ẏ(0) = −v0; 0 when it is stopped before the surface (sub-critical inertia, 4bτ < 1 and slow). */
+  const impactVel = (v0, b, tau, D) => {
+    if (!(b > 1e-12 * (v0 / D))) return v0 * tau > D ? v0 - D / tau : 0;
+    const q = 1 - 4 * b * tau;
+    if (q < 0) { const om = Math.sqrt(-q) / (2 * tau), B = (v0 - D / (2 * tau)) / om, ts = Math.atan2(D * om, v0 - D / (2 * tau)) / om; return Math.exp(-ts / (2 * tau)) * om * Math.hypot(D, B); }
+    const sq = Math.sqrt(q), l1 = (-1 + sq) / (2 * tau), l2 = (-1 - sq) / (2 * tau);
+    if (sq < 1e-9) return v0 > D / (2 * tau) ? (v0 - D / (2 * tau)) * Math.exp(-D / (2 * tau * (v0 - D / (2 * tau)))) : 0;
+    const C1 = (-v0 - l2 * D) / (l1 - l2), C2 = D - C1; if (!(C1 < 0)) return 0;
+    const ts = Math.log(-C2 / C1) / (l1 - l2); return -(l1 * C1 * Math.exp(l1 * ts) + l2 * C2 * Math.exp(l2 * ts));
+  };
+  const cap = o.deposit && o.capture ? o.capture : null, capF = [], depM = f(8), cSt = cap ? clamp(cap.stick ?? 1, 0, 1) : 1, cR = cap ? cap.rP ?? 0.5 * dP : 0, cD = cap ? cap.Db ?? (cap.diffusion === false ? 0 : (1.380649e-23 * (cap.T ?? 298.15)) / (3 * Math.PI * muc * dP)) : 0, cLs = cap ? cap.lenSolid || H : H;
+  if (cap) for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) {
+    if (solid && solid[P]) continue;
+    const x = (i + 0.5) * dx;
+    // unit vector toward the solid surface next to this cell: gradient of the blocked-cell indicator over 5 × 5 cells (Gaussian weights), which
+    // follows the outline that the staircase of blocked cells stands for; a channel wall has its own normal
+    let gxs = 0, gys = 0;
+    if (solid) for (let dj = -2; dj <= 2; dj++) for (let di = -2; di <= 2; di++) { const ii = i + di, jj = j + dj; if (ii < 0 || ii >= nx || jj < 0 || jj >= ny || !solid[jj * nx + ii]) continue; const wgt = Math.exp(-(di * di + dj * dj) / 3); gxs += wgt * di * dx; gys += wgt * dj * dy; }
+    const gs = Math.hypot(gxs, gys), face = (ax, sg, kf, sol) => { const m = sol && gs > 0 ? [gxs / gs, gys / gs] : ax ? [0, sg] : [sg, 0]; capF.push([P, ax, sg, kf, sol, x, m[0], m[1]]); };
+    if (i < nx - 1 ? solid && solid[P + 1] : !flow) face(0, 1, j * nu1 + i, i < nx - 1 ? 1 : 0);
+    if (i > 0 ? solid && solid[P - 1] : !flow) face(0, -1, j * nu1 + i + 1, i > 0 ? 1 : 0);
+    if (j < ny - 1 ? solid && solid[P + nx] : true) face(1, 1, P, j < ny - 1 ? 1 : 0);
+    if (j > 0 ? solid && solid[P - nx] : true) face(1, -1, P + nx, j > 0 ? 1 : 0);
   }
   if (flow) for (let j = 0; j < ny; j++) for (let i = 0; i <= nx; i++) {
     if (!solid) { uc[j * nu1 + i] = Uin; ud[j * nu1 + i] = Uin; continue; }
@@ -2185,6 +2319,26 @@ export async function twoFluid2D(o, ctx) {
     }
     if (flow) for (let j = 0; j < ny; j++) { qIn += Fx[j * nu1]; qOut += Fx[j * nu1 + nx]; const ki = j * nu1, ko = ki + nx; cIn += ((1 - afx[ki]) * uc[ki] + afx[ki] * ud[ki]) * dt * dy - Fx[ki]; cOut += ((1 - afx[ko]) * uc[ko] + afx[ko] * ud[ko]) * dt * dy - Fx[ko]; } // continuous phase = mixture volume flux of the pressure equation − dispersed flux actually transported
     let dep = 0;
+    if (cap) { // capture split by mechanism on walls and solid faces (see capF)
+      let dW = 0, dS = 0; const gm = Math.hypot(gdx, gdy);
+      for (const [P, ax, sg, kf, sol, xw, mx, my] of capF) {
+        const a = al[P]; if (!(a > 0)) continue;
+        const D = ax ? dy : dx, cf = sg * (ax ? my : mx); if (!(cf > 0)) continue; // cf: cosine between the face normal and the normal of the surface
+        const i = P % nx, j = (P - i) / nx;
+        let ucx, ucy, udx, udy; // both phase velocities at the centre of the opposite face
+        if (ax) { if (kf < nx || kf >= ny * nx || (bv !== null && bv[kf])) continue; const q = (kf - i) / nx, k0 = (q - 1) * nu1 + i, k1 = q * nu1 + i; ucy = vc[kf]; udy = vd[kf]; ucx = 0.25 * (uc[k0] + uc[k0 + 1] + uc[k1] + uc[k1 + 1]); udx = 0.25 * (ud[k0] + ud[k0 + 1] + ud[k1] + ud[k1 + 1]); }
+        else { const q = kf - j * nu1; if ((bu !== null && bu[kf]) || (!flow && (q === 0 || q === nx))) continue; ucx = uc[kf]; udx = ud[kf]; if (q === 0 || q === nx) { ucy = 0; udy = 0; } else { const k0 = j * nx + q; ucy = 0.25 * (vc[k0 - 1] + vc[k0] + vc[k0 - 1 + nx] + vc[k0 + nx]); udy = 0.25 * (vd[k0 - 1] + vd[k0] + vd[k0 - 1 + nx] + vd[k0 + nx]); } }
+        const wc = ucx * mx + ucy * my, w = udx * mx + udy * my - wc, gn = gm > 0 ? (gdx * mx + gdy * my) / gm : 0;
+        const noSlip = sol || sC < 0, wp = w > 0 ? w : 0, v0 = wc + wp, vI = v0 > 0 && wp > 0 ? impactVel(v0, wc / D, rd / kDrag(Math.hypot(udx - ucx, udy - ucy), 1 - a, a), D) : 0, wSet = gn > 0 ? Math.min(wp, gn * ut) : 0, wImp = vI > wSet ? vI - wSet : 0, q = cR / D, wInt = wc > 0 ? wc * (q >= 1 ? 1 : noSlip ? q * q : q) : 0;
+        let kd = 0;
+        if (cD > 0 && noSlip) { const tx = 0.5 * (uc[j * nu1 + i] + uc[j * nu1 + i + 1]), ty = 0.5 * (vc[P] + vc[P + nx]), tn = tx * mx + ty * my, gam = Math.hypot(tx - tn * mx, ty - tn * my) / (0.5 * D); kd = (sol ? 0.807 : 0.538) * Math.cbrt((gam * cD * cD) / (sol ? cLs : xw)); }
+        const vt = cSt * (wSet + wImp + wInt + kd); if (!(vt > 0)) continue;
+        const d = a * Math.min(1, (vt * cf * dt) / D), sc2 = (d * cSt) / vt, o4 = sol ? 4 : 0;
+        al[P] -= d; depM[o4] += sc2 * wSet; depM[o4 + 1] += sc2 * wImp; depM[o4 + 2] += sc2 * wInt; depM[o4 + 3] += sc2 * kd;
+        if (sol) dS += d; else dW += d;
+      }
+      return { qIn, qOut, cIn, cOut, clip: clip * dx * dy, dep: (dW + dS) * dx * dy, depS: dS * dx * dy };
+    }
     if (o.deposit && gdy !== 0 && ny > 1) { // capture on the wall the dispersed phase moves toward
       const jw = gdy < 0 ? 0 : ny - 1, jf = gdy < 0 ? 1 : ny - 1;
       // with obstacles the liquid is deflected toward and along the walls and carries the dispersed phase with it without depositing it:
@@ -2238,7 +2392,7 @@ export async function twoFluid2D(o, ctx) {
     div = Math.max(div, Math.abs((q(ke, uc, ud) - q(ke - 1, uc, ud)) / dx + (r(kn, vc, vd) - r(P, vc, vd)) / dy));
   }
   const pT = Float64Array.from(p, (q, P) => q + rc * (gx * ((P % nx) + 0.5) * dx + gy * (((P - (P % nx)) / nx + 0.5) * dy - H))); // total pressure, zero reference at the top
-  return { nx, ny, dx, dy, L, H, al, p: pT, pExcess: p, uc, vc, ud, vd, hist, t, steps, vol0, vol: hist.vol[hist.vol.length - 1], dIn, dOut, cIn: cInT, cOut: cOutT, clip: clipT, dep: depT, depSolid: depST, solid, div, ut, done: t >= tEnd * (1 - 1e-9) };
+  return { nx, ny, dx, dy, L, H, al, p: pT, pExcess: p, uc, vc, ud, vd, hist, t, steps, vol0, vol: hist.vol[hist.vol.length - 1], dIn, dOut, cIn: cInT, cOut: cOutT, clip: clipT, dep: depT, depSolid: depST, solid, div, ut, done: t >= tEnd * (1 - 1e-9), capture: cap ? Object.fromEntries(['wall', 'solid'].map((w, q) => [w, Object.fromEntries(['settling', 'impaction', 'interception', 'diffusion'].map((m, r) => [m, depM[4 * q + r] * dx * dy]))])) : null, diffusivity: cD };
 }
 
 /** Exact Riemann solution of the 1-D Euler equations for an ideal gas (Toro): state [ρ, u, p] at ξ = x/t. */
@@ -2467,8 +2621,16 @@ const histSlope = (ts, ys, t0, t1) => { let st = 0, sy = 0, stt = 0, sty = 0, m 
 /** Period of an oscillating record from its zero crossings about `mid` (mean spacing of crossings × 2); 0 when fewer than two crossings. */
 const histPeriod = (ts, ys, mid = 0) => { const cr = []; for (let k = 1; k < ts.length; k++) { const a = ys[k - 1] - mid, b = ys[k] - mid; if (a * b < 0) cr.push(ts[k - 1] + ((ts[k] - ts[k - 1]) * a) / (a - b)); } return cr.length >= 2 ? (2 * (cr[cr.length - 1] - cr[0])) / (cr.length - 1) : 0; };
 /** Angular frequency of the interfacial gravity–capillary wave of wavenumber k between two layers (heavy below, depth h1; light above, depth h2) in a closed tank. */
+/** Mean period of a pulsed signal: spacing of its upward crossings of `hi`, each armed by a preceding fall below `lo` (hysteresis). */
+const pulsePeriod = (ts, ys, hi, lo) => { const cr = []; let armed = true; for (let k = 1; k < ts.length; k++) { if (armed && ys[k - 1] < hi && ys[k] >= hi) { cr.push(ts[k - 1] + ((ts[k] - ts[k - 1]) * (hi - ys[k - 1])) / (ys[k] - ys[k - 1])); armed = false; } else if (ys[k] < lo) armed = true; } return cr.length >= 2 ? (cr[cr.length - 1] - cr[0]) / (cr.length - 1) : 0; };
 export const sloshOmega = (k, h1, h2, rho1, rho2, g, sigma = 0) => Math.sqrt(Math.max(0, ((rho1 - rho2) * g * k + sigma * k ** 3) / (rho1 / Math.tanh(k * h1) + rho2 / Math.tanh(k * h2))));
 
+/** Message for a free-interface run that ended before its physical end time: what it would have taken and what to change. */
+const tpStopMsg = (r, where, dtTxt, other) => {
+  const ms = r.steps ? (1e3 * r.wall) / r.steps : 0, need = r.stepsNeeded, tt = (need * ms) / 1e3, dur = tt >= 120 ? `${fmt(tt / 60, 2)} min` : `${fmt(tt, 2)} s`;
+  const st = r.dtLimit === 'surface tension';
+  return `The run stopped after ${r.steps} steps at t = ${where}: the end time needs about ${fmt(need, 3)} steps, ${dur} at the ${fmt(ms, 2)} ms per step measured here, more than a run is allowed to take. The time step is limited to ${dtTxt} by ${r.dtLimit} on this grid${st && !r.semi ? ' (it falls as cell size^1.5). Switch the surface-tension time integration to semi-implicit, which lifts this limit, or ' : st ? ' (already semi-implicit: raise the time step ÷ capillary limit, at the price of more damping of capillary waves), or ' : r.dtLimit === 'viscosity' ? ' (it falls as cell size²): ' : ': '}${other}.`;
+};
 const TP_CASES = { dam: 'collapse of a liquid column (dam break)', bubble: 'rising bubble or drop', slosh: 'sloshing of a free surface', rt: 'Rayleigh–Taylor overturning (heavy over light)' };
 /** Set-up of the coupled two-phase study from the inputs: geometry, fluids, the signed distance of the initial interface and the reference scales. */
 function twoPhaseCase(v) {
@@ -2497,23 +2659,40 @@ function mfChannel(v, dom, nyIn, nxMax = 240) {
 async function runTwoPhaseChannel(v, ctx) {
   const dom = v.tpDomain === 'import' ? 'import' : 'spacer', c = mfChannel(v, dom, v.tpChNy ?? 12), { H, L, nx, ny, dx, dy, mk } = c, n = nx * ny, nu1 = nx + 1, W = [], warn = (msg) => W.push({ level: 'warn', msg });
   const r1 = Math.max(v.tpRho1, 1e-3), r2 = Math.max(v.tpRho2, 1e-3), m1 = Math.max(v.tpMu1, 1e-6) * 1e-3, m2 = Math.max(v.tpMu2, 1e-6) * 1e-3, sigma = Math.max(0, v.tpSigma) * 1e-3, g = clamp(v.tpG, 0, 100), U = clamp(v.tpUin ?? 0.3, 1e-4, 20), method = v.tpMethod === 'ls' ? 'ls' : 'vof';
-  const x0 = (clamp(v.tpChX ?? 8, 0, 90) / 100) * L, kind = v.tpChInit === 'bubbles' ? 'bubbles' : 'slug', nB = clamp(Math.round(v.tpChN ?? 3), 1, 12), D = (clamp(v.tpChD ?? 60, 10, 95) / 100) * H, len = (clamp(v.tpChLen ?? 20, 2, 80) / 100) * L;
+  const x0 = (clamp(v.tpChX ?? 8, 0, 90) / 100) * L, kind = ['bubbles', 'inject', 'sparge'].includes(v.tpChInit) ? v.tpChInit : 'slug', inj = kind === 'inject' || kind === 'sparge', nB = clamp(Math.round(v.tpChN ?? 3), 1, 12), D = (clamp(v.tpChD ?? 60, 10, 95) / 100) * H, len = (clamp(v.tpChLen ?? 20, 2, 80) / 100) * L;
   const cen = Array.from({ length: nB }, (_, k) => [x0 + 0.5 * D + k * 1.6 * D, H * (0.5 + (k % 2 ? 0.12 : -0.12))]).filter((q) => q[0] + 0.5 * D < 0.98 * L);
-  const sd = kind === 'slug' ? (x) => Math.min(x - x0, x0 + len - x) : (x, y) => Math.max(...cen.map((q) => 0.5 * D - Math.hypot(x - q[0], y - q[1])));
+  let sd = kind === 'slug' ? (x) => Math.min(x - x0, x0 + len - x) : (x, y) => Math.max(...cen.map((q) => 0.5 * D - Math.hypot(x - q[0], y - q[1])));
   // inlet: parabolic over the open height of the first column (liquid only), mean velocity U over that height
   const uin = new Float64Array(ny); { let ja = ny, jb = -1; for (let j = 0; j < ny; j++) if (!mk.solid[j * nx]) { ja = Math.min(ja, j); jb = Math.max(jb, j); } let q = 0; for (let j = ja; j <= jb; j++) if (!mk.solid[j * nx]) { const sq = (j + 0.5 - ja) / (jb + 1 - ja); uin[j] = 6 * sq * (1 - sq); q += uin[j]; } for (let j = 0; j < ny; j++) uin[j] *= (U * c.open) / q; }
   const tFlow = L / U, tEnd = clamp(v.tpChTime ?? 0.8, 0.02, 20) * tFlow;
+  // Gas injected through the inlet: a band of the open inlet height carries gas, continuously or in periodic slugs (period, duty). Volume of fluid: the
+  // inflow fraction is the band coverage of every inlet cell × the gas fraction; level set (sharp interface): a band narrowed by the gas fraction, given
+  // as the signed distance of the gas that arrives, min(distance to the band edge, U × time to the nearest switching instant).
+  const flow = { uin }, ij = { on: inj };
+  if (inj) {
+    let ja = ny, jb = -1; for (let j = 0; j < ny; j++) if (!mk.solid[j * nx]) { ja = Math.min(ja, j); jb = Math.max(jb, j); }
+    const yA = ja * dy, hO = (jb + 1 - ja) * dy, fr = clamp(v.tpInjA ?? 1, 0.05, 1), hb = 0.5 * (clamp(v.tpInjH ?? 50, 5, 100) / 100) * hO, ycn = clamp(yA + (clamp(v.tpInjY ?? 50, 0, 100) / 100) * hO, yA + hb, yA + hO - hb), hbL = hb * fr;
+    const per = kind === 'sparge' ? clamp(v.tpInjT ?? 0.4, 0.02, 20) * tFlow : Infinity, duty = kind === 'sparge' ? clamp(v.tpInjDuty ?? 40, 5, 95) / 100 : 1, onT = (t) => kind !== 'sparge' || t - per * Math.floor(t / per) < duty * per;
+    const cov = (y, hh) => clamp((Math.min(y + 0.5 * dy, ycn + hh) - Math.max(y - 0.5 * dy, ycn - hh)) / dy, 0, 1);
+    const sgn = (tau) => { if (tau < 0 || kind !== 'sparge') return tau; const q = tau - per * Math.floor(tau / per), d = duty * per; return q < d ? Math.min(q, d - q) : -Math.min(q - d, per - q); };
+    flow.alphaIn = method === 'ls' ? (t, y) => (onT(t) ? cov(y, hbL) : 0) : (t, y) => (onT(t) ? fr * cov(y, hb) : 0);
+    flow.phiIn = (t, x, y) => Math.min(hbL - Math.abs(y - ycn), U * sgn(t - x / U));
+    sd = (x, y) => flow.phiIn(0, Math.max(x, 0) + 0.5 * dx, y);
+    let qg = 0; for (let j = 0; j < ny; j++) qg += uin[j] * dy * (method === 'ls' ? cov((j + 0.5) * dy, hbL) : fr * cov((j + 0.5) * dy, hb)); // gas flow while the injection is on, m² /s per metre depth
+    let tOn = 0; if (kind === 'sparge') { const nP = Math.floor(tEnd / per); tOn = nP * duty * per + Math.min(tEnd - nP * per, duty * per); } else tOn = tEnd;
+    Object.assign(ij, { fr, hb: method === 'ls' ? hbL : hb, ycn, per, duty, qg, tOn, vExp: qg * tOn });
+  }
   ctx?.progress?.(0.02, 'Two-phase channel flow: start');
-  const r = await twoPhase2D({ method, nx, ny, W: L, Hh: H, rhoA: r2, rhoB: r1, muA: m2, muB: m1, sigma, gy: -g, sd, tEnd, slipSide: true, slipTB: false, solid: mk.solid, flow: { uin }, rhoRef: r1, snaps: [tEnd / 3, (2 * tEnd) / 3], maxSteps: 20000, cfl: clamp(v.tpCfl ?? 0.25, 0.05, 0.5) }, ctx);
+  const r = await twoPhase2D({ method, nx, ny, W: L, Hh: H, rhoA: r2, rhoB: r1, muA: m2, muB: m1, sigma, gy: -g, sd, tEnd, slipSide: true, slipTB: false, solid: mk.solid, flow, probeI: Math.round(0.15 * nx), rhoRef: r1, snaps: [tEnd / 3, (2 * tEnd) / 3], maxSteps: 20000, timeBudget: 150, surfaceTension: v.tpST === 'semi' ? 'semi' : 'explicit', stFactor: v.tpSTm ?? 5, cfl: clamp(v.tpCfl ?? 0.25, 0.05, 0.5) }, ctx);
   ctx?.progress?.(0.985, 'Post-processing');
   const h = r.hist, last = h.t.length - 1, mm = (a) => Array.from(a, (x) => x * 1e3), xs = Array.from({ length: nx }, (_, i) => (i + 0.5) * dx * 1e3), ys = Array.from({ length: ny }, (_, j) => (j + 0.5) * dy * 1e3);
   const rows = (f, hole = NaN) => Array.from({ length: ny }, (_, j) => Array.from({ length: nx }, (_, i) => (mk.solid[j * nx + i] ? hole : f(j * nx + i, i, j)))), mask = Array.from({ length: ny }, (_, j) => Array.from({ length: nx }, (_, i) => !!mk.solid[j * nx + i]));
   const Uc = rows((P, i, j) => 0.5 * (r.u[j * nu1 + i] + r.u[j * nu1 + i + 1]), 0), Vc = rows((P) => 0.5 * (r.v[P] + r.v[P + nx]), 0);
   const shapes = mk.shapes.map((q) => ({ x: mm(q.x), y: mm(q.y), closed: q.closed, color: '#0f172a' })), base = { type: 'field', xlabel: 'x (mm)', ylabel: 'y (mm)', x: xs, y: ys, mask, equal: L / H <= 8, shapes }, fld = { ...base, zlabel: 'Gas (second-phase) volume fraction', zunit: '–', zmin: 0, zmax: 1, cmap: 'viridis' };
-  const name = method === 'ls' ? 'level set (third-order upwind, redistancing, volume correction)' : 'volume of fluid (THINC/WLIC)', bal = (r.vol0 + r.volIn - r.volOut - r.vol) / Math.max(r.vol0, 1e-300), Aflu = (n - mk.solid.reduce((a, b) => a + b, 0)) * dx * dy;
+  const name = method === 'ls' ? 'level set (third-order upwind, redistancing, volume correction)' : 'volume of fluid (THINC/WLIC)', vSup = r.vol0 + r.volIn, bal = (r.vol0 + r.volIn - r.volOut - r.vol) / Math.max(vSup, 1e-300), Aflu = (n - mk.solid.reduce((a, b) => a + b, 0)) * dx * dy;
   // slug transport: velocity of the centroid while the whole phase is inside, arrival of the leading edge at the outlet, pressure drop with and without the gas
-  const kIn = h.out.findIndex((x) => x > 1e-3 * r.vol0), kA = kIn < 0 ? last : Math.max(1, kIn - 1), uC = kA > 2 ? histSlope(h.t.slice(0, kA + 1), h.xc.slice(0, kA + 1), 0.15 * h.t[kA], h.t[kA]) : 0, tArr = kIn < 0 ? null : h.t[kIn];
-  const dpMax = Math.max(...h.dp.slice(Math.min(5, last))), dpEnd = h.dp[last], gone = r.vol < 0.02 * r.vol0, tauPk = Math.max(...h.tauMax), tauMn = Math.max(...h.tauMean), tauEnd = h.tauMean[last];
+  const kIn = h.out.findIndex((x) => x > 1e-3 * vSup), kA = kIn < 0 ? last : Math.max(1, kIn - 1), uC = kA > 2 ? histSlope(h.t.slice(0, kA + 1), (inj ? h.xLead : h.xc).slice(0, kA + 1), 0.15 * h.t[kA], h.t[kA]) : 0, tArr = kIn < 0 ? null : h.t[kIn];
+  const dpMax = Math.max(...h.dp.slice(Math.min(5, last))), dpEnd = h.dp[last], gone = !inj && r.vol < 0.02 * r.vol0, tauPk = Math.max(...h.tauMax), tauMn = Math.max(...h.tauMean), tauEnd = h.tauMean[last];
   const Re = (r1 * U * 2 * H) / m1, We = sigma > 0 ? (r1 * U * U * H) / sigma : Infinity, Ca = sigma > 0 ? (m1 * U) / sigma : Infinity, Eo = sigma > 0 ? (Math.abs(r1 - r2) * g * H * H) / sigma : Infinity;
   const plots = [{ ...fld, title: `Gas fraction and velocity at t = ${fmt(r.t * 1e3, 3)} ms (${method === 'ls' ? 'level set' : 'volume of fluid'})`, z: rows((P) => clamp(r.a[P], 0, 1)), u: Uc, v: Vc, vectors: true, note: `Dark outlines: ${c.name === 'imported section' ? 'imported solids' : 'spacer filaments'} (blocked cells of the ${nx} × ${ny} grid). The gas moves with the computed flow and acts back on it through the density, the viscosity and the surface tension.` },
     ...(r.snaps || []).map((q) => ({ ...fld, title: `Gas fraction at t = ${fmt(q.t * 1e3, 3)} ms`, z: rows((P) => clamp(q.a[P], 0, 1)) })),
@@ -2522,29 +2701,33 @@ async function runTwoPhaseChannel(v, ctx) {
     { type: 'line', title: 'Gas volume: hold-up, inflow and outflow', xlabel: 'Time (ms)', ylabel: 'Volume (mm³ per mm depth)', series: [{ name: 'In the channel', x: mm(h.t), y: h.vol.map((x) => x * 1e6) }, { name: 'Left through the outlet (cumulative)', x: mm(h.t), y: h.out.map((x) => x * 1e6) }, { name: 'Entered through the inlet (cumulative)', x: mm(h.t), y: h.inn.map((x) => x * 1e6), dash: true }, { name: 'Hold-up + outflow − inflow', x: mm(h.t), y: h.vol.map((x, k) => (x + h.out[k] - h.inn[k]) * 1e6), dash: true }], note: 'The last curve stays at the initial gas volume: the phase balance closes at every step.' },
     { type: 'line', title: 'Pressure drop and wall shear while the gas passes', xlabel: 'Time (ms)', ylabel: 'Pressure drop (Pa) · wall shear (Pa × 100)', series: [{ name: 'Pressure drop, inlet − outlet column (Pa)', x: mm(h.t.slice(3)), y: h.dp.slice(3) }, { name: 'Mean wall shear × 100 (Pa)', x: mm(h.t.slice(3)), y: h.tauMean.slice(3).map((x) => 100 * x) }, { name: 'Largest wall shear × 100 (Pa)', x: mm(h.t.slice(3)), y: h.tauMax.slice(3).map((x) => 100 * x), dash: true }], note: 'Two-way coupling: the interface raises the pressure drop (capillary pressure at the filament gaps and the liquid displaced around the gas) and the shear on the membrane walls, which is why air sparging is used against fouling.' },
     { type: 'line', title: 'Position of the gas along the channel', xlabel: 'Time (ms)', ylabel: 'x (mm)', series: [{ name: 'Leading edge', x: mm(h.t), y: mm(h.xLead) }, { name: 'Centroid', x: mm(h.t), y: mm(h.xc) }, { name: 'Trailing edge', x: mm(h.t), y: mm(h.xTrail) }, { name: 'Mean liquid velocity × time (from the initial centroid)', x: mm(h.t), y: h.t.map((t) => Math.min(L, h.xc[0] + U * t) * 1e3), dash: true, color: '#94a3b8' }] }];
-  const kpis = [{ label: 'Gas velocity (centroid) ÷ mean liquid velocity', value: uC / U, unit: '', help: 'While all the gas is inside the channel; a slug moves faster than the mean flow when it rides the fast core, slower when it is held at the filaments' }, { label: 'Gas velocity (centroid)', value: uC, unit: 'm/s' },
-    { label: 'Leading edge reaches the outlet at', value: tArr === null ? '–' : tArr * 1e3, unit: tArr === null ? '' : 'ms', status: tArr === null ? 'warn' : 'ok', help: tArr === null ? 'The gas has not reached the outlet in the simulated time' : `Plug-flow estimate ${fmt(((L - (kind === 'slug' ? x0 + len : Math.max(...cen.map((q) => q[0])) + 0.5 * D)) / U) * 1e3, 3)} ms` },
-    { label: 'Gas still in the channel at the end', value: (100 * r.vol) / Math.max(r.vol0, 1e-300), unit: '% of initial', help: 'Gas held in the wakes of the filaments or not yet arrived' },
+  const pMid = inj ? 0.5 * Math.max(...h.probe) : 0, perNum = kind === 'sparge' && pMid > 0 ? pulsePeriod(h.t, h.probe, pMid, 0.3 * pMid) : 0, xPr = (Math.round(0.15 * nx) + 0.5) * dx, qTot = U * c.open * dy;
+  if (inj) plots.push({ type: 'line', title: `Gas fraction of the cross-section at x = ${fmt(xPr * 1e3, 3)} mm`, xlabel: 'Time (ms)', ylabel: 'Gas fraction of the open height (–)', series: [{ name: 'Computed', x: mm(h.t), y: Array.from(h.probe) }], ...(kind === 'sparge' ? { note: `Prescribed injection period ${fmt(ij.per * 1e3, 4)} ms with the gas on for ${fmt(100 * ij.duty, 3)} % of it; period of the passing slugs from the upward crossings of half the peak value: ${perNum > 0 ? fmt(perNum * 1e3, 4) + ' ms' : 'fewer than two slugs have passed'}.` } : {}) });
+  const kpis = [{ label: inj ? 'Gas front velocity ÷ mean liquid velocity' : 'Gas velocity (centroid) ÷ mean liquid velocity', value: uC / U, unit: '', help: inj ? 'Leading edge of the injected gas until it reaches the outlet' : 'While all the gas is inside the channel; a slug moves faster than the mean flow when it rides the fast core, slower when it is held at the filaments' }, { label: inj ? 'Gas front velocity' : 'Gas velocity (centroid)', value: uC, unit: 'm/s' },
+    ...(inj ? [{ label: 'Gas injected through the inlet', value: r.volIn * 1e6, unit: 'mm³ per mm depth', help: 'Time integral of the gas flux through the inlet faces as transported by the solver' }, { label: 'Gas injected ÷ integral of the prescribed inlet flux', value: ij.vExp > 0 ? r.volIn / ij.vExp : 0, unit: '', status: Math.abs(r.volIn / Math.max(ij.vExp, 1e-300) - 1) > 0.03 ? 'warn' : 'ok', help: 'Prescribed: Σ inlet velocity × cell height × gas fraction of the cell × time the injection is on' }, { label: 'Gas share of the inflow (time mean)', value: (100 * r.volIn) / (qTot * r.t), unit: '% by volume' },
+      ...(kind === 'sparge' ? [{ label: 'Slug period: computed', value: perNum > 0 ? perNum * 1e3 : '–', unit: perNum > 0 ? 'ms' : '', status: perNum > 0 ? 'ok' : 'warn', help: `At x = ${fmt(xPr * 1e3, 3)} mm; needs at least two slugs in the simulated time` }, { label: 'Slug period: prescribed', value: ij.per * 1e3, unit: 'ms' }] : []), { label: 'Gas hold-up at the end', value: (100 * r.vol) / Aflu, unit: '% of the fluid area' }] : []),
+    { label: 'Leading edge reaches the outlet at', value: tArr === null ? '–' : tArr * 1e3, unit: tArr === null ? '' : 'ms', status: tArr === null ? 'warn' : 'ok', help: tArr === null ? 'The gas has not reached the outlet in the simulated time' : `Plug-flow estimate ${fmt(((L - (inj ? 0 : kind === 'slug' ? x0 + len : Math.max(...cen.map((q) => q[0])) + 0.5 * D)) / U) * 1e3, 3)} ms` },
+    { label: 'Gas still in the channel at the end', value: (100 * r.vol) / Math.max(vSup, 1e-300), unit: inj ? '% of supplied' : '% of initial', help: 'Gas held in the wakes of the filaments or not yet arrived' },
     { label: 'Largest pressure drop during the passage', value: dpMax, unit: 'Pa' }, { label: gone ? 'Pressure drop, liquid alone (end of run)' : 'Pressure drop at the end of the run', value: dpEnd, unit: 'Pa' },
     { label: 'Largest wall shear (space and time)', value: tauPk, unit: 'Pa' }, { label: 'Mean wall shear: peak ÷ end of run', value: tauEnd > 0 ? tauMn / tauEnd : 0, unit: '', help: 'Shear enhancement by the passing gas when the gas has left by the end of the run' },
-    { label: 'Gas volume balance', value: 100 * bal, unit: '% of initial', status: Math.abs(bal) > 1e-3 ? 'warn' : 'ok', help: '(initial + inflow − outflow − hold-up) ÷ initial' }, { label: 'Largest velocity', value: Math.max(...h.umax), unit: 'm/s' }, { label: 'Time steps', value: r.steps, unit: '' }, { label: 'Largest velocity divergence', value: r.div, unit: '1/s' }];
-  const outputs = { phaseVolumeError: bal, maxVelocity: Math.max(...h.umax), slugVelocity: uC, pressureDropMax: dpMax, wallShearMax: tauPk, gasHoldupEnd: r.vol / Math.max(r.vol0, 1e-300), timeSteps: r.steps };
+    { label: 'Gas volume balance', value: 100 * bal, unit: inj ? '% of supplied' : '% of initial', status: Math.abs(bal) > 1e-3 ? 'warn' : 'ok', help: inj ? '(inflow − outflow − hold-up) ÷ inflow' : '(initial + inflow − outflow − hold-up) ÷ initial' }, { label: 'Largest velocity', value: Math.max(...h.umax), unit: 'm/s' }, { label: 'Time steps', value: r.steps, unit: '' }, { label: 'Largest velocity divergence', value: r.div, unit: '1/s' }];
+  const outputs = { phaseVolumeError: bal, maxVelocity: Math.max(...h.umax), slugVelocity: uC, pressureDropMax: dpMax, wallShearMax: tauPk, gasHoldupEnd: r.vol / Math.max(vSup, 1e-300), timeSteps: r.steps, ...(inj ? { gasInjected: r.volIn, gasInjectedPrescribed: ij.vExp, gasShareOfInflow: r.volIn / (qTot * r.t), ...(perNum > 0 ? { slugPeriod: perNum, slugPeriodPrescribed: ij.per } : {}) } : {}) };
   if (c.mk.note) W.push({ level: 'info', msg: c.mk.note });
-  if (!r.done) warn(`The run stopped after ${r.steps} steps at t = ${fmt(r.t * 1e3, 3)} ms of ${fmt(tEnd * 1e3, 3)} ms: the time step is limited to ${fmt(r.dtFix * 1e6, 3)} µs by surface tension or viscosity on this grid — shorten the simulated time, raise the velocity or coarsen the grid.`);
-  if (Math.abs(bal) > 1e-3) warn(`The gas volume balance is off by ${fmt(100 * bal, 3)} % of the initial volume${method === 'ls' ? ' (the level-set volume correction cannot follow the gas while it leaves through the outlet)' : ''}.`);
-  const cellsD = (kind === 'slug' ? Math.min(len, H) : D) / Math.min(dx, dy);
-  if (cellsD < 8) warn(`The ${kind === 'slug' ? 'slug' : 'bubbles'} span${kind === 'slug' ? 's' : ''} ${fmt(cellsD, 3)} cells: curvature and surface tension need about 12 cells — raise the cells across the gap.`);
+  if (!r.done) warn(tpStopMsg(r, `${fmt(r.t * 1e3, 3)} ms of ${fmt(tEnd * 1e3, 3)} ms`, `${fmt(r.dtFix * 1e6, 3)} µs`, 'shorten the simulated time, raise the velocity (fewer steps per flow-through time) or coarsen the grid'));
+  if (Math.abs(bal) > 1e-3) warn(`The gas volume balance is off by ${fmt(100 * bal, 3)} % of the ${inj ? 'supplied' : 'initial'} volume${method === 'ls' ? ' (the level-set volume correction cannot follow the gas while it leaves through the outlet)' : ''}.`);
+  const cellsD = (inj ? 2 * ij.hb : kind === 'slug' ? Math.min(len, H) : D) / Math.min(dx, dy);
+  if (cellsD < (inj ? 4 : 8)) warn(`The ${inj ? 'injected band' : kind === 'slug' ? 'slug' : 'bubbles'} span${kind === 'bubbles' ? '' : 's'} ${fmt(cellsD, 3)} cells: curvature and surface tension need about 12 cells — raise the cells across the gap.`);
   if (dom === 'spacer' && v.arr !== 'none' && (v.df * 1e-3) / dy < 4) warn(`A filament is ${fmt((v.df * 1e-3) / dy, 2)} cells across; use at least 5–6 cells per filament diameter.`);
   W.unshift({ level: 'info', msg: `Coupled two-phase flow through the ${c.name}: one-fluid Navier–Stokes equations with ${name} on ${nx} × ${ny} cells (${fmt(100 * mk.solidFraction, 3)} % blocked), velocity inlet with a parabolic liquid profile, pressure outlet, no-slip walls and solids, 90° contact angle; ${r.steps} steps. Re = ${fmt(Re, 3)}, We = ${Number.isFinite(We) ? fmt(We, 3) : '∞'}, Ca = ${Number.isFinite(Ca) ? fmt(Ca, 3) : '∞'}.` });
   const stp = Math.max(1, Math.ceil(h.t.length / 40)), hr = [];
   for (let k = 0; k < h.t.length; k += stp) hr.push([h.t[k] * 1e3, h.vol[k] * 1e6, h.inn[k] * 1e6, h.out[k] * 1e6, h.xc[k] * 1e3, h.xLead[k] * 1e3, h.dp[k], h.tauMean[k], h.tauMax[k], h.umax[k]]);
-  const tables = [{ title: 'Two-phase channel study: set-up and numerics', columns: ['Item', 'Value'], rows: [['Domain', c.name], ['Initial gas', kind === 'slug' ? `slug filling the gap from ${fmt(x0 * 1e3, 3)} to ${fmt((x0 + len) * 1e3, 3)} mm` : `${cen.length} bubble${cen.length > 1 ? 's' : ''} of ${fmt(D * 1e3, 3)} mm`], ['Interface method', name], ['Channel (mm)', `${fmt(L * 1e3, 4)} × ${fmt(H * 1e3, 4)}`], ['Grid', `${nx} × ${ny} (${fmt(dx * 1e6, 3)} × ${fmt(dy * 1e6, 3)} µm)`], ['Fluid area (mm²)', Aflu * 1e6], ['Mean inlet velocity (m/s)', U], ['Flow-through time (ms)', tFlow * 1e3],
+  const tables = [{ title: 'Two-phase channel study: set-up and numerics', columns: ['Item', 'Value'], rows: [['Domain', c.name], [inj ? 'Gas supply' : 'Initial gas', inj ? `${kind === 'sparge' ? `periodic slugs through the inlet: period ${fmt(ij.per * 1e3, 4)} ms, gas on ${fmt(100 * ij.duty, 3)} % of it` : 'continuous injection through the inlet'}; band of ${fmt(2 * ij.hb * 1e3, 3)} mm centred at y = ${fmt(ij.ycn * 1e3, 3)} mm${method === 'ls' ? ' (sharp interface: band height × gas fraction)' : `, gas fraction ${fmt(ij.fr, 3)}`}; gas flow while on ${fmt(ij.qg * 1e6, 4)} mm²/s per mm depth` : kind === 'slug' ? `slug filling the gap from ${fmt(x0 * 1e3, 3)} to ${fmt((x0 + len) * 1e3, 3)} mm` : `${cen.length} bubble${cen.length > 1 ? 's' : ''} of ${fmt(D * 1e3, 3)} mm`], ['Interface method', name], ['Channel (mm)', `${fmt(L * 1e3, 4)} × ${fmt(H * 1e3, 4)}`], ['Grid', `${nx} × ${ny} (${fmt(dx * 1e6, 3)} × ${fmt(dy * 1e6, 3)} µm)`], ['Fluid area (mm²)', Aflu * 1e6], ['Mean inlet velocity (m/s)', U], ['Flow-through time (ms)', tFlow * 1e3],
       ['Liquid: density (kg/m³) · viscosity (mPa·s)', `${fmt(r1, 4)} · ${fmt(m1 * 1e3, 4)}`], ['Gas: density (kg/m³) · viscosity (mPa·s)', `${fmt(r2, 4)} · ${fmt(m2 * 1e3, 4)}`], ['Surface tension (mN/m)', sigma * 1e3], ['Gravity, along −y (m/s²)', g], ['Reynolds number ρ U 2H/μ', Re], ['Weber number ρ U² H/σ', Number.isFinite(We) ? We : 'no surface tension'], ['Capillary number μ U/σ', Number.isFinite(Ca) ? Ca : 'no surface tension'], ['Eötvös number Δρ g H²/σ', Number.isFinite(Eo) ? Eo : 'no surface tension'],
       ['Initial gas volume (mm³ per mm depth)', r.vol0 * 1e6], ['Time steps', r.steps], ['Stability limit of the time step without flow (µs)', r.dtFix * 1e6], ['Pressure-solver iterations per step', r.steps ? r.pIters / r.steps : 0], ['Largest |∇·u| (1/s)', r.div]] },
     { title: 'History', columns: ['t (ms)', 'Gas in the channel (mm³/mm)', 'Gas in (mm³/mm)', 'Gas out (mm³/mm)', 'Centroid x (mm)', 'Leading edge (mm)', 'Pressure drop (Pa)', 'Mean wall shear (Pa)', 'Largest wall shear (Pa)', 'Largest speed (m/s)'], rows: hr }];
   for (const k of Object.keys(outputs)) if (!Number.isFinite(outputs[k])) delete outputs[k];
-  return { summary: `${kind === 'slug' ? 'Air slug' : `${cen.length} bubbles`} carried through the ${c.name} at ${fmt(U, 3)} m/s (${method === 'ls' ? 'level set' : 'volume of fluid'}): gas velocity ${fmt(uC / U, 3)} × the mean liquid velocity, pressure drop up to ${fmt(dpMax, 3)} Pa${gone ? ` against ${fmt(dpEnd, 3)} Pa for the liquid alone` : ''}, wall shear up to ${fmt(tauPk, 3)} Pa; ${fmt((100 * r.vol) / Math.max(r.vol0, 1e-300), 3)} % of the gas is still in the channel; gas volume balance ${fmt(100 * Math.abs(bal), 2)} %.`,
-    kpis, warnings: W, recommendations: ['Check the gas volume balance and the divergence first, then refine the cells across the gap: interface positions converge at about first order.', 'Compare the pressure drop and the wall shear during the passage with their values once the gas has left (lengthen the simulated time until the hold-up is zero) to quantify the sparging effect.', 'Surface tension limits the time step as (cell size)^1.5: for long simulated times use a coarser grid or a higher velocity.'], plots, tables,
+  return { summary: `${inj ? (kind === 'sparge' ? `Air slugs injected at the inlet every ${fmt(ij.per * 1e3, 3)} ms (${fmt(r.volIn * 1e6, 3)} mm³/mm in total, ${fmt(ij.vExp > 0 ? r.volIn / ij.vExp : 0, 4)} × the prescribed inlet flux integral)` : `Air injected continuously at the inlet (${fmt(r.volIn * 1e6, 3)} mm³/mm, ${fmt(ij.vExp > 0 ? r.volIn / ij.vExp : 0, 4)} × the prescribed inlet flux integral)`) : kind === 'slug' ? 'Air slug' : `${cen.length} bubbles`} carried through the ${c.name} at ${fmt(U, 3)} m/s (${method === 'ls' ? 'level set' : 'volume of fluid'}): gas velocity ${fmt(uC / U, 3)} × the mean liquid velocity, pressure drop up to ${fmt(dpMax, 3)} Pa${gone ? ` against ${fmt(dpEnd, 3)} Pa for the liquid alone` : ''}, wall shear up to ${fmt(tauPk, 3)} Pa; ${fmt((100 * r.vol) / Math.max(vSup, 1e-300), 3)} % of the gas is still in the channel; gas volume balance ${fmt(100 * Math.abs(bal), 2)} %.`,
+    kpis, warnings: W, recommendations: ['Check the gas volume balance and the divergence first, then refine the cells across the gap: interface positions converge at about first order.', 'Compare the pressure drop and the wall shear during the passage with their values once the gas has left (lengthen the simulated time until the hold-up is zero) to quantify the sparging effect.', 'Explicit surface tension limits the time step as (cell size)^1.5: for fine grids or long simulated times switch its time integration to semi-implicit.'], plots, tables,
     balances: [{ name: 'Gas volume (m³ per metre depth): initial + inflow vs hold-up + outflow', in: r.vol0 + r.volIn, out: r.vol + r.volOut }], outputs };
 }
 
@@ -2553,7 +2736,7 @@ async function runTwoPhase(v, ctx) {
   if (v.tpDomain === 'spacer' || v.tpDomain === 'import') return runTwoPhaseChannel(v, ctx);
   const c = twoPhaseCase(v), { Wt, Ht, nx, ny, g, kind, sigma, len, tc, tEnd } = c, W = [], warn = (msg) => W.push({ level: 'warn', msg }), n = nx * ny, nu1 = nx + 1, dx = Wt / nx, dy = Ht / ny;
   ctx?.progress?.(0.02, 'Two-phase flow: start');
-  const r = await twoPhase2D({ method: c.method, nx, ny, W: Wt, Hh: Ht, rhoA: c.rhoA, rhoB: c.rhoB, muA: c.muA, muB: c.muB, sigma, gy: -g, sd: c.sd, tEnd, slipSide: c.slip, slipTB: c.slip, snaps: [tEnd / 3, (2 * tEnd) / 3], maxSteps: 8000, cfl: clamp(v.tpCfl ?? 0.25, 0.05, 0.5) }, ctx);
+  const r = await twoPhase2D({ method: c.method, nx, ny, W: Wt, Hh: Ht, rhoA: c.rhoA, rhoB: c.rhoB, muA: c.muA, muB: c.muB, sigma, gy: -g, sd: c.sd, tEnd, slipSide: c.slip, slipTB: c.slip, snaps: [tEnd / 3, (2 * tEnd) / 3], maxSteps: 8000, timeBudget: 150, surfaceTension: v.tpST === 'semi' ? 'semi' : 'explicit', stFactor: v.tpSTm ?? 5, cfl: clamp(v.tpCfl ?? 0.25, 0.05, 0.5) }, ctx);
   ctx?.progress?.(0.985, 'Post-processing');
   const h = r.hist, last = h.t.length - 1, liq = (a) => (c.light ? 1 - a : a), mm = (a) => Array.from(a, (x) => x * 1e3);
   const xs = Array.from({ length: nx }, (_, i) => (i + 0.5) * dx * 1e3), ys = Array.from({ length: ny }, (_, j) => (j + 0.5) * dy * 1e3);
@@ -2611,7 +2794,7 @@ async function runTwoPhase(v, ctx) {
     recs.push('For the comparison with linear wave theory keep the amplitude below a few per cent of the depth and the viscosity low.');
   }
   plots.push({ type: 'line', title: 'Conservation and kinetic energy', xlabel: 'Time (s)', ylabel: 'Relative volume change (10⁻⁶) · kinetic energy ÷ peak', series: [{ name: 'Phase-volume change (parts per million)', x: h.t, y: h.vol.map((x) => (1e6 * (x - r.vol0)) / Math.max(r.vol0, 1e-300)) }, { name: 'Kinetic energy ÷ peak', x: h.t, y: h.ke.map((x) => x / Math.max(keMax, 1e-300)) }, { name: 'Largest speed ÷ peak', x: h.t, y: h.umax.map((x) => x / Math.max(umaxAll, 1e-300)), dash: true }] });
-  if (!r.done) warn(`The run stopped after ${r.steps} steps at t = ${fmt(r.t, 3)} s of ${fmt(tEnd, 3)} s: the time step is limited to ${fmt(r.dtFix, 3)} s by surface tension, viscosity or gravity waves on this grid — shorten the simulated time or coarsen the grid.`);
+  if (!r.done) warn(tpStopMsg(r, `${fmt(r.t, 3)} s of ${fmt(tEnd, 3)} s`, `${fmt(r.dtFix, 3)} s`, 'shorten the simulated time or coarsen the grid'));
   if (Math.abs(vErr) > 1e-3) warn(`The phase volume changed by ${fmt(100 * vErr, 3)} % — refine the grid or lower the CFL number.`);
   if (Math.max(c.r1, c.r2) / Math.min(c.r1, c.r2) > 2000) W.push({ level: 'info', msg: 'Density ratios above about 2000 make the variable-density pressure equation stiff; the run stays stable but the pressure solver needs more iterations.' });
   W.unshift({ level: 'info', msg: `Coupled two-phase flow, ${TP_CASES[kind]}: one-fluid Navier–Stokes equations with ${name} on ${nx} × ${ny} cells, ${r.steps} steps; density ratio ${fmt(Math.max(c.r1, c.r2) / Math.min(c.r1, c.r2), 3)}, viscosity ratio ${fmt(Math.max(c.m1, c.m2) / Math.min(c.m1, c.m2), 3)}${sigma > 0 ? `, Eötvös (Bond) number ${fmt(Eo, 3)}` : ', no surface tension'}.` });
@@ -2642,7 +2825,8 @@ async function runTwoFluid(v, ctx) {
   const ut = terminalSN(dP, rc, rd, muc, g), ur0 = hinderedSlip(a0, dP, rc, rd, muc, g), uh = (1 - a0) * ur0, heavy = rd > rc, ReP = (rc * ut * dP) / muc, tauP = ((rd + 0.5 * rc) * dP * dP) / (18 * muc), U = flowC ? clamp(v.tfU, 1e-5, 20) : 0;
   const tEnd = flowC ? (clamp(v.tfTimeF, 0.05, 50) * L) / U : (clamp(v.tfTimeB, 0.02, 5) * H) / Math.max(uh, 1e-12), dep = flowC && v.tfDeposit !== false;
   ctx?.progress?.(0.02, 'Two-fluid model: start');
-  const r = await twoFluid2D({ nx, ny, L, H, rhoC: rc, muC: muc, rhoD: rd, dP, gy: -g, alpha0: a0, flow: flowC ? { U, alphaIn: a0 } : null, cvm: clamp(v.tfCvm, 0, 2), Dtd: Math.max(0, v.tfDtd), alphaMax: aMax, tEnd, slipC: !!v.tfSlip, deposit: dep, maxSteps: chan ? 20000 : 12000, solid: chan ? chan.mk.solid : null }, ctx);
+  const dy0 = H / ny;
+  const r = await twoFluid2D({ nx, ny, L, H, rhoC: rc, muC: muc, rhoD: rd, dP, gy: -g, alpha0: a0, flow: flowC ? { U, alphaIn: a0 } : null, cvm: clamp(v.tfCvm, 0, 2), Dtd: Math.max(0, v.tfDtd), alphaMax: aMax, tEnd, slipC: !!v.tfSlip, deposit: dep, capture: dep && v.tfCapt !== 'settle' ? { stick: clamp(v.tfStick ?? 1, 0, 1), lenSolid: chan && v.tfDomain === 'spacer' ? Math.max(v.df * 1e-3, dy0) : H, T: 298.15 } : null, maxSteps: chan ? 20000 : 12000, solid: chan ? chan.mk.solid : null }, ctx);
   ctx?.progress?.(0.985, 'Post-processing');
   const h = r.hist, last = h.t.length - 1, nu1 = nx + 1, dx = L / nx, dy = H / ny, mm = (a) => Array.from(a, (x) => x * 1e3), xs = Array.from({ length: nx }, (_, i) => (i + 0.5) * dx * 1e3), ys = Array.from({ length: ny }, (_, j) => (j + 0.5) * dy * 1e3);
   const rows = (f) => Array.from({ length: ny }, (_, j) => Array.from({ length: nx }, (_, i) => f(j * nx + i, i, j)));
@@ -2656,6 +2840,7 @@ async function runTwoFluid(v, ctx) {
   const kpis = [{ label: `Terminal ${dir} velocity of one particle (Schiller–Naumann)`, value: ut, unit: 'm/s' }, { label: 'Particle Reynolds number at terminal velocity', value: ReP, unit: '' }, { label: `Hindered ${dir} velocity at the feed fraction (theory)`, value: uh, unit: 'm/s', help: 'α_c × slip velocity from the drag–buoyancy balance with the Wen–Yu swarm correction; equals u_t (1 − α)^4.65 (Richardson–Zaki) in the Stokes regime' }];
   const outputs = { terminalVelocity: ut, hinderedVelocity: uh, particleReynolds: ReP, dispersedVolumeError: bal, maxFraction: amaxEnd, timeSteps: r.steps }, sumRows = [], recs = [];
   let summary;
+  const tablesX = [], tauP0 = (rd * dP * dP) / (18 * muc);
   const balances = [{ name: 'Dispersed-phase volume (m³ per metre depth): initial + inflow vs hold-up + outflow + deposit', in: r.vol0 + r.dIn, out: r.vol + r.dOut + r.dep }];
   if (!flowC) {
     const zBed = (H * a0) / aMax, tMeet = (H - zBed) / Math.max(uh, 1e-12), zF = h.front, t1 = Math.min(r.t, 0.85 * tMeet), t0 = 0.25 * t1, vf = Math.abs(histSlope(h.t, zF, t0, t1)), slipEnd = Math.abs(histAt(h.t, h.slip, 0.3 * t1)), zTh = h.t.map((t) => (heavy ? Math.max(zBed, H - uh * t) : Math.min(H - zBed, uh * t))); // the front meets the packed layer of height H α₀/α_max at t = tMeet
@@ -2681,7 +2866,14 @@ async function runTwoFluid(v, ctx) {
       Object.assign(outputs, { captureOnSolids: dIn > 0 ? dS / dIn : 0, pressureDrop: dpE });
       sumRows.push(['Domain', chan.name], ['Blocked share of the grid (%)', 100 * chan.mk.solidFraction], ['Dispersed volume captured on the solids ÷ entering, last quarter', dIn > 0 ? dS / dIn : 0]);
       if (chan.mk.note) W.push({ level: 'info', msg: chan.mk.note });
-      W.push({ level: 'info', msg: `Deposition model in the channel geometry: the dispersed phase is captured where it ${heavy ? 'settles' : 'rises'} onto the channel wall or onto a solid face (gravitational deposition with the computed phase velocity). Inertial impaction and interception on the upstream faces of the filaments are not modelled: there the dispersed phase slips around the solid with the liquid.` });
+      W.push({ level: 'info', msg: r.capture ? `Deposition model in the channel geometry: every wall and solid face captures the dispersed phase by ${heavy ? 'settling' : 'rise'}, inertial impaction (the particle velocity on arrival, from its own momentum equation and its deceleration over the last cell), interception (liquid flux within one particle radius of a no-slip surface) and Brownian diffusion (Lévêque boundary layer); see the table of the capture by mechanism.` : `Deposition model in the channel geometry: the dispersed phase is captured where it ${heavy ? 'settles' : 'rises'} onto the channel wall or onto a solid face (gravitational deposition with the computed phase velocity). Inertial impaction, interception and Brownian diffusion are switched off — select all deposition mechanisms to include them.` });
+    }
+    if (r.capture) { // capture split by mechanism (whole run)
+      const mech = ['settling', 'impaction', 'interception', 'diffusion'], lab = { settling: heavy ? 'Gravitational settling' : 'Buoyant rise', impaction: 'Inertial impaction', interception: 'Interception', diffusion: 'Brownian diffusion' }, tot = Math.max(r.dep, 1e-300), dInT = Math.max(r.dIn, 1e-300), StF = chan && v.tfDomain === 'spacer' ? (tauP0 * U) / (0.5 * v.df * 1e-3) : (tauP0 * U) / (0.5 * H);
+      plots.push({ type: 'bar', title: 'Captured dispersed phase by mechanism', ylabel: '% of the dispersed phase that entered', categories: mech.map((m) => lab[m]), series: [{ name: 'Channel walls', values: mech.map((m) => (100 * r.capture.wall[m]) / dInT) }, ...(chan ? [{ name: 'Filaments / imported solids', values: mech.map((m) => (100 * r.capture.solid[m]) / dInT) }] : [])], stacked: true });
+      for (const m of mech) { const q = r.capture.wall[m] + r.capture.solid[m]; kpis.push({ label: `Captured by ${m === 'diffusion' ? lab[m] : lab[m].toLowerCase()}`, value: (100 * q) / tot, unit: '% of the capture', help: `${fmt((100 * r.capture.wall[m]) / tot, 3)} % on the channel walls, ${fmt((100 * r.capture.solid[m]) / tot, 3)} % on the solids (whole run)` }); outputs['capture_' + m] = q / dInT; }
+      tablesX.push({ title: 'Capture by mechanism (whole run)', columns: ['Mechanism', 'Channel walls (mm³/mm)', 'Solids (mm³/mm)', 'Walls (% of inflow)', 'Solids (% of inflow)'], rows: mech.map((m) => [lab[m], r.capture.wall[m] * 1e6, r.capture.solid[m] * 1e6, (100 * r.capture.wall[m]) / dInT, (100 * r.capture.solid[m]) / dInT]), note: `Stokes number τ_p U ÷ (${chan && v.tfDomain === 'spacer' ? 'filament radius' : 'half the gap'}) = ${fmt(StF, 3)} with the Stokes relaxation time ${fmt(tauP0, 3)} s (inertial impaction on a cylinder needs more than 1/8 in potential flow); interception ratio particle ÷ ${chan && v.tfDomain === 'spacer' ? 'filament' : 'gap'} size ${fmt(dP / (chan && v.tfDomain === 'spacer' ? v.df * 1e-3 : H), 3)}; Brownian diffusivity ${fmt(r.diffusivity, 3)} m²/s at 25 °C; sticking probability ${fmt(clamp(v.tfStick ?? 1, 0, 1), 3)}.` });
+      sumRows.push(['Stokes number of the particles', StF]);
     }
     balances.push({ name: 'Mixture volume (m³ per metre depth): inflow vs outflow', in: r.cIn + r.dIn, out: r.cOut + r.dOut });
     sumRows.push(['Dispersed volume captured ÷ entering, last quarter', dIn > 0 ? dDep / dIn : 0], ['Surface loading U H / L (m/s)', (U * H) / L]);
@@ -2699,7 +2891,7 @@ async function runTwoFluid(v, ctx) {
   if (ReP > 1000) W.push({ level: 'info', msg: `Particle Reynolds number ${fmt(ReP, 3)}: the drag is on the Newton plateau C_D = 0.44; large bubbles deform and rise more slowly than rigid spheres.` });
   W.unshift({ level: 'info', msg: `Eulerian–Eulerian two-fluid model on ${nx} × ${ny} cells, ${r.steps} steps: continuity and momentum equations for each phase, one shared pressure, Schiller–Naumann drag with the Wen–Yu swarm correction${v.tfCvm > 0 ? `, virtual mass (C_vm = ${fmt(v.tfCvm, 2)})` : ''}${v.tfDtd > 0 ? ', turbulent dispersion' : ''}; relaxation time of a particle ${fmt(tauP, 3)} s.` });
   const tables = [{ title: 'Two-fluid study: set-up and numerics', columns: ['Item', 'Value'], rows: [['Case', chan ? `${chan.name}: velocity inlet, pressure outlet` : flowC ? 'flow-through channel (velocity inlet, pressure outlet)' : 'closed column (batch)'], ['Grid', `${nx} × ${ny} (${fmt(dx * 1e3, 3)} × ${fmt(dy * 1e3, 3)} mm)`], ['Domain (mm)', `${fmt(L * 1e3, 4)} × ${fmt(H * 1e3, 4)}`], ['Continuous phase: density (kg/m³) · viscosity (mPa·s)', `${fmt(rc, 4)} · ${fmt(muc * 1e3, 4)}`], ['Dispersed phase: density (kg/m³) · diameter (µm)', `${fmt(rd, 4)} · ${fmt(dP * 1e6, 4)}`], ['Feed fraction (%)', 100 * a0], ['Packing limit (%)', 100 * aMax],
-      ['Stokes velocity (m/s)', (Math.abs(rd - rc) * g * dP * dP) / (18 * muc)], ['Terminal velocity, Schiller–Naumann (m/s)', ut], ['Hindered slip velocity at the feed fraction (m/s)', ur0], ['Particle relaxation time (s)', tauP], ['Time steps', r.steps], ['Residual of the mixture volume balance, max |∇·(α_c u_c + α_d u_d)| (1/s)', r.div], ['Dispersed-phase volume balance error (relative)', bal], ...sumRows] }];
+      ['Stokes velocity (m/s)', (Math.abs(rd - rc) * g * dP * dP) / (18 * muc)], ['Terminal velocity, Schiller–Naumann (m/s)', ut], ['Hindered slip velocity at the feed fraction (m/s)', ur0], ['Particle relaxation time (s)', tauP], ['Time steps', r.steps], ['Residual of the mixture volume balance, max |∇·(α_c u_c + α_d u_d)| (1/s)', r.div], ['Dispersed-phase volume balance error (relative)', bal], ...sumRows] }, ...tablesX];
   recs.push('Check the dispersed-phase volume balance and the mixture divergence first; then refine the grid across the direction of settling (Mesh tab).');
   for (const k of Object.keys(outputs)) if (!Number.isFinite(outputs[k])) delete outputs[k];
   return { summary, kpis, warnings: W, recommendations: recs, plots, tables, balances, outputs };
@@ -2798,7 +2990,7 @@ const TURB_NAMES = { ml: 'algebraic mixing length', ke: 'standard k–ε with wa
 const F = (key, label, unit, value, min, max, help, extra = {}) => ({ key, label, unit, value, min, max, help, ...extra });
 const SEL = (key, label, value, options, help, extra = {}) => ({ key, label, type: 'select', value, options: options.map(([v, l]) => ({ value: v, label: l })), help, ...extra });
 const isSpacer = (v) => v.geom === 'spacer', isImport = (v) => v.geom === 'import', hasSpecies = (v) => v.species !== 'off';
-const isTP = (v) => v.study === 'twophase', isTF = (v) => v.study === 'twofluid', tpCh = (v) => isTP(v) && (v.tpDomain === 'spacer' || v.tpDomain === 'import'), tpTank = (v) => isTP(v) && !tpCh(v), tpIs = (...k) => (v) => tpTank(v) && k.includes(v.tpCase), tfCh = (v) => isTF(v) && (v.tfDomain === 'spacer' || v.tfDomain === 'import'), tfTank = (v) => isTF(v) && !tfCh(v);
+const tpInj = (v) => v.tpChInit === 'inject' || v.tpChInit === 'sparge', isTP = (v) => v.study === 'twophase', isTF = (v) => v.study === 'twofluid', tpCh = (v) => isTP(v) && (v.tpDomain === 'spacer' || v.tpDomain === 'import'), tpTank = (v) => isTP(v) && !tpCh(v), tpIs = (...k) => (v) => tpTank(v) && k.includes(v.tpCase), tfCh = (v) => isTF(v) && (v.tfDomain === 'spacer' || v.tfDomain === 'import'), tfTank = (v) => isTF(v) && !tfCh(v);
 const isCmp = (v) => v.study === 'shock' || v.study === 'nozzle', twoEqSel = (v) => ['ke', 'kw', 'sst', 'earsm', 'rsm'].includes(v.turb), BOOL = (key, label, help, extra = {}) => ({ key, label, type: 'bool', value: false, help, ...extra });
 
 const suite = {
@@ -2818,7 +3010,7 @@ const suite = {
     'navier-stokes-species', 'navier-stokes-solution-diffusion', 'cfd-concentration-polarization', 'cfd-porous-media', 'cfd-fouling', 'cfd-particle-deposition', 'cfd-population-balance', 'cfd-precipitation', 'cfd-heat/mass-transfer', 'conjugate heat-transfer', 'eulerian-lagrangian', 'lattice-boltzmann', 'cfd-machine-learning', 'reynolds-stress', 'volume-of-fluid', 'level-set', 'eulerian-eulerian', 'multiphase flow',
     'velocity', 'initial pressure field', 'concentration', 'temperature', 'turbulence quantities', 'phase fractions', 'particle distribution', 'deposited material', 'velocity-inlet', 'mass-flow-inlet', 'pressure-inlet', 'pressure-outlet', 'no-slip wall', 'navier-slip', 'symmetry', 'periodic', 'fully developed', 'wall-function', 'impermeable wall', 'specified species concentration', 'specified species flux', 'membrane permeation flux', 'prescribed temperature', 'prescribed heat flux', 'convective heat-transfer',
     'geometry creation and import', 'computational meshing', 'fluid-property definition', 'laminar-flow', 'turbulent-flow modelling', 'porous-media flow', 'species transport', 'salt transport', 'module heat transfer', 'concentration polarisation', 'membrane-wall transport', 'spacer hydrodynamics', 'particle transport and deposition', 'wall shear stress', 'pressure-drop prediction', 'mixing analysis', 'fouling-layer', 'crystallisation and particle formation', 'transient simulation', 'user-defined physical model', 'mesh-independence', 'numerical convergence monitoring', 'scientific visualisation'],
-  equationsNote: 'Scope of the channel study: two-dimensional, incompressible, constant-property flow on a Cartesian grid (uniform in x, wall-clustered in y) with solids represented by blocked cells (stair-step surfaces). A 2-D section represents filaments transverse to the flow; diamond or woven three-dimensional spacer meshes need a 3-D solver, so treat friction and Sherwood numbers as section values and calibrate the 1-D multipliers against element data. Steady runs are valid while the flow is steady (roughly channel Reynolds number below 300–400 with filaments); above that use the transient mode. Turbulence: algebraic mixing length, standard k–ε with log-law wall functions (first cell at y⁺ > 11.6), Wilcox k–ω and Menter k–ω SST (wall functions or integration to the wall), each with transport equations for k and ε or ω. Two Reynolds-stress options: the explicit algebraic (Wallin–Johansson) solution of the stress equations on k–ω with a bounded effective C_μ, and the differential model, which solves transport equations for u′u′, v′v′, w′w′ and u′v′ (exact production, Launder–Reece–Rodi isotropisation-of-production pressure–strain with the Gibson–Launder wall reflection, Daly–Harlow gradient diffusion without its cross-diffusion terms) and for ε; their divergence drives the momentum equations. The differential model is a high-Reynolds-number closure: wall-adjacent cells hold the log-layer stress levels of the wall function (first cell at y⁺ > 11.6), the mean flow is two-dimensional (u′w′ = v′w′ = 0), and steady runs of separated flows may stall at a continuity residual of about 10⁻⁴ — use the upwind scheme or the transient mode there. LES uses the Smagorinsky sub-grid model on the 2-D grid: without vortex stretching it is indicative only. Compressible flow (Euler equations, optionally with viscous stress, heat conduction and wall friction) is solved in one dimension for an ideal gas — shock tube and quasi-1-D nozzle — not in the 2-D channel. Maxwell–Stefan diffusion is solved as a ternary film across the polarisation layer whose thickness comes from the CFD mass-transfer coefficient, not as a coupled 2-D multicomponent field. The second-phase option of the channel study transports a phase on the solved single-phase velocity field: a sharp interface by THINC/WLIC volume-fraction advection or by a level-set function (not volume-conserving), or a dilute dispersed phase by a drift-flux continuity equation with an algebraic (Stokes, hindered) slip velocity and wall deposition. That option is interface kinematics and one-way drift-flux transport: the phases do not act back on the channel flow. Coupled multiphase flow is solved by the two multiphase studies (Study type). Free interface: one-fluid incompressible Navier–Stokes equations with variable density and viscosity and the continuum surface force on a uniform staggered grid, explicit balanced-force projection with a variable-density pressure equation, in a closed rectangular tank or in a channel with a velocity inlet and a pressure outlet in which the spacer filaments or an imported section are blocked cells (the same staircase mask as the channel study, rasterised on the uniform grid; no-slip solids; the gas starts inside the channel and the inlet delivers liquid), interface by THINC/WLIC volume of fluid or by a level set with redistancing and a constant-shift volume correction; two-dimensional, laminar, no phase change, no contact-angle model (90° at the walls), explicit time step limited by the capillary, viscous and convective criteria, and first-order convergence of interface positions with the cell size. Two-fluid model: continuity and momentum equations for a continuous and a mono-sized dispersed phase with one shared pressure, Schiller–Naumann drag with the Wen–Yu swarm correction, virtual mass and turbulent dispersion, a packing limit, closed box or a channel with velocity inlet and pressure outlet, optionally with the spacer filaments or an imported section as blocked cells (no-slip for the liquid, free-slip and impermeable for the dispersed phase, which is captured where it settles or rises onto a wall or a solid face — inertial impaction and interception on the filaments are not modelled); laminar, no particle-contact (solids) pressure below the packing limit, so dense columns develop buoyancy-driven convection that a real suspension damps, no lift force, no coalescence or break-up. Precipitation transports one sparingly soluble salt with first-order wall crystallisation and a four-moment population balance (primary nucleation, linear growth, no aggregation or breakage). The fouling layer feeds back through its hydraulic resistance, not by narrowing the passage. Conjugate heat transfer conducts through the blocked cells. The lattice-Boltzmann option (D2Q9, BGK, laminar, no-slip) supplies the starting field and a comparison; the reported results are those of the finite-volume solver. The regression closure is a cross-validated power law fitted to 5–10 extra solver runs and is valid only inside the sampled range. The pressure inlet is a flow-rate controller on the static pressure of the inlet plane (found by steady iterations, also ahead of a transient run); with a turbulence closure it takes the fully developed (recycled) profile in a plain channel and a uniform one elsewhere, and a target that the passage cannot reach is reported. The periodic option recycles the outlet-plane profile (and turbulence quantities) to the inlet; permeation is retained at the walls. Bounded QUICK is formulated for uniform spacing and is applied unchanged on the clustered y-grid.',
+  equationsNote: 'Scope of the channel study: two-dimensional, incompressible, constant-property flow on a Cartesian grid (uniform in x, wall-clustered in y) with solids represented by blocked cells (stair-step surfaces). A 2-D section represents filaments transverse to the flow; diamond or woven three-dimensional spacer meshes need a 3-D solver, so treat friction and Sherwood numbers as section values and calibrate the 1-D multipliers against element data. Steady runs are valid while the flow is steady (roughly channel Reynolds number below 300–400 with filaments); above that use the transient mode. Turbulence: algebraic mixing length, standard k–ε with log-law wall functions (first cell at y⁺ > 11.6), Wilcox k–ω and Menter k–ω SST (wall functions or integration to the wall), each with transport equations for k and ε or ω. Two Reynolds-stress options: the explicit algebraic (Wallin–Johansson) solution of the stress equations on k–ω with a bounded effective C_μ, and the differential model, which solves transport equations for u′u′, v′v′, w′w′ and u′v′ (exact production, Launder–Reece–Rodi isotropisation-of-production pressure–strain with the Gibson–Launder wall reflection, Daly–Harlow gradient diffusion without its cross-diffusion terms) and for ε; their divergence drives the momentum equations. The differential model is a high-Reynolds-number closure: wall-adjacent cells hold the log-layer stress levels of the wall function (first cell at y⁺ > 11.6), the mean flow is two-dimensional (u′w′ = v′w′ = 0), and steady runs of separated flows may stall at a continuity residual of about 10⁻⁴ — use the upwind scheme or the transient mode there. LES uses the Smagorinsky sub-grid model on the 2-D grid: without vortex stretching it is indicative only. Compressible flow (Euler equations, optionally with viscous stress, heat conduction and wall friction) is solved in one dimension for an ideal gas — shock tube and quasi-1-D nozzle — not in the 2-D channel. Maxwell–Stefan diffusion is solved as a ternary film across the polarisation layer whose thickness comes from the CFD mass-transfer coefficient, not as a coupled 2-D multicomponent field. The second-phase option of the channel study transports a phase on the solved single-phase velocity field: a sharp interface by THINC/WLIC volume-fraction advection or by a level-set function (not volume-conserving), or a dilute dispersed phase by a drift-flux continuity equation with an algebraic (Stokes, hindered) slip velocity and wall deposition. That option is interface kinematics and one-way drift-flux transport: the phases do not act back on the channel flow. Coupled multiphase flow is solved by the two multiphase studies (Study type). Free interface: one-fluid incompressible Navier–Stokes equations with variable density and viscosity and the continuum surface force on a uniform staggered grid, explicit balanced-force projection with a variable-density pressure equation, in a closed rectangular tank or in a channel with a velocity inlet and a pressure outlet in which the spacer filaments or an imported section are blocked cells (the same staircase mask as the channel study, rasterised on the uniform grid; no-slip solids; the gas starts inside the channel or is injected through a band of the inlet, continuously or in periodic slugs), interface by THINC/WLIC volume of fluid or by a level set with redistancing and a constant-shift volume correction; two-dimensional, laminar, no phase change, no contact-angle model (90° at the walls), explicit time step limited by the capillary, viscous and convective criteria — the capillary limit is lifted by the optional semi-implicit surface tension (Laplace–Beltrami term, first order in time, verified up to 5 times the capillary step for moving interfaces; it damps capillary waves at the rate ω²Δt/2) — and first-order convergence of interface positions with the cell size. Two-fluid model: continuity and momentum equations for a continuous and a mono-sized dispersed phase with one shared pressure, Schiller–Naumann drag with the Wen–Yu swarm correction, virtual mass and turbulent dispersion, a packing limit, closed box or a channel with velocity inlet and pressure outlet, optionally with the spacer filaments or an imported section as blocked cells (no-slip for the liquid, free-slip and impermeable for the dispersed phase, which is captured on walls and solid faces by settling or rise, inertial impaction, interception and Brownian diffusion — the latter two as sub-grid terms: the liquid flux within one particle radius of a no-slip surface from a quadratic near-wall law, and the Lévêque mass-transfer coefficient with the Stokes–Einstein diffusivity; impaction uses the particle velocity on arrival after its deceleration over the last cell, with surface normals estimated from the staircase mask, verified for a cylinder on 8 cells per diameter); laminar, no particle-contact (solids) pressure below the packing limit, so dense columns develop buoyancy-driven convection that a real suspension damps, no lift force, no coalescence or break-up. Precipitation transports one sparingly soluble salt with first-order wall crystallisation and a four-moment population balance (primary nucleation, linear growth, no aggregation or breakage). The fouling layer feeds back through its hydraulic resistance, not by narrowing the passage. Conjugate heat transfer conducts through the blocked cells. The lattice-Boltzmann option (D2Q9, BGK, laminar, no-slip) supplies the starting field and a comparison; the reported results are those of the finite-volume solver. The regression closure is a cross-validated power law fitted to 5–10 extra solver runs and is valid only inside the sampled range. The pressure inlet is a flow-rate controller on the static pressure of the inlet plane (found by steady iterations, also ahead of a transient run); with a turbulence closure it takes the fully developed (recycled) profile in a plain channel and a uniform one elsewhere, and a target that the passage cannot reach is reported. The periodic option recycles the outlet-plane profile (and turbulence quantities) to the inlet; permeation is retained at the walls. Bounded QUICK is formulated for uniform spacing and is applied unchanged on the clustered y-grid.',
 
   inputs: [
     { group: 'Geometry', help: 'A 2-D section through the flow passage: x along the flow, y across the gap.', fields: [
@@ -2933,11 +3125,18 @@ const suite = {
     ] },
     { group: 'Multiphase flow: free interface (volume of fluid / level set)', tab: 'setup', showIf: isTP, help: 'Two immiscible incompressible fluids in a closed two-dimensional tank, solved as one fluid with variable density and viscosity: ∇·u = 0, ρ(α) Du/Dt = −∇p + ∇·[μ(α)(∇u + ∇uᵀ)] + ρ(α) g + σ κ ∇α. The interface moves with the computed flow and acts back on it through the density, the viscosity and the surface tension (two-way coupling). Volume of fluid transports the volume fraction with the THINC/WLIC scheme and conserves the phase volume to round-off; the level set transports a signed distance, is redistanced every step and corrected so that the phase volume is restored.', fields: [
       SEL('tpDomain', 'Domain', 'tank', [['tank', 'Closed rectangular tank'], ['spacer', 'Spacer-filled membrane channel (Geometry inputs), through-flow'], ['import', 'Imported CAD section in a channel (Geometry inputs), through-flow']], 'The channel domains take the gap, the filaments (or the imported outline) and the length from the Geometry group on the Inputs tab — the same solid mask as the channel study — with a liquid inlet at x = 0 and a pressure outlet at x = L: an air slug or bubbles are carried through by the cross-flow (air sparging against fouling).'),
+      SEL('tpST', 'Surface tension: time integration', 'explicit', [['explicit', 'Explicit (time step below the capillary-wave limit)'], ['semi', 'Semi-implicit (Laplace–Beltrami term; larger steps on fine grids)']], 'Explicit: Δt ≤ ½√(ρ̄h³/2πσ), which falls as (cell size)^1.5 and makes fine grids and long times expensive. Semi-implicit: the change of curvature during the step is taken into the momentum equation (Δt σ δ Δ_s u), so the step may be several times that limit; capillary waves of frequency ω are then damped at the rate ω²Δt/2, which is negligible for motions resolved by many steps.', { showIf: isTP }),
+      F('tpSTm', 'Time step ÷ capillary limit (semi-implicit)', '×', 5, 0.5, 20, 'Largest step as a multiple of √(ρ̄h³/2πσ); the explicit scheme uses 0.5. Verified up to 5 for moving interfaces and 10 for a static drop; larger values leave stronger spurious interface currents. The convective, viscous and gravity-wave limits still apply.', { showIf: (v) => isTP(v) && v.tpST === 'semi' }),
       SEL('tpMethod', 'Interface method', 'vof', [['vof', 'Volume of fluid (THINC/WLIC, conservative)'], ['ls', 'Level set (redistancing + volume correction)']], 'Both methods drive the same momentum and pressure equations.'),
-      SEL('tpChInit', 'Gas at the start', 'slug', [['slug', 'Slug filling the gap over a length'], ['bubbles', 'Train of bubbles']], 'The gas (second phase) starts inside the channel near the inlet; the inlet itself delivers liquid.', { showIf: tpCh }),
+      SEL('tpChInit', 'Gas supply', 'slug', [['slug', 'Slug inside the channel at the start'], ['bubbles', 'Train of bubbles inside the channel at the start'], ['inject', 'Continuous injection at the inlet'], ['sparge', 'Periodic slugs at the inlet (air sparging)']], 'Either the gas (second phase) starts inside the channel near the inlet and the inlet delivers liquid, or the channel starts full of liquid and a band of the inlet height delivers gas — continuously or in periodic slugs. The total volume flow through the inlet is the same in all cases.', { showIf: tpCh }),
+      F('tpInjH', 'Injected band: height', '% of open inlet height', 50, 5, 100, 'Part of the inlet height through which the gas enters.', { showIf: (v) => tpCh(v) && tpInj(v) }),
+      F('tpInjY', 'Injected band: centre', '% of open inlet height', 50, 0, 100, 'Measured from the lower wall; the band is kept inside the opening.', { showIf: (v) => tpCh(v) && tpInj(v) }),
+      F('tpInjA', 'Gas fraction inside the band', '–', 1, 0.05, 1, 'Volume of fluid: gas volume fraction of the inflow in the band. Level set (sharp interface): the band height is multiplied by this fraction, which carries the same share of the band.', { showIf: (v) => tpCh(v) && tpInj(v) }),
+      F('tpInjT', 'Injection period', 'flow-through times', 0.4, 0.02, 20, 'Time from the start of one slug to the start of the next.', { showIf: (v) => tpCh(v) && v.tpChInit === 'sparge' }),
+      F('tpInjDuty', 'Gas on during', '% of the period', 40, 5, 95, 'Duty of the injection; the inlet delivers liquid for the rest of the period.', { showIf: (v) => tpCh(v) && v.tpChInit === 'sparge' }),
       F('tpUin', 'Mean inlet velocity of the liquid', 'm/s', 0.3, 1e-4, 20, 'Cross-flow velocity over the open inlet height (parabolic profile). The capillary time step does not depend on it, so faster flows need fewer steps per flow-through time.', { showIf: tpCh }),
-      F('tpChX', 'Upstream end of the gas', '% of length', 8, 0, 90, 'Upstream face of the slug, or of the first bubble.', { showIf: tpCh }),
-      F('tpChLen', 'Slug length', '% of length', 20, 2, 80, '', { showIf: (v) => tpCh(v) && v.tpChInit !== 'bubbles' }),
+      F('tpChX', 'Upstream end of the gas', '% of length', 8, 0, 90, 'Upstream face of the slug, or of the first bubble.', { showIf: (v) => tpCh(v) && !tpInj(v) }),
+      F('tpChLen', 'Slug length', '% of length', 20, 2, 80, '', { showIf: (v) => tpCh(v) && v.tpChInit !== 'bubbles' && !tpInj(v) }),
       F('tpChD', 'Bubble diameter', '% of gap', 60, 10, 95, '', { showIf: (v) => tpCh(v) && v.tpChInit === 'bubbles' }),
       F('tpChN', 'Number of bubbles', '', 3, 1, 12, 'Spaced 1.6 diameters apart, alternately above and below mid-gap.', { showIf: (v) => tpCh(v) && v.tpChInit === 'bubbles', step: 1 }),
       F('tpChTime', 'Simulated time (channel)', 'flow-through times', 0.8, 0.02, 20, 'One flow-through time = channel length ÷ mean velocity.', { showIf: tpCh }),
@@ -2971,6 +3170,8 @@ const suite = {
       F('tfAlpha', 'Dispersed-phase volume fraction (initial and inlet)', '%', 10, 1e-4, 60, ''),
       F('tfU', 'Inlet velocity', 'm/s', 0.02, 1e-5, 20, 'Both phases enter at this velocity (mean over the open inlet height in a channel geometry).', { showIf: (v) => tfCh(v) || (isTF(v) && v.tfCase === 'flow') }),
       { key: 'tfDeposit', label: 'Capture the dispersed phase on the wall it reaches', type: 'bool', value: true, showIf: (v) => tfCh(v) || (isTF(v) && v.tfCase === 'flow'), help: 'In a channel geometry: capture on the wall and on the solid faces the phase settles (or rises) onto. Sludge hopper or foam skimmer: the phase leaves through the wall and the same volume of liquid takes its place. Off: it accumulates as a moving layer.' },
+      SEL('tfCapt', 'Deposition mechanisms', 'all', [['all', 'Settling, inertial impaction, interception and Brownian diffusion'], ['settle', 'Gravitational settling (or rise) only']], 'Settling only: the phase is captured where it settles or rises onto a wall or a solid face. All mechanisms: every wall and solid face captures — the dispersed phase that arrives with its own momentum where the liquid is deflected (impaction, Stokes-number effect), particles whose centres pass within one radius of the surface (interception) and the Brownian flux of a Lévêque boundary layer with the Stokes–Einstein diffusivity; the result reports the split for walls and filaments.', { showIf: (v) => (tfCh(v) || (isTF(v) && v.tfCase === 'flow')) && v.tfDeposit !== false }),
+      F('tfStick', 'Sticking probability', '–', 1, 0, 1, 'Share of the particles reaching a surface that stay on it; applied to every mechanism.', { showIf: (v) => (tfCh(v) || (isTF(v) && v.tfCase === 'flow')) && v.tfDeposit !== false && v.tfCapt !== 'settle' }),
       F('tfTimeB', 'Simulated time (closed column)', '× H ÷ hindered velocity', 0.5, 0.02, 5, '1 = the time the suspension front needs to cross the column.', { showIf: (v) => tfTank(v) && v.tfCase !== 'flow' }),
       F('tfTimeF', 'Simulated time (flow-through)', 'flow-through times', 3, 0.05, 50, 'One flow-through time = length ÷ inlet velocity; about three are needed for a steady capture efficiency.', { showIf: (v) => tfCh(v) || (isTF(v) && v.tfCase === 'flow') }),
       F('tfCvm', 'Virtual-mass coefficient C_vm', '–', 0.5, 0, 2, '0.5 for spheres; matters for bubbles, negligible for heavy particles.'),
@@ -3072,9 +3273,11 @@ const suite = {
     { name: 'Multiphase: dam break of a water column (volume of fluid, Martin & Moyce)', values: { study: 'twophase', tpCase: 'dam', tpMethod: 'vof' } },
     { name: 'Multiphase: rising bubble (level set, fluid properties of the Hysing et al. benchmark, case 1)', values: { study: 'twophase', tpCase: 'bubble', tpMethod: 'ls', tpW: 1000, tpH: 2000, tpBubD: 50, tpBubY: 25, tpRho1: 1000, tpMu1: 10000, tpRho2: 100, tpMu2: 1000, tpSigma: 24500, tpG: 0.98, tpTime: 4.2, tpSlip: true, tpNx: 32, tpNy: 64 } },
     { name: 'Multiphase: air slug through the spacer-filled channel (free interface, sparging)', values: { study: 'twophase', tpDomain: 'spacer', nFil: 2, tpChInit: 'slug' } },
+    { name: 'Multiphase: air sparging of a spacer-filled channel (periodic slugs injected at the inlet)', values: { study: 'twophase', tpDomain: 'spacer', nFil: 2, tpChInit: 'sparge', tpInjT: 0.3, tpInjDuty: 40, tpInjH: 50, tpChTime: 1.2 } },
     { name: 'Multiphase: bubbles past an imported strand section (free interface, level set)', values: { study: 'twophase', tpDomain: 'import', tpMethod: 'ls', tpChInit: 'bubbles', tpChN: 2, tpChD: 45, H: 1, L: 6, cad: STRAND_CAD, cadSize: 45, cadX: 55, tpUin: 0.4, tpChTime: 0.7 } },
     { name: 'Multiphase: batch settling of a suspension (two-fluid model, Kynch front)', values: { study: 'twofluid', tfCase: 'batch' } },
     { name: 'Multiphase: particles carried through the spacer-filled channel (two-fluid model, deposition)', values: { study: 'twofluid', tfDomain: 'spacer', nFil: 2, tfDp: 20, tfAlpha: 0.5, tfU: 0.1, tfRhoD: 2650 } },
+    { name: 'Multiphase: particle capture on spacer filaments by impaction, interception and diffusion (two-fluid model)', values: { study: 'twofluid', tfDomain: 'spacer', nFil: 2, tfDp: 25, tfAlpha: 0.1, tfU: 0.5, tfRhoD: 2650, tfCapt: 'all', tfTimeF: 2.6 } },
     { name: 'Multiphase: oil droplets past an imported strand section (two-fluid model)', values: { study: 'twofluid', tfDomain: 'import', H: 1, L: 6, cad: STRAND_CAD, cadSize: 45, cadX: 45, tfDp: 30, tfAlpha: 1, tfU: 0.05, tfRhoD: 850 } },
     { name: 'Multiphase: settling channel with wall capture (two-fluid model, Hazen)', values: { study: 'twofluid', tfCase: 'flow', tfL: 120, tfH: 20, tfDp: 50, tfAlpha: 0.01, tfU: 0.03, tfSlip: true, tfNx: 48, tfNy: 16 } },
     { name: 'Sudden expansion in a brine duct, turbulent, with particles', values: { geom: 'step', H: 100, L: 1400, Uin: 1.2, c0: 65, turb: 'ml', species: 'off', stretch: 3, nx: 120, ny: 30, particles: true, dPart: 60, rhoPart: 2650, alphaU: 0.7, maxIter: 900 } },
@@ -3678,11 +3881,40 @@ const suite = {
         add(`${nm}, coupled flow: projected velocity is divergence-free`, 0, hb.div, 1e-6, 'max |∇·u| after the variable-density pressure projection (1/s)');
       }
     }
+    { // semi-implicit surface tension: steps of several times the capillary limit of the explicit force
+      const R = 0.25, sig = 0.07, semiO = (m) => ({ surfaceTension: 'semi', stFactor: m });
+      for (const [method, nm, m] of [['vof', 'Volume of fluid', 5], ['ls', 'Level set', 10]]) {
+        const dr = await twoPhase2D({ method, nx: 40, ny: 40, W: 1, Hh: 1, rhoA: 1000, rhoB: 1, muA: 1e-3, muB: 1e-5, sigma: sig, gy: 0, sd: (x, y) => R - Math.hypot(x - 0.5, y - 0.5), tEnd: 4, ...semiO(m) }), Ca = (Math.max(...dr.hist.umax) * 1e-3) / sig;
+        add(`${nm}, semi-implicit surface tension: Laplace pressure jump of a static drop at ${m} × the capillary step`, 1, dr.dpJump / (sig / R), 0.03, `Δp ÷ (σ/R), density ratio 1000, 10 cells per radius, ${dr.steps} steps to t = 4 (the explicit scheme needs ${Math.ceil(4 / (0.5 * dr.dtCap))}); largest step ${fmt(dr.dtFix / dr.dtCap, 3)} × √(ρ̄h³/2πσ)`);
+        add(`${nm}, semi-implicit surface tension: spurious currents of the static drop at ${m} × the capillary step`, 0, Ca, 5e-4, `Largest capillary number μU/σ during the run (explicit scheme at half the capillary step: about 8 × 10⁻⁵ volume of fluid, 2 × 10⁻⁵ level set)`);
+      }
+      { // capillary wave on a viscous liquid under a light gas: period and decay against linear theory
+        const N = 48, Hh = 0.5, rl = 1000, kw = 2 * Math.PI, om = sloshOmega(kw, Hh / 2, Hh / 2, rl, 1, 0, 1), nuw = (0.03 * om) / (kw * kw), Tth = (2 * Math.PI) / om;
+        const cw = await twoPhase2D({ method: 'vof', nx: N, ny: N / 2, W: 1, Hh, rhoA: rl, rhoB: 1, muA: rl * nuw, muB: nuw, sigma: 1, gy: 0, sd: (x, y) => Hh / 2 + 0.01 * Math.cos(kw * x) - y, tEnd: 1.7 * Tth, ...semiO(3) }), hw = cw.hist, e = hw.hL.map((x) => Hh / 2 - x), cr = [];
+        for (let q = 1; q < e.length; q++) if (e[q - 1] * e[q] < 0) cr.push(hw.t[q - 1] + ((hw.t[q] - hw.t[q - 1]) * e[q - 1]) / (e[q - 1] - e[q]));
+        let e1 = 0, t1 = 0, e2 = 0, t2 = 0; e.forEach((x, q) => { const tq = hw.t[q] / Tth; if (tq >= 0.8 && tq < 1.3) { if (x > e1) { e1 = x; t1 = hw.t[q]; } } else if (tq >= 1.3 && -x > e2) { e2 = -x; t2 = hw.t[q]; } });
+        add('Semi-implicit surface tension: period of a capillary wave at 3 × the capillary step', 1, cr.length >= 2 ? (2 * (cr[1] - cr[0])) / Tth : 0, 0.06, `ω² = σk³/(ρ₁ coth kh₁ + ρ₂ coth kh₂) (Lamb, Hydrodynamics §267; standard result, not read from the primary source), wavelength = tank width, ${N} × ${N / 2} cells, amplitude 1 % of the wavelength, density ratio 1000, ${cw.steps} steps for 1.7 periods (ω Δt = ${fmt(om * cw.dtFix, 2)}); ratio to theory, tolerance 6 %. The explicit scheme gives 1.046 on 64 × 32 cells: the offset is that of the continuum-surface-force curvature, not of the time integration`);
+        add('Semi-implicit surface tension: decay rate of the capillary wave at 3 × the capillary step', 1, e1 > 0 && e2 > 0 ? Math.log(e1 / e2) / (t2 - t1) / (2 * nuw * kw * kw) : 0, 0.35, `Amplitude from the peak after one period to the trough after one and a half against γ = 2νk² (Lamb §349, weak damping νk²/ω = 0.03; standard result, not read from the primary source); ratio, tolerance 35 % on this grid (1.27; 1.20 on 64 × 32 cells). The implicit term adds the damping θω²Δt/2 of a first-order implicit step (here ${fmt((om * cw.dtFix) / (4 * 0.03), 2)} of the physical rate at most): measured from the first to the second return peak on 64 × 32 cells 1.02 explicit, 1.14 at 3 × and 1.23 at 5 × the capillary step. With the term switched off the nominal step of 5 × is not sustained — interface currents grow until the convective limit cuts the step (1183 instead of 342 steps for 2.25 periods)`);
+      }
+      { // rising-bubble benchmark with the semi-implicit scheme
+        const hb = await twoPhase2D({ method: 'vof', nx: 24, ny: 48, W: 1, Hh: 2, rhoA: 100, rhoB: 1000, muA: 1, muB: 10, sigma: 24.5, gy: -0.98, sd: (x, y) => 0.25 - Math.hypot(x - 0.5, y - 0.5), tEnd: 3, slipSide: true, slipTB: false, ...semiO(5) });
+        let vmB = 0, tmB = 0; hb.hist.vr.forEach((x, k) => { if (x > vmB) { vmB = x; tmB = hb.hist.t[k]; } });
+        add('Semi-implicit surface tension: rising-bubble centroid at t = 3', 1.081, hb.hist.yc[hb.hist.yc.length - 1], 0.02, `Hysing et al. test case 1 on 24 × 48 cells in ${hb.steps} steps (explicit: 374), step ${fmt(hb.dtFix / hb.dtCap, 3)} × the capillary step, then set by ${hb.dtLimit}; explicit scheme 1.087`);
+        add('Semi-implicit surface tension: largest rise velocity of the bubble', 0.2419, vmB, 0.012, 'Same run; explicit scheme 0.2367');
+        add('Semi-implicit surface tension: time of the largest rise velocity', 0.927, tmB, 0.07, 'Same run; explicit scheme 0.949. The maximum is flat, and the damping of the first-order implicit term shifts it by 0.04; tolerance 0.07');
+      }
+      { // a long run on a fine grid: more than the 20,000 steps of the cap with the explicit force
+        const Hc = 1e-3, Uq = 0.02, tE = 0.48, pf = Float64Array.from({ length: 8 }, (_, j) => { const q = (j + 0.5) / 8; return 6 * Uq * q * (1 - q); });
+        const r = await twoPhase2D({ method: 'vof', nx: 24, ny: 8, W: 3e-3, Hh: Hc, rhoA: 10, rhoB: rho, muA: 1.8e-5, muB: mu, sigma: 0.072, gy: -9.80665, rhoRef: rho, sd: (x) => Math.min(x - 0.25e-3, 0.9e-3 - x), tEnd: tE, flow: { uin: pf }, ...semiO(5) }), nEx = Math.ceil(tE / (0.5 * r.dtCap));
+        add('Semi-implicit surface tension: a run beyond the step cap of the explicit scheme completes', 1, r.done && r.steps < 20000 && nEx > 20000 ? 1 : 0, 0, `Gas slug (10 kg/m³) carried through a 1 mm water channel at 0.02 m/s for ${fmt(tE * 1e3, 4)} ms on 125 µm cells: ${r.steps} steps at up to 5 × the capillary step; the explicit force needs at least ${nEx} steps of ${fmt(0.5 * r.dtCap * 1e6, 3)} µs and stopped at the cap of 20,000`);
+        add('Semi-implicit surface tension: gas volume balance of that run', 0, (r.vol0 + r.volIn - r.volOut - r.vol) / r.vol0, 1e-9, `(initial + inflow − outflow − hold-up) ÷ initial; ${fmt((100 * r.volOut) / r.vol0, 4)} % of the gas has left through the outlet. At 10 × the capillary step the same run shows interface currents five times those of the explicit scheme and a balance error of 6 × 10⁻⁵ from the clipping of the volume fraction: 5 × is the validated multiple for moving interfaces`);
+      }
+    }
     { // Eulerian–Eulerian two-fluid model
       const gE = 9.80665, rc = 1000, rd = 2500, muc = 1e-3, d1 = 300e-6, u1 = terminalSN(d1, rc, rd, muc), Re1 = (rc * u1 * d1) / muc;
       add('Two-fluid model: terminal velocity satisfies the Schiller–Naumann drag balance', (4 / 3) * ((rc * (rd - rc) * gE * d1 ** 3) / (muc * muc)), schillerNaumann(Re1) * Re1, 1e-6 * schillerNaumann(Re1) * Re1, `C_D Re² = (4/3) Ar for a 300 µm sphere of density 2500 kg/m³ in water (Re = ${fmt(Re1, 3)}, u_t = ${fmt(u1 * 1e3, 3)} mm/s)`);
       add('Two-fluid model: Stokes limit of the terminal velocity', 1, terminalSN(5e-6, rc, rd, muc) / (((rd - rc) * gE * 25e-12) / (18 * muc)), 1e-3, '5 µm particle, Re ≈ 10⁻⁴ (ratio to (ρ_d − ρ_c) g d²/18μ)');
-      const dS = 20e-6, aS = 0.15, uS = terminalSN(dS, rc, rd, muc), Hc = 0.02, tS = (0.5 * Hc) / uS, bs = await twoFluid2D({ nx: 4, ny: 80, L: 0.004, H: Hc, rhoC: rc, muC: muc, rhoD: rd, dP: dS, alpha0: aS, tEnd: tS, slipC: true });
+      const dS = 20e-6, aS = 0.15, uS = terminalSN(dS, rc, rd, muc), Hc = 0.02, tS = (0.5 * Hc) / uS, bs = await twoFluid2D({ nx: 2, ny: 80, L: 0.002, H: Hc, rhoC: rc, muC: muc, rhoD: rd, dP: dS, alpha0: aS, tEnd: tS, slipC: true });
       add('Two-fluid model: batch-settling front against Kynch theory with Richardson–Zaki hindrance', uS * (1 - aS) ** 4.65, -histSlope(bs.hist.t, bs.hist.front, 0.3 * tS, tS), 0.02 * uS * (1 - aS) ** 4.65, 'Suspension front of 20 µm particles at 15 % by volume falls at u_t (1 − α)^4.65 (Stokes regime): drag, buoyancy and the return flow of the liquid from the coupled phase momentum and continuity equations (m/s)');
       const dB = 100e-6, aB = 0.2, uB = terminalSN(dB, rc, rd, muc), HB = 0.1, bb = await twoFluid2D({ nx: 4, ny: 60, L: 0.02, H: HB, rhoC: rc, muC: muc, rhoD: rd, dP: dB, alpha0: aB, tEnd: (0.4 * HB) / uB, slipC: true }), urB = hinderedSlip(aB, dB, rc, rd, muc);
       add('Two-fluid model: slip velocity in the suspension at finite Reynolds number', urB, -bb.hist.slip[bb.hist.slip.length - 1], 1e-3 * urB, 'k′(u_r) u_r = α_c (ρ_d − ρ_c) g with the Schiller–Naumann / Wen–Yu drag, 100 µm particles at 20 % (m/s)');
@@ -3690,7 +3922,7 @@ const suite = {
       add('Two-fluid model: shared pressure carries the weight of both phases', (aB * rd + (1 - aB) * rc) * gE * HB * (59 / 60), pb - pt, 0.005 * (aB * rd + (1 - aB) * rc) * gE * HB, 'Pressure difference between the lowest and highest cell centres = mean mixture density × g × height (hold-up balance, Pa), while the suspension is settling');
       add('Two-fluid model: dispersed-phase volume is conserved', 0, bb.vol / bb.vol0 - 1, 1e-10, 'Flux-form continuity equation with the packing limiter (relative change)');
       add('Two-fluid model: mixture volume balance', 0, bb.div * (HB / uB), 1e-6, 'max |∇·(α_c u_c + α_d u_d)| × H/u_t after the shared-pressure solve');
-      const dF = 50e-6, uF = terminalSN(dF, rc, rd, muc), Lf = 0.06, Hf = 0.01, Uf = 0.05, fl = await twoFluid2D({ nx: 40, ny: 12, L: Lf, H: Hf, rhoC: rc, muC: muc, rhoD: rd, dP: dF, alpha0: 1e-3, flow: { U: Uf, alphaIn: 1e-3 }, tEnd: (4 * Lf) / Uf, slipC: true, deposit: true }), hn = fl.hist.t.length - 1, hm = Math.floor(0.75 * hn);
+      const dF = 50e-6, uF = terminalSN(dF, rc, rd, muc), Lf = 0.06, Hf = 0.01, Uf = 0.05, fl = await twoFluid2D({ nx: 20, ny: 8, L: Lf, H: Hf, rhoC: rc, muC: muc, rhoD: rd, dP: dF, alpha0: 1e-3, flow: { U: Uf, alphaIn: 1e-3 }, tEnd: (4 * Lf) / Uf, slipC: true, deposit: true }), hn = fl.hist.t.length - 1, hm = Math.floor(0.75 * hn);
       add('Two-fluid model: ideal-settler capture (Hazen)', (uF * Lf) / (Uf * Hf), (fl.hist.dep[hn] - fl.hist.dep[hm]) / (fl.hist.dIn[hn] - fl.hist.dIn[hm]), 0.02 * ((uF * Lf) / (Uf * Hf)), 'Captured fraction = u_t L/(U H) for a dilute suspension in plug flow through a channel with a velocity inlet, pressure outlet and capture on the floor');
       add('Two-fluid model: flow-through volume balance of the dispersed phase', 0, (fl.vol0 + fl.dIn - fl.dOut - fl.dep - fl.vol) / fl.dIn, 1e-10, '(initial + inflow − outflow − captured − hold-up) ÷ inflow');
       add('Two-fluid model: mixture inflow equals mixture outflow', 1, (fl.cOut + fl.dOut) / (fl.cIn + fl.dIn), 1e-8, 'Incompressible mixture: Σ α_k u_k through the outlet ÷ through the inlet');
@@ -3703,6 +3935,19 @@ const suite = {
         add(`${nm}, through-flow channel: an air slug travels at the flow velocity`, 1, (h.xc[k3] - h.xc[0]) / (Uc * h.t[k3]), method === 'ls' ? 3e-3 : 1e-6, 'Centroid displacement ÷ U·t after 30 ms in plug flow (uniform inlet, free-slip walls, pressure outlet), air slug in water, 48 × 8 cells (ratio)');
         add(`${nm}, through-flow channel: the slug arrives at the outlet on time`, 1, tHalf / ((Lc - 0.5 * (x0 + x1)) / Uc), method === 'ls' ? 0.015 : 2e-3, 'Time at which half of the gas has left through the outlet ÷ (distance of the slug centre from the outlet ÷ U) (ratio)');
         add(`${nm}, through-flow channel: gas volume balance through the outlet`, 0, (r.vol0 + r.volIn - r.volOut - r.vol) / r.vol0, method === 'ls' ? 2e-3 : 1e-12, method === 'ls' ? '(initial + inflow − outflow − hold-up) ÷ initial after the slug has left; the level set is corrected to the volume the boundary fluxes leave in the channel, which is first-order accurate while the interface crosses the outlet' : `(initial + inflow − outflow − hold-up) ÷ initial after the slug has left: flux-form transport; ${fmt((100 * r.volOut) / r.vol0, 6)} % of the gas left through the outlet`);
+      }
+      { // gas injected through the inlet: continuous band and periodic slugs (air sparging), volume of fluid and level set
+        const ya = 0.25 * Hc, yb = 0.75 * Hc, per = 0.012, tE = 0.06, dyq = Hc / 8, dxq = Lc / 48, onT = (t) => t - per * Math.floor(t / per) < 0.5 * per;
+        const aIn = (t, y) => (onT(t) ? clamp((Math.min(y + 0.5 * dyq, yb) - Math.max(y - 0.5 * dyq, ya)) / dyq, 0, 1) : 0), sg = (tau) => { if (tau < 0) return tau; const q = tau - per * Math.floor(tau / per), d = 0.5 * per; return q < d ? Math.min(q, d - q) : -Math.min(q - d, per - q); };
+        const pIn = (t, x, y) => Math.min(Math.min(y - ya, yb - y), Uc * sg(t - x / Uc)), vEx = Uc * (yb - ya) * 0.5 * tE;
+        const rc2 = await twoPhase2D({ method: 'vof', nx: 48, ny: 8, W: Lc, Hh: Hc, rhoA: 1.2, rhoB: rho, muA: 1.8e-5, muB: mu, sigma: 0, gy: 0, sd: () => -1, tEnd: 0.02, flow: { uin: Uc, alphaIn: (t, y) => aIn(0, y) }, slipTB: true });
+        add('Volume of fluid, gas injected continuously at the inlet: injected volume equals the integral of the inlet flux', 1, rc2.volIn / (Uc * (yb - ya) * 0.02), 1e-9, 'Gas through the middle half of the inlet height in plug flow for 20 ms: volume carried in by the transport scheme ÷ U × band height × time (ratio)');
+        for (const [method, nm] of [['vof', 'Volume of fluid'], ['ls', 'Level set']]) {
+          const r = await twoPhase2D({ method, nx: 48, ny: 8, W: Lc, Hh: Hc, rhoA: 1.2, rhoB: rho, muA: 1.8e-5, muB: mu, sigma: 0, gy: 0, sd: (x, y) => pIn(0, x + 0.5 * dxq, y), tEnd: tE, flow: { uin: Uc, alphaIn: aIn, phiIn: pIn }, probeI: 12, slipTB: true }), h = r.hist, pk = Math.max(...h.probe);
+          add(`${nm}, periodic slugs injected at the inlet: injected volume equals the integral of the inlet flux`, 1, r.volIn / vEx, 0.01, `Five slugs (period 12 ms, gas on half of it) through the middle half of the inlet height, plug flow, 48 × 8 cells: gas carried in ÷ U × band height × time on (ratio). The switching instants are resolved to one time step${method === 'ls' ? '; the level set receives the signed distance of the arriving gas as its inflow boundary value and its volume correction holds the gas in the channel to the volume carried in' : ''}`);
+          add(`${nm}, periodic slugs injected at the inlet: the train passes with the prescribed period`, 1, pulsePeriod(h.t, h.probe, 0.5 * pk, 0.3 * pk) / per, 0.02, `Spacing of the upward crossings of half the peak gas fraction of the cross-section at x = ${fmt(12.5 * dxq * 1e3, 3)} mm ÷ injection period (ratio)`);
+          add(`${nm}, periodic slugs injected at the inlet: gas volume balance closes`, 0, (r.vol0 + r.volIn - r.volOut - r.vol) / r.volIn, method === 'ls' ? 2e-3 : 1e-11, `(inflow − outflow − hold-up) ÷ inflow after 60 ms; ${fmt((100 * r.volOut) / r.volIn, 3)} % of the injected gas has left through the outlet`);
+        }
       }
       const nxs = 36, nys = 12, Ls2 = 4.5e-3, gys = yGrid(Hc, nys, 1), mks = buildMask({ type: 'spacer', arr: 'zigzag', L: Ls2, H: Hc, df: 0.4e-3, lm: 2.25e-3, nFil: 2 }, nxs, nys, gys.yc);
       const colS = (pq, i) => { let a2 = 0, m2 = 0; for (let j = 0; j < nys; j++) if (!mks.solid[j * nxs + i]) { a2 += pq[j * nxs + i]; m2++; } return a2 / m2; }, dpS = (pq) => colS(pq, 1) - colS(pq, nxs - 2);
@@ -3720,7 +3965,27 @@ const suite = {
       const tfs = await twoFluid2D({ nx: nxs, ny: nys, L: Ls2, H: Hc, rhoC: rho, muC: mu, rhoD: 2500, dP: 30e-6, gy: -9.80665, alpha0: 0.01, flow: { U: 0.1, alphaIn: 0.01 }, tEnd: (3 * Ls2) / 0.1, solid: mks.solid, deposit: true });
       add('Two-fluid model, spacer-filled channel: dispersed-phase balance with deposition on walls and filaments', 0, (tfs.vol0 + tfs.dIn - tfs.dOut - tfs.dep - tfs.vol) / tfs.dIn, 1e-10, `(initial + inflow − outflow − captured − hold-up) ÷ inflow, 30 µm particles at 1 % through zigzag filaments; ${fmt((100 * tfs.dep) / tfs.dIn, 3)} % of the inflow is captured, ${fmt((100 * tfs.depSolid) / Math.max(tfs.dep, 1e-300), 3)} % of that on the filaments`);
       add('Two-fluid model, spacer-filled channel: mixture inflow equals mixture outflow', 1, (tfs.cOut + tfs.dOut) / (tfs.cIn + tfs.dIn), 1e-8, 'Σ α_k u_k through the outlet ÷ through the inlet with blocked cells in the shared-pressure equation');
-      const nxf = 40, nyf = 15, Lf2 = 0.06, Hf2 = 0.0125, hs2 = 0.0025, solF = new Uint8Array(nxf * nyf); for (let j = 0; j < 3; j++) for (let i = 0; i < nxf; i++) solF[j * nxf + i] = 1;
+      { // deposition by mechanism: inertial impaction and interception on a cylinder in cross-flow, Brownian diffusion to a wall, settling-only limit
+        const cyl = async (StD, Rq, Re, LD, HD, tE) => { // half a cylinder (diameter 1) on the symmetry plane y = 0, uniform inflow 1, free-slip side boundary; 8 cells per diameter
+          const nD = 8, nxq = LD * nD, nyq = HD * nD, muq = 1 / Re, rdq = (18 * muq * StD) / (Rq * Rq), sq = new Uint8Array(nxq * nyq), aI = 1e-4;
+          for (let j = 0; j < nyq; j++) for (let i = 0; i < nxq; i++) if (Math.hypot((i + 0.5) / nD - 2, (j + 0.5) / nD) < 0.5) sq[j * nxq + i] = 1;
+          const r = await twoFluid2D({ nx: nxq, ny: nyq, L: LD, H: HD, rhoC: 1, muC: muq, rhoD: rdq, dP: Rq, gx: 0, gy: 0, alpha0: aI, flow: { U: 1, alphaIn: aI }, tEnd: tE, slipC: true, solid: sq, deposit: true, capture: { stick: 1, diffusion: false }, sample: 10 });
+          const hn = r.hist.t.length - 1, hm = r.hist.t.findIndex((t) => t >= 0.7 * tE), eta = (r.hist.depS[hn] - r.hist.depS[hm]) / (r.hist.t[hn] - r.hist.t[hm]) / (aI * 0.5), cs = Math.PI / 8 / (LD * HD);
+          return { r, eta, imp: (eta * r.capture.solid.impaction) / r.depSolid, int: (eta * r.capture.solid.interception) / r.depSolid, cs };
+        };
+        const ir = (St) => 1 / (1 + 1.25 / (St - 0.125) - 0.014 / (St - 0.125) ** 2 + 0.508e-4 / (St - 0.125) ** 3), srcI = 'standard result, not read from the primary source';
+        const c1 = await cyl(0.04, 0.01, 100, 4, 2, 3), c2 = await cyl(0.5, 0.01, 100, 5, 3, 4.5), c3 = await cyl(0.001, 0.1, 0.5, 4, 2, 1.2);
+        add('Two-fluid model, cylinder in cross-flow: no inertial impaction below the critical Stokes number', 0, c1.imp, 0.01, `Stokes number τ_p U/a = 0.08 (a: cylinder radius), below the critical value 1/8 of potential flow, at which the particle equation τÿ + ẏ + (2U/a)y = 0 at the front stagnation point turns from overdamped to oscillatory (4·(2U/a)·τ = 1; derived here, ${srcI}). Impaction efficiency = captured flux ÷ flux through the projected cylinder height, Re = 100, 8 cells per diameter`);
+        add('Two-fluid model, cylinder in cross-flow: inertial impaction efficiency at Stokes number 1', ir(1), c2.imp, 0.08, `Correlation of Israel & Rosner (1983, Aerosol Sci. Technol. 2, 45–51) for potential flow, η = [1 + 1.25 (St − 1/8)⁻¹ − 0.014 (St − 1/8)⁻² + 0.508 × 10⁻⁴ (St − 1/8)⁻³]⁻¹ with St = τ_p U/a (${srcI}): ${fmt(ir(1), 3)}. Computed at Re = 100 with a blockage of 17 % on 8 cells per diameter: ${fmt(c2.imp, 3)}; tolerance 0.08. At St = 2: 0.666 against 0.601 on this grid, 0.633 with 12 cells per diameter and 12.5 % blockage`);
+        add('Two-fluid model, cylinder in cross-flow: interception efficiency against the Kuwabara cell model', 1, c3.int / (() => { const c = c3.cs, Ku = -0.5 * Math.log(c) - 0.75 + c - 0.25 * c * c, R = 0.1; return ((1 + R) / (2 * Ku)) * (2 * Math.log(1 + R) - 1 + c + (1 - c / 2) / (1 + R) ** 2 - (c / 2) * (1 + R) ** 2); })(), 0.2, `Particle ÷ cylinder diameter R = 0.1, Re = 0.5, inertia negligible (St = 0.002): η_R = (1 + R)/(2Ku) [2 ln(1 + R) − 1 + c + (1 − c/2)/(1 + R)² − (c/2)(1 + R)²], Ku = −½ ln c − ¾ + c − c²/4, for the solid fraction c = ${fmt(c3.cs, 3)} of the computed cell (Kuwabara flow; Lee & Liu 1982; ${srcI}). Computed ${fmt(c3.int, 3)}; ratio, tolerance 20 %. The same value is obtained with 12 cells per diameter; for R = 0.2 the ratio is 0.80, where the quadratic near-wall law of the sub-grid model is stretched`);
+        add('Two-fluid model, capture by mechanism: dispersed-phase balance closes', 0, Math.max(...[c1, c2, c3].map((q) => Math.abs((q.r.vol0 + q.r.dIn - q.r.dOut - q.r.dep - q.r.vol) / q.r.dIn))), 1e-10, '(initial + inflow − outflow − captured − hold-up) ÷ inflow, largest of the three cylinder runs; the captured volume is the sum of the four mechanisms on walls and solids');
+        add('Two-fluid model, capture by mechanism: the split adds up to the captured volume', 1, [c2, c3].reduce((m2, q) => Math.min(m2, (Object.values(q.r.capture.wall).reduce((a2, b2) => a2 + b2, 0) + Object.values(q.r.capture.solid).reduce((a2, b2) => a2 + b2, 0)) / q.r.dep), 2), 1e-9, 'Σ over settling, impaction, interception and diffusion on walls and solids ÷ total capture (smaller of two runs)');
+        const dS2 = 50e-6, uS2 = terminalSN(dS2, rho, 2500, mu), hz = await twoFluid2D({ nx: 10, ny: 8, L: 0.06, H: 0.01, rhoC: rho, muC: mu, rhoD: 2500, dP: dS2, alpha0: 1e-3, flow: { U: 0.05, alphaIn: 1e-3 }, tEnd: (4 * 0.06) / 0.05, slipC: true, deposit: true, capture: { stick: 1 } }), hq = hz.hist.t.length - 1, hp = Math.floor(0.75 * hq);
+        add('Two-fluid model, capture by mechanism: without obstacles and inertia it reduces to settling (Hazen)', (uS2 * 0.06) / (0.05 * 0.01), (hz.hist.dep[hq] - hz.hist.dep[hp]) / (hz.hist.dIn[hq] - hz.hist.dIn[hp]), 0.03 * ((uS2 * 0.06) / (0.05 * 0.01)), `Plug flow of 50 µm particles through an empty channel with all mechanisms switched on: capture = u_t L/(U H) as with the settling-only model; share of settling in the capture ${fmt((100 * hz.capture.wall.settling) / hz.dep, 5)} %`);
+        const Ud = 0.05, Ld = 4e-3, df2 = await twoFluid2D({ nx: 16, ny: 8, L: Ld, H: Hc, rhoC: rho, muC: mu, rhoD: rho, dP: 0.1e-6, gx: 0, gy: 0, alpha0: 1e-4, flow: { U: Ud, alphaIn: 1e-4 }, tEnd: (3 * Ld) / Ud, deposit: true, capture: { stick: 1 } }), dq = df2.hist.t.length - 1, dm = Math.floor(0.6 * dq);
+        add('Two-fluid model, Brownian deposition on the channel walls against the Lévêque solution', 1, (df2.hist.dep[dq] - df2.hist.dep[dm]) / (df2.hist.t[dq] - df2.hist.t[dm]) / (2 * 0.807 * Math.cbrt((((6 * Ud) / Hc) * df2.diffusivity ** 2) / Ld) * Ld * 1e-4), 0.12, `0.1 µm particles, D = k_B T/(3πμd) = ${fmt(df2.diffusivity, 3)} m²/s (Stokes–Einstein): capture rate on both walls ÷ 2 · 0.807 (γD²/L)^⅓ L α with the developed shear rate γ = 6U/H (mean of the local Lévêque coefficient 0.538 (γD²/x)^⅓; ${srcI}). The inlet is uniform, so the shear near the inlet is higher than 6U/H: +5 % on 16 × 8 cells, +10 % on 32 × 16; tolerance 12 %`);
+      }
+      const nxf = 20, nyf = 15, Lf2 = 0.06, Hf2 = 0.0125, hs2 = 0.0025, solF = new Uint8Array(nxf * nyf); for (let j = 0; j < 3; j++) for (let i = 0; i < nxf; i++) solF[j * nxf + i] = 1;
       const dF2 = 50e-6, uF2 = terminalSN(dF2, rho, 2500, mu), hz = await twoFluid2D({ nx: nxf, ny: nyf, L: Lf2, H: Hf2, rhoC: rho, muC: mu, rhoD: 2500, dP: dF2, alpha0: 1e-3, flow: { U: 0.05, alphaIn: 1e-3 }, tEnd: (4 * Lf2) / 0.05, slipC: false, deposit: true, solid: solF }), hn2 = hz.hist.t.length - 1, hm2 = Math.floor(0.75 * hn2);
       add('Two-fluid model with a solid mask: settling onto a solid surface (Hazen)', (uF2 * Lf2) / (0.05 * (Hf2 - hs2)), (hz.hist.dep[hn2] - hz.hist.dep[hm2]) / (hz.hist.dIn[hn2] - hz.hist.dIn[hm2]), 0.02 * ((uF2 * Lf2) / (0.05 * (Hf2 - hs2))), `Channel whose floor is a slab of blocked cells (no-slip): captured fraction = u_t L/(U h) with h the open height, for any unidirectional velocity profile; all of the capture is on the solid (${fmt((100 * hz.depSolid) / Math.max(hz.dep, 1e-300), 4)} %)`);
     }
