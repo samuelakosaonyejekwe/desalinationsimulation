@@ -20,6 +20,8 @@ import { explainPanel } from './explain.js';
 const lastResult = new Map(); // suite id -> full result of the last run (kept in memory)
 const prevResult = new Map(); // suite id -> the run before it (for “compared with the previous run”)
 const history = new Map(); // suite id -> snapshots of the stored inputs taken before bulk changes (for Undo)
+/** Restore the inputs saved by the last snapshot of a suite; returns the reason text or null. */
+export function undoLast(suite) { const st = history.get(suite.id); if (!st?.length) return null; const s0 = st.pop(); store.setInputs(suite.id, JSON.parse(s0.json)); return s0.reason; }
 /** Remember the inputs before a bulk change (example loaded, reset, run with linked values, fitted parameters applied). */
 export function snapshot(suite, reason) {
   const st = history.get(suite.id) || [], cur = JSON.stringify(store.inputs(suite.id) || {});
@@ -434,8 +436,8 @@ export function renderSuite(suite, root, app) {
   ].filter(Boolean);
 
   const undoBtn = btn('↶ Undo', () => {
-    const st = history.get(suite.id); if (!st?.length) return toast('Nothing to undo.');
-    const s0 = st.pop(); store.setInputs(suite.id, JSON.parse(s0.json)); toast(`Inputs restored to how they were ${s0.reason}.`, 'ok'); tabset.show(tabset.active()); refreshTools();
+    const why = undoLast(suite); if (!why) return toast('Nothing to undo.');
+    toast(`Inputs restored to how they were ${why}.`, 'ok'); tabset.show(tabset.active()); refreshTools();
   }, 'mini ghost', 'Restore the inputs as they were before the last bulk change (example loaded, reset, run with linked values, fitted parameters applied)');
   const resetAll = () => { snapshot(suite, 'before the reset'); store.clearInputs(suite.id); bigValues.forEach((_, k) => k.startsWith(suite.id + '.') && bigValues.delete(k)); toast('Inputs reset to the built-in example — Undo brings yours back.'); tabset.show(tabset.active()); refreshTools(); };
   const refreshTools = () => { const st = history.get(suite.id) || []; undoBtn.disabled = !st.length; undoBtn.title = st.length ? `Restore the inputs as they were ${st[st.length - 1].reason}` : 'Nothing to undo yet'; };

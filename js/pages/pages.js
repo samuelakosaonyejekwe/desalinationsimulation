@@ -2,7 +2,7 @@
 import { h, clear, btn, kpiGrid, dataTable, toast, badge, fieldRow, importBtn, help, fill } from '../core/ui.js';
 import { store } from '../core/store.js';
 import { SUITES, CHAIN, byId, loadSuite, downstream } from '../suites/index.js';
-import { runSuite, applyLinks, linkItems, allFields, setInputValue } from '../core/suiteview.js';
+import { runSuite, applyLinks, linkItems, allFields, setInputValue, snapshot, undoLast } from '../core/suiteview.js';
 import { readFiles, geometryCard, generatorPanel, formatCatalogue, attachGeometry, derive, ACCEPT } from '../core/geomview.js';
 import { geometryLinks } from '../core/geomlinks.js';
 import { SUITE_GEOMETRY, formatOf } from '../core/geom.js';
@@ -258,7 +258,7 @@ export function portalPage(root) {
     const d = derive(g), routes = [];
     for (const m of SUITES) { try { const su = await loadSuite(m.id), items = geometryLinks(su, g, d), accepts = (SUITE_GEOMETRY[m.id]?.accepts || []).includes(g.kind); if (items.length || accepts) routes.push({ su, items }); } catch { /* suite not available */ } }
     routes.sort((a, b) => b.items.length - a.items.length);
-    const send = (su, items) => { attachGeometry(su.id, g); for (const it of items) setInputValue(su, it.key, it.value); store.pref('tab.' + su.id, 'geometry'); toast(`${g.name} sent to ${su.short}${items.length ? ` — ${items.length} input${items.length > 1 ? 's' : ''} set` : ''}.`, 'ok'); location.hash = '#/suite/' + su.id; };
+    const send = (su, items) => { snapshot(su, 'before the portal sent geometry'); attachGeometry(su.id, g); for (const it of items) setInputValue(su, it.key, it.value); store.pref('tab.' + su.id, 'geometry'); toast(`${g.name} sent to ${su.short}${items.length ? ` — ${items.length} input${items.length > 1 ? 's' : ''} set` : ''}.`, 'ok'); location.hash = '#/suite/' + su.id; };
     out.append(card(h('h2', null, `Geometry: ${g.name}`), geometryCard(g),
       h('h3', null, 'Send to a suite'),
       routes.length ? h('div', { class: 'tbl-scroll' }, h('table', { class: 'tbl' }, h('thead', null, h('tr', null, ['Suite', 'What it will take from this geometry', ''].map((x) => h('th', null, x)))),
@@ -289,7 +289,7 @@ export function portalPage(root) {
       dataTable({ title: 'Preview (first 12 rows)', columns: t.headers, rows: t.records.slice(0, 12).map((r) => t.headers.map((hd) => r[hd])) }),
       h('div', { class: 'row-tools' }, btn('This file is geometry (coordinates, soundings, point cloud, network table) — read it as geometry', async () => { try { await showGeometry(await readFiles(files)); } catch (e) { toast(e.message, 'bad', 12000); } })),
       targets.length ? h('div', null, h('h3', null, 'Send to a suite as data'), h('div', { class: 'row-tools' }, sel), mapBox,
-        h('div', { class: 'row-tools' }, btn('Load into suite', () => { const { su, f } = targets[+sel.value]; const m = Object.fromEntries([...mapBox.querySelectorAll('select')].map((s) => [s.dataset.key, s.value])); store.setInput(su.id, f.key, t.records.map((r) => Object.fromEntries(f.columns.map((c) => [c.key, m[c.key] ? r[m[c.key]] : null])))); toast(`${t.records.length} rows loaded into ${su.short}.`, 'ok'); location.hash = '#/suite/' + su.id; }, 'primary'))) : null,
+        h('div', { class: 'row-tools' }, btn('Load into suite', () => { const { su, f } = targets[+sel.value]; snapshot(su, 'before the portal loaded a table'); const m = Object.fromEntries([...mapBox.querySelectorAll('select')].map((s) => [s.dataset.key, s.value])); store.setInput(su.id, f.key, t.records.map((r) => Object.fromEntries(f.columns.map((c) => [c.key, m[c.key] ? r[m[c.key]] : null])))); toast(`${t.records.length} rows loaded into ${su.short} — Undo on that suite restores the previous table.`, 'ok'); location.hash = '#/suite/' + su.id; }, 'primary'))) : null,
       h('p', { class: 'note' }, 'Water analyses (ion names with mg/L) can be imported directly inside any feed-analysis editor with its “Import analysis” button.')));
   };
   const input = h('input', { type: 'file', hidden: true, multiple: true, accept: ACCEPT + ',.xlsx,.xlsm,.tsv' });
@@ -324,12 +324,12 @@ export function chainPage(root) {
   function kpText(o) { return o?._kpis?.length ? o._kpis.slice(0, 4).map((k) => `${k.label} ${typeof k.value === 'number' ? fmt(k.value, 3) : k.value} ${k.unit}`).join(' · ') : '—'; }
   const go = btn('▶  Run the selected suites in sequence', async () => {
     go.disabled = true; bar.hidden = false; clear(summary);
-    const list = CHAIN.filter((id) => sel[id].checked); let okN = 0, viol = 0;
+    const list = CHAIN.filter((id) => sel[id].checked), touched = []; let okN = 0, viol = 0;
     for (let i = 0; i < list.length; i++) {
       const id = list[i]; bar.firstChild.style.width = Math.round((100 * i) / list.length) + '%';
       clear(cell[id].st).append(badge('running…', 'warn'));
       try {
-        const su = await loadSuite(id), items = linkItems(su), n = applyLinks(su, items);
+        const su = await loadSuite(id), items = linkItems(su); snapshot(su, 'before the integrated run'); touched.push(su); const n = applyLinks(su, items);
         cell[id].ln.textContent = n ? `${n} linked` : '–'; cell[id].ln.title = items.map((x) => `${x.key} ← ${x.from}`).join('\n');
         await new Promise((r) => setTimeout(r, 15));
         const res = await runSuite(su), bad = res.warnings.filter((w) => w.level === 'bad').length;
@@ -348,7 +348,9 @@ export function chainPage(root) {
       o.zld?.solids != null && { label: 'ZLD solids', value: o.zld.solids, unit: 't/d' }, o.econ?.lcow && { label: 'Levelised cost of water', value: o.econ.lcow, unit: '$/m³' }, o.econ?.capex && { label: 'CAPEX', value: o.econ.capex / 1e6, unit: 'M$' },
     ].filter(Boolean)), h('p', { class: 'summary' }, `${okN} of ${list.length} suites solved` + (viol ? `, with ${viol} design-limit issue${viol > 1 ? 's' : ''} to review (open the flagged suites).` : ' with no design-limit violations.')),
     h('div', { class: 'row-tools' }, btn('Export all results (JSON)', () => download(JSON.stringify({ case: store.case.name, site: { name: store.case.site.name, lat: store.case.site.lat, lon: store.case.site.lon }, outputs: store.case.outputs }, null, 1), `${store.case.name}_all_results.json`, 'application/json'))));
-    summary.append(h('div', { class: 'linkbar' }, 'Next: ', h('a', { class: 'btn mini primary', href: '#/advisor' }, 'See ranked recommendations and the sustainability scorecard →')));
+    summary.append(h('div', { class: 'linkbar' }, 'Next: ', h('a', { class: 'btn mini primary', href: '#/advisor' }, 'See ranked recommendations and the sustainability scorecard →'),
+      btn('Undo the linked inputs this run applied', () => { let n = 0; for (const su of touched) if (undoLast(su)) n++; toast(n ? `Inputs of ${n} suite${n > 1 ? 's' : ''} restored to how they were before this run. Results stay until you run again.` : 'Nothing to undo.', 'ok'); }, 'mini ghost', 'Each suite received values from the suites before it; this puts every suite’s inputs back as they were'),
+      btn('Clear this summary', () => clear(summary), 'mini ghost')));
     toast('Integrated run finished.', 'ok');
   }, 'primary');
   fill(root, 
