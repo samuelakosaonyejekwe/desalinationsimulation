@@ -14,6 +14,7 @@ export function h(tag, attrs, ...kids) {
     else if (k === 'text') el.textContent = v;
     else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
     else if (k === 'dataset') Object.assign(el.dataset, v);
+    else if (k === 'style') { if (typeof v === 'string') el.style.cssText = v; else Object.assign(el.style, v); } // through the style object: an inline style attribute would be refused by the security policy
     else if (k === 'value') el.value = v;
     else if (k === 'checked' || k === 'disabled' || k === 'hidden' || k === 'selected' || k === 'open') el[k] = !!v;
     else el.setAttribute(k, v === true ? '' : String(v));
