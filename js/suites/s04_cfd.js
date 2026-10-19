@@ -938,6 +938,7 @@ export async function solveChannel(o, ctx) {
   const hist = { it: [], mass: [], dU: [], scal: [] }, tick = async (f, msg) => { if (ctx?.progress) ctx.progress(f, msg); if (ctx?.tick) await ctx.tick(); };
   const tol = o.tol ?? 1e-5, maxIter = o.maxIter ?? 600;
   let iters = 0, converged = false, probe = null, time = 0;
+  const frames = []; // snapshots of a transient run (o.frames > 1)
   const rescale = (f) => { // pressure inlet: the flow rate is adjusted until the inlet gauge pressure matches the target
     for (let k = 0; k < u.length; k++) u[k] *= f;
     for (let k = 0; k < v.length; k++) v[k] *= f;
@@ -1030,6 +1031,7 @@ export async function solveChannel(o, ctx) {
     // small antisymmetric disturbance so that wake instabilities can develop from a symmetric start
     for (let jf = 1; jf < ny; jf++) for (let i = 0; i < nx; i++) if (!vblk[jf * nx + i]) v[jf * nx + i] += 0.03 * Uref * Math.sin((6 * Math.PI * (i + 0.5)) / nx) * Math.sin((Math.PI * yf[jf]) / H);
     let step = 0, hold = 0;
+    const nFr = Math.max(0, Math.round(o.frames || 0)), frT = nFr > 1 ? Array.from({ length: nFr }, (_, k) => tEnd * (0.5 + (0.5 * k) / (nFr - 1))) : []; // snapshot instants for the animated views (second half: developed flow)
     while (time < tEnd && step < maxIter) {
       let um = 1e-12;
       for (let k = 0; k < u.length; k++) um = Math.max(um, Math.abs(u[k]));
@@ -1057,6 +1059,7 @@ export async function solveChannel(o, ctx) {
       let po = 0, mo = 0;
       for (let j = 0; j < ny; j++) if (!solid[j * nx + nx - 1]) { po += p[j * nx + nx - 1] * dy[j]; mo += dy[j]; }
       probe.t.push(time); probe.v.push(v[probe.j * nx + probe.i]); probe.dp.push(pIn() - (mo ? po / mo : 0));
+      while (frames.length < frT.length && time >= frT[frames.length] * (1 - 1e-9)) frames.push({ t: time, u: Float32Array.from(u), v: Float32Array.from(v), c: spc ? Float32Array.from(spc.phi) : null }); // copies only: the solution is not touched
       if (time > 0.5 * tEnd) { // time-averaged wall quantities over the second half
         wallShear(); stat.n++; stat.dp += probe.dp[probe.dp.length - 1];
         for (let i = 0; i < nx; i++) { stat.tauB[i] += tauB[i]; stat.tauT[i] += tauT[i]; stat.JB[i] += Jb[i]; stat.JT[i] += Jt[i]; if (spc) { stat.cB[i] += spc.wB[i]; stat.cT[i] += spc.wT[i]; } }
@@ -1131,7 +1134,7 @@ export async function solveChannel(o, ctx) {
   }
   if (o.turb) updateTurb(); else wallShear();
   if (permCap) throw permErr();
-  return { scal, mom, usr, foul, afB, afT, pFac, nx, ny, dx, L, H, yf, yc, dy, dyc, solid, u, v, p, mue, Jb, Jt, tauB, tauT, Qin, Uref, uin, hist, iters, converged, scalRes, spc, eng, probe, time, utau: utauG, nu1, tm, tk, te, rs: twoEq ? reynolds() : null, wallB, wallT, slipLen: bSlip };
+  return { scal, mom, usr, foul, afB, afT, pFac, nx, ny, dx, L, H, yf, yc, dy, dyc, solid, u, v, p, mue, Jb, Jt, tauB, tauT, Qin, Uref, uin, hist, iters, converged, scalRes, spc, eng, probe, time, frames, utau: utauG, nu1, tm, tk, te, rs: twoEq ? reynolds() : null, wallB, wallT, slipLen: bSlip };
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -2076,6 +2079,9 @@ export async function twoPhase2D(o, ctx) {
   let t = 0, steps = 0, um = diag(0), amin = 0, amax = 1;
   const maxSteps = o.maxSteps ?? 20000, tEnd = o.tEnd, snapT = (o.snaps || []).filter((x) => x > 0 && x < tEnd).sort((x, y) => x - y), snaps = [];
   let snapK = 0;
+  // frames for the animated views: α and the cell-centred velocity at the requested instants (copies only)
+  const frT = (o.frames || []).filter((x) => x >= 0 && x <= tEnd).sort((x, y) => x - y), frames = [], cen = () => { const U = new Float32Array(n), V = new Float32Array(n); for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { U[P] = 0.5 * (u[j * nu1 + i] + u[j * nu1 + i + 1]); V[P] = 0.5 * (v[P] + v[P + nx]); } return { U, V }; };
+  if (frT.length && frT[0] <= 0) frames.push({ t: 0, a: Float32Array.from(a), ...cen() });
   // Step cap: maxSteps always; beyond it the run continues while the projected wall-clock time of the whole run stays within o.timeBudget seconds.
   const clock = () => (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000, wall0 = clock(), budget = o.timeBudget > 0 ? o.timeBudget : 0;
   let more = budget > 0;
@@ -2093,6 +2099,7 @@ export async function twoPhase2D(o, ctx) {
     if (!Number.isFinite(um)) throw new Error('The two-phase solution diverged. Refine the grid, lower the CFL number or reduce the density and viscosity ratio.');
     if (!ls) for (let P = 0; P < n; P++) { if (a[P] < amin) amin = a[P]; if (a[P] > amax) amax = a[P]; }
     while (snapK < snapT.length && t >= snapT[snapK] * (1 - 1e-12)) { snaps.push({ t, a: Float64Array.from(a) }); snapK++; }
+    while (frames.length < frT.length && t >= frT[frames.length] * (1 - 1e-9)) frames.push({ t, a: Float32Array.from(a), ...cen() });
     if (steps % 20 === 0) { ctx?.progress?.(Math.min(0.98, t / tEnd), `Two-phase flow: t = ${t.toExponential(2)} s of ${tEnd.toExponential(2)} s (step ${steps})`); if (ctx?.tick) await ctx.tick(); }
   }
   })();
@@ -2102,7 +2109,7 @@ export async function twoPhase2D(o, ctx) {
   for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { if (solid !== null && solid[P]) continue; const q = p[P] - rB * (gx * (i + 0.5) * dx + gy * (j + 0.5) * dy); if (a[P] > 0.999) { pa += q; na++; } else if (a[P] < 0.001) { pb += q; nb++; } }
   let div = 0;
   for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { if (solid !== null && solid[P]) continue; div = Math.max(div, Math.abs((u[j * nu1 + i + 1] - u[j * nu1 + i]) / dx + (v[P + nx] - v[P]) / dy)); }
-  return { nx, ny, dx, dy, W, Hh, a, phi, u, v, p, rho, kap, hist, snaps, t, steps, vol0, vol: hist.vol[hist.vol.length - 1], dpJump: na && nb ? pa / na - pb / nb : 0, umax: um, div, pIters, pFactors: Bs ? Bs.factors : 0, lsShift, done: t >= tEnd * (1 - 1e-9), method: ls ? 'ls' : 'vof', dtFix, solid, volIn, volOut, through: !!flow, dtLimit, dtCap, semi, stIters, wall: clock() - wall0, stepsNeeded: t > 0 ? Math.ceil((steps * tEnd) / t) : Infinity };
+  return { nx, ny, dx, dy, W, Hh, a, phi, u, v, p, rho, kap, hist, snaps, frames, t, steps, vol0, vol: hist.vol[hist.vol.length - 1], dpJump: na && nb ? pa / na - pb / nb : 0, umax: um, div, pIters, pFactors: Bs ? Bs.factors : 0, lsShift, done: t >= tEnd * (1 - 1e-9), method: ls ? 'ls' : 'vof', dtFix, solid, volIn, volOut, through: !!flow, dtLimit, dtCap, semi, stIters, wall: clock() - wall0, stepsNeeded: t > 0 ? Math.ceil((steps * tEnd) / t) : Infinity };
 }
 
 /** Schiller–Naumann drag coefficient times the particle Reynolds number, C_D·Re = 24 (1 + 0.15 Re^0.687) (0.44 Re above Re = 1000). */
@@ -2400,12 +2407,16 @@ export async function twoFluid2D(o, ctx) {
   const ut = terminalSN(dP, rc, rd, muc, Math.hypot(gx, gy)), cfl = o.cfl ?? 0.3, dtV = Math.min((0.2 * h * h) / nuc, Dtd > 0 ? (0.2 * h * h) / Dtd : Infinity, o.dtMax ?? Infinity);
   let t = 0, steps = 0, um = diag(0);
   const tEnd = o.tEnd, maxSteps = o.maxSteps ?? 20000, every = Math.max(1, o.sample ?? 1);
+  // frames for the animated views: dispersed fraction and cell-centred dispersed-phase velocity at the requested instants (copies only)
+  const frT = (o.frames || []).filter((x) => x >= 0 && x <= tEnd).sort((x, y) => x - y), frames = [], cen = () => { const U = new Float32Array(n), V = new Float32Array(n); for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { U[P] = 0.5 * (ud[j * nu1 + i] + ud[j * nu1 + i + 1]); V[P] = 0.5 * (vd[P] + vd[P + nx]); } return { U, V }; };
+  if (frT.length && frT[0] <= 0) frames.push({ t: 0, a: Float32Array.from(al), ...cen() });
   await (async () => { // the time loop as a function of its own, so that a long run compiles this loop and not the whole solver around it
   while (t < tEnd * (1 - 1e-12) && steps < maxSteps) {
     const dt = Math.min(dtV, (cfl * h) / Math.max(um, ut, Math.abs(Uin), 1e-12), tEnd - t);
     const r = step(dt);
     dIn += r.qIn; dOut += r.qOut; cInT += r.cIn; cOutT += r.cOut; clipT += r.clip; depT += r.dep; depST += r.depS;
     t += dt; steps++;
+    while (frames.length < frT.length && t >= frT[frames.length] * (1 - 1e-9)) frames.push({ t, a: Float32Array.from(al), ...cen() });
     if (steps % every === 0 || t >= tEnd * (1 - 1e-12)) um = diag(t);
     else { um = 0; for (let k = 0; k < uc.length; k++) um = Math.max(um, Math.abs(uc[k]), Math.abs(ud[k])); for (let k = 0; k < vc.length; k++) um = Math.max(um, Math.abs(vc[k]), Math.abs(vd[k])); }
     if (!Number.isFinite(um)) throw new Error('The two-fluid solution diverged. Refine the grid or lower the CFL number.');
@@ -2418,7 +2429,7 @@ export async function twoFluid2D(o, ctx) {
     div = Math.max(div, Math.abs((q(ke, uc, ud) - q(ke - 1, uc, ud)) / dx + (r(kn, vc, vd) - r(P, vc, vd)) / dy));
   }
   const pT = Float64Array.from(p, (q, P) => q + rc * (gx * ((P % nx) + 0.5) * dx + gy * (((P - (P % nx)) / nx + 0.5) * dy - H))); // total pressure, zero reference at the top
-  return { nx, ny, dx, dy, L, H, al, p: pT, pExcess: p, uc, vc, ud, vd, hist, t, steps, vol0, vol: hist.vol[hist.vol.length - 1], dIn, dOut, cIn: cInT, cOut: cOutT, clip: clipT, dep: depT, depSolid: depST, solid, div, ut, done: t >= tEnd * (1 - 1e-9), capture: cap ? Object.fromEntries(['wall', 'solid'].map((w, q) => [w, Object.fromEntries(['settling', 'impaction', 'interception', 'diffusion'].map((m, r) => [m, depM[4 * q + r] * dx * dy]))])) : null, diffusivity: cD };
+  return { nx, ny, dx, dy, L, H, al, p: pT, pExcess: p, uc, vc, ud, vd, hist, frames, t, steps, vol0, vol: hist.vol[hist.vol.length - 1], dIn, dOut, cIn: cInT, cOut: cOutT, clip: clipT, dep: depT, depSolid: depST, solid, div, ut, done: t >= tEnd * (1 - 1e-9), capture: cap ? Object.fromEntries(['wall', 'solid'].map((w, q) => [w, Object.fromEntries(['settling', 'impaction', 'interception', 'diffusion'].map((m, r) => [m, depM[4 * q + r] * dx * dy]))])) : null, diffusivity: cD };
 }
 
 /** Exact Riemann solution of the 1-D Euler equations for an ideal gas (Toro): state [ρ, u, p] at ξ = x/t. */
@@ -2658,6 +2669,61 @@ const tpStopMsg = (r, where, dtTxt, other) => {
   return `The run stopped after ${r.steps} steps at t = ${where}: the end time needs about ${fmt(need, 3)} steps, ${dur} at the ${fmt(ms, 2)} ms per step measured here, more than a run is allowed to take. The time step is limited to ${dtTxt} by ${r.dtLimit} on this grid${st && !r.semi ? ' (it falls as cell size^1.5). Switch the surface-tension time integration to semi-implicit, which lifts this limit, or ' : st ? ' (already semi-implicit: raise the time step ÷ capillary limit, at the price of more damping of capillary waves), or ' : r.dtLimit === 'viscosity' ? ' (it falls as cell size²): ' : ': '}${other}.`;
 };
 const TP_CASES = { dam: 'collapse of a liquid column (dam break)', bubble: 'rising bubble or drop', slosh: 'sloshing of a free surface', rt: 'Rayleigh–Taylor overturning (heavy over light)' };
+// ---- animated and 3-D views built from the solver's own snapshots ----------------------------------------------------
+/** Indices 0, s, 2s … so that at most `max` nodes are kept along one direction (fields stay ≤ about 120 × 120 nodes). */
+const thinIdx = (N, max = 120) => { const s = Math.max(1, Math.ceil(N / max)), o = []; for (let k = 0; k < N; k += s) o.push(k); return o; };
+const quant = (vals, q) => { const a = vals.filter(Number.isFinite).sort((x, y) => x - y); return a.length ? a[Math.min(a.length - 1, Math.floor(q * (a.length - 1)))] : 0; };
+/**
+ * Animated field from snapshots on a uniform nx × ny cell grid (row-major, j from the bottom): colour z(f, P), arrows [u, v](f, P).
+ * g = { nx, ny, xs, ys, solid }; o = { label(t), zmin, zmax, sym } — a common colour scale is used for all frames.
+ */
+function animatedField(spec, g, frames, z, uv, o) {
+  const { nx, ny, xs, ys, solid } = g, I = thinIdx(nx), J = thinIdx(ny), sol = (P) => !!(solid && solid[P]);
+  const grid = (f, hole) => J.map((j) => I.map((i) => (sol(j * nx + i) ? hole : f(j * nx + i))));
+  const fr = frames.map((f) => ({ label: o.label(f.t), z: grid((P) => z(f, P), NaN), ...(uv ? { u: grid((P) => uv(f, P)[0], 0), v: grid((P) => uv(f, P)[1], 0) } : {}) }));
+  const all = fr.flatMap((q) => q.z.flat());
+  let lo = o.zmin ?? quant(all, 0), hi = o.zmax ?? quant(all, 1);
+  if (o.sym) { const m = Math.max(quant(all.map(Math.abs), 0.99), 1e-30); lo = -m; hi = m; }
+  if (!(hi > lo)) hi = lo + 1;
+  return { ...spec, _own: true, x: I.map((i) => xs[i]), y: J.map((j) => ys[j]), ...(solid ? { mask: J.map((j) => I.map((i) => sol(j * nx + i))) } : {}), z: fr[0].z, ...(uv ? { u: fr[0].u, v: fr[0].v, vectors: true } : {}), zmin: lo, zmax: hi, frames: fr, frame: 0, frameLabel: 'Time', fps: 8 };
+}
+/** Transient channel run: vorticity (and the salt field when it is solved) with velocity arrows at the stored instants of the second half of the run. */
+function channelAnimation(q, r, base, tFT) {
+  const fr = r.frames || [], { nx, ny, nu1, solid, dx, yc } = r, n = nx * ny;
+  if (fr.length < 4) return [];
+  const I = thinIdx(nx), J = thinIdx(ny), cut = (rows) => J.map((j) => I.map((i) => rows[j][i])), views = [];
+  const cen = (f) => { const uc = new Float64Array(n), vc = new Float64Array(n); for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) if (!solid[P]) { uc[P] = 0.5 * (f.u[j * nu1 + i] + f.u[j * nu1 + i + 1]); vc[P] = 0.5 * (f.v[P] + f.v[P + nx]); } return { uc, vc }; };
+  // ω = ∂v/∂x − ∂u/∂y at the cell centres: central differences between fluid neighbours, one-sided next to walls and solids (u = v = 0 on the wall itself)
+  const vort = ({ uc, vc }) => { const w = new Float64Array(n); for (let j = 0, P = 0; j < ny; j++) for (let i = 0; i < nx; i++, P++) { if (solid[P]) continue;
+    const fE = i < nx - 1 && !solid[P + 1], fW = i > 0 && !solid[P - 1], fN = j < ny - 1 && !solid[P + nx], fS = j > 0 && !solid[P - nx];
+    const dvdx = fE && fW ? (vc[P + 1] - vc[P - 1]) / (2 * dx) : fE ? (vc[P + 1] - vc[P]) / dx : fW ? (vc[P] - vc[P - 1]) / dx : 0;
+    const yN = fN ? yc[j + 1] : j < ny - 1 ? 0.5 * (yc[j] + yc[j + 1]) : r.H, yS = fS ? yc[j - 1] : j > 0 ? 0.5 * (yc[j] + yc[j - 1]) : 0, uN = fN ? uc[P + nx] : 0, uS = fS ? uc[P - nx] : 0;
+    w[P] = dvdx - (uN - uS) / Math.max(yN - yS, 1e-30); } return w; };
+  const label = (t) => `t = ${fmt(t * 1e3, 3)} ms (${fmt(t / tFT, 3)} flow-through times)`, X = I.map((i) => base.x[i]), Y = J.map((j) => base.y[j]), mask = base.mask ? cut(base.mask) : undefined;
+  const fv = fr.map((f) => { const c = cen(f); return { t: f.t, w: q.field(vort(c)), u: q.field(c.uc, 1, 0), v: q.field(c.vc, 1, 0), c: f.c ? q.field(f.c) : null }; });
+  const wm = Math.max(quant(fv.flatMap((f) => f.w.flat().map(Math.abs)), 0.99), 1e-30);
+  views.push({ ...base, _own: true, x: X, y: Y, mask, title: 'Vorticity and velocity during the transient run (animated)', zlabel: 'Vorticity ω = ∂v/∂x − ∂u/∂y', zunit: '1/s', cmap: 'coolwarm', zmin: -wm, zmax: wm, z: cut(fv[0].w), u: cut(fv[0].u), v: cut(fv[0].v), vectors: true,
+    frames: fv.map((f) => ({ label: label(f.t), z: cut(f.w), u: cut(f.u), v: cut(f.v) })), frame: 0, frameLabel: 'Time', fps: 8,
+    note: `Press ▶ to play ${fv.length} snapshots stored during the second half of the run (developed flow). Red: anticlockwise rotation, blue: clockwise; arrows: velocity. Vortices shed alternately from the two sides of a filament travel downstream as a von Kármán street; they sweep the membrane walls and renew the boundary layer, which is what raises mass transfer in a spacer channel. The colour scale is shared by all frames (99th percentile of |ω|).` });
+  if (fv[0].c) {
+    const cs = fv.flatMap((f) => f.c.flat()), lo = quant(cs, 0), hi = quant(cs, 1);
+    views.push({ ...base, _own: true, x: X, y: Y, mask, title: 'Salt concentration during the transient run (animated)', zlabel: 'Concentration', zunit: 'g/L', cmap: 'salinity', zmin: lo, zmax: hi > lo ? hi : lo + 1e-9, z: cut(fv[0].c), frames: fv.map((f) => ({ label: label(f.t), z: cut(f.c) })), frame: 0, frameLabel: 'Time', fps: 8,
+      note: 'Salt concentration at the same instants: the polarisation layers on the membranes are torn up and renewed as the vortices pass. Shared colour scale.' });
+  }
+  return views;
+}
+/** Steady channel: velocity magnitude as a surface over the channel plane (height and colour = speed; solids are holes). */
+function channelSurface(speed, xm, ym, title) {
+  const I = thinIdx(xm.length, 120), J = thinIdx(ym.length, 60), xs = I.map((i) => xm[i]), ys0 = J.map((j) => ym[j]), z = J.map((j) => I.map((i) => speed[j][i]));
+  const Lx = xs[xs.length - 1] - xs[0] || 1, Ly = ys0[ys0.length - 1] - ys0[0] || 1, f = Math.max(1, (0.35 * Lx) / Ly), ys = ys0.map((y) => ys0[0] + (y - ys0[0]) * f); // the gap is stretched so that the flow pattern stays readable
+  let hi = 0; for (const row of z) for (const q of row) if (Number.isFinite(q) && q > hi) hi = q;
+  const floor = -0.04 * (hi || 1), corner = (i, j, label) => ({ x: xs[i], y: ys[j], z0: floor, z1: Number.isFinite(z[j][i]) ? z[j][i] : floor, label, color: '#64748b' });
+  return { type: 'surface3d', _own: true, axes: false, title, x: xs, y: ys, z: ys.map(() => xs.map(() => NaN)), cmap: 'viridis', azimuth: 200, elevation: 38, zscale: (0.3 * Lx) / ((hi || 1) - floor),
+    layers: [{ name: 'Speed', z, base: ys.map(() => xs.map(() => floor)), c: z, cmap: 'viridis', clabel: 'Speed', cunit: 'm/s', opacity: 1 }],
+    markers: [corner(0, 0, `x = ${fmt(xs[0], 3)} mm · bottom wall`), corner(0, ys.length - 1, 'top wall'), corner(xs.length - 1, ys.length - 1, `x = ${fmt(xs[xs.length - 1], 3)} mm`)],
+    note: `Height and colour: local speed over the channel plane (flow along x from the corner marked with the inlet position${f > 1 ? `; the gap height is stretched × ${fmt(f, 3)} for readability` : ''}). Ridges are the jets squeezed between filaments and walls, valleys the wakes and recirculation zones where foulants settle; holes are the solid filaments. Drag or use ◀ ▶ to turn the view.` };
+}
+
 /** Set-up of the coupled two-phase study from the inputs: geometry, fluids, the signed distance of the initial interface and the reference scales. */
 function twoPhaseCase(v) {
   const Wt = clamp(v.tpW, 1, 1e5) * 1e-3, Ht = clamp(v.tpH, 1, 1e5) * 1e-3, nx = clamp(Math.round(v.tpNx), 16, 200), ny = clamp(Math.round(v.tpNy), 16, 200), g = clamp(v.tpG, 0.01, 100), kind = TP_CASES[v.tpCase] ? v.tpCase : 'dam';
@@ -2709,7 +2775,7 @@ async function runTwoPhaseChannel(v, ctx) {
     Object.assign(ij, { fr, hb: method === 'ls' ? hbL : hb, ycn, per, duty, qg, tOn, vExp: qg * tOn });
   }
   ctx?.progress?.(0.02, 'Two-phase channel flow: start');
-  const r = await twoPhase2D({ method, nx, ny, W: L, Hh: H, rhoA: r2, rhoB: r1, muA: m2, muB: m1, sigma, gy: -g, sd, tEnd, slipSide: true, slipTB: false, solid: mk.solid, flow, probeI: Math.round(0.15 * nx), rhoRef: r1, snaps: [tEnd / 3, (2 * tEnd) / 3], maxSteps: 20000, timeBudget: 150, surfaceTension: v.tpST === 'semi' ? 'semi' : 'explicit', stFactor: v.tpSTm ?? 5, cfl: clamp(v.tpCfl ?? 0.25, 0.05, 0.5) }, ctx);
+  const r = await twoPhase2D({ method, nx, ny, W: L, Hh: H, rhoA: r2, rhoB: r1, muA: m2, muB: m1, sigma, gy: -g, sd, tEnd, slipSide: true, slipTB: false, solid: mk.solid, flow, probeI: Math.round(0.15 * nx), rhoRef: r1, snaps: [tEnd / 3, (2 * tEnd) / 3], frames: Array.from({ length: 36 }, (_, k) => (k * tEnd) / 35), maxSteps: 20000, timeBudget: 150, surfaceTension: v.tpST === 'semi' ? 'semi' : 'explicit', stFactor: v.tpSTm ?? 5, cfl: clamp(v.tpCfl ?? 0.25, 0.05, 0.5) }, ctx);
   ctx?.progress?.(0.985, 'Post-processing');
   const h = r.hist, last = h.t.length - 1, mm = (a) => Array.from(a, (x) => x * 1e3), xs = Array.from({ length: nx }, (_, i) => (i + 0.5) * dx * 1e3), ys = Array.from({ length: ny }, (_, j) => (j + 0.5) * dy * 1e3);
   const rows = (f, hole = NaN) => Array.from({ length: ny }, (_, j) => Array.from({ length: nx }, (_, i) => (mk.solid[j * nx + i] ? hole : f(j * nx + i, i, j)))), mask = Array.from({ length: ny }, (_, j) => Array.from({ length: nx }, (_, i) => !!mk.solid[j * nx + i]));
@@ -2729,6 +2795,9 @@ async function runTwoPhaseChannel(v, ctx) {
     { type: 'line', title: 'Position of the gas along the channel', xlabel: 'Time (ms)', ylabel: 'x (mm)', series: [{ name: 'Leading edge', x: mm(h.t), y: mm(h.xLead) }, { name: 'Centroid', x: mm(h.t), y: mm(h.xc) }, { name: 'Trailing edge', x: mm(h.t), y: mm(h.xTrail) }, { name: 'Mean liquid velocity × time (from the initial centroid)', x: mm(h.t), y: h.t.map((t) => Math.min(L, h.xc[0] + U * t) * 1e3), dash: true, color: '#94a3b8' }] }];
   const pMid = inj ? 0.5 * Math.max(...h.probe) : 0, perNum = kind === 'sparge' && pMid > 0 ? pulsePeriod(h.t, h.probe, pMid, 0.3 * pMid) : 0, xPr = (Math.round(0.15 * nx) + 0.5) * dx, qTot = U * c.open * dy;
   if (inj) plots.push({ type: 'line', title: `Gas fraction of the cross-section at x = ${fmt(xPr * 1e3, 3)} mm`, xlabel: 'Time (ms)', ylabel: 'Gas fraction of the open height (–)', series: [{ name: 'Computed', x: mm(h.t), y: Array.from(h.probe) }], ...(kind === 'sparge' ? { note: `Prescribed injection period ${fmt(ij.per * 1e3, 4)} ms with the gas on for ${fmt(100 * ij.duty, 3)} % of it; period of the passing slugs from the upward crossings of half the peak value: ${perNum > 0 ? fmt(perNum * 1e3, 4) + ' ms' : 'fewer than two slugs have passed'}.` } : {}) });
+  if (r.frames?.length > 3) plots.push(animatedField({ type: 'field', title: 'Gas carried through the channel (animated)', xlabel: 'x (mm)', ylabel: 'y (mm)', equal: L / H <= 8, shapes, zlabel: 'Gas (second-phase) volume fraction', zunit: '–', cmap: 'viridis',
+    note: `Press ▶ to play ${r.frames.length} snapshots from the start to ${fmt(r.t * 1e3, 3)} ms. Colour: gas fraction (yellow = gas, dark = liquid); arrows: velocity of the one-fluid flow. Watch the gas squeeze through the gaps between the ${c.name === 'imported section' ? 'solids' : 'filaments'}, break up or get held in their wakes — the passing interface is what scours the membrane walls in air sparging.` },
+    { nx, ny, xs, ys, solid: mk.solid }, r.frames, (f, P) => clamp(f.a[P], 0, 1), (f, P) => [f.U[P], f.V[P]], { label: (t) => `t = ${fmt(t * 1e3, 3)} ms`, zmin: 0, zmax: 1 }));
   const kpis = [{ label: inj ? 'Gas front velocity ÷ mean liquid velocity' : 'Gas velocity (centroid) ÷ mean liquid velocity', value: uC / U, unit: '', help: inj ? 'Leading edge of the injected gas until it reaches the outlet' : 'While all the gas is inside the channel; a slug moves faster than the mean flow when it rides the fast core, slower when it is held at the filaments' }, { label: inj ? 'Gas front velocity' : 'Gas velocity (centroid)', value: uC, unit: 'm/s' },
     ...(inj ? [{ label: 'Gas injected through the inlet', value: r.volIn * 1e6, unit: 'mm³ per mm depth', help: 'Time integral of the gas flux through the inlet faces as transported by the solver' }, { label: 'Gas injected ÷ integral of the prescribed inlet flux', value: ij.vExp > 0 ? r.volIn / ij.vExp : 0, unit: '', status: Math.abs(r.volIn / Math.max(ij.vExp, 1e-300) - 1) > 0.03 ? 'warn' : 'ok', help: 'Prescribed: Σ inlet velocity × cell height × gas fraction of the cell × time the injection is on' }, { label: 'Gas share of the inflow (time mean)', value: (100 * r.volIn) / (qTot * r.t), unit: '% by volume' },
       ...(kind === 'sparge' ? [{ label: 'Slug period: computed', value: perNum > 0 ? perNum * 1e3 : '–', unit: perNum > 0 ? 'ms' : '', status: perNum > 0 ? 'ok' : 'warn', help: `At x = ${fmt(xPr * 1e3, 3)} mm; needs at least two slugs in the simulated time` }, { label: 'Slug period: prescribed', value: ij.per * 1e3, unit: 'ms' }] : []), { label: 'Gas hold-up at the end', value: (100 * r.vol) / Aflu, unit: '% of the fluid area' }] : []),
@@ -2762,7 +2831,7 @@ async function runTwoPhase(v, ctx) {
   if (v.tpDomain === 'spacer' || v.tpDomain === 'import') return runTwoPhaseChannel(v, ctx);
   const c = twoPhaseCase(v), { Wt, Ht, nx, ny, g, kind, sigma, len, tc, tEnd } = c, W = [], warn = (msg) => W.push({ level: 'warn', msg }), n = nx * ny, nu1 = nx + 1, dx = Wt / nx, dy = Ht / ny;
   ctx?.progress?.(0.02, 'Two-phase flow: start');
-  const r = await twoPhase2D({ method: c.method, nx, ny, W: Wt, Hh: Ht, rhoA: c.rhoA, rhoB: c.rhoB, muA: c.muA, muB: c.muB, sigma, gy: -g, sd: c.sd, tEnd, slipSide: c.slip, slipTB: c.slip, snaps: [tEnd / 3, (2 * tEnd) / 3], maxSteps: 8000, timeBudget: 150, surfaceTension: v.tpST === 'semi' ? 'semi' : 'explicit', stFactor: v.tpSTm ?? 5, cfl: clamp(v.tpCfl ?? 0.25, 0.05, 0.5) }, ctx);
+  const r = await twoPhase2D({ method: c.method, nx, ny, W: Wt, Hh: Ht, rhoA: c.rhoA, rhoB: c.rhoB, muA: c.muA, muB: c.muB, sigma, gy: -g, sd: c.sd, tEnd, slipSide: c.slip, slipTB: c.slip, snaps: [tEnd / 3, (2 * tEnd) / 3], frames: Array.from({ length: 36 }, (_, k) => (k * tEnd) / 35), maxSteps: 8000, timeBudget: 150, surfaceTension: v.tpST === 'semi' ? 'semi' : 'explicit', stFactor: v.tpSTm ?? 5, cfl: clamp(v.tpCfl ?? 0.25, 0.05, 0.5) }, ctx);
   ctx?.progress?.(0.985, 'Post-processing');
   const h = r.hist, last = h.t.length - 1, liq = (a) => (c.light ? 1 - a : a), mm = (a) => Array.from(a, (x) => x * 1e3);
   const xs = Array.from({ length: nx }, (_, i) => (i + 0.5) * dx * 1e3), ys = Array.from({ length: ny }, (_, j) => (j + 0.5) * dy * 1e3);
@@ -2819,6 +2888,9 @@ async function runTwoPhase(v, ctx) {
     }
     recs.push('For the comparison with linear wave theory keep the amplitude below a few per cent of the depth and the viscosity low.');
   }
+  if (r.frames?.length > 3) plots.push(animatedField({ type: 'field', title: `${{ dam: 'Collapse of the liquid column', bubble: 'Rise of the bubble', slosh: 'Sloshing of the free surface', rt: 'Rayleigh–Taylor overturning' }[kind] || 'Interface motion'} (animated)`, xlabel: 'x (mm)', ylabel: 'y (mm)', equal: true, shapes: shp, zlabel: 'Liquid volume fraction', zunit: '–', cmap: 'viridis',
+    note: `Press ▶ to play ${r.frames.length} snapshots from the release to ${fmt(r.t, 3)} s. Colour: liquid fraction (yellow = liquid); arrows: velocity of the shared momentum equations; dashed white line: the initial interface. ${{ dam: 'The column collapses under gravity and the surge runs along the floor to the far wall.', bubble: 'Buoyancy lifts the bubble while surface tension and viscosity resist its deformation.', slosh: 'The tilted surface swings back and forth at the first sloshing mode of the tank.', rt: 'The heavy layer on top falls through the light one in growing fingers and mushroom-shaped plumes.' }[kind] || ''}` },
+    { nx, ny, xs, ys, solid: null }, r.frames, (f, P) => clamp(liq(f.a[P]), 0, 1), (f, P) => [f.U[P], f.V[P]], { label: (t) => `t = ${fmt(t, 3)} s`, zmin: 0, zmax: 1 }));
   plots.push({ type: 'line', title: 'Conservation and kinetic energy', xlabel: 'Time (s)', ylabel: 'Relative volume change (10⁻⁶) · kinetic energy ÷ peak', series: [{ name: 'Phase-volume change (parts per million)', x: h.t, y: h.vol.map((x) => (1e6 * (x - r.vol0)) / Math.max(r.vol0, 1e-300)) }, { name: 'Kinetic energy ÷ peak', x: h.t, y: h.ke.map((x) => x / Math.max(keMax, 1e-300)) }, { name: 'Largest speed ÷ peak', x: h.t, y: h.umax.map((x) => x / Math.max(umaxAll, 1e-300)), dash: true }] });
   if (!r.done) warn(tpStopMsg(r, `${fmt(r.t, 3)} s of ${fmt(tEnd, 3)} s`, `${fmt(r.dtFix, 3)} s`, 'shorten the simulated time or coarsen the grid'));
   if (Math.abs(vErr) > 1e-3) warn(`The phase volume changed by ${fmt(100 * vErr, 3)} % — refine the grid or lower the CFL number.`);
@@ -2852,7 +2924,7 @@ async function runTwoFluid(v, ctx) {
   const tEnd = flowC ? (clamp(v.tfTimeF, 0.05, 50) * L) / U : (clamp(v.tfTimeB, 0.02, 5) * H) / Math.max(uh, 1e-12), dep = flowC && v.tfDeposit !== false;
   ctx?.progress?.(0.02, 'Two-fluid model: start');
   const dy0 = H / ny;
-  const r = await twoFluid2D({ nx, ny, L, H, rhoC: rc, muC: muc, rhoD: rd, dP, gy: -g, alpha0: a0, flow: flowC ? { U, alphaIn: a0 } : null, cvm: clamp(v.tfCvm, 0, 2), Dtd: Math.max(0, v.tfDtd), alphaMax: aMax, tEnd, slipC: !!v.tfSlip, deposit: dep, capture: dep && v.tfCapt !== 'settle' ? { stick: clamp(v.tfStick ?? 1, 0, 1), lenSolid: chan && v.tfDomain === 'spacer' ? Math.max(v.df * 1e-3, dy0) : H, T: 298.15 } : null, maxSteps: chan ? 20000 : 12000, solid: chan ? chan.mk.solid : null }, ctx);
+  const r = await twoFluid2D({ nx, ny, L, H, rhoC: rc, muC: muc, rhoD: rd, dP, gy: -g, alpha0: a0, flow: flowC ? { U, alphaIn: a0 } : null, cvm: clamp(v.tfCvm, 0, 2), Dtd: Math.max(0, v.tfDtd), alphaMax: aMax, tEnd, slipC: !!v.tfSlip, deposit: dep, capture: dep && v.tfCapt !== 'settle' ? { stick: clamp(v.tfStick ?? 1, 0, 1), lenSolid: chan && v.tfDomain === 'spacer' ? Math.max(v.df * 1e-3, dy0) : H, T: 298.15 } : null, maxSteps: chan ? 20000 : 12000, solid: chan ? chan.mk.solid : null, frames: Array.from({ length: 36 }, (_, k) => (k * tEnd) / 35) }, ctx);
   ctx?.progress?.(0.985, 'Post-processing');
   const h = r.hist, last = h.t.length - 1, nu1 = nx + 1, dx = L / nx, dy = H / ny, mm = (a) => Array.from(a, (x) => x * 1e3), xs = Array.from({ length: nx }, (_, i) => (i + 0.5) * dx * 1e3), ys = Array.from({ length: ny }, (_, j) => (j + 0.5) * dy * 1e3);
   const rows = (f) => Array.from({ length: ny }, (_, j) => Array.from({ length: nx }, (_, i) => f(j * nx + i, i, j)));
@@ -2909,6 +2981,9 @@ async function runTwoFluid(v, ctx) {
     summary = `Flow-through ${heavy ? 'settler' : 'flotation channel'} (two-fluid model): ${fmt(100 * capt, 3)} % of the ${fmt(dP * 1e6, 3)} µm ${phase} are captured against ${fmt(100 * haz, 3)} % for the ideal settler; terminal velocity ${fmt(ut * 1e3, 3)} mm/s; dispersed volume conserved to ${fmt(100 * Math.abs(bal), 2)} %.`;
     recs.push('Lower the velocity or lengthen the channel until the surface loading U·H/L falls below the terminal velocity for complete capture.');
   }
+  if (r.frames?.length > 3) plots.push(animatedField({ type: 'field', title: `${flowC ? 'Dispersed phase carried through the channel' : heavy ? 'Settling of the suspension' : 'Rise of the dispersion'} (animated)`, xlabel: 'x (mm)', ylabel: 'y (mm)', equal: base.equal, ...(chan ? { shapes: base.shapes } : {}), zlabel: 'Dispersed-phase fraction', zunit: '%', cmap: 'viridis',
+    note: `Press ▶ to play ${r.frames.length} snapshots from the start to ${fmt(r.t, 3)} s. Colour: volume fraction of the dispersed ${phase}; arrows: their own velocity (two-fluid momentum equation). ${flowC ? `Watch the ${phase} drift ${heavy ? 'down' : 'up'} across the flow towards the walls${chan ? ' and onto the solids' : ''} where they are captured.` : `A clear-liquid zone opens ${heavy ? 'at the top' : 'at the bottom'} and the suspension front moves at the hindered ${dir} velocity, as in Kynch’s kinematic theory, while a packed layer builds up ${heavy ? 'on the floor' : 'under the lid'}.`}` },
+    { nx, ny, xs, ys, solid: chan ? chan.mk.solid : null }, r.frames, (f, P) => 100 * f.a[P], (f, P) => [f.U[P], f.V[P]], { label: (t) => `t = ${fmt(t, 3)} s`, zmin: 0 }));
   plots.push({ type: 'line', title: 'Largest fraction, slip velocity and volume balance', xlabel: 'Time (s)', ylabel: 'Fraction ÷ packing limit · slip ÷ terminal velocity', series: [{ name: 'Largest fraction ÷ packing limit', x: h.t, y: h.amax.map((x) => x / aMax) }, { name: 'Mean slip velocity ÷ single-particle terminal velocity', x: h.t, y: h.slip.map((x) => Math.abs(x) / Math.max(ut, 1e-300)) }] });
   if (!r.done) warn(`The run stopped after ${r.steps} steps at t = ${fmt(r.t, 3)} s of ${fmt(tEnd, 3)} s — shorten the simulated time or coarsen the grid.`);
   if (Math.abs(bal) > 1e-6) warn(`The dispersed-phase volume balance is off by ${fmt(100 * bal, 3)} %.`);
@@ -3018,6 +3093,261 @@ const SEL = (key, label, value, options, help, extra = {}) => ({ key, label, typ
 const isSpacer = (v) => v.geom === 'spacer', isImport = (v) => v.geom === 'import', hasSpecies = (v) => v.species !== 'off';
 const tpInj = (v) => v.tpChInit === 'inject' || v.tpChInit === 'sparge', isTP = (v) => v.study === 'twophase', isTF = (v) => v.study === 'twofluid', tpCh = (v) => isTP(v) && (v.tpDomain === 'spacer' || v.tpDomain === 'import'), tpTank = (v) => isTP(v) && !tpCh(v), tpIs = (...k) => (v) => tpTank(v) && k.includes(v.tpCase), tfCh = (v) => isTF(v) && (v.tfDomain === 'spacer' || v.tfDomain === 'import'), tfTank = (v) => isTF(v) && !tfCh(v);
 const isCmp = (v) => v.study === 'shock' || v.study === 'nozzle', twoEqSel = (v) => ['ke', 'kw', 'sst', 'earsm', 'rsm'].includes(v.turb), BOOL = (key, label, help, extra = {}) => ({ key, label, type: 'bool', value: false, help, ...extra });
+
+// ---- plain-language explanations of the results ----------------------------------------------------------------
+// Meaning of every key result (exact label, or a pattern for labels that carry a variable part); a run-specific detail already on the KPI follows.
+const CFD_HELP = {
+  'Reynolds number (d_h = 2H)': 'Ratio of inertial to viscous forces, ρ·U·d_h/μ with the hydraulic diameter d_h = 2H and the superficial mean velocity. Membrane feed channels run at about 50–1000 (laminar with spacer-induced unsteadiness); above about 2500 an empty duct turns turbulent.',
+  'Pressure gradient': 'Loss of flow-averaged total pressure per metre of channel, from the solved pressure field between the two marked planes. It sets the pumping energy and must stay below the element limit (feed–brine Δp of about 1 bar per element in RO).',
+  'Darcy friction factor': 'Dimensionless pressure loss f = (Δp/L)·d_h ÷ (½ρU²). Spacers raise it well above the empty-channel value 96/Re.',
+  'f·Re': 'Friction factor × Reynolds number: exactly 96 for fully developed laminar flow between plates; higher values measure the extra drag of spacers, entrance effects or turbulence.',
+  'Mean wall shear stress': 'Average drag of the water on the channel walls, τ = μ·∂u/∂y at the wall. Higher shear scours deposits off membranes; typical spacer channels give about 1–10 Pa.',
+  'Minimum wall shear': 'Lowest wall shear stress anywhere along the walls (time-averaged in a transient run). Spots below the low-shear limit, often in filament wakes, are where fouling starts.',
+  'Recirculation (reverse-flow) area': 'Share of the fluid area where the water flows backwards (upstream), behind filaments or steps. Recirculation traps foulants and salt.',
+  'Stagnant area (< 10 % of mean speed)': 'Share of the fluid area where the water moves at less than a tenth of the mean velocity — dead zones with poor mixing and high fouling risk.',
+  'Cross-flow (mixing) intensity ⟨|v|⟩/U': 'Average speed across the gap divided by the mean velocity along it: zero in an empty straight channel. Spacers create this cross-flow, which thins the polarisation layer.',
+  'Specific pumping power': 'Hydraulic power dissipated per m² of active wall: pressure gradient × mean velocity × channel height. It is the energy price of the mass transfer gained.',
+  'Salt non-uniformity at the outlet (CoV)': 'Coefficient of variation of the salt concentration over the outlet section: 0 = perfectly mixed. Large values mean concentrated layers near the walls.',
+  'Temperature non-uniformity at the outlet': 'Standard deviation of the temperature over the outlet section: 0 = uniform; large values mean thermal boundary layers that have not mixed.',
+  'Sherwood number (downstream half)': 'Dimensionless mass-transfer rate Sh = k·d_h/D between the bulk flow and the walls, averaged over the downstream half where the flow has developed. Higher means thinner polarisation layers; empty channels give about 8, spacer channels 20–100.',
+  'Mass-transfer coefficient': 'Rate at which salt is carried away from the membrane surface, k = Sh·D/d_h. Higher values mean less concentration polarisation; RO spacer channels typically reach 20–80 µm/s.',
+  'k ÷ Schock–Miquel correlation': 'Computed mass-transfer coefficient divided by the classic spacer correlation used by RO design programs. It is offered to the RO design suite as its mass-transfer multiplier.',
+  'Polarisation factor (mean)': 'Mean ratio of the salt concentration at the membrane surface to the bulk concentration (c_wall/c_bulk). Above about 1.2 the scaling and fouling risk rises; it is the key output for RO design.',
+  'Maximum wall concentration': 'Highest salt concentration on the membrane surface (away from contact lines with obstacles). It decides where scaling starts.',
+  'Mean permeate flux': 'Average water flux through the membrane walls, from the solution–diffusion law with the local wall concentration (osmotic pressure) and pressure. Seawater RO runs at 12–17 L/m²·h.',
+  'Local salt rejection': 'Share of the salt held back by the membrane at the local conditions: 1 − permeate ÷ feed concentration.',
+  'Nusselt number (downstream half)': 'Dimensionless heat-transfer rate Nu = h·d_h/k between the bulk flow and the walls over the developed half of the channel (7.54 for an empty channel with fixed wall temperature).',
+  'Outlet bulk temperature': 'Flow-averaged (mixing-cup) temperature leaving the channel.',
+  'Temperature-polarisation coefficient': '(T_wall − T_ext) ÷ (T_bulk − T_ext): the share of the bulk-to-outside temperature difference that reaches the membrane. 1 = no temperature polarisation; membrane distillation typically gives 0.3–0.7.',
+  'Particles deposited': 'Share of the tracked particles that ended on a wall or an obstacle (Lagrangian tracking with drag, gravity and Brownian motion).',
+  'Strouhal number': 'Dimensionless shedding frequency St = f·d/U from the probe signal (d: filament diameter). A single cylinder sheds at about 0.2.',
+  'Iterations': 'Number of solver iterations (or time steps) used. Amber means the run stopped before reaching the tolerance.',
+  'Mass-balance closure': 'Difference between the water entering and leaving, in per cent: a numerical check that should be close to zero.',
+  'Mass flow per metre width': 'Mass of water passing per second per metre of channel width (the 2-D section): density × volume flow.',
+  'Inlet gauge pressure (target)': 'Pressure prescribed at the inlet relative to the outlet (pressure-driven flow).',
+  'Resulting mean velocity': 'Mean inlet velocity that the prescribed inlet pressure produces through this geometry.',
+  'Wall slip velocity (downstream half)': 'Velocity of the liquid right at a slip wall, u = b·∂u/∂y (Navier slip with slip length b); it lowers the friction.',
+  'Velocity on the symmetry plane': 'Velocity on the symmetry boundary (zero shear), i.e. the centre-line velocity of the full channel.',
+  'Friction velocity u_τ': 'Velocity scale of the near-wall turbulence, √(τ_w/ρ). It sets the wall units y⁺ and u⁺.',
+  'First-cell y⁺': 'Distance of the first cell centre from the wall in wall units, y·u_τ/ν. Wall functions need 30–300, wall-resolved models about 1 or less.',
+  'Peak turbulence intensity √(⅔k)/U': 'Highest turbulent velocity fluctuation relative to the mean velocity, from the turbulent kinetic energy k.',
+  'Maximum eddy-viscosity ratio ν_t/ν': 'Largest ratio of turbulent to molecular viscosity: how strongly turbulence enhances momentum mixing.',
+  'Normal-stress anisotropy (u′u′ − v′v′)/2k': 'Difference between streamwise and transverse velocity fluctuations relative to the turbulent energy; 0 for isotropic turbulence (Boussinesq closures).',
+  'Shear-stress ratio u′v′/k': 'Turbulent shear stress relative to the turbulent kinetic energy; about −0.3 in an equilibrium boundary layer.',
+  'Mean sub-grid viscosity ratio ν_sgs/ν': 'Average ratio of the sub-grid (unresolved) eddy viscosity of the large-eddy simulation to the molecular viscosity; small values mean most turbulence is resolved.',
+  'Resolved fluctuation v′_rms / U at the probe': 'Root-mean-square transverse velocity fluctuation resolved at the probe, relative to the mean velocity.',
+  'Lattice-Boltzmann pressure gradient': 'Pressure gradient from the lattice-Boltzmann (D2Q9) solution of the same channel, an independent method.',
+  'Lattice-Boltzmann ÷ finite-volume pressure gradient': 'Agreement of the two independent flow solvers: 1 means identical pressure gradients.',
+  'Pressure gradient inside the porous zone': 'Pressure loss per metre inside the porous region from the Darcy–Forchheimer (or Ergun) resistance.',
+  'Ergun equation (1-D packed bed)': 'Pressure gradient of the same porous zone from the 1-D Ergun equation for a packed bed, for comparison.',
+  'Darcy–Forchheimer (1-D)': 'Pressure gradient of the same porous zone from the 1-D Darcy–Forchheimer law, for comparison.',
+  'Integrated user source': 'Total of the user-defined source term over the domain.',
+  'User scalar at the outlet (flow-averaged)': 'Flow-averaged value of the user-defined scalar leaving the channel.',
+  'User scalar range': 'Lowest and highest value of the user-defined scalar in the domain.',
+  'Heat conducted through solids to the walls': 'Heat flowing through the solid filaments into the walls (conjugate heat transfer).',
+  'Hottest solid temperature': 'Highest temperature inside the solid parts (conjugate heat transfer).',
+  'Mean solid temperature': 'Average temperature of the solid parts.',
+  'Maximum wall supersaturation': 'Highest saturation ratio S = c/c_sat of the scaling salt at the walls; above 1 crystals can grow on the membrane.',
+  'Mean scale deposition flux': 'Average rate at which scaling salt crystallises on the walls (wall crystallisation kinetics).',
+  'Peak scale deposition flux': 'Highest local rate of scale deposition on the walls — where scaling starts first.',
+  'Scaling salt removed at the walls': 'Share of the scaling salt entering the channel that crystallised on the walls.',
+  'Crystal number density at the outlet': 'Number of suspended crystals per m³ leaving the channel (population-balance moments).',
+  'Sauter mean crystal size at the outlet': 'Surface-weighted mean size of the suspended crystals leaving the channel.',
+  'Suspended crystal mass at the outlet': 'Mass of crystals carried in suspension out of the channel.',
+  'Flux decline over the fouling period': 'Fall of the mean permeate flux over the simulated fouling period as the deposit grows.',
+  'Fouling ÷ membrane resistance': 'Hydraulic resistance of the deposit relative to the clean membrane at the end of the period.',
+  'Mean deposit load': 'Average mass of deposit per m² of membrane at the end of the period.',
+  'Mean / maximum deposit thickness': 'Average and largest thickness of the fouling layer along the membrane.',
+  'Multicomponent correction to the Fick film': 'Change of the polarisation predicted by the Maxwell–Stefan (multicomponent) film against independent Fick films.',
+  'Maxwell–Stefan polarisation factor, second solute': 'Polarisation factor of the second solute in the multicomponent film model.',
+  'Friction closure: worst leave-one-out error': 'Largest error of the learned friction law on a solver run left out of the fit — a check of how far the regression can be trusted.',
+  'Sherwood closure: worst leave-one-out error': 'Largest error of the learned Sherwood law on a solver run left out of the fit.',
+  'Learned friction law: Re exponent': 'Reynolds-number exponent of the friction law fitted to the solver runs (−1 for laminar flow, about −0.25 to −0.3 with spacers).',
+  'Learned Sherwood law: Re exponent': 'Reynolds-number exponent of the Sherwood law fitted to the solver runs (about 0.3–0.9).',
+  '1-D model with the learned closure: flux': 'Permeate flux of the 1-D channel model when it uses the learned correlations instead of the textbook ones.',
+  '1-D model with the learned closure: polarisation': 'Polarisation factor of the 1-D channel model with the learned correlations.',
+  'Second-phase volume (initial → final)': 'Volume of the second phase at the start and the end of the run; equal values mean the phase is conserved.',
+  'Phase-volume conservation error': 'Relative change of the phase volume over the run — a numerical check that should be close to zero.',
+  'Interface sharpness: phase volume in cells with α > 0.95': 'Share of the second phase held in nearly full cells: high values mean a sharp, well-resolved interface.',
+  'Mean interface travel speed ÷ mean velocity': 'Speed of the second phase through the channel relative to the mean liquid velocity.',
+  'Peak dispersed volume fraction': 'Highest local volume fraction of the dispersed phase.',
+  'Slip (settling) velocity': 'Velocity of the dispersed phase relative to the liquid from the drag–buoyancy balance.',
+  'Dispersed phase captured on the walls': 'Share of the dispersed phase deposited on the walls during the run.',
+  'Ideal settler (Hazen) capture v_s L / (U H)': 'Capture of an ideal settler: settling velocity × length ÷ (velocity × height) (Hazen); 1 means everything settles.',
+  // free-interface (VOF / level set) studies
+  'Change of the phase volume': 'Relative change of the volume of the tracked phase over the run — a numerical check that should be close to zero.',
+  'Largest velocity during the run': 'Highest speed anywhere at any time of the run.',
+  'Peak kinetic energy': 'Largest kinetic energy of the whole flow during the run, per metre of depth.',
+  'Simulated time': 'Physical time covered by the run; amber if it stopped before the requested end.',
+  'Time steps': 'Number of time steps taken, limited by the flow (CFL), viscous and surface-tension stability conditions.',
+  'Largest velocity divergence': 'Largest remaining |∇·u| after the pressure projection — a check of incompressibility that should be small.',
+  'Front position at the end, x/a': 'Distance travelled by the surge front along the floor, in multiples of the initial column width a.',
+  'Front speed dZ/dT': 'Speed of the surge front in dimensionless form, from the slope of the front position over the second half of its travel.',
+  'Front speed': 'Speed of the surge front along the floor.',
+  'Front reaches the far wall at T': 'Dimensionless time t·√(2g/a) when the surge reaches the far wall.',
+  'Rise velocity at the end': 'Vertical velocity of the bubble (or drop) phase at the end of the run.',
+  'Largest rise velocity': 'Highest vertical velocity of the bubble during the run (a benchmark quantity of rising-bubble tests).',
+  'Centroid displacement': 'Distance travelled by the centre of the bubble.',
+  'Smallest circularity': 'Lowest circularity reached (1 = circle): how much the bubble deforms.',
+  'Pressure jump across the interface ÷ σ/R': 'Measured pressure difference across the interface divided by the Laplace value σ/R; 1 for a resting circular interface.',
+  'Sloshing period, computed': 'Period of the free-surface oscillation at the wall, from its zero crossings.',
+  'Sloshing period, linear theory': 'Period of the first sloshing mode from linear wave theory for this depth and tank width.',
+  'Fall of the heavy-phase centroid': 'How far the centre of the heavy phase has fallen as it overturns — a measure of the mixing progress.',
+  'Linear growth rate √(A g k)': 'Growth rate of the seeded wave in the early, linear Rayleigh–Taylor stage (Atwood number A, wavenumber k).',
+  // free interface in a channel
+  'Gas front velocity ÷ mean liquid velocity': 'Speed of the leading edge of the injected gas relative to the mean liquid velocity.',
+  'Gas velocity (centroid) ÷ mean liquid velocity': 'Speed of the gas centroid relative to the mean liquid velocity: above 1 when it rides the fast core, below 1 when held at the filaments.',
+  'Gas front velocity': 'Speed of the leading edge of the injected gas along the channel.',
+  'Gas velocity (centroid)': 'Speed of the centre of the gas along the channel.',
+  'Gas injected through the inlet': 'Gas volume that entered through the inlet during the run.',
+  'Gas injected ÷ integral of the prescribed inlet flux': 'Gas actually transported in ÷ gas prescribed at the inlet — 1 means the inflow boundary works as intended.',
+  'Gas share of the inflow (time mean)': 'Gas as a share of the total volume flow entering, averaged over the run.',
+  'Slug period: computed': 'Time between passing gas slugs measured downstream of the inlet.',
+  'Slug period: prescribed': 'Injection period set at the inlet.',
+  'Gas hold-up at the end': 'Share of the fluid volume occupied by gas at the end of the run.',
+  'Leading edge reaches the outlet at': 'Time when the gas first leaves through the outlet.',
+  'Gas still in the channel at the end': 'Share of the gas still inside the channel at the end, e.g. trapped in filament wakes.',
+  'Largest pressure drop during the passage': 'Highest inlet-to-outlet pressure difference while the gas passes; the interface and capillary pressure add to the liquid friction.',
+  'Pressure drop, liquid alone (end of run)': 'Pressure drop once the gas has left — the reference for the liquid alone.',
+  'Pressure drop at the end of the run': 'Inlet-to-outlet pressure difference at the end of the run.',
+  'Largest wall shear (space and time)': 'Highest wall shear stress anywhere at any time — the scouring peak that makes air sparging work against fouling.',
+  'Mean wall shear: peak ÷ end of run': 'Shear enhancement by the passing gas: peak mean wall shear divided by the value after the gas has left.',
+  'Gas volume balance': 'Gas balance error (initial + inflow − outflow − hold-up) relative to the supplied gas — should be close to zero.',
+  'Largest velocity': 'Highest speed anywhere during the run.',
+  // two-fluid model
+  'Front velocity, two-fluid model': 'Speed of the suspension front (where the fraction is half the initial value) in the two-fluid solution.',
+  'Slip velocity in the suspension': 'Mean velocity of the dispersed phase relative to the liquid in the suspension (hindered by the neighbouring particles).',
+  'Particle Reynolds number at terminal velocity': 'Reynolds number of one particle at its terminal velocity; below about 1 the Stokes drag law applies.',
+  'Largest fraction': 'Highest dispersed-phase fraction anywhere at the end; it is limited by the packing fraction.',
+  'Largest fraction (packed layer)': 'Fraction in the packed sediment (or creamed) layer at the end.',
+  'Mixture volume balance, outflow ÷ inflow': 'Total volume flowing out ÷ in: 1 for an incompressible mixture.',
+  'Captured on the channel wall': 'Share of the dispersed phase that entered and was captured on the channel walls.',
+  'Captured on the filaments / imported solids': 'Share of the dispersed phase that entered and was captured on the filaments or imported solids.',
+  'Capture efficiency (last quarter of the run)': 'Share of the incoming dispersed phase captured during the last quarter of the run, when the flow has settled.',
+  'Ideal-settler capture v_t L/(U H) (Hazen)': 'Capture of an ideal settler: terminal velocity × length ÷ (velocity × height) (Hazen); 1 means everything settles before the outlet.',
+  'Pressure difference bottom − top ÷ mixture weight': 'Pressure difference over the column divided by the weight of the mixture: 1 when the particles are fully suspended.',
+  'Pressure drop, inlet − outlet column': 'Inlet-to-outlet pressure difference of the channel.',
+  'Pseudo-time steps': 'Number of time steps of the two-fluid solution.',
+  // compressible gas
+  'Shock Mach number': 'Speed of the shock relative to the gas ahead of it, divided by the speed of sound there (exact Riemann solution).',
+  'Shock speed': 'Speed at which the shock travels down the line.',
+  'Contact (gas) velocity': 'Velocity of the gas behind the shock (contact surface between the two initial gases).',
+  'Intermediate (star) pressure': 'Pressure between the shock and the expansion wave (exact Riemann solution).',
+  'Temperature behind the shock': 'Gas temperature just behind the shock, raised by the compression.',
+  'Density error vs exact solution (L1)': 'Average difference between the computed and the exact density profile: the numerical error, which falls as the grid is refined.',
+  'Peak numerical pressure': 'Highest pressure in the computed profile (overshoots indicate numerical oscillations).',
+  'Mass flow': 'Mass flow through the nozzle per second.',
+  'Mass flow ÷ choked (isentropic) value': 'Computed mass flow ÷ the ideal choked flow of an isentropic nozzle: 1 when the throat is sonic and losses are negligible.',
+  'Throat Mach number': 'Gas velocity at the throat ÷ speed of sound; 1 when the nozzle is choked.',
+  'Exit Mach number': 'Gas velocity at the exit ÷ speed of sound from the computation.',
+  'Exit Mach number, theory': 'Exit Mach number of ideal isentropic flow for this area ratio and back pressure.',
+  'Exit static pressure': 'Static pressure in the exit plane; a motive nozzle should exit near the suction-chamber pressure.',
+  'Exit velocity': 'Gas velocity in the exit plane — the jet that entrains the suction vapour in a steam ejector.',
+  'Normal-shock position': 'Where a normal shock stands inside the diverging part (over-expanded flow); none if the nozzle flows fully supersonic.',
+  'Nozzle thrust': 'Momentum flux plus pressure force at the exit per unit time — the driving force of the jet.',
+};
+const CFD_HELP_PATTERNS = [
+  [/^Captured by /, 'Share of the dispersed phase that entered and was captured by this mechanism (impaction, interception, diffusion or settling).'],
+  [/^Hindered .* velocity at the feed fraction/, 'Settling (or rise) velocity of the dispersed phase at the feed fraction, reduced by the neighbouring particles (hindered-settling theory).'],
+  [/^Terminal .* velocity of one particle/, 'Velocity of a single particle when drag balances buoyancy (Schiller–Naumann drag law).'],
+];
+const CFD_NOTES = [
+  ['Velocity magnitude and streamlines', 'Speed (colour) and streamlines of the solved flow; filaments are shown solid. Look for the jets between filaments and walls and the slow wakes behind them.'],
+  ['Velocity magnitude$', 'Speed (colour) and streamlines of the flow at the end of the run.'],
+  ['Pressure$', 'Pressure field relative to the reference; the drop along the channel is the friction loss, local peaks sit on the upstream faces of obstacles.'],
+  ['Salt concentration', 'Salt concentration in the channel: thin polarised layers build up on the membranes where water leaves; obstacles that sweep the walls keep them thin.'],
+  ['Temperature$', 'Temperature field of the solved energy equation.'],
+  ['Eddy-viscosity ratio', 'Turbulent ÷ molecular viscosity: where the turbulence model adds mixing.'],
+  ['Wall shear stress', 'Shear of the water on both walls along the channel; peaks where filaments push the flow against the wall, low values in wakes where fouling begins.'],
+  ['Local Sherwood number', 'Local mass-transfer rate along both walls against the empty-channel Lévêque solution and the spacer correlation (log scale): peaks downstream of filaments mark where the polarisation layer is renewed.'],
+  ['Membrane-wall concentration and local permeate flux', 'Salt concentration at both membrane surfaces against the bulk, and the local permeate flux: where the wall concentration peaks, the osmotic pressure rises and the flux falls.'],
+  ['Wall and bulk concentration', 'Salt concentration at both walls against the mixing-cup bulk value.'],
+  ['Local Nusselt number and wall temperature', 'Local heat-transfer rate and wall temperature along the channel against the bulk temperature.'],
+  ['Mean pressure along the channel', 'Section-mean static and flow-averaged total pressure along the channel; the pressure gradient is taken between the marked planes.'],
+  ['Velocity profiles', 'Velocity across the gap at three positions, against the parabolic profile of the empty channel.'],
+  ['Convergence history', 'Residuals of continuity and velocity during the iterations (log scale); the solution is converged when both fall below the tolerance line.'],
+  ['Residual history', 'Residuals per time step of the transient run (log scale).'],
+  ['Probe signal', 'Transverse velocity at the probe and the inlet–outlet pressure drop over time; a regular oscillation means vortex shedding.'],
+  ['Particle trajectories', 'Paths of the tracked particles over the speed field: particles that touch a wall or obstacle stick with the chosen probability.'],
+  ['Deposition map along the channel', 'Where along the channel particles were deposited on each wall and on obstacles.'],
+  ['Turbulent kinetic energy', 'Turbulent kinetic energy k of the RANS closure: highest in shear layers and near walls.'],
+  ['Turbulent dissipation rate', 'Rate at which turbulence is dissipated.'],
+  ['Specific dissipation rate', 'Specific dissipation rate ω of the k–ω family (log scale).'],
+  ['Velocity profile in wall units', 'Velocity in wall units against the logarithmic law of the wall; agreement checks the near-wall treatment.'],
+  ['Reynolds stresses in wall units', 'Turbulent stresses across the near-wall region in wall units.'],
+  ['Reynolds shear stress', 'Turbulent shear stress −u′v′ from its own transport equation.'],
+  ['Normal-stress anisotropy', 'Anisotropy of the normal stresses from the transported Reynolds stresses.'],
+  ['Mixing analysis', 'How uniform salt and temperature are over each cross-section along the channel.'],
+  ['Density$', 'Gas density along the line at the end of the run against the exact Riemann solution: the jump at the shock, the step at the contact surface and the smooth expansion fan; smearing over a few cells is numerical diffusion.'],
+  ['Velocity$', 'Gas velocity along the line against the exact solution: constant between the expansion fan and the shock.'],
+  ['Mach number along the nozzle', 'Gas velocity ÷ speed of sound along the nozzle: subsonic in the converging part, 1 at a choked throat, supersonic after it unless a normal shock (sudden drop) stands in the diverging part.'],
+  ['Static pressure', 'Static pressure along the nozzle (or the line): it falls as the gas accelerates; a jump marks a shock.'],
+  ['Area ratio and mass flow', 'Nozzle cross-section ÷ throat area and the mass flow along the nozzle, which must be constant in a converged steady solution.'],
+  ['Profiles along the nozzle', 'Pressure, temperature and velocity along the nozzle from the quasi-1-D solution.'],
+  ['Profiles at the end of the run', 'Density, velocity and pressure along the line at the end of the run, against the exact Riemann solution: shock, contact surface and expansion fan.'],
+  ['Temperature and velocity', 'Gas temperature and velocity along the line at the end of the run.'],
+  ['Gas and nozzle summary', 'Key states of the nozzle flow.'],
+  ['Gas and wave summary', 'Key states of the wave pattern.'],
+  ['Supersaturation ratio of the scaling salt', 'Saturation ratio S = c/c_sat of the scaling salt: above 1 (supersaturated) mainly in the polarisation layers on the membranes, where crystals start to grow.'],
+  ['Wall supersaturation and scale deposition flux', 'Saturation ratio at the walls and the rate at which scale crystallises there along the channel.'],
+  ['Crystal number density', 'Number of suspended crystals per m³ (log scale) from the population balance: nucleation in supersaturated layers, transport by the flow.'],
+  ['Crystal population along the channel', 'Number, size and mass of the suspended crystals along the channel (flow-averaged moments of the population balance).'],
+  ['Fouling history', 'Growth of the fouling layer and the resulting flux decline over time.'],
+  ['Permeate flux decline during fouling', 'Mean permeate flux over the fouling period: it falls as the deposit adds hydraulic resistance.'],
+  ['Fouling layer along the membrane', 'Deposit thickness and the remaining permeability along the membrane at the end of the period: thickest where shear is low.'],
+  ['Phase volume and centroid', 'Volume and centroid of the second phase over time: the volume should stay constant while the centroid follows the flow.'],
+  ['Dispersed-phase hold-up in the domain', 'Volume of the dispersed phase in the domain over time.'],
+  ['Dispersed-phase volume fraction', 'Volume fraction of the dispersed phase over the channel.'],
+  ['Second-phase volume fraction after', 'Volume fraction of the second phase at the end of the run (1 = second phase).'],
+  ['Dispersed-phase deposition along the walls', 'Where the dispersed phase deposited on the walls along the channel.'],
+  ['Liquid fraction at t =', 'Snapshot of the liquid fraction at an intermediate time (the animated view shows the whole run).'],
+  ['Gas fraction at t =', 'Snapshot of the gas fraction at an intermediate time (the animated view shows the whole run).'],
+  ['Liquid fraction and velocity at t =', 'Liquid fraction (colour) and velocity (arrows) at the end of the run.'],
+  ['Gas fraction and velocity at t =', 'Gas fraction (colour) and velocity (arrows) at the end of the run.'],
+  ['Conservation and kinetic energy', 'Phase-volume change (should stay near zero), kinetic energy and largest speed over time: checks of the numerics and a record of the motion.'],
+  ['Bubble centroid and rise velocity', 'Height of the bubble centre and its rise velocity over time: the velocity peaks and settles towards the terminal value as the bubble deforms.'],
+  ['Bubble shape: circularity', 'Circularity of the bubble over time: 1 for a circle, lower as it deforms.'],
+  ['Free-surface elevation at the left wall', 'Elevation of the free surface at the left wall over time against linear wave theory: the period and the damping of the sloshing.'],
+  ['Height of the heavy-phase centroid and kinetic energy', 'The heavy phase falls as the Rayleigh–Taylor fingers grow; the kinetic energy rises with the overturning.'],
+  ['Surge front along the floor', 'Position of the surge front and height of the column over dimensionless time against the classic experiment.'],
+  ['Position of the gas along the channel', 'Leading edge, centroid and trailing edge of the gas over time against plug flow at the mean liquid velocity.'],
+  ['Gas volume: hold-up, inflow and outflow', 'Gas held in the channel, entered and left over time; the balance line checks conservation.'],
+  ['Pressure drop and wall shear while the gas passes', 'Pressure drop and wall shear over time as the gas passes through the channel.'],
+  ['Gas fraction of the cross-section at x', 'Gas fraction of the cross-section near the inlet over time: each pulse is a passing slug.'],
+  ['Pressure in excess of the liquid hydrostatic pressure', 'Pressure field without the liquid hydrostatic part (zero at the outlet): the capillary jumps at the interfaces show up here.'],
+  ['Dispersed-phase volume fraction and velocity at t =', 'Volume fraction of the dispersed phase (colour) and its velocity (arrows) at the end of the run.'],
+  ['Continuous-phase speed and streamlines', 'Speed and streamlines of the liquid: the counter-flow displaced by the settling or rising dispersed phase, or the through-flow of the channel.'],
+  ['Slip velocity between the phases', 'Relative velocity of the dispersed phase against the liquid: the settling (or rise) velocity, hindered where the suspension is dense.'],
+  ['Shared pressure in excess of the continuous-phase hydrostatic pressure', 'Pressure carried by both phases above the liquid hydrostatic level: it supports the weight of the suspended particles.'],
+  ['Section-mean dispersed fraction over the height', 'Dispersed fraction averaged across each height at the end against the initial value: clear liquid, the uniform suspension and the packed layer.'],
+  ['Suspension front', 'Height of the suspension front over time from the two-fluid model against Kynch’s kinematic theory.'],
+  ['Largest fraction, slip velocity and volume balance', 'Largest fraction relative to the packing limit and the mean slip relative to the single-particle terminal velocity over time.'],
+  ['Dispersed fraction across the gap at the outlet', 'Dispersed fraction across the gap at the outlet and mid-length against the inlet value: depletion near the capturing wall, accumulation where particles drift.'],
+  ['Cumulative dispersed-phase volumes', 'Dispersed volume entered, left, captured and held up over time.'],
+  ['Captured dispersed phase by mechanism', 'Share of the incoming dispersed phase captured by each mechanism on the walls and the solids.'],
+  ['Lattice-Boltzmann velocity magnitude', 'Speed field of the independent lattice-Boltzmann (D2Q9) solution of the same channel.'],
+  ['Velocity profile at x =', 'Velocity profiles of the lattice-Boltzmann and finite-volume solutions at the same position: agreement checks both solvers.'],
+  ['Lattice-Boltzmann / finite-volume hybrid', 'Comparison of the two flow solvers.'],
+  ['Temperature in fluid and solids', 'Temperature in the fluid and inside the solid parts (conjugate heat transfer).'],
+  ['User-defined scalar', 'Field of the user-defined scalar transported by the solved flow with the given source expression.'],
+  ['Maxwell–Stefan concentration profiles', 'Concentrations across the polarisation film from the multicomponent Maxwell–Stefan model.'],
+  ['Multicomponent (Maxwell–Stefan) film versus independent Fick films', 'Polarisation of each solute with coupled (Maxwell–Stefan) and independent (Fick) diffusion.'],
+  ['Training runs for the regression closure', 'Solver runs used to learn the friction and Sherwood correlations.'],
+  ['Regression closure: parity', 'Learned correlations against the solver runs: points on the 1 : 1 line mean the regression reproduces the solver.'],
+];
+/** Every KPI gets its plain meaning and every plot a reading note (run-specific details already present are kept after it). */
+function explainCFD(res) {
+  for (const k of res.kpis || []) {
+    const base = CFD_HELP[k.label] ?? CFD_HELP_PATTERNS.find(([re]) => re.test(k.label))?.[1];
+    if (base) k.help = k.help && !base.includes(k.help) ? `${base} ${k.help.replace(/\.?$/, '.')}` : base;
+  }
+  for (const pl of res.plots || []) {
+    if (pl._own) continue;
+    const n = CFD_NOTES.find(([t]) => (t.endsWith('$') ? pl.title === t.slice(0, -1) : (pl.title || '').startsWith(t)));
+    if (n) pl.note = pl.note ? `${n[1]} ${pl.note}` : n[1];
+  }
+  return res;
+}
 
 const suite = {
   id: 'cfd', num: 4, title: 'Flow in Membranes, Channels & Equipment (CFD)', short: 'CFD', icon: '🌀',
@@ -3309,6 +3639,8 @@ const suite = {
     { name: 'Sudden expansion in a brine duct, turbulent, with particles', values: { geom: 'step', H: 100, L: 1400, Uin: 1.2, c0: 65, turb: 'ml', species: 'off', stretch: 3, nx: 120, ny: 30, particles: true, dPart: 60, rhoPart: 2650, alphaU: 0.7, maxIter: 900 } },
   ],
 
+  predict: { inputs: ['Uin', 'H', 'df', 'lm', 'c0', 'dPtm', 'T', 'L'], outputs: ['Pressure gradient', 'Sherwood number', 'Polarisation factor', 'Mean wall shear stress', 'Mean permeate flux', 'Minimum wall shear', 'Mass-transfer coefficient', 'Reynolds number'] },
+
   pull: ({ feed, outputs } = {}) => [
     Number.isFinite(feed?.T) ? { key: 'T', value: feed.T, from: 'Case feed water' } : null,
     outputs?.ro?.streams?.feed?.tds ? { key: 'c0', value: outputs.ro.streams.feed.tds / 1000, from: 'RO design: feed TDS' } : null,
@@ -3316,7 +3648,9 @@ const suite = {
   ].filter(Boolean),
   site: (site) => (Number.isFinite(site?.data?.sst) ? [{ key: 'T', value: site.data.sst, from: 'Sea-surface temperature at site' }] : []),
 
-  async run(v, ctx) {
+  async run(v, ctx) { return explainCFD(await suite.runStudy(v, ctx)); }, // every result is explained (KPI meanings, plot notes)
+
+  async runStudy(v, ctx) {
     if (v.study === 'shock' || v.study === 'nozzle') return runCompressible(v);
     if (v.study === 'twophase') return runTwoPhase(v, ctx);
     if (v.study === 'twofluid') return runTwoFluid(v, ctx);
@@ -3329,6 +3663,7 @@ const suite = {
       else { ctx?.progress?.(0.01, 'Lattice-Boltzmann flow'); lbm = lbmStart(c, v); if (lbm.init) c.o.init = lbm.init; }
     }
     // a diverged solution is repeated once with the most robust numerics before the run is given up
+    if (c.o.steady === false) c.o.frames = 32; // snapshots for the animated view (copies of the solution; the numbers are not affected)
     let r, robust = false;
     try { r = await solveChannel(c.o, ctx); }
     catch (e) {
@@ -3657,6 +3992,7 @@ const suite = {
       outputs.mlFrictionExponent = fx.exps[0];
       info(`Regression closure trained on ${mlr.X.length} additional solver runs (${mlr.nx} × ${mlr.ny} cells each); cross-validated R² = ${fmt(fx.r2loo, 4)} for friction${fs ? ` and ${fmt(fs.r2loo, 4)} for the Sherwood number` : ''}. It is valid only inside the sampled range of Reynolds number${mlr.geo ? ' and pitch' : ''}.`);
     }
+    plots.push(...(o.steady ? [channelSurface(speed, xm, ym, 'Velocity magnitude over the channel (3-D)')] : channelAnimation(q, r, base, L / Math.max(r.Uref, 1e-12))));
     for (const k of Object.keys(outputs)) if (!Number.isFinite(outputs[k])) delete outputs[k];
     return {
       summary: `Re = ${fmt(q.Re, 3)}: pressure gradient ${fmt(q.dpdx / 100, 3)} mbar/m (f = ${fmt(q.f, 3)}), mean wall shear ${fmt(q.tauMean, 3)} Pa, ${fmt(100 * q.recirc, 3)} % recirculating area` + (sp && shDev ? `, Sherwood number ${fmt(shDev, 3)}` : '') + (memb ? `, polarisation factor ${fmt(q.cpMean, 3)} at ${fmt(q.Jmean / LMH, 3)} L/m²·h.` : '.'),

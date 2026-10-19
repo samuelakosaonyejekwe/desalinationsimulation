@@ -313,10 +313,11 @@ export function simulateBatch(v) {
   };
   if (tdsOf(cf, neutral) <= p.targetTDS) throw new Error(`The feed (${fmt(tdsOf(cf, neutral), 4)} mg/L) already meets the ${p.targetTDS} mg/L target — nothing to desalinate.`);
   const y0 = [...cf.map((c) => c * Vd0), ...cf.map((c) => c * Vc0), Vd0, Vc0], sol = rk4(rhs, y0, 0, tEnd, nt);
-  const t = [], tdsD = [], tdsC = [], iAvg = [], P = [], ratio = [];
+  const t = [], tdsD = [], tdsC = [], iAvg = [], P = [], ratio = [], hist = []; // hist: current along one pass at every output step (for the animated views)
   let E = 0, charge = 0, last = null, tHit = null;
   sol.y.forEach((y, k) => {
     const { s, m } = pass(y), Uel = electrodeVoltage(m.iAvg, par, T), Pk = ((Ncp * p.Ucp + Uel) * m.I) / (1 - par.shunt) / (p.etaRect / 100);
+    hist.push(m.segs.map((g) => ({ x: g.x, i: g.i, ilim: g.ilim, ratio: g.ratio })));
     t.push(sol.t[k] / 60); tdsD.push(tdsOf(s.cd, neutral)); tdsC.push(tdsOf(s.cc, neutral)); iAvg.push(m.iAvg); P.push(Pk); ratio.push(m.ratioMax);
     if (tHit === null && k > 0 && tdsD[k] <= p.targetTDS) tHit = t[k - 1] + ((t[k] - t[k - 1]) * (tdsD[k - 1] - p.targetTDS)) / (tdsD[k - 1] - tdsD[k]);
     if (k > 0 && tHit === null) { E += 0.5 * (Pk + last.P) * (sol.t[k] - sol.t[k - 1]); charge += 0.5 * (m.I + last.I) * (sol.t[k] - sol.t[k - 1]); }
@@ -326,7 +327,7 @@ export function simulateBatch(v) {
   const kEnd = tHit === null ? nt : Math.max(1, t.findIndex((x) => x >= tHit)), fr = tHit === null ? 1 : (tHit - t[kEnd - 1]) / (t[kEnd] - t[kEnd - 1]);
   const lerp = (a) => a[kEnd - 1] + fr * (a[kEnd] - a[kEnd - 1]), yA = sol.y[kEnd - 1], yB = sol.y[kEnd], yE = yA.map((a, j) => a + fr * (yB[j] - a)), sE = unpack(yE);
   const tUse = tHit ?? t[nt], m0 = pass(y0).m, dp = m0.dp + p.dpManifold * 1e5, Ppump = (2 * qd0 * Ncp * dp) / (p.etaPump / 100), eqRem = sum(cf.map((c, j) => (Z[j] > 0 ? AZ[j] * (c * Vd0 - sE.cd[j] * sE.Vd) : 0)));
-  return { p, par, G, T, Ncp, nSeg, nt, t, tdsD, tdsC, iAvg, P, ratio, tHit, tUse, sE, cf, neutral, ionsF, ionsP: toIons(sE.cd, ionsF), ionsC: toIons(sE.cc, ionsF), tdsP: lerp(tdsD), tdsCend: lerp(tdsC), tdsF: tds(ionsF),
+  return { p, par, G, T, Ncp, nSeg, nt, t, tdsD, tdsC, iAvg, P, ratio, hist, tHit, tUse, sE, cf, neutral, ionsF, ionsP: toIons(sE.cd, ionsF), ionsC: toIons(sE.cc, ionsF), tdsP: lerp(tdsD), tdsCend: lerp(tdsC), tdsF: tds(ionsF),
     E, Ppump, sec: (E + Ppump * tUse * 60) / 3.6e6 / sE.Vd, secDC: E / 3.6e6 / sE.Vd, eff: (F * eqRem) / Math.max(charge * Ncp, 1e-30), area: 2 * Ncp * G.W * G.L, Vd0, Vc0, m0, y0, yE,
     Qprod: sE.Vd / (tUse / 60), waterRec: sE.Vd / (Vd0 + Vc0), ratioMax: Math.max(...ratio.slice(0, kEnd + 1)), iMean: sum(iAvg.slice(0, kEnd + 1)) / (kEnd + 1), power: E / (tUse * 60) };
 }
@@ -1234,6 +1235,222 @@ function advancedED(r, p, W) {
   return { kpis, plots, tables, recs, out, bal };
 }
 
+// ---- plain-language explanations of the results ----------------------------------------------------------------
+// KPI meanings per process (label → text); `ED_KEEP` lists the labels whose run-specific detail is appended to the meaning.
+const ED_COMMON = {
+  'Product TDS': 'Dissolved salt left in the product water, from the ion-by-ion mass balance of the diluate. Drinking water usually needs less than 500–1000 mg/L.',
+  'Salt removal': 'Share of the dissolved salt taken out of the treated water: 1 − product TDS ÷ feed TDS.',
+  'Water recovery': 'Product water ÷ all water entering (diluate + concentrate make-up). ED and EDR usually reach 80–95 % on brackish water; the limit is scaling in the concentrate.',
+  'Specific energy': 'Electricity per m³ of product: rectifier input for the stack current plus the pumping power, from voltage × current ÷ rectifier efficiency. Brackish-water ED typically needs 0.5–2 kWh/m³ and the energy rises with the salt removed.',
+  'Current efficiency': 'Share of the electric current that actually moves salt from the diluate to the concentrate (Faraday’s law: equivalents removed × F ÷ charge passed). The rest is lost to co-ion leakage, back-diffusion and shunt currents; good stacks reach 85–95 %.',
+  'Mean current density': 'Average current per m² of membrane along the flow path, from the cell-pair voltage balance (Donnan + polarisation + ohmic drops). Higher current means less membrane but more energy.',
+  'Highest i / i_lim': 'Largest ratio of the local current to the limiting current, at which the salt concentration at the membrane surface would fall to zero. Keep it below about 70–80 %: above 100 % water splits, the pH shifts and scale forms.',
+  'Membrane area': 'Total cation- plus anion-exchange membrane area installed: 2 × cell pairs × flow-path width × length. It is the main capital-cost driver.',
+  'Gypsum saturation (wall)': 'Calcium-sulphate saturation ratio of the concentrate at the membrane surface, where polarisation makes it saltier than the bulk. Above 1 gypsum can precipitate; polarity reversal (EDR) tolerates about 1.75.',
+  'Thermodynamic minimum': 'Reversible (ideal) work needed for this separation at the same feed, product and concentrate salinities. The ratio to the specific energy shows how far the stack is from the ideal.',
+};
+const ED_HELP = {
+  ed: {
+    ...ED_COMMON,
+    'Product flow': 'Desalinated water (diluate leaving the last stage) per hour, after the water dragged to the concentrate by electro-osmosis and osmosis.',
+    'Stages × cell pairs': 'Hydraulic stages in series × cell pairs per stage. In design mode the stages are added until the target is reached with the current kept at the chosen share of the limiting current.',
+    'Stack voltage (stage 1)': 'Voltage applied to one stack of the first stage: cell pairs × voltage per cell pair + electrode voltage (water electrolysis, overpotentials, rinse compartments).',
+    'Total DC power': 'Direct-current power of all stacks: stack voltage × stack current summed over the stages, before rectifier losses.',
+    'Pumping power': 'Power to push diluate and concentrate through the spacer channels and manifolds: flow × pressure drop ÷ pump efficiency.',
+    'Concentrate TDS': 'Salinity of the concentrate (brine) blow-down. It rises with recovery and controls the scaling risk and the disposal route.',
+    'Pressure drop': 'Pressure lost by the water in the spacer-filled channels and manifolds of one stage (spacer correlation or the selected flow model). Stacks are usually limited to about 2–3 bar.',
+    'Diluate pH (estimated)': 'pH of the product, shifted when the current exceeds the limiting value and water splits into H⁺ and OH⁻ at the membranes. Stays near the feed pH below the limiting current.',
+    'GHK membrane potential (inlet, both membranes)': 'Zero-current potential of the cation plus the anion membrane from the Goldman–Hodgkin–Katz (constant-field) equation, ion by ion. It opposes the applied voltage and grows with the concentrate/diluate ratio.',
+    'Electroconvection threshold': 'Voltage across the depleted boundary layer at which vortices start to stir it (linear stability of the electro-osmotic slip model). Above it the current can exceed the limiting value.',
+    'Over-limiting slope d(i/i_lim)/dV': 'How fast the current rises above the limiting value per volt across the depleted layer, from the vortex solutions. It sets the over-limiting branch of the polarisation curve.',
+    'Over-limiting current at 1.7 × threshold (grid-extrapolated)': 'Current carried at 1.7 × the threshold voltage, as a multiple of the limiting current, extrapolated to zero grid size from three grids.',
+    'Numerical uncertainty of the over-limiting current (GCI)': 'Grid-convergence index of the finest grid: an error band on the computed over-limiting current. Below about 5 % the grid is fine enough.',
+    'Observed order of grid convergence': 'Rate at which the result converges as the grid is refined; it should be close to the formal order of the scheme (2).',
+    'Vortex-pair wavelength': 'Width of one pair of electroconvective vortices, in boundary-layer thicknesses (the most-transporting wavelength of the scan).',
+    'Sherwood number (2-D Navier–Stokes)': 'Dimensionless mass-transfer rate between the bulk flow and the membranes, from the solved 2-D flow and salt fields. Higher means thinner boundary layers and a higher limiting current.',
+    'Boundary-layer thickness (2-D Navier–Stokes)': 'Thickness of the depleted salt layer next to the membrane, from the solved channel.',
+    'Channel pressure drop per stage (2-D Navier–Stokes)': 'Pressure lost along one stage from the solved momentum equations of the spacer-filled channel.',
+    'Channel inlet pressure (2-D Navier–Stokes)': 'Outlet pressure plus the solved pressure drop of one stage: the pressure the feed pump must provide at the stack inlet.',
+    'Channel inlet pressure (Navier–Stokes)': 'Pressure needed at the channel inlet: outlet pressure plus the pressure drop from the momentum equation of the open channel.',
+    'Mean Sherwood number (Navier–Stokes–Nernst–Planck)': 'Average dimensionless mass-transfer rate to the membranes from the solved developing flow and salt transport in the open channel.',
+    'Hydrodynamic entrance length': 'Distance from the inlet over which the velocity profile develops into its parabolic shape; mass transfer is higher there.',
+    'Debye length in the diluate': 'Thickness of the electric double layer in the diluate: √(ε·R·T ÷ (2·F²·c)). Nanometres in brackish water, so electroneutrality holds almost everywhere.',
+    'Membrane-system voltage, Poisson–Nernst–Planck': 'Voltage across diluate film, cation membrane and concentrate film at the operating current, solved with the full Poisson–Nernst–Planck equations (double layers resolved).',
+    'Counter-ion transport number (PNP)': 'Share of the current carried by counter-ions through the membrane in the Poisson–Nernst–Planck solution; 1 would be a perfect membrane.',
+    'Surface charge of the wall (PNP)': 'Charge per m² that the wall carries at the chosen wall potential, from the Poisson–Nernst–Planck solution of the diffuse layer.',
+    'Current through the insulating wall': 'Check of the zero-flux wall condition; it should be zero.',
+    'Limiting current of the film (PNP plateau)': 'Current at which the depleted layer runs out of salt, read from the plateau of the Poisson–Nernst–Planck current–voltage curve.',
+    'Extended space-charge thickness': 'Width of the region next to the membrane where the solution carries a net charge at the highest voltage solved; it grows above the limiting current.',
+    'Over-limiting conductance from space charge': 'Slope of the current–voltage curve above the plateau that the extended space charge alone provides (no vortices, no water splitting).',
+    'Counter-ion transport number (Maxwell–Stefan)': 'Share of the current carried by counter-ions through the cation membrane when ion–water, ion–polymer and ion–ion friction are all included (Maxwell–Stefan).',
+    'Electro-osmotic water transport (Maxwell–Stefan)': 'Moles of water dragged through the cation membrane per Faraday of charge by ion–water friction. It lowers the product recovery; typical 4–10 mol per Faraday.',
+    'Stack temperature rise': 'Temperature rise of the water in the stack from the Joule and polarisation heat: ρ·c_p·Q·ΔT = heat released − heat lost. A warmer stack conducts better but membranes are limited to about 40–45 °C.',
+    'Specific energy, isothermal at inlet temperature': 'Specific energy the same stack would need without the conductivity gain from its own heating; the difference shows the thermal benefit.',
+    'Cell-pair voltage rise from fouling and scaling': 'Increase of the voltage per cell pair at the end of the campaign caused by organic fouling of the anion membranes and mineral scale, at constant current.',
+    'Days to cleaning': 'Operating days until the fouling and scaling raise the cell-pair voltage to the cleaning trigger: the clean-in-place interval.',
+    'Energy increase at the end of the campaign': 'Extra electricity per m³ caused by the deposits at the end of the campaign (voltage rise × current ÷ rectifier efficiency ÷ product flow).',
+    'Surrogate R², specific energy (held-out)': 'How well the trained machine-learning surrogate reproduces the specific energy of model runs it has never seen: 1 is perfect, above 0.95 is good.',
+    'Surrogate R², salt removal (held-out)': 'Same check for the salt removal predicted by the surrogate.',
+    'Selected surrogate (specific energy)': 'Learner (kernel regression, Gaussian process or neural network) with the lowest validation error, used for fast predictions.',
+    'Lowest unit cost (optimised operation)': 'Cheapest cost of water (electricity + membrane replacement) found by re-designing the stack over the current fraction and the flow velocity.',
+    'Optimal i / i_lim': 'Share of the limiting current at the cost optimum: a higher current saves membrane but costs energy.',
+    'Optimal linear velocity': 'Channel velocity at the cost optimum: faster flow raises the limiting current but costs pumping energy and pressure drop.',
+  },
+  batch: {
+    ...ED_COMMON,
+    'Batch time': 'Time until the diluate tank reaches the target salinity (or the maximum batch time), from integrating the tank balances with the stack solved at every step.',
+    'Product TDS': 'Salinity of the diluate tank at the end of the batch. Drinking water usually needs less than 500–1000 mg/L.',
+    'Product volume': 'Water left in the diluate tank at the end of the batch; some is lost to the concentrate by electro-osmosis and osmosis.',
+    'Average production': 'Product volume ÷ batch time: the equivalent continuous output of one batch (turn-around time not included).',
+    'Mean DC power': 'Average rectifier input power over the batch (energy ÷ batch time).',
+    'Concentrate TDS (end)': 'Salinity of the concentrate tank at the end of the batch; it controls scaling and the disposal route.',
+    'Specific energy': 'Electricity per m³ of product over the whole batch: rectifier energy plus pumping, integrated in time. Brackish-water ED typically needs 0.5–2 kWh/m³.',
+    'Mean current density': 'Time-averaged current per m² of membrane. It falls during the batch because the diluate becomes less conductive.',
+    'Highest i / i_lim': 'Largest ratio of local to limiting current during the batch, usually reached near the end when the diluate is most depleted. Keep it below about 70–80 %.',
+  },
+  bpmed: {
+    'NaOH production': 'Caustic soda produced per hour: current × current efficiency ÷ Faraday constant × 40 g/mol.',
+    'HCl production': 'Hydrochloric acid produced per hour, from the same charge balance as the base (× 36.5 g/mol).',
+    'Base / acid flow (each)': 'Volume of acid and of base product per hour at the chosen product strength.',
+    'Energy per kg NaOH': 'Electricity per kg of caustic: repeating-unit voltage × charge per kg ÷ current efficiency. Industrial bipolar-membrane units use about 1.5–3 kWh/kg; above 2.8 it is flagged.',
+    'Thermodynamic minimum': 'Reversible energy per kg NaOH for splitting water into acid and base at these strengths (the ΔpH potential). The gap to the actual energy is ohmic and kinetic loss.',
+    'Energy per m³ of feed': 'Electricity per m³ of salt solution treated.',
+    'Unit voltage': 'Voltage of one bipolar | anion | cation membrane repeating unit: water-splitting potential + junction overpotential + ohmic drops of membranes and solutions.',
+    'Water-splitting voltage': 'Thermodynamic voltage to split water across the bipolar membrane, from the pH difference between acid and base (about 0.83 V for 1 mol/L).',
+    'Current efficiency': 'Share of the current that produces acid and base; protons and hydroxide leaking back through the monopolar membranes waste the rest. It falls as the products get stronger.',
+    'Bipolar-membrane area': 'Bipolar-membrane area installed: total current ÷ current density. The anion and cation membranes add the same area again each.',
+    'Repeating units / stacks': 'Number of repeating units and of stacks needed to carry the current.',
+    'Total current': 'Current needed for the salt conversion: equivalents converted × F ÷ current efficiency.',
+    'Power': 'Electric power of the stacks (incl. rectifier) plus pumping.',
+    'Salt conversion': 'Share of the salt in the feed that is split into acid and base.',
+    'Depleted salt concentration': 'Salt left in the salt channel at the outlet. Below about 100 eq/m³ its resistance climbs steeply.',
+  },
+  mcdi: {
+    'Product TDS (cycle average)': 'Average salinity of the water produced during the adsorption step, from the time-integrated effluent concentration.',
+    'Salt removal': 'Share of the feed salt removed during the adsorption step: 1 − product ÷ feed salinity.',
+    'Salt adsorption per cycle': 'Salt stored in the electrodes per cycle per gram of electrode material (dynamic salt adsorption). Activated-carbon electrodes typically reach 5–20 mg/g.',
+    'Equilibrium salt adsorption capacity': 'Salt the electrodes would hold if charged to equilibrium between the charging and discharge voltages (modified-Donnan model). The dynamic value is lower because the cycle is finite.',
+    'Equilibrium charge': 'Electric charge stored per gram of electrode at equilibrium (double-layer charge).',
+    'Charge efficiency': 'Salt removed ÷ charge passed (in equivalents). Without membranes co-ions are expelled and it is lower; with membranes (MCDI) it reaches 80–95 %.',
+    'Specific energy': 'Net electricity per m³ of product: charging energy minus any energy recovered on discharge. Typically 0.1–1 kWh/m³ for low-salinity brackish water.',
+    'Energy per mole of salt': 'Net energy per mole of salt removed. Values near 20–40 kJ/mol are efficient for capacitive deionisation.',
+    'Water recovery': 'Product ÷ total water used: the adsorption time ÷ (adsorption + desorption time) at equal flows.',
+    'Productivity': 'Product water per m² of electrode cell area per hour.',
+    'Cell area required': 'Electrode cell area needed for the requested flow: flow ÷ (productivity).',
+    'Electrode mass': 'Mass of porous carbon electrode needed: cell area × electrode loading.',
+    'Average power': 'Average electric power over a cycle.',
+  },
+};
+const ED_KEEP = new Set(['Stages × cell pairs', 'Gypsum saturation (wall)', 'Electroconvection threshold', 'Over-limiting slope d(i/i_lim)/dV', 'Over-limiting current at 1.7 × threshold (grid-extrapolated)', 'Numerical uncertainty of the over-limiting current (GCI)', 'Observed order of grid convergence', 'Vortex-pair wavelength', 'Sherwood number (2-D Navier–Stokes)', 'Boundary-layer thickness (2-D Navier–Stokes)', 'Channel pressure drop per stage (2-D Navier–Stokes)', 'Channel inlet pressure (Navier–Stokes)', 'Membrane-system voltage, Poisson–Nernst–Planck', 'Surface charge of the wall (PNP)', 'Current through the insulating wall', 'Limiting current of the film (PNP plateau)', 'Extended space-charge thickness', 'Counter-ion transport number (Maxwell–Stefan)', 'Stack temperature rise', 'Specific energy, isothermal at inlet temperature', 'Cell-pair voltage rise from fouling and scaling', 'Days to cleaning', 'Surrogate R², specific energy (held-out)', 'Surrogate R², salt removal (held-out)', 'Selected surrogate (specific energy)', 'Lowest unit cost (optimised operation)', 'Equilibrium salt adsorption capacity']);
+// plot notes: what is plotted and how to read it (title prefix → text); a run-specific note already on the plot follows
+const ED_NOTES = [
+  ['Salinity along the flow path', 'Diluate and concentrate salinity from the inlet of the first stage to the outlet of the last (log scale); dashed: the diluate right at the membrane wall, lowered by concentration polarisation. The diluate falls roughly exponentially at constant voltage; the stage boundaries are marked.'],
+  ['Current density and limiting current density', 'Local current density against the limiting current density, which falls with the diluate concentration. Where the two curves approach (ratio above the 80 % line) the stage runs close to water splitting; each new stage restarts with its own voltage.'],
+  ['Voltage breakdown per cell pair', 'Where the voltage of one cell pair goes, averaged along the path: membrane (Donnan) potential, concentration polarisation, ohmic drops of membranes and of both channels, and the electrodes shared over all cell pairs. The tallest bar is the first target for saving energy.'],
+  ['Polarisation curve of one cell pair', 'Current density versus voltage per cell pair at the inlet and the outlet conditions: a straight ohmic region, the limiting plateau and the over-limiting branch. The operating voltage should sit well left of the plateau.'],
+  ['Nernst–Planck–Donnan profile', 'Concentrations and electric potential across diluate film, cation-exchange membrane and concentrate film at the stack inlet: the co-ion is depleted towards the membrane in the diluate film, excluded inside the membrane (Donnan) and enriched in the concentrate film.'],
+  ['Ion removal from the diluate', 'Share of each ion removed from the treated water. Divalent and fast ions are usually removed more readily; selective membranes change the pattern.'],
+  ['Desalination energy versus feed salinity', 'Specific energy of a re-designed stack for feeds from 0.4 to 2.6 times the present salinity, next to the reversible minimum and the number of stages needed.'],
+  ['Product TDS versus voltage and velocity', 'Colour map of the product salinity this stack would deliver at other voltages and velocities; follow a contour to find operating points with the same product quality. More voltage or a slower flow removes more salt.'],
+  ['Concentration-polarisation and water transport', 'Wall ÷ bulk concentration in both channels (below 1 in the diluate, above 1 in the concentrate) and the water flux dragged into the concentrate by electro-osmosis and osmosis.'],
+  ['Over-limiting current from electroconvection', 'Current above the limiting value carried by electroconvective vortices as the voltage across the depleted layer exceeds the instability threshold.'],
+  ['Electroconvection: grid convergence', 'Convergence of the over-limiting current as the grid is refined, with the Richardson extrapolation to zero cell size and the wavelength scan.'],
+  ['Electroconvective vortices', 'Salt concentration (colour) and streamlines of the vortex pairs in the depleted layer next to the membrane: the vortices bring fresh salt to the surface and so carry current above the limiting value.'],
+  ['Velocity in the ED channel', 'Flow speed (colour) and streamlines between the membranes and around the spacer filaments, solved with the 2-D Navier–Stokes equations.'],
+  ['Salt concentration in the diluate channel', 'Salt concentration in the solved channel at the mean current density: depleted layers grow along both membranes and are thinnest where the flow is fastest.'],
+  ['Local Sherwood number and pressure along the channel', 'Local mass-transfer rate at the walls and the pressure along the solved channel section; peaks of the Sherwood number mark where filaments push the flow against the membranes.'],
+  ['Developing velocity profile', 'Velocity profiles across the gap at several distances from the inlet, developing from uniform inflow to the parabolic profile.'],
+  ['Pressure, Sherwood number and wall concentration along the channel', 'Pressure, local mass-transfer rate and wall concentration along the open channel (log distance): mass transfer is highest at the inlet and settles once the boundary layer has developed.'],
+  ['Poisson–Nernst–Planck solution', 'Full Poisson–Nernst–Planck solution (lines) next to the electroneutral model (points): they agree except within a few Debye lengths of the interfaces.'],
+  ['Space-charge region', 'Net charge and potential within a few nanometres of the diluate | membrane interface — the double layer that the electroneutral model replaces by a Donnan jump.'],
+  ['Diffuse double layer at an insulating', 'Potential and ion concentrations next to a charged wall: the Poisson–Nernst–Planck solution against the Gouy–Chapman analytical result.'],
+  ['Current–voltage curve of the depleted diffusion layer', 'Current through the depleted layer as the voltage rises: the plateau at the limiting current and the slow over-limiting rise carried by the extended space charge.'],
+  ['Ion profiles in the depleted layer', 'Counter- and co-ion concentrations next to the membrane at the highest voltage solved (log–log).'],
+  ['Maxwell–Stefan ion profiles', 'Concentration of each ion across the cation membrane from the Maxwell–Stefan model: counter-ions near the fixed-charge level, co-ions strongly excluded.'],
+  ['Fouling and scaling during the operating campaign', 'Growth of the organic deposit and mineral scale and the resulting rise of the cell-pair voltage over the campaign; the dashed line is the cleaning trigger.'],
+  ['Surrogate parity', 'Surrogate predictions against the mechanistic model on runs held out from training: points on the 1 : 1 line mean a faithful surrogate.'],
+  ['Surrogate versus mechanistic model along the voltage', 'Surrogate (lines) and mechanistic model (points) along the voltage at the present feed and velocity.'],
+  ['Unit cost versus operating current fraction and velocity', 'Colour map of the cost of water over the current fraction and the velocity, with the optimum and the present point.'],
+  ['Tank salinity during the batch', 'Diluate and concentrate tank salinity during the batch (log scale): the diluate falls until the target line is crossed, the concentrate rises.'],
+  ['Current density and limiting-current ratio', 'Mean current density and the highest local share of the limiting current during the batch: the current falls as the diluate becomes less conductive while the ratio rises towards the end.'],
+  ['Electrical power', 'Rectifier input power during the batch; it falls with the current as the diluate is depleted.'],
+  ['Voltage of one repeating unit versus current density', 'Voltage of one bipolar | anion | cation repeating unit as the current density rises; the dashed line is the thermodynamic water-splitting voltage that is always needed.'],
+  ['Voltage breakdown of one repeating unit', 'Where the voltage of one repeating unit goes: water splitting (thermodynamic), junction overpotential and ohmic drops.'],
+  ['Energy and current efficiency versus product strength', 'Energy per kg NaOH and current efficiency as stronger acid and base are made: leakage through the monopolar membranes lowers the efficiency and raises the energy.'],
+  ['Energy and membrane area versus current density', 'Trade-off between energy per kg NaOH (rises with current density) and membrane area (falls with current density).'],
+  ['Energy per kg NaOH versus current density and product strength', 'Colour map of the energy per kg NaOH over current density and product strength, with the operating point.'],
+  ['Effluent salinity during one cycle', 'Salinity of the water leaving the cell during one adsorption–desorption cycle: low while the electrodes charge, a salty pulse on discharge.'],
+  ['Cell current and equilibrium voltage', 'Current density and double-layer voltage during the cycle: the current decays as the double layers charge.'],
+  ['Equilibrium salt adsorption versus cell voltage', 'Salt held per gram of electrode at equilibrium as the cell voltage rises, from the modified-Donnan model with and without membranes and the planar Gouy–Chapman–Stern model.'],
+  ['Charge efficiency versus cell voltage', 'Salt removed per charge stored, as the voltage rises: without membranes co-ions are expelled at low voltage; membranes keep it high.'],
+  ['Equilibrium adsorption versus feed salinity', 'Salt adsorption capacity and charge efficiency as the feed salinity changes (log scale).'],
+  ['Salt adsorption capacity versus voltage and salinity', 'Colour map of the equilibrium salt adsorption over charging voltage and feed concentration, with the operating point.'],
+];
+/** Every KPI gets its plain meaning (process-specific) and every plot its reading note. */
+function explainED(v, res) {
+  const kind = v.process === 'bpmed' ? 'bpmed' : v.process === 'mcdi' ? 'mcdi' : v.mode === 'batch' ? 'batch' : 'ed', H = ED_HELP[kind];
+  for (const k of res.kpis || []) {
+    const base = H[k.label] || ED_COMMON[k.label];
+    if (base) k.help = ED_KEEP.has(k.label) && k.help ? `${base} ${k.help.replace(/\.?$/, '.')}` : base;
+  }
+  for (const pl of res.plots || []) {
+    const n = ED_NOTES.find(([t]) => (pl.title || '').startsWith(t));
+    if (n && !pl._own) pl.note = pl.note ? `${n[1]} ${pl.note}` : n[1];
+  }
+  return res;
+}
+
+// ---- animated and 3-D views ------------------------------------------------------------------------------------
+/** Floating 3-D surface z(x, y) on abstract axes, coloured by c: the second axis is rescaled to 0.8 × the length of the first, the corners carry the real values. */
+function surfaceED(title, xs, ys, z, c, o) {
+  const Lx = xs[xs.length - 1] - xs[0] || 1, y0 = ys[0], Ly = ys[ys.length - 1] - y0 || 1, yy = ys.map((y) => ((y - y0) / Ly) * 0.8 * Lx + xs[0]);
+  let lo = Infinity, hi = -Infinity; for (const row of z) for (const q of row) if (Number.isFinite(q)) { if (q < lo) lo = q; if (q > hi) hi = q; }
+  const floor = lo - 0.06 * (hi - lo || 1), corner = (i, j, label) => ({ x: xs[i], y: yy[j], z0: floor, z1: Number.isFinite(z[j][i]) ? z[j][i] : floor, label: o.zl && Number.isFinite(z[j][i]) ? `${label} · ${o.zl(z[j][i])}` : label, color: '#64748b' });
+  return { type: 'surface3d', title, _own: true, axes: false, x: xs, y: yy, z: ys.map(() => xs.map(() => NaN)), cmap: o.cmap, azimuth: 215, elevation: 34, zscale: (0.45 * Lx) / (hi - floor || 1), zlabel: o.zlabel,
+    layers: [{ name: o.zlabel, z, base: ys.map(() => xs.map(() => floor)), c, cmap: o.cmap, clabel: o.clabel, cunit: o.cunit, opacity: 1 }],
+    markers: [corner(0, 0, `${o.xl(xs[0])} · ${o.yl(ys[0])}`), corner(0, ys.length - 1, o.yl(ys[ys.length - 1])), corner(xs.length - 1, ys.length - 1, o.xl(xs[xs.length - 1])), ...(o.mark ? [{ x: o.mark.x, y: ((o.mark.y - y0) / Ly) * 0.8 * Lx + xs[0], z0: floor, z1: o.mark.z, label: o.mark.label, color: '#ef4444' }] : [])], note: o.note };
+}
+const interp = (xa, ya, x) => { if (x < xa[0] || x > xa[xa.length - 1]) return NaN; let k = 1; while (k < xa.length - 1 && xa[k] < x) k++; const a = xa[k - 1], b = xa[k]; return b > a ? ya[k - 1] + ((ya[k] - ya[k - 1]) * (x - a)) / (b - a) : ya[k]; };
+/** Continuous ED: Nernst–Planck–Donnan profile across film | membrane | film at successive positions along the flow path (animated and 3-D), and the product-TDS map in 3-D. */
+function edPathViews(r, p, segs, T, map, Us, us, op) {
+  const views = [], X = p.Xfix * 1000, dm = p.dMem * 1e-6, n = Math.max(6, Math.round(p.nProf)), ks = segs.length <= 36 ? segs.map((_, k) => k) : [...new Set(linspace(0, segs.length - 1, 36).map(Math.round))];
+  const prof = ks.map((k) => {
+    const g = segs[k], e = electrolyte(CH.map((q) => (q === 'Na' || q === 'Cl' ? g.ceqD : 0)), T), delta = g.k > 0 ? electrolyte(g.cd, T).Ds / g.k : 5e-5;
+    const pf = g.iFilm > 0 ? npProfile({ cd: g.ceqD, cc: g.ceqC, i: g.iFilm, X, dm, Dp: e.Dc, Dm: e.Da, DpM: 0.05 * e.Dc, DmM: 0.05 * e.Da, deltaD: delta, deltaC: delta, T, n }) : null;
+    return pf && pf.ok ? { g, pf, um: pf.x.map((x) => x * 1e6), cp: pf.cplus.map((c, j) => (pf.x[j] >= 0 && pf.x[j] <= dm ? c / 20 : c)), mv: pf.phi.map((q) => q * 1000) } : null;
+  }).filter(Boolean);
+  if (prof.length >= 3) {
+    let lo = Infinity, hi = -Infinity, x0 = Infinity, x1 = -Infinity;
+    for (const q of prof) { for (const a of [q.pf.c, q.cp, q.mv]) for (const y of a) if (Number.isFinite(y)) { lo = Math.min(lo, y); hi = Math.max(hi, y); } x0 = Math.min(x0, q.um[0]); x1 = Math.max(x1, q.um[q.um.length - 1]); }
+    const d = hi - lo || 1, fr = prof.map(({ g, pf, um, cp, mv }) => ({ label: `${fmt(g.X, 3)} m along the path (stage ${g.stage}): diluate ${fmt(tdsOf(g.cd, r.neutral), 3)} mg/L, ${fmt(g.i, 3)} A/m² = ${fmt(100 * g.ratio, 3)} % of the limiting current`,
+      series: [{ name: 'Co-ion (anion) concentration (mol/m³)', x: um, y: pf.c, color: '#0ea5e9' }, { name: 'Counter-ion concentration ÷ 20 in the membrane (mol/m³)', x: um, y: cp, dash: true, color: '#10b981' }, { name: 'Electric potential (mV)', x: um, y: mv, color: '#f97316' }] }));
+    views.push({ type: 'line', title: 'Concentration and potential across the cell along the flow path (animated)', _own: true, xlabel: 'Distance from the diluate-side membrane face (µm)', ylabel: 'mol/m³ · mV', xmin: x0, xmax: x1, ymin: lo - 0.04 * d, ymax: hi + 0.3 * d, series: fr[0].series, vlines: [{ x: 0, label: 'membrane', color: '#64748b' }, { x: dm * 1e6, label: '', color: '#64748b' }], frames: fr, frame: 0, frameLabel: 'Position', fps: 6,
+      note: `Press ▶ to travel down the flow path. Each frame is the exact electroneutral Nernst–Planck–Donnan solution across diluate film | cation-exchange membrane | concentrate film at the local bulk concentrations and current of the stack solution (equivalent 1:1 salt). As the diluate is depleted, the co-ion in the diluate film falls towards zero at the membrane face — the approach to the limiting current — and the potential needed across the cell grows; at a new stage the current changes with the stage voltage.` });
+    // the same profiles as a surface: co-ion concentration over (position across the cell × path length)
+    const xg = linspace(x0, x1, 49), zz = prof.map((q) => xg.map((x) => interp(q.um, q.pf.c, x)));
+    views.push(surfaceED('Salt across film | membrane | film along the flow path (3-D)', xg, prof.map((q) => q.g.X), zz, zz, { cmap: 'salinity', zlabel: 'Co-ion concentration', clabel: 'Co-ion (salt) concentration', cunit: 'mol/m³', xl: (x) => `${fmt(x, 3)} µm`, yl: (y) => `${fmt(y, 3)} m`,
+      note: `Height and colour: co-ion (salt) concentration across the cell (across the picture: diluate film, membrane, concentrate film; the membrane face is at 0 µm) at every position along the flow path (into the picture, ${fmt(prof[0].g.X, 3)} to ${fmt(prof[prof.length - 1].g.X, 3)} m). The trench is the membrane, which excludes co-ions; the diluate side sinks and the concentrate side rises along the path. Drag or use ◀ ▶ to turn the view.` }));
+  }
+  const gL = map.map((row) => row.map((q) => q / 1000)); // g/L keeps the colour-bar labels short
+  if (map.length >= 2 && map[0].length >= 2) views.push(surfaceED('Product TDS over voltage and velocity (3-D)', Us, us, gL, gL, { cmap: 'salinity', zlabel: 'Product TDS', clabel: 'Product TDS', cunit: 'g/L', xl: (x) => `${fmt(x, 3)} V`, yl: (y) => `${fmt(y, 3)} cm/s`, mark: { ...op, z: op.z / 1000, label: `operating · ${fmt(op.z, 3)} mg/L` },
+    note: 'The product-salinity map of this stack as a surface: voltage per cell pair across, linear velocity into the picture; every node is a full march through all stages. Low ground is clean water — reached with more voltage or slower flow, at the price of energy or output. The red pole marks the present operating point. Drag or use ◀ ▶ to turn the view.' }));
+  return views;
+}
+/** Batch ED: current density along one pass at successive moments (animated) and over (path × time) in 3-D, from the stack solutions of the batch integration. */
+function edBatchViews(r) {
+  const views = [], kEnd = r.tHit === null ? r.nt : Math.max(1, r.t.findIndex((x) => x >= r.tHit)), hist = r.hist || [];
+  if (hist.length < 3 || !hist[0].length) return views;
+  const ks = [...new Set(linspace(0, Math.min(kEnd, hist.length - 1), Math.min(40, kEnd + 1)).map(Math.round))], xs = hist[0].map((g) => g.x);
+  let hi = 0; for (const k of ks) for (const g of hist[k]) hi = Math.max(hi, g.i, g.ilim);
+  const fr = ks.map((k) => ({ label: `${fmt(r.t[k], 3)} min: diluate tank ${fmt(r.tdsD[k], 4)} mg/L, highest i / i_lim ${fmt(100 * r.ratio[k], 3)} %`, series: [{ name: 'Current density (A/m²)', x: xs, y: hist[k].map((g) => g.i), mode: 'both', color: '#f97316' }, { name: 'Limiting current density (A/m²)', x: xs, y: hist[k].map((g) => g.ilim), dash: true, color: '#64748b' }, { name: '80 % of the limiting current (A/m²)', x: xs, y: hist[k].map((g) => 0.8 * g.ilim), dash: true, color: '#ef4444' }] }));
+  views.push({ type: 'line', title: 'Current along one pass during the batch (animated)', _own: true, xlabel: 'Position along the flow path of one pass (m)', ylabel: 'A/m²', xmin: 0, xmax: r.G.L, ymin: 0, ymax: 1.3 * hi, series: fr[0].series, frames: fr, frame: 0, frameLabel: 'Time', fps: 8,
+    note: 'Press ▶ to follow the batch. At every moment the stack is solved along one pass with the tank concentrations of that moment: the current falls as the diluate tank is depleted, while the limiting current falls even faster, so the gap closes towards the end of the batch — the reason for stepping the voltage down.' });
+  const ts = ks.map((k) => r.t[k]), z = xs.map((_, j) => ks.map((k) => hist[k][j].i)), c = xs.map((_, j) => ks.map((k) => 100 * hist[k][j].ratio)); // rows: position along the pass, columns: time
+  if (xs.length >= 2) views.push(surfaceED('Current density over batch time and the flow path (3-D)', ts, xs, z, c, { cmap: 'thermal', zlabel: 'Current density', clabel: 'Share of the limiting current', cunit: '%', zl: (q) => `${fmt(q, 3)} A/m²`, xl: (t) => (t > 0 ? `${fmt(t, 3)} min` : 't = 0'), yl: (x) => `${fmt(x, 3)} m`,
+    note: 'Height: local current density during the batch (time runs across) at every position along one pass (into the picture, inlet in front). Colour: the same current as a share of the limiting current — hot colours mark where the stack comes closest to water splitting, normally at the pass outlet late in the batch. Drag or use ◀ ▶ to turn the view.' }));
+  return views;
+}
+
 const suite = {
   id: 'ed', num: 7, title: 'Electrodialysis & Membrane Electrochemical Processes', short: 'Electrodialysis', icon: '⚡',
   tagline: 'Ion-by-ion design and rating of ED/EDR stacks, with bipolar-membrane acid/base production and membrane capacitive deionisation.',
@@ -1401,6 +1618,8 @@ const suite = {
     { name: 'Membrane capacitive deionisation, 1 g/L', values: { process: 'mcdi', ions: WATERS.lowbrackish.ions, Qp: 5, pH: 7.8 } },
   ],
 
+  predict: { inputs: ['Qp', 'salinityFactor', 'targetTDS', 'recovery', 'safety', 'uLin', 'T', 'Ucp'], outputs: ['Specific energy', 'Product TDS', 'Membrane area', 'Current efficiency', 'Highest i / i_lim', 'Water recovery', 'Total DC power', 'Salt removal'] },
+
   pull: ({ feed, outputs }) => [
     feed?.ions ? { key: 'ions', value: feed.ions, from: 'Case feed water' } : null, feed?.T ? { key: 'T', value: clamp(feed.T, 5, 45), from: 'Case feed water' } : null, feed?.pH ? { key: 'pH', value: feed.pH, from: 'Case feed water' } : null,
     outputs?.ro?.streams?.permeate?.ions ? { key: 'ions', value: outputs.ro.streams.permeate.ions, from: 'RO permeate (polishing by ED)' } : null,
@@ -1410,7 +1629,7 @@ const suite = {
   site: (site) => [{ key: 'T', value: site?.data?.sst !== undefined && site?.data?.sst !== null ? clamp(site.data.sst, 5, 45) : undefined, from: 'Sea-surface temperature at site' }],
 
   run(v, ctx) { // synchronous by default; asynchronous with the 2-D Navier–Stokes channel option (finite-volume solver) and, when the caller can yield, with the longer opt-in sub-models
-    const go = () => (v.process === 'bpmed' ? runBPMED(v) : v.process === 'mcdi' ? runCDI(v) : v.mode === 'batch' ? runBatch(v) : runED(v));
+    const go = () => explainED(v, v.process === 'bpmed' ? runBPMED(v) : v.process === 'mcdi' ? runCDI(v) : v.mode === 'batch' ? runBatch(v) : runED(v));
     if (isED(v) && v.flowModel === 'cfd2d') { ctx?.progress?.(0.05, 'Solving the 2-D Navier–Stokes channel flow'); return prepareChannelCFD(v, ctx).then(async () => { ctx?.progress?.(0.6, 'Solving the stack'); await ctx?.tick?.(); return go(); }); }
     if (isED(v) && (v.olModel === 'rz' || v.surrogate || v.optimise || (v.pnp && v.pnp !== 'off')) && ctx?.tick) return (async () => { ctx.progress?.(0.2, 'Solving the stack and the selected sub-models'); await ctx.tick(); return go(); })(); // yield once so the interface can show progress before the longer sub-models
     return go();
@@ -1650,6 +1869,7 @@ function runED(v) {
       { type: 'field', title: 'Product TDS versus voltage and velocity (this stack)', xlabel: 'Voltage per cell pair (V)', ylabel: 'Linear velocity (cm/s)', zlabel: 'Product TDS', zunit: 'mg/L', x: Us, y: us, z: map, cmap: 'salinity', contours: 8, markers: [{ x: clamp(sum(st.map((s) => s.U)) / r.nSt, 0.2, 1.4), y: clamp(u0 * 100, 3, 16), label: 'operating' }], note: `${r.nSt} stage${r.nSt > 1 ? 's' : ''} with the same voltage on every stage; coarse grid (4 segments per stage).` },
       { type: 'line', title: 'Concentration-polarisation and water transport', xlabel: 'Path length through all stages (m)', ylabel: 'see legend', series: [{ name: 'Wall ÷ bulk concentration, diluate', x: xs, y: segs.map((g) => g.wd / g.ceqD) }, { name: 'Wall ÷ bulk concentration, concentrate', x: xs, y: segs.map((g) => g.wc / g.ceqC) }, { name: 'Water flux to concentrate (L/m²·h)', x: xs, y: segs.map((g) => g.jw * 3.6e6) }], vlines: stageEdges },
       ...adv.plots,
+      ...edPathViews(r, p, segs, T, map, Us, us, { x: clamp(sum(st.map((s) => s.U)) / r.nSt, 0.2, 1.4), y: clamp(u0 * 100, 3, 16), z: r.tdsP, label: 'operating' }),
     ],
     tables: [
       { title: 'Stage summary', columns: ['Stage', 'Diluate in (mg/L)', 'Diluate out (mg/L)', 'Concentrate out (mg/L)', 'V per cell pair', 'Electrode voltage (V)', 'Stack voltage (V)', 'Stack current (A)', 'Mean i (A/m²)', 'Max i / i_lim (%)', 'DC power (kW)', 'Pressure drop (bar)', 'Velocity (cm/s)', 'Reynolds'],
@@ -1712,6 +1932,7 @@ function runBatch(v) {
       { type: 'line', title: 'Polarisation curve of one cell pair', xlabel: 'Voltage per cell pair (V)', ylabel: 'Current density (A/m²)', series: [{ name: 'Start of batch', x: pol.U, y: pol.i }, { name: 'End of batch', x: polE.U, y: polE.i }], vlines: [{ x: p.Ucp, label: 'operating' }] },
       ...(prof ? [prof.plot] : []),
       { type: 'bar', title: 'Ion removal from the diluate', ylabel: '% removed', categories: act.map((j) => IONS[CH[j]].label), series: [{ name: 'Removal', values: act.map(rem) }] },
+      ...edBatchViews(r),
     ],
     tables: [
       { title: 'Batch history', columns: ['Time (min)', 'Diluate TDS (mg/L)', 'Concentrate TDS (mg/L)', 'Mean i (A/m²)', 'Max i / i_lim (%)', 'Power (kW)'], rows: r.t.map((x, i) => [x, r.tdsD[i], r.tdsC[i], r.iAvg[i], 100 * r.ratio[i], r.P[i] / 1000]).filter((_, i) => i <= k && (r.nt <= 40 || i % Math.ceil(r.nt / 40) === 0 || i === k)) },
