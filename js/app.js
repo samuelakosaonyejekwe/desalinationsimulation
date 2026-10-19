@@ -25,7 +25,7 @@ const main = document.getElementById('main'), nav = document.getElementById('nav
 let cleanup = null, deferredInstall = null, swReg = null, version = '', running = '', offlineReady = false;
 
 const app = {
-  get version() { return version; },
+  get version() { return running || version; }, // the build this page runs (its stored copy), else the one the host reports
   offlineReady: () => offlineReady,
   installed: () => window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true,
   downstream,
@@ -158,7 +158,8 @@ function refreshArchiveCopy() {
     // captured under its own address (?v=<build>), which is always new to the Archive.
     const ask = (u) => fetch('https://web.archive.org/save/' + u, { mode: 'no-cors', credentials: 'omit', referrerPolicy: 'no-referrer', cache: 'no-store' });
     // the plain address is what the Install & offline page links to (through the Archive's list of captures), so it is asked for first
-    ask(ARCHIVE_SOURCE).then(() => ask(ARCHIVE_SOURCE + '?v=' + version)).catch(() => store.pref('archived', ''));
+    // the per-build address is new to the Archive for every build, so it is always captured at once; the plain address follows
+    ask(ARCHIVE_SOURCE + '?v=' + version).then(() => ask(ARCHIVE_SOURCE)).catch(() => store.pref('archived', ''));
   } catch { /* storage or network unavailable: try again on a later visit */ }
 }
 

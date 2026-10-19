@@ -390,7 +390,10 @@ export function appPage(root, app) {
         else { const r = await fetch(url + 'version.json?t=' + Date.now(), { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'cors' }); clearTimeout(tm); const j = await r.json(); el.className = 'source ok'; el.lastChild.textContent = `online · build ${String(j.version).slice(0, 12)}`; }
       }
       catch { el.className = 'source fail'; el.lastChild.textContent = navigator.onLine ? 'not reachable from this network' : 'offline'; }
-      el.append(h('a', { class: 'btn mini', href: arch ? archUrl : url + 'index.html', rel: 'noopener', title: arch ? 'Opens the latest capture held by the Archive' : null }, 'Open'));
+      // the copy of exactly this build lives at its own address (?v=<build>), which the Archive captures fresh for every build
+      const buildV = app.version && app.version !== 'single-file' ? app.version : '';
+      if (arch && buildV) el.append(h('a', { class: 'btn mini primary', href: `https://web.archive.org/web/${new Date().toISOString().replace(/\D/g, '').slice(0, 14)}id_/${ARCHIVE_SOURCE}?v=${buildV}`, rel: 'noopener', title: `Opens the Archive's copy of build ${buildV} — exactly the build you are using` }, 'Open this build'));
+      el.append(h('a', { class: 'btn mini', href: arch ? archUrl : url + 'index.html', rel: 'noopener', title: arch ? 'Opens the newest copy the Archive holds' : null }, arch ? 'Open newest copy' : 'Open'));
     }
   };
   const paintStorage = async () => {

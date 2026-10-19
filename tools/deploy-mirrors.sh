@@ -18,6 +18,7 @@ case "${1:-}" in
   netlify)    npx --yes netlify-cli deploy --prod --dir . --site "${2:?site id}" ;;
   gitlab)     git push "${2:?remote url}" HEAD:main ;;
   codeberg)   git push "${2:?remote url}" HEAD:pages ;;
-  archive)    curl -s -o /dev/null -w 'Internet Archive capture: %{http_code} %{redirect_url}\n' "https://web.archive.org/save/${2:-https://samuelakosaonyejekwe.github.io/desalinationsimulation/standalone.html}" ;;
+  archive)    V=$(grep -o '"version":"[a-z0-9]*"' version.json | cut -d'"' -f4); U=${2:-https://samuelakosaonyejekwe.github.io/desalinationsimulation/standalone.html}
+              for u in "$U?v=$V" "$U"; do curl -s -o /dev/null -w "Internet Archive capture of $u: %{http_code} %{redirect_url}\n" "https://web.archive.org/save/$u"; done ;;
   *) sed -n '2,12p' "$0"; exit 1 ;;
 esac
