@@ -4,6 +4,7 @@
 const VERSION = '__VERSION__';
 const SHELL = 'brinelab-shell-' + VERSION, DATA = 'brinelab-data-v1', TILES = 'brinelab-tiles-v2';
 const FILES = __FILES__;
+const HASHES = __HASHES__; // SHA-256 of each file of this build
 const DATA_HOSTS = ['api.open-meteo.com', 'marine-api.open-meteo.com', 'geocoding-api.open-meteo.com', 'api.bigdatacloud.net', 'pae-paha.pacioos.hawaii.edu', 'gis.ngdc.noaa.gov', 'erddap.emodnet-physics.eu', 'api.worldbank.org', 'open.er-api.com', 'ourworldindata.org', 'power.larc.nasa.gov', 'api.openalex.org', 'api.crossref.org'];
 
 const tell = async (msg) => { for (const c of await self.clients.matchAll({ includeUncontrolled: true })) c.postMessage(msg); };
@@ -12,7 +13,19 @@ self.addEventListener('install', (e) => {
   e.waitUntil((async () => {
     const cache = await caches.open(SHELL);
     // Fetch every file fresh from the network so a new build never mixes with stale HTTP-cached files.
-    await Promise.all(FILES.map(async (f) => { const r = await fetch(new Request(f, { cache: 'reload' })); if (!r.ok) throw new Error('precache failed: ' + f); await cache.put(f, r); }));
+    // Each file must match this build's fingerprint; while a deployment is still spreading, the host can serve an older copy
+    // for a few minutes, so a mismatch is retried (up to about ten minutes) before the new build is refused.
+    const hex = (buf) => [...new Uint8Array(buf)].map((x) => x.toString(16).padStart(2, '0')).join('');
+    await Promise.all(FILES.map(async (f) => {
+      for (let attempt = 0; ; attempt++) {
+        const r = await fetch(new Request(f + (attempt ? (f.includes('?') ? '&' : '?') + 'b=' + VERSION + '-' + attempt : ''), { cache: 'reload' }));
+        if (!r.ok) throw new Error('precache failed: ' + f);
+        const body = await r.arrayBuffer(), want = HASHES[f];
+        if (!want || hex(await crypto.subtle.digest('SHA-256', body)) === want) { await cache.put(f, new Response(body, { headers: r.headers })); return; }
+        if (attempt >= 20) throw new Error('file does not match this build yet: ' + f);
+        await new Promise((ok) => setTimeout(ok, 30000));
+      }
+    }));
     if (!self.registration.active) await self.skipWaiting(); // first install: take control immediately
   })());
 });

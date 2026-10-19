@@ -47,5 +47,8 @@ if (esbuildPath && existsSync(esbuildPath)) {
 
 const precache = ['./', ...files, 'version.json', ...(existsSync(join(root, 'standalone.html')) ? [] : [])];
 writeFileSync(join(root, 'version.json'), JSON.stringify({ version, built: new Date().toISOString(), files: files.length }) + '\n');
-writeFileSync(join(root, 'sw.js'), readFileSync(join(root, 'tools/sw.template.js'), 'utf8').replace('__VERSION__', version).replace('__FILES__', JSON.stringify(precache)));
+// fingerprint of every pre-cached file: the service worker only accepts a new build when each file it fetched matches, so a
+// deployment that is still spreading across the host's servers (new version.json, older code) can never be stored half-way
+const hashes = Object.fromEntries(files.map((f) => [f, createHash('sha256').update(readFileSync(join(root, f))).digest('hex')]));
+writeFileSync(join(root, 'sw.js'), readFileSync(join(root, 'tools/sw.template.js'), 'utf8').replace('__VERSION__', version).replace('__FILES__', JSON.stringify(precache)).replace('__HASHES__', JSON.stringify(hashes)));
 console.log(`build ${version}: ${files.length} files pre-cached${standalone ? `, standalone.html written (${standalone})` : ' (standalone.html not rebuilt: esbuild not found)'}`);

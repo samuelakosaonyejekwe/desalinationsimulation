@@ -41,7 +41,7 @@ const app = {
     try {
       const j = await (await fetch('version.json?t=' + Date.now(), { cache: 'no-store' })).json();
       const mine = running || version; // the build this page actually runs (from its stored copy), not the one the network offers
-      if (mine && j.version && j.version !== mine) { await swReg?.update(); offerReload(); }
+      if (mine && j.version && j.version !== mine) { await swReg?.update().catch(() => {}); if (!swReg || swReg.waiting) offerReload(); else if (manual) toast('A newer build is being downloaded and checked; you will be offered it as soon as it is complete.', 'info'); } // offered once the stored copy is complete and verified
       else if (manual) toast('You have the latest build.', 'ok');
     } catch { if (manual) toast('Could not check for updates right now.', 'warn'); }
   },
@@ -136,7 +136,7 @@ async function setupServiceWorker() {
   try {
     swReg = await navigator.serviceWorker.register('sw.js');
     navigator.serviceWorker.addEventListener('message', (e) => { if (e.data?.type === 'offline-ready') offlineReady = true; if (e.data?.type === 'version' && !version) version = e.data.version;
-      if (e.data?.type === 'running' && e.data.version) { running = e.data.version; setBuildId(running); if (version && version !== running) { swReg?.update().catch(() => {}); offerReload(); } } });
+      if (e.data?.type === 'running' && e.data.version) { running = e.data.version; setBuildId(running); if (version && version !== running) { swReg?.update().catch(() => {}); if (swReg?.waiting) offerReload(); } } });
     navigator.serviceWorker.controller?.postMessage('version?');
     navigator.serviceWorker.ready.then((r) => { r.active?.postMessage('status'); r.periodicSync?.register('refresh', { minInterval: 6 * 3600e3 }).catch(() => {}); });
     swReg.addEventListener('updatefound', () => { const w = swReg.installing; w?.addEventListener('statechange', () => { if (w.state === 'installed' && navigator.serviceWorker.controller) offerReload(); }); });
