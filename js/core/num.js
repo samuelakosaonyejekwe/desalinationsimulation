@@ -420,5 +420,6 @@ export function fmt(x, sig = 4) {
   const ax = Math.abs(x);
   if (ax >= 1e7 || ax < 1e-4) return x.toExponential(Math.max(1, sig - 1)).replace('e+', 'e');
   const digits = Math.max(0, sig - 1 - Math.floor(Math.log10(ax)));
-  return x.toLocaleString('en-US', { maximumFractionDigits: Math.min(8, digits), minimumFractionDigits: 0 });
+  return NF[Math.min(8, digits)].format(x); // cached formatters: toLocaleString builds a new one on every call, which is slow in tables and animations
 }
+const NF = Array.from({ length: 9 }, (_, d) => new Intl.NumberFormat('en-US', { maximumFractionDigits: d, minimumFractionDigits: 0 }));
