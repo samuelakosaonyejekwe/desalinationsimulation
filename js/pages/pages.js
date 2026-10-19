@@ -368,7 +368,10 @@ export function appPage(root, app) {
     for (const el of mirrorBox.children) {
       const url = el.dataset.url;
       const arch = el.dataset.kind === 'archive';
-      let archUrl = url;
+      // fallback link when the Archive's lookup service is busy: a capture time of "now" makes the Archive pick its newest capture
+      // (its fixed far-future address can be answered from a stale cache)
+      const nowStamp = new Date().toISOString().replace(/\D/g, '').slice(0, 14);
+      let archUrl = arch ? `https://web.archive.org/web/${nowStamp}id_/${ARCHIVE_SOURCE}` : url;
       try {
         const ctl = new AbortController(), tm = setTimeout(() => ctl.abort(), 12000);
         if (arch) {
@@ -381,7 +384,7 @@ export function appPage(root, app) {
             const when = Date.UTC(+ts.slice(0, 4), +ts.slice(4, 6) - 1, +ts.slice(6, 8), +ts.slice(8, 10), +ts.slice(10, 12), +ts.slice(12, 14));
             archUrl = `https://web.archive.org/web/${ts}id_/${ARCHIVE_SOURCE}`;
             el.className = 'source ok'; el.lastChild.textContent = `captured ${new Date(when).toLocaleString()}` + (built ? (when >= built - 60e3 ? ' · holds the current build' : ' · holds an earlier build; a new capture has been requested') : '');
-          } else { await fetch(url, { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'no-cors' }); el.className = 'source ok'; el.lastChild.textContent = 'reachable'; }
+          } else { await fetch(url, { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'no-cors' }); el.className = 'source ok'; el.lastChild.textContent = 'reachable · opens the newest capture (the Archive did not say when it was taken)'; }
           clearTimeout(tm);
         }
         else { const r = await fetch(url + 'version.json?t=' + Date.now(), { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'cors' }); clearTimeout(tm); const j = await r.json(); el.className = 'source ok'; el.lastChild.textContent = `online · build ${String(j.version).slice(0, 12)}`; }
