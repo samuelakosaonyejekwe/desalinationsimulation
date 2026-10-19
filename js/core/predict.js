@@ -106,9 +106,9 @@ export function predictTab(env) {
       const f = field(sel.value), x = +at.value; if (!Number.isFinite(x)) return toast('Enter a value.', 'warn');
       const [r] = await solveAll([{ [f.key]: x }], `${f.label} = ${fmt(x)}`), k = kpiMap(r), b0 = kpiMap(last);
       const rows = chosenOuts().filter((l) => k[l]).map((l) => [l, k[l].unit || '', b0[l]?.value, k[l].value, k[l].value - (b0[l]?.value ?? NaN), pct(b0[l]?.value, k[l].value)]);
-      const big = rows.filter((r2) => Number.isFinite(r2[5])).sort((p, q) => Math.abs(q[5]) - Math.abs(p[5])).slice(0, 3);
+      const big = rows.filter((r2) => Number.isFinite(r2[5]) && Math.abs(r2[5]) >= 0.01).sort((p, q) => Math.abs(q[5]) - Math.abs(p[5])).slice(0, 3);
       fill(out, h('div', { class: 'explain' }, h('h3', null, `Prediction with ${f.label} = ${fmt(x)}${unitOf(f)} (now ${fmt(base[f.key])})`),
-        h('p', null, big.length ? `The results that move most: ${big.map((r2) => `${r2[0]} ${fmtPct(r2[5])} (${fmt(r2[2])} → ${fmt(r2[3])}${r2[1] ? ' ' + r2[1] : ''})`).join('; ')}.` : 'No selected result changes.'),
+        h('p', null, big.length ? `The results that move most: ${big.map((r2) => `${r2[0]} ${fmtPct(r2[5])} (${fmt(r2[2])} → ${fmt(r2[3])}${r2[1] ? ' ' + r2[1] : ''})`).join('; ')}.` : 'None of the selected results changes by 0.01 % or more.'),
         (r.warnings || []).filter((w) => w.level === 'bad' || w.level === 'warn').length ? h('ul', null, r.warnings.filter((w) => w.level === 'bad' || w.level === 'warn').slice(0, 6).map((w) => h('li', { class: 'warn-inline' }, w.msg))) : null),
         dataTable({ title: 'Predicted against current', columns: ['Result', 'Unit', 'Now', 'Predicted', 'Change', 'Change %'], rows }));
     }), '');
