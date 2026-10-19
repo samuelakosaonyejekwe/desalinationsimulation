@@ -26,6 +26,7 @@ let cleanup = null, deferredInstall = null, swReg = null, version = '', running 
 
 const app = {
   get version() { return running || version; }, // the build this page runs (its stored copy), else the one the host reports
+  get latest() { return version; }, // the newest build the host offers
   offlineReady: () => offlineReady,
   installed: () => window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true,
   downstream,

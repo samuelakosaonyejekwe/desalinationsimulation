@@ -377,14 +377,9 @@ export function appPage(root, app) {
         if (arch) {
           // The Archive is asked which capture is its latest (its "most recent" address can answer from a stale cache), and the link is
           // pointed at exactly that capture; its time is compared with the build time of the primary address to say whether it is current.
-          let ts = '', built = 0;
-          try { const j = await (await fetch('https://archive.org/wayback/available?url=' + encodeURIComponent(ARCHIVE_SOURCE), { signal: ctl.signal, cache: 'no-store', credentials: 'omit' })).json(); ts = String(j?.archived_snapshots?.closest?.timestamp || '').replace(/\D/g, '').slice(0, 14); } catch { ts = ''; }
-          try { const v = await (await fetch(ARCHIVE_SOURCE.replace(/[^/]*$/, 'version.json?t=') + Date.now(), { signal: ctl.signal, cache: 'no-store', credentials: 'omit' })).json(); built = Date.parse(v.built) || 0; } catch { built = 0; }
-          if (ts.length === 14) {
-            const when = Date.UTC(+ts.slice(0, 4), +ts.slice(4, 6) - 1, +ts.slice(6, 8), +ts.slice(8, 10), +ts.slice(10, 12), +ts.slice(12, 14));
-            archUrl = `https://web.archive.org/web/${ts}id_/${ARCHIVE_SOURCE}`;
-            el.className = 'source ok'; el.lastChild.textContent = `captured ${new Date(when).toLocaleString()}` + (built ? (when >= built - 60e3 ? ' · holds the current build' : ' · holds an earlier build; a new capture has been requested') : '');
-          } else { await fetch(url, { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'no-cors' }); el.className = 'source ok'; el.lastChild.textContent = 'reachable · opens the newest capture (the Archive did not say when it was taken)'; }
+          // every build is kept at its own address (?v=<build>), so no lookup is needed: the reachability of the Archive is checked
+          await fetch(url, { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'no-cors' });
+          el.className = 'source ok'; el.lastChild.textContent = 'reachable · every build is kept at its own address — “Open this build” opens yours';
           clearTimeout(tm);
         }
         else { const r = await fetch(url + 'version.json?t=' + Date.now(), { signal: ctl.signal, cache: 'no-store', credentials: 'omit', mode: 'cors' }); clearTimeout(tm); const j = await r.json(); el.className = 'source ok'; el.lastChild.textContent = `online · build ${String(j.version).slice(0, 12)}`; }
@@ -393,7 +388,9 @@ export function appPage(root, app) {
       // the copy of exactly this build lives at its own address (?v=<build>), which the Archive captures fresh for every build
       const buildV = app.version && app.version !== 'single-file' ? app.version : '';
       if (arch && buildV) el.append(h('a', { class: 'btn mini primary', href: `https://web.archive.org/web/${new Date().toISOString().replace(/\D/g, '').slice(0, 14)}id_/${ARCHIVE_SOURCE}?v=${buildV}`, rel: 'noopener', title: `Opens the Archive's copy of build ${buildV} — exactly the build you are using` }, 'Open this build'));
-      el.append(h('a', { class: 'btn mini', href: arch ? archUrl : url + 'index.html', rel: 'noopener', title: arch ? 'Opens the newest copy the Archive holds' : null }, arch ? 'Open newest copy' : 'Open'));
+      const newest = app.latest && app.latest !== 'single-file' && app.latest !== buildV ? app.latest : ''; // a newer build than the one running
+      if (arch && newest) el.append(h('a', { class: 'btn mini', href: `https://web.archive.org/web/${new Date().toISOString().replace(/\D/g, '').slice(0, 14)}id_/${ARCHIVE_SOURCE}?v=${newest}`, rel: 'noopener', title: `Opens the Archive's copy of the newest build, ${newest}` }, 'Open newest build'));
+      el.append(h('a', { class: 'btn mini' + (arch ? ' ghost' : ''), href: arch ? archUrl : url + 'index.html', rel: 'noopener', title: arch ? 'Opens the newest copy held at the plain address (it can lag a few hours behind, because the Archive refreshes that address only every few hours)' : null }, arch ? 'Plain address' : 'Open'));
     }
   };
   const paintStorage = async () => {
