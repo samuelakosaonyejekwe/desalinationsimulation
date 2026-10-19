@@ -21,10 +21,23 @@ suites around one shared case, so a single industrial desalination study can be 
 | 12 | Energy recovery & pumps | System curves, NPSH, pressure exchangers, turbines, water hammer |
 | 13 | Economics | CAPEX / OPEX, LCOW, cash flow, Monte-Carlo, carbon |
 
-Every suite has the same workflow: **Guide → Inputs → Model setup → Mesh → Results → Calibrate &
+Every suite has the same workflow: **Guide → Inputs → Model setup → Mesh → Results → Predict & what-if → Calibrate &
 validate → Verify → Theory**, with plots, tables, CSV/PNG/JSON/HTML-report export, a three-level
 grid-convergence (GCI) study where a discretisation exists, least-squares calibration with parameter
 identifiability, independent validation metrics, and live verification checks.
+
+Every result is explained and every suite can predict:
+
+* **What these results mean** — each run opens with a plain-language reading: what the run says, what each key result is,
+  how it is obtained and what is good or limiting, what changed since the previous run and how the case differs from the example.
+* **Predict & what-if** — the suite's own engine answers “what if”: one input swept with the response, sensitivity and optimum of
+  every result stated in sentences; a map of one result over two inputs with the best combination; and a forecast with
+  uncertainty (P10 / P50 / P90) that names the input driving each result.
+* **Dynamic and 3-D views** — animated simulations wherever the engine computes them (transient flow fields, plumes over the tide,
+  start-up along RO trains and evaporators, crystallisation, fouling growth, surge waves, optimiser progress, cash flow) and
+  rotatable 3-D views with scales; every chart has play/pause, full screen and high-definition image export.
+* **Undo and back** — Undo restores the inputs before any bulk change (example, reset, linked values, fitted parameters,
+  integrated run, portal import); after a run, one click returns to the tab you came from or clears the results.
 
 Beyond the suites the app provides:
 

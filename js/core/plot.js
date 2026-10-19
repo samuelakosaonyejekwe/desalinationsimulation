@@ -317,7 +317,7 @@ function drawField(canvas, spec) {
           if (spec.mask && spec.mask[Math.round(j)][Math.round(i)]) break;
           ctx.lineTo(m.l + (i / (nx - 1)) * pw, m.t + ph - (j / (ny - 1)) * ph);
         }
-        ctx.stroke();
+        ctx.strokeStyle = 'rgba(15,23,42,.45)'; ctx.lineWidth = 2.4; ctx.stroke(); ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineWidth = 0.9; ctx.stroke(); // dark halo, then white: legible on pale and dark colours
       }
     }
     if (spec.vectors) {
@@ -330,8 +330,9 @@ function drawField(canvas, spec) {
         if (!(sp > vmax * 1e-3)) continue;
         const px0 = m.l + (i / (nx - 1)) * pw, py0 = m.t + ph - (j / (ny - 1)) * ph, k = (len * Math.sqrt(sp / vmax)) / sp;
         const ex = px0 + uu * k * (spec.equal ? 1 : 1), ey = py0 - vv * k, ang = Math.atan2(ey - py0, ex - px0);
-        ctx.beginPath(); ctx.moveTo(px0, py0); ctx.lineTo(ex, ey); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(ex, ey); ctx.lineTo(ex - 5 * Math.cos(ang - 0.45), ey - 5 * Math.sin(ang - 0.45)); ctx.lineTo(ex - 5 * Math.cos(ang + 0.45), ey - 5 * Math.sin(ang + 0.45)); ctx.fill();
+        const head = () => { ctx.beginPath(); ctx.moveTo(ex, ey); ctx.lineTo(ex - 5 * Math.cos(ang - 0.45), ey - 5 * Math.sin(ang - 0.45)); ctx.lineTo(ex - 5 * Math.cos(ang + 0.45), ey - 5 * Math.sin(ang + 0.45)); ctx.closePath(); };
+        ctx.strokeStyle = 'rgba(15,23,42,.5)'; ctx.lineWidth = 2.8; ctx.beginPath(); ctx.moveTo(px0, py0); ctx.lineTo(ex, ey); ctx.stroke(); head(); ctx.lineWidth = 2.2; ctx.stroke(); // dark halo under the white arrow
+        ctx.strokeStyle = 'rgba(255,255,255,.95)'; ctx.fillStyle = 'rgba(255,255,255,.95)'; ctx.lineWidth = 1.1; ctx.beginPath(); ctx.moveTo(px0, py0); ctx.lineTo(ex, ey); ctx.stroke(); head(); ctx.fill();
       }
     }
   }
