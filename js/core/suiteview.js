@@ -234,23 +234,30 @@ export function renderSuite(suite, root, app) {
   const resultsTab = () => {
     const res = lastResult.get(suite.id);
     if (!res) return emptyState('No results yet', `Press “${L.run}” to solve this suite with the current inputs. The defaults describe a realistic industrial case, so you can run straight away.`, btn('▶  ' + L.run, doRun, 'primary'));
-    const plotEls = res.plots.map((p) => plotCard(p, { onDownload: download }));
+    const isDyn = (p) => p.type === 'surface3d' || (Array.isArray(p.frames) && p.frames.length > 1);
+    const dynSpecs = res.plots.filter(isDyn), plainSpecs = res.plots.filter((p) => !isDyn(p));
+    const dynEls = dynSpecs.map((p) => plotCard(p, { onDownload: download })), plainEls = plainSpecs.map((p) => plotCard(p, { onDownload: download })), plotEls = [...dynEls, ...plainEls];
     const box = h('div', { class: 'results' });
     const back = fromTab && defs.find((d) => d.id === fromTab);
     box.append(h('div', { class: 'backbar' },
       back ? btn(`← Back to ${back.label}`, () => tabset.show(back.id), 'mini', 'Return to the tab you were on before the run') : null,
       btn('Clear results', () => { lastResult.delete(suite.id); tabset.show(back ? back.id : 'inputs'); toast('Results cleared. Your inputs are unchanged.'); }, 'mini ghost', 'Remove these results from the screen and return to the inputs (nothing else changes)'),
+      dynSpecs.length ? btn(`▶ ${dynSpecs.length} animation${dynSpecs.length > 1 ? 's' : ''} and 3-D view${dynSpecs.length > 1 ? 's' : ''} ↓`, () => dynSec?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 'mini primary', 'Jump to the dynamic simulations and 3-D views of this run') : null,
       btn(`Predict & what-if →`, () => tabset.show('predict'), 'mini', 'Ask how the results would change under other conditions')));
     if (res.warnings.length) box.append(h('div', { class: 'warns' }, res.warnings.map((w) => h('div', { class: 'warn ' + (w.level || 'info') }, h('b', null, w.level === 'bad' ? 'Limit exceeded' : w.level === 'warn' ? 'Check' : 'Note'), ' ', w.msg))));
     if (res.summary) box.append(h('p', { class: 'summary' }, res.summary));
     { const ch = changesFor(suite.id); box.append(h('p', { class: 'note stamp' }, `Engine build ${res._build || 'unknown'} · solved ${new Date(res._at || Date.now()).toLocaleString()}`, ch.length ? h('span', null, ' · ', h('button', { type: 'button', class: 'linklike', onclick: () => tabset.show('theory') }, `${ch.length} recorded model change${ch.length > 1 ? 's' : ''} affect this suite`)) : null)); }
     box.append(kpiGrid(res.kpis));
+    let dynSec = null;
+    if (dynEls.length) box.append(dynSec = h('section', { class: 'dynsec' }, h('h2', { class: 'sect' }, `Dynamic simulations and 3-D views (${dynEls.length})`),
+      h('p', { class: 'note' }, 'Press ▶ Play under a chart title to run its animation (the slider steps through it by hand, the selector sets the speed). Drag a 3-D view, or use its ◀ ▶ buttons, to turn it. ⛶ opens any chart full screen; PNG saves it in high definition.'),
+      h('div', { class: 'plots' }, dynEls)));
     try { box.append(explainPanel({ suite, res, prev: prevResult.get(suite.id), fields: allFields(suite), defaults: defaults(suite) })); } catch (e) { console.warn('explain', e); }
     box.append(h('div', { class: 'row-tools' },
       btn('Report (HTML)', () => exportReport(suite, res, plotEls), 'mini', 'Self-contained report with inputs, KPIs, plots and tables — print it to PDF from your browser'),
       btn('Results (JSON)', () => download(JSON.stringify({ suite: suite.id, case: store.case.name, build: res._build, solvedAt: res._at, inputs: sanitize(res._inputs), kpis: res.kpis, tables: res.tables, outputs: res.outputs, warnings: res.warnings }, null, 1), `${suite.id}_results.json`, 'application/json'), 'mini'),
       btn('All tables (CSV)', () => download(res.tables.map((t) => `# ${t.title}\n` + toCSV(t.columns, t.rows)).join('\n\n'), `${suite.id}_tables.csv`, 'text/csv'), 'mini')));
-    if (plotEls.length) box.append(h('div', { class: 'plots' }, plotEls));
+    if (plainEls.length) box.append(h('section', null, dynEls.length ? h('h2', { class: 'sect' }, 'Charts') : null, h('div', { class: 'plots' }, plainEls)));
     res.tables.forEach((t) => box.append(dataTable(t)));
     try { box.append(advicePanel(suite, res.recommendations || [])); } catch (e) { console.warn('advisor', e); }
     const down = app?.downstream?.(suite.id) || [];
@@ -428,6 +435,14 @@ export function renderSuite(suite, root, app) {
     { id: 'geometry', label: L.geometry, render: () => geometryTab(suite, { fields: allFields(suite), values: () => values(suite), setValue: (k, val) => setValue(suite, k, val) }), tip: 'Import CAD, mesh, GIS, point-cloud, image or network geometry, or generate one' },
     suite.live && allFields(suite).some((f) => f.key === suite.live.key && f.type === 'table') && { id: 'live', label: 'Live feed', render: liveTab, tip: 'Follow a plant export file and re-analyse as new data arrive' },
     { id: 'results', label: L.results, render: resultsTab, tip: 'KPIs, plots, tables and exports' },
+    { id: 'dynamic', label: 'Animations & 3-D', render: () => {
+      const res = lastResult.get(suite.id), specs = (res?.plots || []).filter((p) => p.type === 'surface3d' || (Array.isArray(p.frames) && p.frames.length > 1));
+      if (!res) return emptyState('No simulation yet', `Press “${L.run}” to solve this suite; its animated simulations and 3-D views then appear here.`, btn('▶  ' + L.run, doRun, 'primary'));
+      const hint = suite.presets?.length ? ' More appear with some examples (“Load example…” at the top), and some suites add 3-D maps when “Animated and 3-D views” is ticked on the setup tab.' : '';
+      if (!specs.length) return h('div', { class: 'groups' }, h('p', { class: 'summary' }, `This run produced no animated or 3-D view.${hint}`));
+      return h('div', { class: 'groups' }, h('p', { class: 'summary' }, `${specs.length} dynamic simulation${specs.length > 1 ? 's' : ''} and 3-D view${specs.length > 1 ? 's' : ''} from the last run. Press ▶ Play under a chart title to animate it; drag a 3-D view (or use ◀ ▶) to turn it; ⛶ for full screen.${hint}`),
+        h('div', { class: 'plots' }, specs.map((p) => plotCard(p, { onDownload: download }))));
+    }, tip: 'Animated simulations and rotatable 3-D views of the last run' },
     { id: 'predict', label: L.predict || 'Predict & what-if', render: () => predictTab({ suite, fields: allFields(suite), values: () => values(suite), lastResult: () => lastResult.get(suite.id), runLabel: L.run, cancel: () => cancelRun(), solveAt: async (v) => (await solve(suite, v, context({}))).res }), tip: 'Predict the results under other conditions with this suite’s own engine: one-input sweeps, two-input maps and forecasts with uncertainty' },
     ...(suite.views || []).map((v) => ({ id: 'x_' + v.id, label: v.label, tip: v.tip, render: () => { const el = h('div', { class: 'groups' }); try { v.render(el, { values: () => values(suite), set: (k, val) => setValue(suite, k, val), result: () => lastResult.get(suite.id), run: doRun, h, plotCard: (p) => plotCard(p, { onDownload: download }), dataTable, kpiGrid, toast, download, store }); } catch (e) { el.append(h('p', { class: 'bad' }, e.message)); } return el; } })),
     { id: 'cal', label: L.cal, render: calTab, tip: 'Parameter estimation and independent validation' },

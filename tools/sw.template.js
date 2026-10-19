@@ -27,6 +27,7 @@ self.addEventListener('activate', (e) => {
 
 self.addEventListener('message', (e) => {
   if (e.data === 'skipWaiting') self.skipWaiting();
+  if (e.data === 'version?') e.source?.postMessage({ type: 'running', version: VERSION }); // the build this stored copy holds (the page asks, to know whether it is current)
   if (e.data === 'status') caches.has(SHELL).then((ok) => ok && e.source?.postMessage({ type: 'offline-ready' }));
 });
 

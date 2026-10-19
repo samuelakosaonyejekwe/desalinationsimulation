@@ -8,7 +8,8 @@ import { home, casePage, sitePage, portalPage, chainPage, appPage } from './page
 import { fetchSite, mergeSiteData } from './core/live.js';
 import { APP, ARCHIVE_SOURCE } from './data/app.js';
 import { advisorPage } from './core/advisorview.js';
-import { buildId } from './core/build.js';
+import { buildId, setBuildId } from './core/build.js';
+import { isRunning } from './core/runner.js';
 
 const PAGES = [
   { path: 'home', label: 'Overview', icon: '🏠', render: home },
@@ -21,7 +22,7 @@ const PAGES = [
   { path: 'app', label: 'Install & offline', icon: '📲', render: appPage },
 ];
 const main = document.getElementById('main'), nav = document.getElementById('nav'), pager = document.getElementById('pager');
-let cleanup = null, deferredInstall = null, swReg = null, version = '', offlineReady = false;
+let cleanup = null, deferredInstall = null, swReg = null, version = '', running = '', offlineReady = false;
 
 const app = {
   get version() { return version; },
@@ -39,15 +40,22 @@ const app = {
     if (!navigator.onLine) { if (manual) toast('You are offline — the installed copy keeps working.', 'warn'); return; }
     try {
       const j = await (await fetch('version.json?t=' + Date.now(), { cache: 'no-store' })).json();
-      if (version && j.version && j.version !== version) { await swReg?.update(); offerReload(); }
+      const mine = running || version; // the build this page actually runs (from its stored copy), not the one the network offers
+      if (mine && j.version && j.version !== mine) { await swReg?.update(); offerReload(); }
       else if (manual) toast('You have the latest build.', 'ok');
     } catch { if (manual) toast('Could not check for updates right now.', 'warn'); }
   },
 };
 
+// A newer build is installed and waiting: switch to it automatically at the next page change (inputs are stored on the
+// device, so nothing is lost), or at once with the button. A reload also follows when another tab activated the new build.
+let applying = false;
+function applyUpdate() { if (applying) return; applying = true; const w = swReg?.waiting; if (w) w.postMessage('skipWaiting'); setTimeout(() => location.reload(), w ? 1500 : 50); }
+if ('serviceWorker' in navigator) navigator.serviceWorker.addEventListener('controllerchange', () => { if (applying || document.getElementById('upd')) { applying = true; location.reload(); } });
 function offerReload() {
   if (document.getElementById('upd')) return;
-  const bar = h('div', { id: 'upd', class: 'update-bar', role: 'status' }, 'A newer build is ready. ', btn('Reload now', () => { swReg?.waiting?.postMessage('skipWaiting'); setTimeout(() => location.reload(), 300); }, 'mini primary'), btn('Later', () => bar.remove(), 'mini ghost'));
+  window.addEventListener('hashchange', () => { if (!isRunning()) applyUpdate(); }, { once: true });
+  const bar = h('div', { id: 'upd', class: 'update-bar', role: 'status' }, 'A newer build is ready — it opens automatically when you move to another page. ', btn('Update now', () => applyUpdate(), 'mini primary'), btn('Later', () => bar.remove(), 'mini ghost'));
   document.body.append(bar);
 }
 
@@ -127,7 +135,9 @@ async function setupServiceWorker() {
   if (!('serviceWorker' in navigator) || !/^https?:$/.test(location.protocol)) return;
   try {
     swReg = await navigator.serviceWorker.register('sw.js');
-    navigator.serviceWorker.addEventListener('message', (e) => { if (e.data?.type === 'offline-ready') offlineReady = true; if (e.data?.type === 'version' && !version) version = e.data.version; });
+    navigator.serviceWorker.addEventListener('message', (e) => { if (e.data?.type === 'offline-ready') offlineReady = true; if (e.data?.type === 'version' && !version) version = e.data.version;
+      if (e.data?.type === 'running' && e.data.version) { running = e.data.version; setBuildId(running); if (version && version !== running) { swReg?.update().catch(() => {}); offerReload(); } } });
+    navigator.serviceWorker.controller?.postMessage('version?');
     navigator.serviceWorker.ready.then((r) => { r.active?.postMessage('status'); r.periodicSync?.register('refresh', { minInterval: 6 * 3600e3 }).catch(() => {}); });
     swReg.addEventListener('updatefound', () => { const w = swReg.installing; w?.addEventListener('statechange', () => { if (w.state === 'installed' && navigator.serviceWorker.controller) offerReload(); }); });
     if (swReg.waiting && navigator.serviceWorker.controller) offerReload();

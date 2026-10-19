@@ -9,3 +9,5 @@ export async function buildId() {
   return cached;
 }
 export const buildIdNow = () => cached || 'unknown';
+/** Set the identity of the running build when it is known better (the stored copy that serves the page). */
+export function setBuildId(v) { if (v) cached = v; }
