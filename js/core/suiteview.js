@@ -82,8 +82,26 @@ export function linkItems(suite) {
   const known = new Set(allFields(suite).map((f) => f.key));
   return items.filter((it) => known.has(it.key));
 }
+/**
+ * Several sources can offer the same input (e.g. the case feed water and the RO concentrate both offer the feed analysis).
+ * Only one is applied per input: the one the user picked on the link panel, else the suite's first non-optional offer
+ * (suites list their offers in order of preference and mark the situational ones `optional`); "own" keeps the suite's value.
+ */
+export function resolveLinks(suite, items = linkItems(suite)) {
+  const pick = store.inputs(suite.id)._linkPick || {}, byKey = new Map();
+  for (const it of items) { if (!byKey.has(it.key)) byKey.set(it.key, []); byKey.get(it.key).push(it); }
+  const out = [];
+  for (const [key, list] of byKey) {
+    const p = pick[key];
+    if (p === '__own') continue;
+    const chosen = (p && list.find((it) => it.from === p)) || list.find((it) => !it.optional);
+    if (chosen) out.push(chosen);
+  }
+  return out;
+}
 export function applyLinks(suite, items = linkItems(suite)) {
   const prov = store.inputs(suite.id)._links || {};
+  items = resolveLinks(suite, items);
   for (const it of items) { setValue(suite, it.key, sanitize(it.value)); prov[it.key] = it.from; }
   store.setInput(suite.id, '_links', prov);
   return items.length;
@@ -195,9 +213,24 @@ export function renderSuite(suite, root, app) {
   const linkPanel = (repaint) => {
     const items = linkItems(suite);
     if (!items.length) return h('div', { class: 'linkbar quiet' }, h('span', null, '⛓ No linked data yet. Run an upstream suite or set the site on the Global Site Data page and matching inputs will be offered here automatically.'));
-    const list = h('ul', { class: 'linklist' }, items.map((it) => h('li', null, h('b', null, allFields(suite).find((f) => f.key === it.key)?.label || it.key), ' ← ', typeof it.value === 'number' ? fmt(it.value) : typeof it.value === 'object' ? 'data set' : String(it.value), h('small', null, ' · ' + it.from))));
+    const label = (k) => allFields(suite).find((f) => f.key === k)?.label || k, show = (v) => (typeof v === 'number' ? fmt(v) : typeof v === 'object' ? 'data set' : String(v));
+    const byKey = new Map(); for (const it of items) { if (!byKey.has(it.key)) byKey.set(it.key, []); byKey.get(it.key).push(it); }
+    const used = new Set(resolveLinks(suite, items).map((it) => it.key + '|' + it.from));
+    const pickOf = () => store.inputs(suite.id)._linkPick || {};
+    const setPick = (key, from) => { // a choice for one input follows to the other inputs offered by the same source (e.g. feed analysis, salinity and flow of the RO concentrate)
+      const pk = { ...pickOf(), [key]: from }, src = from === '__own' ? null : from.split(/[ :(]/).slice(0, 2).join(' ');
+      for (const [k2, l2] of byKey) if (k2 !== key && l2.length > 1) { const m = src && l2.find((it) => it.from.startsWith(src)); if (m) pk[k2] = m.from; else if (from === '__own' && byKey.get(key).some((x) => l2.some((y) => y.from === x.from))) pk[k2] = '__own'; }
+      store.setInput(suite.id, '_linkPick', pk); repaint();
+    };
+    const list = h('ul', { class: 'linklist' }, [...byKey].map(([key, l]) => {
+      if (l.length === 1 && !l[0].optional) return h('li', null, h('b', null, label(key)), ' ← ', show(l[0].value), h('small', null, ' · ' + l[0].from));
+      const cur = l.find((it) => used.has(key + '|' + it.from));
+      const sel = h('select', { 'aria-label': 'Source for ' + label(key), onchange: (e) => setPick(key, e.target.value) },
+        l.map((it) => h('option', { value: it.from, selected: cur === it }, `${it.from} — ${show(it.value)}`)), h('option', { value: '__own', selected: !cur }, 'Keep this suite’s own value'));
+      return h('li', null, h('b', null, label(key)), ' ← ', sel, h('small', null, cur ? (l.length > 1 ? ` · ${l.length} sources offer this input; the one shown is applied` : ' · applied') : ` · ${l.length > 1 ? `${l.length} sources offer this input; ` : ''}not applied unless chosen — this suite keeps its own value`));
+    }));
     return h('details', { class: 'linkbar' },
-      h('summary', null, `⛓ ${items.length} input${items.length > 1 ? 's' : ''} available from linked suites and site data`,
+      h('summary', null, `⛓ ${byKey.size} input${byKey.size > 1 ? 's' : ''} available from linked suites and site data`,
         btn('Apply all', (e) => { e.preventDefault(); snapshot(suite, 'before linked values were applied'); const n = applyLinks(suite, items); toast(`${n} linked value${n > 1 ? 's' : ''} applied.`, 'ok'); repaint(); }, 'mini primary')),
       list, h('p', { class: 'note' }, store.case.autolink ? 'Auto-link is on: these values are applied automatically each time you run. Turn it off on the Case page to keep manual values.' : 'Auto-link is off: values are only applied when you press “Apply all”.'));
   };

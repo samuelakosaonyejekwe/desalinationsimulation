@@ -884,8 +884,8 @@ const suite = {
     feed?.ions ? { key: 'ions', value: feed.ions, from: 'Case feed water' } : null,
     feed?.ions ? { key: 'Xf', value: salinityFromTDS(tds(feed.ions), feed.T ?? 25), from: 'Case feed water salinity' } : null,
     feed?.T ? { key: 'Tsw', value: clamp(feed.T, 2, 40), from: 'Case feed water' } : null,
-    outputs?.ro?.streams?.concentrate?.ions ? { key: 'ions', value: outputs.ro.streams.concentrate.ions, from: 'RO concentrate (hybrid RO–thermal)' } : null,
-    outputs?.ro?.streams?.concentrate?.tds ? { key: 'Xf', value: salinityFromTDS(outputs.ro.streams.concentrate.tds, outputs.ro.streams.concentrate.T ?? 25), from: 'RO concentrate salinity (hybrid RO–thermal)' } : null,
+    outputs?.ro?.streams?.concentrate?.ions ? { key: 'ions', value: outputs.ro.streams.concentrate.ions, from: 'RO concentrate (hybrid RO–thermal)', optional: true } : null,
+    outputs?.ro?.streams?.concentrate?.tds ? { key: 'Xf', value: salinityFromTDS(outputs.ro.streams.concentrate.tds, outputs.ro.streams.concentrate.T ?? 25), from: 'RO concentrate salinity (hybrid RO–thermal)', optional: true } : null,
   ],
   site: (site) => [
     { key: 'Tsw', value: site?.data?.sst, from: 'Sea-surface temperature at site' }, { key: 'Xf', value: site?.data?.salinity, from: 'Sea-surface salinity at site' },

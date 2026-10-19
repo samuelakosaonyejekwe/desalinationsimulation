@@ -1102,7 +1102,7 @@ const suite = {
     if (o.thermal?.secElec > 0) P.push({ key: 'medSecElec', value: clamp(o.thermal.secElec, 0.3, 5), from: 'Thermal desalination: auxiliary electricity' });
     if (o.zld?.secElec > 0 && o.zld?.waterRecovered > 0) P.push({ key: 'bcAux', value: clamp(0.06 * o.zld.secElec, 0, 8), from: 'ZLD: auxiliary share of specific electricity' });
     if (o.fouling?.normPermeability > 0) P.push({ key: 'roFF', value: clamp(o.fouling.normPermeability, 0.4, 1.2), from: 'Fouling monitor: normalised permeability' });
-    if (o.opt?.best?.recovery > 0) P.push({ key: 'recovery', value: clamp(o.opt.best.recovery, 5, 92), from: 'Optimiser recommendation' });
+    if (o.opt?.best?.recovery > 0) P.push({ key: 'recovery', value: clamp(o.opt.best.recovery, 5, 92), from: 'Optimiser recommendation', optional: true });
     return P;
   },
   site: (site) => {

@@ -1192,8 +1192,8 @@ const suite = {
   pull: ({ feed, outputs }) => [
     feed?.ions ? { key: 'ions', value: feed.ions, from: 'Case feed water' } : null, feed?.Q ? { key: 'Qf', value: feed.Q, from: 'Case feed water' } : null,
     feed?.T ? { key: 'T', value: clamp(feed.T, 5, 45), from: 'Case feed water' } : null, feed?.pH ? { key: 'pH', value: feed.pH, from: 'Case feed water' } : null,
-    outputs?.ro?.streams?.concentrate?.ions ? { key: 'ions', value: outputs.ro.streams.concentrate.ions, from: 'RO concentrate (brine concentration by MD)' } : null,
-    outputs?.ro?.streams?.concentrate?.Q ? { key: 'Qf', value: outputs.ro.streams.concentrate.Q, from: 'RO concentrate flow' } : null,
+    outputs?.ro?.streams?.concentrate?.ions ? { key: 'ions', value: outputs.ro.streams.concentrate.ions, from: 'RO concentrate (brine concentration by MD)', optional: true } : null,
+    outputs?.ro?.streams?.concentrate?.Q ? { key: 'Qf', value: outputs.ro.streams.concentrate.Q, from: 'RO concentrate flow', optional: true } : null,
     outputs?.ro?.recovery ? { key: 'roRec', value: clamp(100 * outputs.ro.recovery, 10, 85), from: 'RO design recovery' } : null,
   ],
   site: (site) => [

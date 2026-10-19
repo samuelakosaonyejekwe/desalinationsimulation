@@ -1621,9 +1621,10 @@ const suite = {
   predict: { inputs: ['Qp', 'salinityFactor', 'targetTDS', 'recovery', 'safety', 'uLin', 'T', 'Ucp'], outputs: ['Specific energy', 'Product TDS', 'Membrane area', 'Current efficiency', 'Highest i / i_lim', 'Water recovery', 'Total DC power', 'Salt removal'] },
 
   pull: ({ feed, outputs }) => [
-    feed?.ions ? { key: 'ions', value: feed.ions, from: 'Case feed water' } : null, feed?.T ? { key: 'T', value: clamp(feed.T, 5, 45), from: 'Case feed water' } : null, feed?.pH ? { key: 'pH', value: feed.pH, from: 'Case feed water' } : null,
-    outputs?.ro?.streams?.permeate?.ions ? { key: 'ions', value: outputs.ro.streams.permeate.ions, from: 'RO permeate (polishing by ED)' } : null,
-    outputs?.ro?.streams?.concentrate?.ions ? { key: 'ions', value: outputs.ro.streams.concentrate.ions, from: 'RO concentrate (brine valorisation by ED / BPMED)' } : null,
+    // ED is competitive for brackish water: the case feed is applied by default only below 10 g/L; RO streams are offered on choice
+    feed?.ions ? { key: 'ions', value: feed.ions, from: 'Case feed water', optional: Object.values(feed.ions).reduce((a, b) => a + (+b || 0), 0) > 10000 } : null, feed?.T ? { key: 'T', value: clamp(feed.T, 5, 45), from: 'Case feed water' } : null, feed?.pH ? { key: 'pH', value: feed.pH, from: 'Case feed water' } : null,
+    outputs?.ro?.streams?.permeate?.ions ? { key: 'ions', value: outputs.ro.streams.permeate.ions, from: 'RO permeate (polishing by ED)', optional: true } : null,
+    outputs?.ro?.streams?.concentrate?.ions ? { key: 'ions', value: outputs.ro.streams.concentrate.ions, from: 'RO concentrate (brine valorisation by ED / BPMED)', optional: true } : null,
     outputs?.cfd?.sherwood && outputs?.cfd?.reynolds ? { key: 'shA', value: clamp(outputs.cfd.sherwood / (outputs.cfd.reynolds ** 0.5 * 8.4), 0.05, 2), from: 'CFD Sherwood number' } : null,
   ],
   site: (site) => [{ key: 'T', value: site?.data?.sst !== undefined && site?.data?.sst !== null ? clamp(site.data.sst, 5, 45) : undefined, from: 'Sea-surface temperature at site' }],
