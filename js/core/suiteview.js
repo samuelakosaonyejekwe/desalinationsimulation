@@ -14,8 +14,18 @@ import { solve, cancelRun } from './runner.js';
 import { changesFor } from '../data/changelog.js';
 import { buildId, buildIdNow } from './build.js';
 import { readTable } from './io.js';
+import { predictTab } from './predict.js';
+import { explainPanel } from './explain.js';
 
 const lastResult = new Map(); // suite id -> full result of the last run (kept in memory)
+const prevResult = new Map(); // suite id -> the run before it (for “compared with the previous run”)
+const history = new Map(); // suite id -> snapshots of the stored inputs taken before bulk changes (for Undo)
+/** Remember the inputs before a bulk change (example loaded, reset, run with linked values, fitted parameters applied). */
+export function snapshot(suite, reason) {
+  const st = history.get(suite.id) || [], cur = JSON.stringify(store.inputs(suite.id) || {});
+  if (st.length && st[st.length - 1].json === cur) { st[st.length - 1].reason = reason; return; }
+  st.push({ json: cur, reason, at: Date.now() }); if (st.length > 25) st.shift(); history.set(suite.id, st);
+}
 const bigValues = new Map(); // `${suite}.${key}` -> large imported objects (geometry) kept out of localStorage
 
 export const allFields = (suite) => suite.inputs.flatMap((g) => g.fields);
@@ -73,6 +83,7 @@ export async function runSuite(suite, ctxExtra) {
   res._threaded = solved.threaded;
   res.kpis ||= []; res.tables ||= []; res.plots ||= []; res.warnings ||= []; res.outputs ||= {};
   res._ms = performance.now() - t0; res._inputs = v; res._build = await buildId(); res._at = new Date().toISOString();
+  const prior = lastResult.get(suite.id); if (prior) prevResult.set(suite.id, prior);
   lastResult.set(suite.id, res);
   store.setOutputs(suite.id, { ...res.outputs, _build: res._build, _kpis: res.kpis.slice(0, 8).map((k) => ({ label: k.label, value: k.value, unit: k.unit || '', status: k.status || '' })), _warnings: res.warnings.length });
   return res;
@@ -120,7 +131,10 @@ export function renderSuite(suite, root, app) {
   const status = h('span', { class: 'run-status', role: 'status', 'aria-live': 'polite' });
   const bar = h('div', { class: 'progress', hidden: true }, h('i'));
 
+  let fromTab = null;
   const doRun = async () => {
+    const here = tabset?.active(); if (here && here !== 'results') fromTab = here;
+    snapshot(suite, 'before the run');
     runBtn.disabled = true; cancelBtn.hidden = false; bar.hidden = false; bar.firstChild.style.width = '4%';
     status.textContent = 'Running…';
     try {
@@ -141,7 +155,7 @@ export function renderSuite(suite, root, app) {
   cancelBtn.hidden = true;
   const presetSel = suite.presets?.length ? h('select', { 'aria-label': 'Load an example case', onchange: (e) => {
     const p = suite.presets[+e.target.value];
-    if (p) { store.setInputs(suite.id, { ...defaults(suite), ...p.values }); toast(`Loaded example: ${p.name}`); tabset.show(tabset.active()); }
+    if (p) { snapshot(suite, 'before loading an example'); store.setInputs(suite.id, { ...defaults(suite), ...p.values }); toast(`Loaded example: ${p.name} — Undo restores your previous inputs.`); tabset.show(tabset.active()); refreshTools(); }
     e.target.value = '';
   } }, h('option', { value: '' }, 'Load example…'), suite.presets.map((p, i) => h('option', { value: i }, p.name))) : null;
 
@@ -171,7 +185,7 @@ export function renderSuite(suite, root, app) {
     const list = h('ul', { class: 'linklist' }, items.map((it) => h('li', null, h('b', null, allFields(suite).find((f) => f.key === it.key)?.label || it.key), ' ← ', typeof it.value === 'number' ? fmt(it.value) : typeof it.value === 'object' ? 'data set' : String(it.value), h('small', null, ' · ' + it.from))));
     return h('details', { class: 'linkbar' },
       h('summary', null, `⛓ ${items.length} input${items.length > 1 ? 's' : ''} available from linked suites and site data`,
-        btn('Apply all', (e) => { e.preventDefault(); const n = applyLinks(suite, items); toast(`${n} linked value${n > 1 ? 's' : ''} applied.`, 'ok'); repaint(); }, 'mini primary')),
+        btn('Apply all', (e) => { e.preventDefault(); snapshot(suite, 'before linked values were applied'); const n = applyLinks(suite, items); toast(`${n} linked value${n > 1 ? 's' : ''} applied.`, 'ok'); repaint(); }, 'mini primary')),
       list, h('p', { class: 'note' }, store.case.autolink ? 'Auto-link is on: these values are applied automatically each time you run. Turn it off on the Case page to keep manual values.' : 'Auto-link is off: values are only applied when you press “Apply all”.'));
   };
 
@@ -220,10 +234,16 @@ export function renderSuite(suite, root, app) {
     if (!res) return emptyState('No results yet', `Press “${L.run}” to solve this suite with the current inputs. The defaults describe a realistic industrial case, so you can run straight away.`, btn('▶  ' + L.run, doRun, 'primary'));
     const plotEls = res.plots.map((p) => plotCard(p, { onDownload: download }));
     const box = h('div', { class: 'results' });
+    const back = fromTab && defs.find((d) => d.id === fromTab);
+    box.append(h('div', { class: 'backbar' },
+      back ? btn(`← Back to ${back.label}`, () => tabset.show(back.id), 'mini', 'Return to the tab you were on before the run') : null,
+      btn('Clear results', () => { lastResult.delete(suite.id); tabset.show(back ? back.id : 'inputs'); toast('Results cleared. Your inputs are unchanged.'); }, 'mini ghost', 'Remove these results from the screen and return to the inputs (nothing else changes)'),
+      btn(`Predict & what-if →`, () => tabset.show('predict'), 'mini', 'Ask how the results would change under other conditions')));
     if (res.warnings.length) box.append(h('div', { class: 'warns' }, res.warnings.map((w) => h('div', { class: 'warn ' + (w.level || 'info') }, h('b', null, w.level === 'bad' ? 'Limit exceeded' : w.level === 'warn' ? 'Check' : 'Note'), ' ', w.msg))));
     if (res.summary) box.append(h('p', { class: 'summary' }, res.summary));
     { const ch = changesFor(suite.id); box.append(h('p', { class: 'note stamp' }, `Engine build ${res._build || 'unknown'} · solved ${new Date(res._at || Date.now()).toLocaleString()}`, ch.length ? h('span', null, ' · ', h('button', { type: 'button', class: 'linklike', onclick: () => tabset.show('theory') }, `${ch.length} recorded model change${ch.length > 1 ? 's' : ''} affect this suite`)) : null)); }
     box.append(kpiGrid(res.kpis));
+    try { box.append(explainPanel({ suite, res, prev: prevResult.get(suite.id), fields: allFields(suite), defaults: defaults(suite) })); } catch (e) { console.warn('explain', e); }
     box.append(h('div', { class: 'row-tools' },
       btn('Report (HTML)', () => exportReport(suite, res, plotEls), 'mini', 'Self-contained report with inputs, KPIs, plots and tables — print it to PDF from your browser'),
       btn('Results (JSON)', () => download(JSON.stringify({ suite: suite.id, case: store.case.name, build: res._build, solvedAt: res._at, inputs: sanitize(res._inputs), kpis: res.kpis, tables: res.tables, outputs: res.outputs, warnings: res.warnings }, null, 1), `${suite.id}_results.json`, 'application/json'), 'mini'),
@@ -282,7 +302,7 @@ export function renderSuite(suite, root, app) {
         fill(out, 
           dataTable({ title: 'Fitted parameters', columns: ['Parameter', 'Initial', 'Fitted', '± Std. error', 'Relative error %', 'Identifiability'], rows: active.map((a, i) => [a.p.label, base[a.p.key], r.p[i], r.se[i], Math.abs((100 * r.se[i]) / (r.p[i] || 1)), !Number.isFinite(r.se[i]) ? 'Not identifiable' : Math.abs(r.se[i] / (r.p[i] || 1)) < 0.25 ? 'Well identified' : 'Weakly identified']), note: `Levenberg–Marquardt least squares, ${r.iterations} iterations, ${rows.length} data rows. Standard errors come from the parameter covariance matrix; a weakly identified parameter means the data do not constrain it — add operating points that span pressure, recovery, temperature and salinity.` }),
           metricTable('Goodness of fit on the calibration data (not a validation)', ps),
-          h('div', { class: 'row-tools' }, btn('Apply fitted parameters to this case', () => { active.forEach((a, i) => setValue(suite, a.p.key, r.p[i])); toast('Fitted parameters applied to the inputs.', 'ok'); }, 'primary')),
+          h('div', { class: 'row-tools' }, btn('Apply fitted parameters to this case', () => { snapshot(suite, 'before fitted parameters were applied'); active.forEach((a, i) => setValue(suite, a.p.key, r.p[i])); toast('Fitted parameters applied to the inputs — Undo restores the previous values.', 'ok'); refreshTools(); }, 'primary'), btn('Clear fit results', () => fill(out), 'ghost')),
           h('div', { class: 'plots' }, ps.flatMap((q) => q.plots).map((p) => plotCard(p, { onDownload: download }))));
       } catch (e) { toast('Calibration failed: ' + e.message, 'bad'); }
     };
@@ -303,7 +323,7 @@ export function renderSuite(suite, root, app) {
       h('fieldset', { class: 'group' }, h('legend', null, '2 · Calibration data', help('Measured operating points. Columns that match model inputs set the operating condition of each row; the remaining columns are the measured targets.')),
         fieldRow(calDef, () => getT(calDef), setT), h('div', { class: 'row-tools' }, btn('Fit parameters', fit, 'primary')), out),
       h('fieldset', { class: 'group' }, h('legend', null, '3 · Independent validation data', help('Use operating points that were NOT used for calibration. Agreement with calibration data is not validation.')),
-        fieldRow(valDef, () => getT(valDef), setT), h('div', { class: 'row-tools' }, btn('Validate model', validate, 'primary')), vout),
+        fieldRow(valDef, () => getT(valDef), setT), h('div', { class: 'row-tools' }, btn('Validate model', validate, 'primary'), btn('Clear validation results', () => fill(vout), 'ghost')), vout),
       cat.calibration ? h('details', { class: 'ref' }, h('summary', null, 'Recommended calibration practice for this suite'), h('p', null, cat.calibration)) : null,
       cat.validation ? h('details', { class: 'ref' }, h('summary', null, 'Recommended validation practice for this suite'), h('p', null, cat.validation)) : null);
   };
@@ -406,19 +426,27 @@ export function renderSuite(suite, root, app) {
     { id: 'geometry', label: L.geometry, render: () => geometryTab(suite, { fields: allFields(suite), values: () => values(suite), setValue: (k, val) => setValue(suite, k, val) }), tip: 'Import CAD, mesh, GIS, point-cloud, image or network geometry, or generate one' },
     suite.live && allFields(suite).some((f) => f.key === suite.live.key && f.type === 'table') && { id: 'live', label: 'Live feed', render: liveTab, tip: 'Follow a plant export file and re-analyse as new data arrive' },
     { id: 'results', label: L.results, render: resultsTab, tip: 'KPIs, plots, tables and exports' },
+    { id: 'predict', label: L.predict || 'Predict & what-if', render: () => predictTab({ suite, fields: allFields(suite), values: () => values(suite), lastResult: () => lastResult.get(suite.id), runLabel: L.run, cancel: () => cancelRun(), solveAt: async (v) => (await solve(suite, v, context({}))).res }), tip: 'Predict the results under other conditions with this suite’s own engine: one-input sweeps, two-input maps and forecasts with uncertainty' },
     ...(suite.views || []).map((v) => ({ id: 'x_' + v.id, label: v.label, tip: v.tip, render: () => { const el = h('div', { class: 'groups' }); try { v.render(el, { values: () => values(suite), set: (k, val) => setValue(suite, k, val), result: () => lastResult.get(suite.id), run: doRun, h, plotCard: (p) => plotCard(p, { onDownload: download }), dataTable, kpiGrid, toast, download, store }); } catch (e) { el.append(h('p', { class: 'bad' }, e.message)); } return el; } })),
     { id: 'cal', label: L.cal, render: calTab, tip: 'Parameter estimation and independent validation' },
     { id: 'verify', label: L.verify, render: verifyTab, tip: 'Conservation, limiting cases and hand-calculation checks' },
     { id: 'theory', label: L.theory, render: theoryTab, tip: 'Governing equations, IC/BC and modules' },
   ].filter(Boolean);
 
-  tabset = tabs(defs, store.pref('tab.' + suite.id) || 'guide', (id) => store.pref('tab.' + suite.id, id));
+  const undoBtn = btn('↶ Undo', () => {
+    const st = history.get(suite.id); if (!st?.length) return toast('Nothing to undo.');
+    const s0 = st.pop(); store.setInputs(suite.id, JSON.parse(s0.json)); toast(`Inputs restored to how they were ${s0.reason}.`, 'ok'); tabset.show(tabset.active()); refreshTools();
+  }, 'mini ghost', 'Restore the inputs as they were before the last bulk change (example loaded, reset, run with linked values, fitted parameters applied)');
+  const resetAll = () => { snapshot(suite, 'before the reset'); store.clearInputs(suite.id); bigValues.forEach((_, k) => k.startsWith(suite.id + '.') && bigValues.delete(k)); toast('Inputs reset to the built-in example — Undo brings yours back.'); tabset.show(tabset.active()); refreshTools(); };
+  const refreshTools = () => { const st = history.get(suite.id) || []; undoBtn.disabled = !st.length; undoBtn.title = st.length ? `Restore the inputs as they were ${st[st.length - 1].reason}` : 'Nothing to undo yet'; };
+  const tools = h('div', { class: 'tabtools' }, undoBtn, btn('Reset', resetAll, 'mini ghost reset-t', 'Restore the built-in example inputs of this suite (Undo brings yours back)'), btn('▶ ' + L.run, () => doRun(), 'mini primary', 'Solve with the current inputs (Ctrl/⌘ + Enter)'));
+  tabset = tabs(defs, store.pref('tab.' + suite.id) || 'guide', (id) => { store.pref('tab.' + suite.id, id); refreshTools(); }, tools);
   const onKey = (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && root.isConnected) { e.preventDefault(); doRun(); } };
   document.addEventListener('keydown', onKey);
   fill(root, 
     h('header', { class: 'suite-head' },
       h('div', { class: 'suite-title' }, h('span', { class: 'suite-num' }, suite.num), h('div', null, h('h1', null, suite.title), h('p', null, suite.tagline))),
-      h('div', { class: 'actions' }, presetSel, btn('Reset', () => { store.clearInputs(suite.id); bigValues.forEach((_, k) => k.startsWith(suite.id + '.') && bigValues.delete(k)); toast('Inputs reset to defaults.'); tabset.show(tabset.active()); }, 'ghost', 'Restore the default inputs of this suite'), cancelBtn, runBtn)),
+      h('div', { class: 'actions' }, presetSel, btn('Reset', resetAll, 'ghost', 'Restore the built-in example inputs of this suite (Undo brings yours back)'), cancelBtn, runBtn)),
     h('div', { class: 'statusline' }, status, bar), tabset);
   return () => { document.removeEventListener('keydown', onKey); stopLive(); };
 }

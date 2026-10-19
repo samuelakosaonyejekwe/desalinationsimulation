@@ -49,8 +49,9 @@ const tickLabel = (v) => {
 };
 const cssVar = (el, name, fb) => (getComputedStyle(el).getPropertyValue(name) || fb).trim() || fb;
 
+let DPR_OVERRIDE = 0; // set while a high-definition image is exported
 function setup(canvas, height) {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2.5), w = Math.max(260, canvas.clientWidth || canvas.parentElement.clientWidth || 600);
+  const dpr = DPR_OVERRIDE || Math.min(window.devicePixelRatio || 1, 2.5), w = Math.max(260, canvas.clientWidth || canvas.parentElement.clientWidth || 600);
   canvas.width = Math.round(w * dpr); canvas.height = Math.round(height * dpr);
   canvas.style.height = height + 'px';
   const ctx = canvas.getContext('2d');
@@ -543,10 +544,13 @@ export function plotCard(spec, { onDownload } = {}) {
   const frames = Array.isArray(spec.frames) && spec.frames.length > 1 ? spec.frames : null, is3d = spec.type === 'surface3d';
   let fk = frames ? Math.max(0, Math.min(frames.length - 1, Math.round(spec.frame ?? 0))) : 0, cur = frames ? frameSpec(spec, fk) : spec;
   const view = is3d ? { az: spec.azimuth ?? 205, el: spec.elevation ?? 30 } : null;
-  const shown = () => (is3d ? Object.assign(cur === spec ? { ...spec } : cur, { azimuth: view.az, elevation: view.el }) : cur);
+  const full = () => document.fullscreenElement === card;
+  const shown = () => { const s0 = is3d ? Object.assign(cur === spec ? { ...spec } : cur, { azimuth: view.az, elevation: view.el }) : cur; return full() ? { ...s0, height: Math.max(300, window.innerHeight - (frames ? 150 : 110)) } : s0; };
+  document.addEventListener('fullscreenchange', () => { if (canvas.isConnected) requestAnimationFrame(() => render()); });
   const fileName = () => (frames ? safe + '_' + String(frames[fk].label ?? fk + 1).replace(/[^\w.-]+/g, '_').slice(0, 30) : safe);
   if (is3d) { mk('◀', 'Rotate the view to the left', () => { view.az -= 30; render(); }); mk('▶', 'Rotate the view to the right', () => { view.az += 30; render(); }); }
-  mk('PNG', 'Download this chart as an image', () => canvas.toBlob((b) => onDownload && onDownload(b, fileName() + '.png')));
+  mk('PNG', 'Download this chart as a high-definition image (three times screen resolution)', () => { DPR_OVERRIDE = 3; render(); canvas.toBlob((b) => { DPR_OVERRIDE = 0; render(); if (onDownload) onDownload(b, fileName() + '.png'); }); });
+  mk('⛶', 'Full screen (Esc to leave)', () => { if (document.fullscreenElement === card) document.exitFullscreen?.(); else card.requestFullscreen?.().catch(() => {}); });
   mk('CSV', 'Download the plotted data as a table', () => onDownload && onDownload(new Blob([plotToCSV(shown())], { type: 'text/csv' }), fileName() + '.csv'));
   head.append(title, tools);
   const wrap = document.createElement('div'); wrap.className = 'plot-wrap'; wrap.append(canvas, tip);
@@ -560,7 +564,18 @@ export function plotCard(spec, { onDownload } = {}) {
     val.style.fontWeight = '600';
     const show = () => { const f = frames[fk]; val.textContent = String(f.label ?? `${fk + 1} of ${frames.length}`); rng.setAttribute('aria-valuetext', val.textContent); title.textContent = f.title || spec.title || ''; canvas.setAttribute('aria-label', title.textContent || 'chart'); };
     rng.addEventListener('input', () => { fk = Math.max(0, Math.min(frames.length - 1, +rng.value || 0)); cur = frameSpec(spec, fk); show(); tip.hidden = true; render(); });
-    show(); row.append(cap, rng, val); card.append(row);
+    show();
+    // animation: play the frames in order (time steps, tidal phases, depth slices …) at a chosen speed, looping
+    const play = document.createElement('button'), speed = document.createElement('select');
+    play.type = 'button'; play.className = 'mini'; play.textContent = '▶ Play'; play.title = 'Play the frames as an animation';
+    speed.setAttribute('aria-label', 'Animation speed'); [['0.5', '½×'], ['1', '1×'], ['2', '2×'], ['4', '4×']].forEach(([v, t]) => { const o = document.createElement('option'); o.value = v; o.textContent = t; o.selected = v === '1'; speed.append(o); });
+    let timer = null;
+    const stop = () => { clearInterval(timer); timer = null; play.textContent = '▶ Play'; };
+    const start = () => { stop(); play.textContent = '⏸ Pause'; timer = setInterval(() => { if (!card.isConnected) return stop(); card._setFrame((fk + 1) % frames.length); }, 1000 / ((spec.fps || 4) * +speed.value)); };
+    play.addEventListener('click', () => (timer ? stop() : start())); speed.addEventListener('change', () => { if (timer) start(); });
+    rng.addEventListener('pointerdown', stop);
+    row.append(play, cap, rng, val, speed); card.append(row);
+    if (spec.autoplay) setTimeout(() => { if (card.isConnected) start(); }, 400);
     card._setFrame = (k) => { rng.value = String(k); rng.dispatchEvent(new Event('input')); };
   }
   card.append(wrap);

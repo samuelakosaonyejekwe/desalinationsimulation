@@ -366,3 +366,19 @@ main:focus, main:focus-visible { outline: none; }
 
 .tbl.params td.lead { white-space: normal; min-width: 150px; } .tbl.params td input { min-width: 64px; width: 100%; }
 @media (max-width: 720px) { fieldset.group { min-width: 0; } .tbl.params th, .tbl.params td { padding: 5px 6px; } }
+
+/* sticky suite toolbar, back bar after a run, plain-language explanations, predictions */
+.tabtools { margin-left: auto; display: flex; gap: 6px; align-items: center; padding: 0 0 6px 8px; }
+.tabtools .btn[disabled] { opacity: .45; cursor: default; }
+@media (max-width: 720px) { .tabtools { position: sticky; right: 0; background: var(--bg); padding-left: 6px; } .tabtools .btn.reset-t { display: none; } }
+.backbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 10px; }
+.explain.card-lite { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; margin: 12px 0; }
+.explain > summary { cursor: pointer; font-weight: 700; color: var(--brand); }
+.explain-body h4, .explain h3 { margin: 12px 0 4px; font-size: 14px; }
+.explain-body ul, .explain ul { margin: 4px 0 8px; padding-left: 20px; }
+.kpi-explain li { margin: 0 0 6px; } .kpi-explain .badge { margin-left: 6px; font-size: 11px; }
+.predict .explain { background: var(--soft); border-radius: 10px; padding: 8px 12px; margin: 10px 0; }
+.warn-inline { color: var(--warn, #b45309); }
+.plot:fullscreen { background: var(--card); padding: 16px 20px; overflow: auto; } .plot:fullscreen .plot-wrap { width: 100%; }
+.predict .row-tools { flex-wrap: wrap; } .predict .row-tools label.inline { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; max-width: 100%; min-width: 0; }
+.predict select { max-width: 100%; min-width: 0; text-overflow: ellipsis; } .predict .chips label { max-width: 100%; }

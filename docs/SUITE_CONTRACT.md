@@ -146,3 +146,17 @@ came from it, `atlasNotes` and `atlasVintage` say which data set and year, and `
 - `props.js`: `density, viscosity, cp, conductivityThermal, psat, tsat, psatSeawater, antoine, latentHeat, bpe, enthalpyLiquid, enthalpyVapour, vapourDensity, osmoticCoefficient, osmoticPressure, diffusivityNaCl, conductivityFromTDS, salinityFromTDS, tdsFromSalinity, tcf, R, F, G, KELVIN` (T in °C, S in g/kg, SI otherwise)
 - `water.js`: `IONS, ION_IDS, CATIONS, ANIONS, WATERS, cloneIons, tds, molar, totalMolar, ionicStrength, chargeBalance, balanceCharge, scaleIons, mixIons, seawaterAtTDS, osmoticPressureIons, vantHoff, conductivity, hardness, alkalinity, summarize`
 - `io.js` (pure parts): `sliceMesh, polylinesToSegments, rasterize`
+
+## Explanations, predictions and animation
+
+- **KPI help.** Every KPI may carry `help`: one or two plain sentences saying what the number is, how it is obtained
+  (the equation in words) and what is good or typical. The results tab shows it in “What these results mean”; a suite
+  may instead supply `kpiHelp: { 'label or label prefix': 'text' }`. Without either, a shared glossary is used.
+- **Plot notes.** Every plot should carry `note`: what is plotted, how to read it, and what to look for.
+- **Predictions.** The generic “Predict & what-if” tab solves the suite's own engine for one-input sweeps, two-input maps
+  and Latin-hypercube uncertainty forecasts. A suite may set `predict: { inputs: [keys], outputs: [KPI labels] }` to
+  choose the inputs offered first and the results ticked by default.
+- **Animation.** Any plot with `frames` gets a slider and a ▶ Play button; `fps` (default 4) sets the speed and
+  `autoplay: true` starts it on display. Use frames for time-dependent results (transients, tidal cycles, fouling
+  growth, start-up), sweeps along a train, depth slices and rotating views. Keep frames to about 40 and fields to about
+  100 × 100 nodes so results stay small. Every chart has full-screen (⛶) and exports PNG at three times screen resolution.

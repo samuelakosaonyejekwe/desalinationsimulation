@@ -56,17 +56,18 @@ export function dataTable(spec) {
     spec.note ? h('p', { class: 'note' }, spec.note) : null);
 }
 
-export function tabs(defs, initial, onChange) {
+export function tabs(defs, initial, onChange, tools) {
   const bar = h('div', { class: 'tabs', role: 'tablist' }), body = h('div', { class: 'tab-body' });
   let active = null;
   const show = (id) => {
     const d = defs.find((x) => x.id === id) || defs[0];
     active = d.id;
-    for (const b of bar.children) { const on = b.dataset.id === active; b.classList.toggle('on', on); b.setAttribute('aria-selected', on); }
+    for (const b of bar.querySelectorAll('.tab')) { const on = b.dataset.id === active; b.classList.toggle('on', on); b.setAttribute('aria-selected', on); }
     clear(body); body.append(d.render());
     if (onChange) onChange(active);
   };
   defs.forEach((d) => bar.append(h('button', { type: 'button', class: 'tab', role: 'tab', dataset: { id: d.id }, onclick: () => show(d.id), title: d.tip || null }, d.label, d.count ? h('span', { class: 'pill' }, d.count) : null)));
+  if (tools) bar.append(tools); // compact controls that stay in view with the sticky tab bar
   const el = h('div', { class: 'tabset' }, bar, body);
   el.show = show; el.active = () => active;
   show(initial || defs[0].id);
