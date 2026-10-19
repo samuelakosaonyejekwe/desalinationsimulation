@@ -389,7 +389,7 @@ function drawSurface3D(canvas, spec) {
   const xs = spec.x, ys = spec.y, zb = spec.z, nx = xs.length, ny = ys.length, layers = spec.layers || [];
   const cw = Math.max(260, canvas.clientWidth || canvas.parentElement.clientWidth || 600);
   const C = setup(canvas, spec.height || Math.round(Math.min(480, Math.max(240, 0.62 * cw)))), { ctx, w, h } = C;
-  const bar = layers.find((l) => l.c) || null, m = { l: 10, r: bar ? 70 : 10, t: 10, b: 30 }, pw = w - m.l - m.r, ph = h - m.t - m.b;
+  const bar = layers.find((l) => l.c) || null, axesOn = spec.axes !== false, m = { l: axesOn ? 46 : 10, r: (bar ? 70 : 10) + (axesOn ? 34 : 0), t: axesOn ? 18 : 10, b: axesOn ? 52 : 30 }, pw = w - m.l - m.r, ph = h - m.t - m.b;
   const az = ((spec.azimuth ?? 205) * Math.PI) / 180, el = (Math.max(8, Math.min(85, spec.elevation ?? 30)) * Math.PI) / 180;
   const fin = Number.isFinite, cx = 0.5 * (xs[0] + xs[nx - 1]), cy = 0.5 * (ys[0] + ys[ny - 1]), Lx = Math.abs(xs[nx - 1] - xs[0]) || 1, Ly = Math.abs(ys[ny - 1] - ys[0]) || 1;
   let zlo = Infinity, zhi = -Infinity;
@@ -455,6 +455,32 @@ function drawSurface3D(canvas, spec) {
     if (q.fill) { ctx.fillStyle = q.fill; path(cor, true); ctx.fill(); }
     if (q.name) { const top = cor.reduce((a, b) => (SY(b) < SY(a) ? b : a)); ctx.fillStyle = q.color || '#38bdf8'; ctx.textAlign = 'center'; ctx.textBaseline = 'bottom'; ctx.fillText(q.name, Math.max(m.l + 60, Math.min(w - m.r - 60, SX(top))), Math.max(m.t + 13, SY(top) - 3)); }
   }
+  if (spec.axes !== false) { // scales: ticks and labels along the two front edges of the ground and a vertical axis at the back corner
+    const X0 = Math.min(xs[0], xs[nx - 1]), X1 = Math.max(xs[0], xs[nx - 1]), Y0 = Math.min(ys[0], ys[ny - 1]), Y1 = Math.max(ys[0], ys[ny - 1]);
+    const ccx = SX(P3(cx, cy, zlo)), ccy = SY(P3(cx, cy, zlo)), dep = (x, y) => P3(x, y, zlo)[2];
+    const yE = dep(cx, Y0) < dep(cx, Y1) ? Y0 : Y1, xE = dep(X0, cy) < dep(X1, cy) ? X0 : X1; // the edges nearer the viewer
+    ctx.font = '10.5px system-ui, sans-serif'; ctx.lineWidth = 1;
+    const axis = (pts, ticks, at, title) => {
+      ctx.strokeStyle = C.mute; path(pts, false); ctx.stroke();
+      // outward normal of the axis on screen (away from the middle of the box): ticks, values and the title go that way
+      const A = [SX(pts[0]), SY(pts[0])], B = [SX(pts[1]), SY(pts[1])], dx = B[0] - A[0], dy = B[1] - A[1], L = Math.hypot(dx, dy) || 1;
+      let nx2 = -dy / L, ny2 = dx / L; const mx = 0.5 * (A[0] + B[0]), my = 0.5 * (A[1] + B[1]); if (nx2 * (mx - ccx) + ny2 * (my - ccy) < 0) { nx2 = -nx2; ny2 = -ny2; }
+      ctx.textAlign = nx2 > 0.35 ? 'left' : nx2 < -0.35 ? 'right' : 'center'; ctx.textBaseline = ny2 > 0.35 ? 'top' : ny2 < -0.35 ? 'bottom' : 'middle';
+      let wmax = 0; const step = L / Math.max(1, ticks.length - 1);
+      ticks.forEach((v, k) => { const q = at(v), px = SX(q), py = SY(q), lab = tickLabel(v); wmax = Math.max(wmax, ctx.measureText(lab).width);
+        ctx.strokeStyle = C.mute; ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px + 5 * nx2, py + 5 * ny2); ctx.stroke();
+        if (step >= 22 || k % 2 === 0) { ctx.fillStyle = C.mute; ctx.fillText(lab, px + 8 * nx2, py + 8 * ny2); } });
+      if (title) { ctx.fillStyle = C.fg; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        let t = title; while (t.length > 8 && ctx.measureText(t).width > Math.max(60, L)) t = t.slice(0, -2).trimEnd() + '…';
+        const hw = ctx.measureText(t).width / 2, off = 14 + Math.abs(nx2) * (wmax + hw) + Math.abs(ny2) * 12, tx = Math.max(hw + 2, Math.min(w - hw - 2, mx + off * nx2)), ty = Math.max(8, Math.min(h - 18, my + off * ny2 + (Math.abs(nx2) > 0.35 ? 0 : 4 * Math.sign(ny2))));
+        ctx.fillText(t, tx, ty); }
+    };
+    const tk = (lo, hi, n) => niceTicks(lo, hi, n).filter((v) => v >= lo - 1e-9 * Math.abs(hi - lo) && v <= hi + 1e-9 * Math.abs(hi - lo));
+    axis([P3(X0, yE, zlo), P3(X1, yE, zlo)], tk(X0, X1, 5), (v) => P3(v, yE, zlo), spec.xlabel);
+    axis([P3(xE, Y0, zlo), P3(xE, Y1, zlo)], tk(Y0, Y1, 5), (v) => P3(xE, v, zlo), spec.ylabel);
+    const xB = xE === X0 ? X1 : X0, yB = yE === Y0 ? Y1 : Y0; // the back corner carries the vertical scale
+    axis([P3(xB, yB, zlo), P3(xB, yB, zhi)], tk(zlo, zhi, 4), (v) => P3(xB, yB, v), spec.zlabel);
+  }
   for (const q of spec.markers || []) {
     const a = P3(q.x, q.y, q.z0 ?? zlo), b = P3(q.x, q.y, q.z1 ?? zhi);
     ctx.strokeStyle = q.color || C.fg; ctx.lineWidth = 1.6; path([a, b]); ctx.stroke();
@@ -463,7 +489,7 @@ function drawSurface3D(canvas, spec) {
   }
   ctx.restore();
   // orientation: north arrow on the ground plane, horizontal scale and the view parameters
-  { const o = [m.l + 26, h - m.b - 22], nxs = ry, nys = dyv * se, nl = Math.hypot(nxs, nys) || 1, ax = (18 * nxs) / nl, ay = (-18 * nys) / nl;
+  { const o = axesOn ? [w - m.r - 22, m.t + 24] : [m.l + 26, h - m.b - 22], nxs = ry, nys = dyv * se, nl = Math.hypot(nxs, nys) || 1, ax = (18 * nxs) / nl, ay = (-18 * nys) / nl;
     ctx.strokeStyle = C.fg; ctx.fillStyle = C.fg; ctx.lineWidth = 1.4; ctx.beginPath(); ctx.moveTo(o[0] - 0.5 * ax, o[1] - 0.5 * ay); ctx.lineTo(o[0] + ax, o[1] + ay); ctx.stroke();
     const an = Math.atan2(ay, ax); ctx.beginPath(); ctx.moveTo(o[0] + ax, o[1] + ay); ctx.lineTo(o[0] + ax - 6 * Math.cos(an - 0.5), o[1] + ay - 6 * Math.sin(an - 0.5)); ctx.lineTo(o[0] + ax - 6 * Math.cos(an + 0.5), o[1] + ay - 6 * Math.sin(an + 0.5)); ctx.fill();
     ctx.font = '11px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('N', o[0] + 1.6 * ax, o[1] + 1.6 * ay); }
@@ -568,7 +594,7 @@ export function plotCard(spec, { onDownload } = {}) {
     // animation: play the frames in order (time steps, tidal phases, depth slices …) at a chosen speed, looping
     const play = document.createElement('button'), speed = document.createElement('select');
     play.type = 'button'; play.className = 'mini'; play.textContent = '▶ Play'; play.title = 'Play the frames as an animation';
-    speed.setAttribute('aria-label', 'Animation speed'); [['0.5', '½×'], ['1', '1×'], ['2', '2×'], ['4', '4×']].forEach(([v, t]) => { const o = document.createElement('option'); o.value = v; o.textContent = t; o.selected = v === '1'; speed.append(o); });
+    speed.setAttribute('aria-label', 'Animation speed'); Object.assign(speed.style, { width: 'auto', minWidth: '0', flex: '0 0 auto', padding: '2px 6px', minHeight: '28px' }); [['0.5', '½×'], ['1', '1×'], ['2', '2×'], ['4', '4×']].forEach(([v, t]) => { const o = document.createElement('option'); o.value = v; o.textContent = t; o.selected = v === '1'; speed.append(o); });
     let timer = null;
     const stop = () => { clearInterval(timer); timer = null; play.textContent = '▶ Play'; };
     const start = () => { stop(); play.textContent = '⏸ Pause'; timer = setInterval(() => { if (!card.isConnected) return stop(); card._setFrame((fk + 1) % frames.length); }, 1000 / ((spec.fps || 4) * +speed.value)); };
