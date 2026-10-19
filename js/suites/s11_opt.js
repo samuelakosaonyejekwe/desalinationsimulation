@@ -1047,6 +1047,48 @@ const designOut = (e) => ({ recovery: e.m.rec, targetFlux: e.inp.targetFlux, ele
 const FEAS = 1e-3; // a design is accepted as feasible when no limit is exceeded by more than 0.1 %
 const stepXY = (hist) => ({ x: hist.map((h) => h[0]), y: hist.map((h) => h[1]) });
 
+// ---- Dynamic views of the optimisers: search paths on the objective landscape, the landscape in 3-D, the Pareto front evolving ----
+const PATH_COL = ['#f97316', '#0ea5e9', '#a855f7', '#22c55e', '#e11d48', '#eab308', '#14b8a6', '#64748b'];
+const fq = (x, d = 3) => (Number.isFinite(x) ? String(+x.toPrecision(d)) : '–'); // light formatter for frame titles (fmt's locale formatting is slow)
+/** Objective landscape over the two main continuous decision variables (others at the optimum): 8 × 8 cached model runs, with the optimiser's search paths as frames. */
+async function optLandscape(v, vars, cIdx, E, bestS, starts, O, show, eOpt, ctx) {
+  if (cIdx.length < 2) return [];
+  const pick = (key, alt) => { const j = vars.findIndex((d) => d.key === key && !d.int); return j >= 0 ? j : alt; }, jA = pick('recovery', cIdx[0]), jB = pick('targetFlux', cIdx.find((j) => j !== jA));
+  const A = vars[jA], B = vars[jB], G = 8, ua = linspace(0, 1, G), xA = ua.map((q) => A.lo + q * (A.hi - A.lo)), yB = ua.map((q) => B.lo + q * (B.hi - B.lo));
+  ctx.progress(0.93, 'Objective landscape for the animated and 3-D views'); await ctx.tick();
+  const cells = ua.map((qb) => ua.map((qa) => { const w = [...bestS.u]; w[jA] = qa; w[jB] = qb; const e = E.at(w); return e.ok ? { f: show(O.f(e)), u: 100 * (1 + Math.max(...e.g)) } : null; }));
+  const ok = cells.flat().filter(Boolean);
+  if (ok.length < 4) return [];
+  const fLo = Math.min(...ok.map((c) => c.f)), fHi = Math.max(...ok.map((c) => c.f)), inf = (c) => !c || c.u > 100 * (1 + FEAS);
+  const toXY = (u) => [A.lo + clamp(u[jA], 0, 1) * (A.hi - A.lo), B.lo + clamp(u[jB], 0, 1) * (B.hi - B.lo)];
+  const off = []; let tot = 0; for (const st of starts) { off.push(tot); tot += st.calls; }
+  const miles = [...new Set(linspace(1, Math.max(1, tot), Math.min(30, Math.max(2, tot))).map(Math.round))];
+  const optXY = toXY(bestS.u), lab = (d) => `${d.label}${d.unit ? ` (${d.unit})` : ''}`;
+  const pathAt = (c) => starts.map((st, k) => { const pts = st.path.filter(([n]) => n + off[k] <= c).map(([, u]) => toXY(u)); return { pts, k }; }).filter((q) => q.pts.length);
+  const field = { type: 'field', title: `Search paths on the ${lcFirst(O.label)} landscape`, xlabel: lab(A), ylabel: lab(B), zlabel: O.label, zunit: O.unit, x: xA, y: yB, z: cells.map((r) => r.map((c) => (c ? c.f : fLo))), mask: cells.map((r) => r.map(inf)), cmap: 'viridis', contours: 8,
+    markers: [{ x: optXY[0], y: optXY[1], label: 'optimum' }], frameLabel: 'Evaluations', fps: 4, frame: miles.length - 1,
+    frames: miles.map((c) => { const P = pathAt(c); return { label: `${c} of ${tot}`, title: `Search paths on the ${lcFirst(O.label)} landscape — ${c} of ${tot} evaluations`, shapes: P.map(({ pts, k }) => ({ x: pts.map((q) => q[0]), y: pts.map((q) => q[1]), color: PATH_COL[k % PATH_COL.length] })), markers: [...P.map(({ pts, k }) => ({ x: pts[pts.length - 1][0], y: pts[pts.length - 1][1], label: `start ${k + 1}` })), ...(c >= tot ? [{ x: optXY[0], y: optXY[1], label: 'optimum' }] : [])] }; }),
+    note: `Colour: ${lcFirst(O.label)} (${O.unit}) over ${lcFirst(A.label)} and ${lcFirst(B.label)}, from ${G} × ${G} runs of the RO model with every other decision variable held at the optimum; grey cells break at least one operating limit (or cannot be simulated). Press ▶ Play to watch each start of the optimiser (one colour per start) move its best design so far across the landscape as evaluations accumulate. Paths are projections onto this slice, so a start may appear to cross grey cells while other variables differ. The optimum normally sits in a valley of the colour map or against the edge of the grey (constrained) region.` };
+  const zFloor = fLo - 0.05 * (fHi - fLo || 1), cmax = (k) => cells[k[0]][k[1]]?.f ?? fLo;
+  const surf = { type: 'surface3d', title: `${O.label} over ${lcFirst(A.label)} × ${lcFirst(B.label)} around the optimum (3-D)`, xlabel: `${lab(A)} (0 = ${fq(A.lo)}, 1 = ${fq(A.hi)})`, ylabel: `${lab(B)} (0 = ${fq(B.lo)}, 1 = ${fq(B.hi)})`, zlabel: `${O.label} (${O.unit})`, x: ua, y: ua, z: ua.map(() => ua.map(() => NaN)), azimuth: 220, elevation: 28, zscale: 0.5 / Math.max(fHi - fLo, 1e-9 * Math.abs(fHi) + 1e-12),
+    layers: [{ name: O.label, z: cells.map((r) => r.map((c) => (c ? c.f : NaN))), base: ua.map(() => ua.map(() => zFloor)), c: cells.map((r) => r.map((c) => (c ? clamp(c.u, 70, 130) : NaN))), cmap: 'coolwarm', cmin: 70, cmax: 130, clabel: 'Most critical limit', cunit: '% of limit', opacity: 1 }],
+    markers: [{ x: 0, y: 0, z0: cmax([0, 0]), z1: cmax([0, 0]), label: `${fq(A.lo)} · ${fq(B.lo)}` }, { x: 1, y: 0, z0: cmax([0, G - 1]), z1: cmax([0, G - 1]), label: `${fq(A.hi)} · ${fq(B.lo)}` }, { x: 0, y: 1, z0: cmax([G - 1, 0]), z1: cmax([G - 1, 0]), label: `${fq(A.lo)} · ${fq(B.hi)}` },
+      { x: clamp(bestS.u[jA], 0, 1), y: clamp(bestS.u[jB], 0, 1), z0: zFloor, z1: show(O.f(eOpt)), label: `optimum ${fq(show(O.f(eOpt)), 4)} ${O.unit}`, color: '#f97316' }],
+    note: `Height: ${lcFirst(O.label)} (${O.unit}) of the same ${G} × ${G} designs (${lcFirst(A.label)} across, ${lcFirst(B.label)} back; corners labelled with their values), every other decision variable at the optimum. Colour: utilisation of the most critical operating limit — blue is comfortably inside every limit, white is at 100 % of a limit, red exceeds one. The orange pole is the optimum: it should sit at the lowest blue-to-white point of the surface. Holes are designs the model cannot simulate. Drag or use ◀ ▶ to turn the view.` };
+  return [field, surf];
+}
+/** NSGA-II: population and non-dominated front after each generation (frames), in the energy–recovery plane. */
+function moFrontAnim(conv, ek, eBase, nObj = 2) {
+  const all = conv.fr.flatMap((q) => q.pop), xs = all.map((p) => p[0]), ys = all.map((p) => p[1]), pad = (a, b) => 0.05 * (b - a || 1);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys), ix = [...new Set(linspace(0, conv.fr.length - 1, Math.min(40, conv.fr.length)).map(Math.round))];
+  const ser = (q) => [{ name: 'Population', x: q.pop.map((p) => p[0]), y: q.pop.map((p) => p[1]), mode: 'points', color: '#94a3b8' }, { name: 'Non-dominated front', x: q.front.map((p) => p[0]), y: q.front.map((p) => p[1]), mode: nObj > 2 ? 'points' : 'both' }];
+  const last = conv.fr[conv.fr.length - 1];
+  return { type: 'line', title: 'Pareto front evolving over the generations', xlabel: 'Recovery (%)', ylabel: 'Specific energy (kWh/m³)', xmin: x0 - pad(x0, x1), xmax: x1 + pad(x0, x1), ymin: y0 - pad(y0, y1), ymax: y1 + pad(y0, y1), frameLabel: 'Generation', fps: 3, frame: ix.length - 1,
+    series: [...ser(last), { name: 'Knee point', x: [ek.m.rec], y: [ek.m.sec], mode: 'points' }],
+    frames: ix.map((k) => ({ label: `${conv.g[k]}`, title: `Pareto front evolving — generation ${conv.g[k]}: ${conv.fr[k].front.length} non-dominated designs, lowest energy ${fq(conv.sec[k])} kWh/m³, highest recovery ${fq(conv.rec[k])} %`, series: [...ser(conv.fr[k]), ...(k === conv.fr.length - 1 ? [{ name: 'Knee point', x: [ek.m.rec], y: [ek.m.sec], mode: 'points' }] : []), ...(eBase.ok ? [{ name: 'Base case', x: [eBase.m.rec], y: [eBase.m.sec], mode: 'points' }] : [])] })),
+    note: 'Press ▶ Play to watch NSGA-II at work: grey points are the whole population of designs in each generation (only those the model could simulate), the coloured points (joined by a line for two objectives) are the current non-dominated designs; with a third objective (product TDS or cost) some of them sit above others in this energy–recovery view because they win on the third objective. Generation 0 is the Latin-hypercube start; selection, crossover and mutation then push the front down (less energy) and to the right (more recovery) until it stops moving. A front that still moves in the last frames needs more generations.' };
+}
+
 // ---- Task 1: single-objective constrained optimisation -------------------------------------------------------
 async function taskOpt(v, ctx) {
   const base = roBase(v), vars = decisionVars(v), n = vars.length, O = OBJ[v.objective] || OBJ.cost, CL = consFor(v);
@@ -1062,7 +1104,7 @@ async function taskOpt(v, ctx) {
   const ones = new Array(cIdx.length).fill(1), zc = new Array(cIdx.length).fill(0);
   const nStarts = clamp(Math.round(v.nStarts), 1, 8), seed = Math.round(v.seed), starts = [], lh = lhs(nStarts, n, seed);
   let cur = null;
-  const track = (u) => { const m = merit(E.at(u)); cur.calls++; if (m < cur.best - 1e-12) { cur.best = m; cur.hist.push([cur.calls, m]); } return m; };
+  const track = (u) => { const m = merit(E.at(u)); cur.calls++; if (m < cur.best - 1e-12) { cur.best = m; cur.hist.push([cur.calls, m]); cur.path.push([cur.calls, [...u]]); } return m; };
   const continuous = (u, algo) => { // optimise the continuous variables with the integers held fixed
     if (!cIdx.length) return { u };
     const uc0 = cIdx.map((j) => u[j]);
@@ -1089,7 +1131,7 @@ async function taskOpt(v, ctx) {
   for (let k = 0; k < nStarts; k++) {
     ctx.progress(0.05 + (0.75 * k) / nStarts, `Start ${k + 1} of ${nStarts} (${v.algo === 'de' ? 'differential evolution' : v.algo === 'sqp' ? 'SQP' : 'Nelder–Mead'})`);
     await ctx.tick();
-    cur = { calls: 0, best: Infinity, hist: [], seed: seed + k };
+    cur = { calls: 0, best: Infinity, hist: [], path: [], seed: seed + k };
     let u = snap(k === 0 ? vars.map((d) => clamp((d.x0 - d.lo) / (d.hi - d.lo), 0, 1)) : lh[k]), sqp = null;
     if (v.algo === 'de') {
       const r = diffEvolution(track, new Array(n).fill(0), new Array(n).fill(1), { pop: Math.max(5, Math.round(v.dePop)), gens: Math.max(1, Math.round(v.deGens)), F: 0.6, CR: 0.9, seed: seed + k });
@@ -1126,7 +1168,8 @@ async function taskOpt(v, ctx) {
   if (spread > 0.02) W.push({ level: 'warn', msg: `The ${nStarts} starts disagree by ${fmt(100 * spread, 2)} % in the penalised objective — the problem is multi-modal or not fully converged; use more starts, generations or the global algorithm.` });
   if (cIdx.length && feasible && kk.relResidual > 0.15) W.push({ level: 'warn', msg: `The first-order optimality residual is ${fmt(100 * kk.relResidual, 2)} % of the objective gradient: the point is good but not a tight stationary point (finite-difference noise or an integer-limited optimum).` });
   const active = CL.filter((c, i) => eOpt.g[i] > -4e-3), costCats = ['Energy', 'Membranes + vessels', 'Chemicals / pre-treatment', 'Brine disposal'], costOf = (e) => [e.cost.energy, e.cost.membrane, e.cost.chemicals, e.cost.brine];
-  const extra = designEvidence(v, eBase, eOpt);
+  const extra = designEvidence(v, eBase, eOpt), nEv = E.evals;
+  const views = v.optViews !== false ? await optLandscape(v, vars, cIdx, E, bestS, starts, O, show, eOpt, ctx) : [];
   const perfRows = [['Recovery (%)', (e) => e.m.rec], ['Average flux (L/m²·h)', (e) => e.m.avgFlux], ['Elements per vessel', (e) => e.inp.elements], ['Element class', (e) => memName(e.inp.membrane)], ['Vessels per stage', (e) => e.m.vessels.join(' : ')],
     ['Elements installed', (e) => e.m.nEl], ['Feed pressure (bar)', (e) => e.m.Pf], ['Specific energy (kWh/m³)', (e) => e.m.sec], ['Cost of water ($/m³)', (e) => e.cost.total], ['Product flow (m³/h)', (e) => e.m.Qp], ['Brine flow (m³/h)', (e) => e.m.Qb],
     ['Product TDS (mg/L)', (e) => e.m.tds], ['Product boron (mg/L)', (e) => e.m.boron], ['Lead-element flux (L/m²·h)', (e) => e.m.maxFlux], ['Polarisation factor β', (e) => e.m.maxCP], ['Permeate back-pressure (bar)', (e) => e.inp.Pp], ['Inter-stage boost (bar)', (e) => e.inp.boost2]];
@@ -1140,7 +1183,7 @@ async function taskOpt(v, ctx) {
       { label: 'Specific energy', value: eOpt.m.sec, unit: 'kWh/m³' }, { label: 'Cost of water', value: eOpt.cost.total, unit: '$/m³' },
       { label: 'Feed pressure', value: eOpt.m.Pf, unit: 'bar' }, { label: 'Product TDS', value: eOpt.m.tds, unit: 'mg/L', status: eOpt.g[0] > FEAS ? 'bad' : 'ok' },
       { label: 'Largest constraint violation', value: 100 * Math.max(0, ...eOpt.g), unit: '% of limit', status: feasible ? 'ok' : 'bad' }, { label: 'Active constraints', value: active.length ? active.map((c) => c.label).join(', ') : 'none' },
-      { label: 'KKT stationarity residual', value: kk.relResidual, unit: 'relative', status: kk.relResidual < 0.15 ? 'ok' : 'warn', help: '‖∇f + Σλ∇g‖∞ / ‖∇f‖∞ in the continuous variables with non-negative multipliers on the active set' }, { label: 'Model evaluations', value: E.evals },
+      { label: 'KKT stationarity residual', value: kk.relResidual, unit: 'relative', status: kk.relResidual < 0.15 ? 'ok' : 'warn', help: '‖∇f + Σλ∇g‖∞ / ‖∇f‖∞ in the continuous variables with non-negative multipliers on the active set' }, { label: 'Model evaluations', value: nEv },
       ...extra.kpis,
     ],
     recommendations: [
@@ -1156,6 +1199,7 @@ async function taskOpt(v, ctx) {
       ...(sweep.x.length > 2 ? [{ type: 'line', title: `${O.label} versus recovery through the optimum`, xlabel: 'Recovery (%)', ylabel: O.unit, series: [{ name: O.label, x: sweep.x, y: sweep.f, mode: 'both' }], vlines: [{ x: eOpt.m.rec, label: 'optimum' }] },
         { type: 'line', title: 'Most critical constraint versus recovery', xlabel: 'Recovery (%)', ylabel: 'Largest normalised constraint (% over limit)', series: [{ name: 'max g(x)', x: sweep.x, y: sweep.viol, mode: 'both' }], hlines: [{ y: 0, label: 'feasible below this line' }], vlines: [{ x: eOpt.m.rec, label: 'optimum' }] }] : []),
       { type: 'bar', title: 'Multi-start results', ylabel: `${O.label} (${O.unit})`, categories: starts.map((s, k) => `Start ${k + 1}`), series: [{ name: O.label, values: starts.map((s) => (s.e.ok ? show(O.f(s.e)) : 0)) }] },
+      ...views,
     ],
     tables: [
       { title: 'Optimum compared with the base case', columns: ['Quantity', 'Base case', 'Optimum'], rows: perfRows.map(([nm, f]) => [nm, f(eBase), f(eOpt)]) },
@@ -1182,8 +1226,8 @@ async function taskMO(v, ctx) {
   if (third === 'cost') objs.push({ label: 'Cost of water', lc: 'minimise cost of water', f: (e) => e.cost.total });
   const evalFn = (u) => { const e = E.at(u); return e.ok ? { f: objs.map((o) => o.f(e)), cv: Math.max(...e.g) > FEAS ? e.viol : 0, e } : { f: objs.map(() => 1e6), cv: 100, e }; };
   const gens = Math.max(1, Math.round(v.moGens)), S = nsga2Init(evalFn, new Array(n).fill(0), new Array(n).fill(1), { pop: Math.round(v.moPop), seed: Math.round(v.seed) });
-  const conv = { g: [], sec: [], rec: [], nFront: [] };
-  const log = () => { const F = paretoFront(S.P).filter((p) => p.e.ok); conv.g.push(S.gen); conv.sec.push(F.length ? Math.min(...F.map((p) => p.e.m.sec)) : 0); conv.rec.push(F.length ? Math.max(...F.map((p) => p.e.m.rec)) : 0); conv.nFront.push(F.length); };
+  const conv = { g: [], sec: [], rec: [], nFront: [], fr: [] };
+  const log = () => { const F = paretoFront(S.P).filter((p) => p.e.ok); conv.fr.push({ pop: S.P.filter((p) => p.e.ok).map((p) => [p.e.m.rec, p.e.m.sec]), front: F.map((p) => [p.e.m.rec, p.e.m.sec]).sort((a, b) => a[0] - b[0]) }); conv.g.push(S.gen); conv.sec.push(F.length ? Math.min(...F.map((p) => p.e.m.sec)) : 0); conv.rec.push(F.length ? Math.max(...F.map((p) => p.e.m.rec)) : 0); conv.nFront.push(F.length); };
   log();
   for (let g = 0; g < gens; g++) { nsga2Step(S); log(); ctx.progress(0.05 + (0.9 * (g + 1)) / gens, `Generation ${g + 1} of ${gens}`); await ctx.tick(); }
   const seen = new Set(), front = paretoFront(S.P).filter((p) => p.e.ok && !seen.has(p.e) && seen.add(p.e)).sort((a, b) => a.e.m.rec - b.e.m.rec).slice(0, 60);
@@ -1215,6 +1259,7 @@ async function taskMO(v, ctx) {
       scatter('Pareto front: product TDS versus recovery', 'Product TDS (mg/L)', (e) => e.m.tds),
       scatter('Cost of water along the front', 'Cost of water ($/m³)', (e) => e.cost.total),
       { type: 'line', title: 'Product quality versus energy', xlabel: 'Specific energy (kWh/m³)', ylabel: 'Product TDS (mg/L)', series: [{ name: 'Pareto designs', x: X((e) => e.m.sec), y: X((e) => e.m.tds), mode: 'points' }, { name: 'Knee point', x: [ek.m.sec], y: [ek.m.tds], mode: 'points' }] },
+      moFrontAnim(conv, ek, eBase, objs.length),
       { type: 'line', title: 'Convergence of the front by generation', xlabel: 'Generation', ylabel: 'Energy (kWh/m³) · recovery/10 (%) · designs/10', series: [{ name: 'Lowest energy on front', x: conv.g, y: conv.sec, mode: 'both' }, { name: 'Highest recovery ÷ 10', x: conv.g, y: conv.rec.map((q) => q / 10), mode: 'both' }, { name: 'Front size ÷ 10', x: conv.g, y: conv.nFront.map((q) => q / 10), mode: 'step' }] },
     ],
     tables: [
@@ -3201,6 +3246,402 @@ const memOptions = Object.entries(MEMBRANES).map(([k, m]) => ({ value: k, label:
 const nums = (prefix, n, label, vals, showFn, help) => range(n).map((i) => ({ key: prefix + (i + 1), label: `${label} ${i + 1}`, unit: '', value: vals[i], min: -1e12, max: 1e12, help: i ? undefined : help, showIf: (v) => showFn(v, i) }));
 const texts = (prefix, n, label, vals, showFn, help) => range(n).map((i) => ({ key: prefix + (i + 1), label: label(i + 1), type: 'text', value: vals[i], help: i ? undefined : help, showIf: (v) => showFn(v, i) }));
 
+// ---- Plain-language meaning of every key result and chart, per task (shown in “What these results mean” and under each chart) ----
+// Each entry: [label (exact or prefix) or RegExp, text or (kpi, v) => text]. A KPI's own detail text, when it has one, is kept after the meaning.
+const RO_KPI = [
+  ['Specific energy', 'Electrical energy per m³ of permeate for this design: high-pressure pump work net of energy recovery, from the element-by-element RO model of suite 1. Seawater RO typically needs 2.5–3.5 kWh/m³; lower is better.'],
+  ['Cost of water', 'Simple cost of water of this design: annualised membranes and vessels + energy + chemicals and pre-treatment + brine disposal, per m³ of product. Use suite 13 for the full economics; here it ranks designs.'],
+  ['Feed pressure', 'Pressure the high-pressure pump must deliver at the membrane inlet for this design: osmotic pressure of the concentrate + the net driving pressure for the flux + pressure losses. It must stay below the vessel rating.'],
+  ['Product TDS', 'Salt left in the permeate (blend of all elements) from the solution–diffusion model. It must stay below the product-quality limit; drinking water is usually below 500 mg/L.'],
+];
+const SURR_RMSE = 'Root-mean-square error of the model’s predictions on test points it never saw during training, in the units of the target. Compare it with the spread of the data: a good surrogate has an error far below the baseline that always predicts the mean.';
+const KPI_HELP = {
+  opt: [
+    [/^Optimal /, (k, v) => `Best value of the objective (${lcFirst(k.label.replace(/^Optimal /, ''))}) found by the optimiser among all designs that respect the operating constraints, from repeated runs of the RO model of suite 1. It is the number to compare with the base case.`],
+    ['Improvement on base case', 'How much better the optimum is than the base design entered on the Inputs tab: (base − optimum) ÷ base × 100. Positive is an improvement; a few per cent is typical for an already sensible design.'],
+    ['Optimal recovery', 'Share of the feed that becomes permeate in the optimal design. Higher recovery saves intake and pre-treatment but raises the concentrate salinity, feed pressure and scaling risk; seawater RO usually runs at 40–50 %.'],
+    ['Optimal average flux', 'Permeate flow per m² of membrane in the optimal design (total permeate ÷ installed area). Higher flux needs fewer elements but more pressure and fouling; seawater RO typically runs at 12–16 L/m²·h.'],
+    ['Elements per vessel', 'Number of membrane elements in series in each pressure vessel of the optimal design (an integer decision variable). Longer vessels raise recovery per pass but load the lead element more.'],
+    ['Element class', 'Membrane element type chosen by the optimiser from the allowed set (a categorical decision variable): high-rejection, low-energy or ultra-low-energy elements trade salt passage against permeability.'],
+    ...RO_KPI,
+    ['Largest constraint violation', 'How far the worst operating limit (pressure, product TDS, boron, flux, polarisation, concentrate flow, …) is exceeded at the optimum, as % of that limit. Zero means every constraint is met; a design counts as feasible below 0.1 %.'],
+    ['Active constraints', 'Limits that the optimal design touches (within 0.4 %). These are what stops the objective improving further: relaxing an active limit improves the optimum, relaxing an inactive one does not.'],
+    ['KKT stationarity residual', 'First-order optimality check (Karush–Kuhn–Tucker): at a true constrained optimum the objective gradient is balanced by the active constraint gradients times non-negative multipliers. Values below about 0.15 confirm a stationary point.'],
+    ['Model evaluations', 'Number of distinct RO plant simulations the optimiser needed (repeated designs are taken from a cache). It measures the cost of the search; more starts or generations raise it.'],
+    ['Specific-energy cap', 'Upper limit on the specific energy imposed as an extra constraint of the optimisation.'],
+    ['Concentrate saturation index', 'Scaling constraint: log₁₀ of how far the concentrate is above saturation for the constrained minerals, from the electrolyte model of suite 2. Above 0 the mineral can precipitate; antiscalants allow modest positive values.'],
+  ],
+  mo: [
+    ['Pareto designs', 'Number of distinct non-dominated designs found by NSGA-II: designs for which no other design is better in every objective at once. Each is optimal for some weighting of the objectives; 10 or more give a well-resolved trade-off curve.'],
+    ['Knee recovery', 'Recovery of the knee point — the compromise design nearest the ideal corner after scaling each objective to 0–1. It is the recommended balanced choice when no weighting is given.'],
+    ['Knee specific energy', 'Specific energy of the knee (recommended compromise) design, from the RO model of suite 1.'],
+    ['Knee product TDS', 'Permeate salinity of the knee design; check it against the product-quality limit.'],
+    ['Knee cost of water', 'Simple cost of water (membranes, energy, chemicals, brine) of the knee design, per m³ of product.'],
+    ['Knee average flux', 'Average membrane flux of the knee design (permeate ÷ installed area).'],
+    ['Knee element class', 'Membrane element type of the knee design.'],
+    ['Lowest energy on front', 'Smallest specific energy of any non-dominated design — one end of the trade-off, usually reached at low recovery.'],
+    ['Highest recovery on front', 'Largest recovery reached by a design that still meets the constraints — the other end of the trade-off, bought with more energy.'],
+    ['Lowest product TDS on front', 'Best permeate quality among the non-dominated designs.'],
+    ['Feasible front', 'Whether the designs on the front satisfy every operating constraint. “No” means the best compromise still violates a limit — relax the limit or widen the bounds.'],
+    ['Plant simulations', 'Number of distinct RO plant simulations run by NSGA-II (population × generations, with repeats taken from a cache).'],
+  ],
+  sa: [
+    ['Most influential factor', 'Input whose uncertainty explains the largest share of the output variance (largest total Sobol index, which includes its interactions). Firm this input up first.'],
+    ['Its total Sobol index', 'Share of the output variance that would remain unexplained if every input except this one were known — its main effect plus all its interactions. 0 = irrelevant, 1 = explains everything.'],
+    ['Its first-order index', 'Share of the output variance caused by this input alone (its main effect), estimated by Saltelli sampling.'],
+    ['Second factor', 'Second most influential input by total Sobol index.'],
+    ['Sum of first-order indices', 'Sum of all main-effect indices. Close to 1 means the output is essentially additive in the inputs; well below 1 means interactions matter.'],
+    ['Interaction share', 'Part of the output variance due to interactions between inputs: 1 − Σ first-order indices. Small values (below about 0.1) mean each input can be studied on its own.'],
+    ['Morris σ/μ* of top factor', 'Ratio of the spread to the mean of the Morris elementary effects of the top factor. A large ratio means its effect changes across the input space (non-linear or interacting).'],
+    [/^Nominal /, 'Value of the studied output with every input at its nominal (base-case) value.'],
+    ['Output standard deviation', 'Spread of the studied output when all factors vary together over their ranges (square root of the variance estimated from the Sobol sample).'],
+    ['Largest one-at-a-time swing', 'Largest change of the output when a single factor moves from its low to its high value with the others at nominal — the top bar of the tornado chart.'],
+    ['Factors screened', 'Number of uncertain inputs included in the screening and variance analyses.'],
+  ],
+  uq: [
+    ['SEC, median (P50)', 'Median specific energy over the Monte-Carlo sample of uncertain feed conditions and membrane state: half of the possible operating conditions need less, half more.'],
+    ['SEC, P5 – P95', 'Range that contains 90 % of the simulated specific energies (5th to 95th percentile). Size equipment and budgets on the upper end.'],
+    ['SEC, mean ± std. error', 'Average specific energy over the sample and the statistical uncertainty of that average (standard deviation ÷ √n); raise the sample size if the error is not small enough.'],
+    [/P95$/, 'Value exceeded in only 5 % of the simulated operating conditions — a prudent design value for pumps, vessels or product-quality guarantees.'],
+    [/^P\(any limit exceeded\)/, 'Share of the simulated operating conditions in which at least one operating limit is exceeded. Below a few per cent is a robust design.'],
+    [/^P\(/, 'Share of the simulated operating conditions in which this limit is exceeded, counted over the Monte-Carlo sample. It turns the uncertainty into a risk you can compare with your tolerance.'],
+    ['Valid samples', 'Number of Monte-Carlo samples for which the RO model converged; failed samples (for example pressure beyond the pump) are excluded.'],
+  ],
+  ml: [
+    ['Selected model', 'Surrogate family with the lowest validation error (response surface, Gaussian process or neural network); it is used for the predictions, slices and Bayesian optimisation.'],
+    [/^Test RMSE/, SURR_RMSE],
+    [/^Test R²/, 'Coefficient of determination on the test set: 1 − Σ(error²) ÷ Σ(deviation from the mean²). 1 is perfect, 0 is no better than predicting the mean; above 0.95 is good for a surrogate.'],
+    [/^Test MAE/, 'Mean absolute error on the test set — the typical size of a prediction error, less sensitive to a few large misses than the RMSE.'],
+    ['Mean-baseline RMSE', 'Error of the trivial model that always predicts the training mean. Every useful surrogate must beat it by a wide margin.'],
+    ['Skill over baseline', 'Reduction of the test error compared with the mean baseline: (1 − RMSE ÷ baseline RMSE) × 100. Above 80–90 % is a skilful surrogate.'],
+    [/(Response-surface|Gaussian-process|Neural-network) test RMSE/, 'Test error of this surrogate family, for comparison with the others on the same unseen points.'],
+    [/-fold CV RMSE/, 'Cross-validated error: the training data are split into folds, each fold is predicted by a model trained on the others, and the errors are pooled. It checks the test error is not a lucky split.'],
+    ['GP ±2σ coverage on test', 'Share of test points that fall inside the Gaussian process’s own ±2-standard-deviation band. About 95 % means its uncertainty estimate is honest; much lower means it is over-confident.'],
+    ['Rows train / val / test', 'How the data were split: rows used to fit, rows used to choose the model and stop training, and rows held back for the final test.'],
+    [/^Bayesian-optimised/, 'Best value of the target found by Bayesian optimisation on the surrogate (expected-improvement search), then checked with the real model or data where possible.'],
+    ['Change versus reference point', 'Difference between the Bayesian-optimised value and the reference (base-case) point, in per cent.'],
+  ],
+  pinn: [
+    ['Film Péclet number Jw/k', 'Ratio of the permeate velocity to the mass-transfer coefficient — how strongly the permeate flow piles salt up against the membrane. The polarisation factor is exp(Pe).'],
+    ['Polarisation factor, analytical', 'Wall-to-bulk concentration ratio from the exact film-theory solution exp(Jw/k): the reference the network is checked against. Above about 1.2 raises scaling and fouling risk.'],
+    ['Polarisation factor, network', 'The same ratio predicted by the physics-informed neural network, trained only on the differential equation and its boundary conditions (no data).'],
+    ['Polarisation factor, finite difference', 'The same ratio from a conventional finite-difference solution, for comparison with the network.'],
+    ['Network maximum error', 'Largest relative difference between the network and the exact concentration profile; below about 1 % shows the network has learned the physics.'],
+    ['Network RMS error', 'Root-mean-square difference between the network and the exact profile across the film.'],
+    ['Finite-difference maximum error', 'Largest error of the finite-difference solution against the exact profile — the benchmark a classical solver reaches.'],
+    ['Final training loss', 'Mean squared equation residual plus weighted boundary error at the end of training. It should be small and still falling slowly.'],
+    ['Wall concentration (network)', 'Salt concentration at the membrane surface predicted by the network.'],
+    ['Wall concentration (analytical)', 'Salt concentration at the membrane surface from the exact solution.'],
+    ['Boundary-layer thickness D/k', 'Thickness of the concentration-polarisation film: diffusivity ÷ mass-transfer coefficient. Typical RO channels give tens of micrometres.'],
+    ['Trainable parameters', 'Number of weights and biases of the network.'],
+  ],
+  ts: [
+    [/^Best \d+-step model/, 'Forecasting method with the lowest error at the chosen horizon on the held-out period (Holt–Winters, autoregressive or persistence).'],
+    [/-step RMSE \(best\)/, 'Root-mean-square error of the best model when forecasting this many steps ahead over the held-out test period, in the units of the series.'],
+    [/-step RMSE \(persistence\)/, 'Error of the naive forecast “tomorrow equals today” at the same horizon — the benchmark a forecasting model has to beat.'],
+    ['Skill over persistence', 'Error reduction of the best model compared with persistence: (1 − RMSE ÷ persistence RMSE) × 100. Positive means the model adds value.'],
+    ['Estimated permeability now', 'Current normalised performance estimated by the extended Kalman filter, which blends the fouling model with the noisy measurements.'],
+    ['Estimated decline rate', 'Fouling-rate constant estimated on-line by the Kalman filter — how fast performance is currently falling.'],
+    ['Time to threshold (P50)', 'Median time until the projected performance reaches the cleaning threshold, from the state estimate and its uncertainty — use it to plan the next cleaning.'],
+    ['Time to threshold (P10–P90)', 'Range in which the cleaning threshold will be reached with 80 % probability.'],
+    ['Anomalies flagged', 'Number of measurements outside the control limits of the residual chart (EWMA) or rejected by the filter’s innovation gate — check them for sensor faults or upsets.'],
+    ['95 % interval coverage (Holt–Winters, test)', 'Share of test measurements inside the forecast’s 95 % prediction interval. Close to 95 % means the stated uncertainty is reliable.'],
+    ['Rows train / test', 'Measurements used to fit the forecasting models and held back to test them.'],
+    ['Rolling origins', 'Number of forecast start points used in the rolling-origin evaluation — more origins give a more reliable error estimate.'],
+  ],
+  ctl: [
+    [/^MPC integral absolute error/, 'Integral of the absolute tank-level deviation from its set-point under model-predictive control over the test scenario. Smaller is tighter control.'],
+    [/^PI integral absolute error/, 'The same tracking error for a conventional PI controller, for comparison with MPC.'],
+    [/flux-limit excess$/, 'Largest amount by which the permeate flux exceeded its limit during the scenario. MPC handles the limit explicitly and should keep this at zero.'],
+    [/settling time/, 'Time until the level stays within 5 % of the step size around its set-point after the disturbance.'],
+    [/overshoot$/, 'Largest excursion of the level beyond its set-point after the step.'],
+    ['Learned schedule cost', 'Daily electricity cost of the pump schedule learned by Q-learning (reinforcement learning) under the time-of-use tariff.'],
+    ['Level-band control cost', 'Daily cost of simple on/off control that runs the trains whenever the tank is below a level band — the conventional benchmark.'],
+    ['Dynamic-programming optimum', 'True minimum daily cost found by dynamic programming over all tank levels and hours; no schedule can be cheaper.'],
+    ['Saving versus level-band control', 'Cost reduction of the learned schedule against level-band control, in per cent.'],
+    ['Gap to optimum', 'How far the learned schedule is above the dynamic-programming optimum. Small values show the agent has learned an almost optimal policy.'],
+    ['Peak-tariff share of running hours', 'Share of the train running hours that fall in the expensive tariff periods; a good schedule keeps it low by filling the tank off-peak.'],
+  ],
+  wb: [
+    [/^(?!Domain mean).* at end time$/, 'Value of this state at the final time of the integration (adaptive Runge–Kutta solution).'],
+    [/ range$/, 'Smallest and largest value of this state over the integration interval.'],
+    ['Fixed steps', 'Number of steps of the fixed-step fourth-order Runge–Kutta solution.'],
+    ['Adaptive steps', 'Number of steps the adaptive Runge–Kutta (4/5) solver needed for the requested tolerance; many steps indicate stiffness or fast transients.'],
+    ['RK4 vs adaptive difference', 'Largest difference between the fixed-step and adaptive solutions, relative to the solution size — a check on the time step. Below about 0.1 % is converged.'],
+    [/^Observed order \(RK4\)/, 'Order of accuracy measured from runs at successively halved time steps; close to 4 confirms the fixed-step RK4 solution behaves as expected.'],
+    ['Residual norm', 'Size of the equation residuals F(x) at the solution; close to zero (below about 10⁻⁸) means the system is solved.'],
+    ['Newton iterations', 'Number of Newton–Raphson iterations to converge; a handful is normal from a reasonable starting point.'],
+    ['Converged', 'Whether Newton’s method met the tolerance.'],
+    ['Scattered starts converging', 'Share of randomly scattered starting points from which Newton’s method converged — a measure of how robust the solution is to the initial guess.'],
+    ['Distinct solutions found', 'Number of different solutions reached from the scattered starts; more than one means the equations have multiple roots — check which is physical.'],
+    ['Objective at optimum', 'Value of your objective function at the constrained minimum found by the augmented-Lagrangian method.'],
+    ['Objective at start', 'Value of the objective at the starting point, for comparison.'],
+    ['Active inequality constraints', 'Inequality constraints g(x) ≤ 0 that hold with equality at the optimum — the limits that shape the solution.'],
+    ['Outer iterations', 'Number of augmented-Lagrangian updates of the multipliers and penalty.'],
+    ['Objective evaluations', 'Number of times the objective was evaluated during the search.'],
+    ['Domain mean at end time', 'Average of the solution u over the domain at the final time (finite-volume, θ-scheme).'],
+    [/^Value at (left|right) boundary/, 'Solution value at this boundary at the final time.'],
+    [/^(Maximum|Minimum) over domain/, 'Extreme value of the solution over the domain at the final time; check it stays physically meaningful (no unphysical overshoot).'],
+    ['Cell Péclet number', 'Advection ÷ diffusion over one cell, v·Δx ÷ D. Above 2 the central scheme can oscillate — refine the grid or use upwinding.'],
+    ['Diffusion number D·Δt/Δx²', 'Explicit stability number of the diffusion term; above 0.5 an explicit scheme would be unstable (the θ-scheme used here is stable, but accuracy suffers).'],
+    ['Courant number v·Δt/Δx', 'How many cells the flow crosses per time step; values above about 1 reduce accuracy.'],
+    ['Change on grid halving (RMS)', 'Difference between the solution on this grid and on a grid twice as fine — an estimate of the discretisation error.'],
+    ['Observed order (manufactured solution)', 'Order of accuracy measured against an exact manufactured solution; close to 2 confirms the solver is implemented correctly (code verification).'],
+    [/^[A-Za-z_]\w*( at optimum)?$/, 'Value of this unknown at the solution of your equations (algebraic mode: Newton–Raphson root; optimisation mode: constrained minimum).'],
+  ],
+  pe: [
+    [/\(± std\. error\)$/, 'Best-fit value of this model parameter by non-linear least squares (Levenberg–Marquardt) with its standard error from the parameter covariance. A standard error above about half the value means the data hardly constrain it.'],
+    ['RMSE', 'Root-mean-square difference between the fitted model and the data, in the units of y.'],
+    ['R²', 'Share of the variance of the data explained by the fitted model; above 0.95 is a good fit for smooth data.'],
+    ['Residual standard deviation', 'Estimated measurement noise: √(sum of squared residuals ÷ degrees of freedom).'],
+    ['Degrees of freedom', 'Number of data points minus the number of fitted parameters.'],
+    ['Collinearity index γ', 'Measures whether parameters compensate each other: 1 / √(smallest eigenvalue of the normalised sensitivity matrix).'],
+    ['Identifiable parameters', 'How many parameters can be estimated independently from these data (profile likelihood and collinearity checks).'],
+    ['MCMC acceptance rate', 'Share of proposed steps accepted by the Metropolis sampler for the Bayesian posterior; 20–50 % mixes well.'],
+    ['Largest R̂ (chain mixing)', 'Gelman–Rubin statistic over the parallel chains; below about 1.1 means the chains agree and the posterior is converged.'],
+  ],
+  oc: [
+    ['Optimal cycle energy', 'Pumping energy of the energy-optimal permeate-flux trajectory for the batch cycle, from Pontryagin’s maximum principle solved by shooting on the costate.'],
+    ['Saving against constant flux', 'Energy saved by the optimal trajectory compared with withdrawing permeate at a constant rate over the same time.'],
+    ['Saving against constant pressure', 'Energy saved compared with running the cycle at constant feed pressure.'],
+    [/^Initial costate/, 'Costate (shadow price of permeate volume) at the start of the cycle.'],
+    [/^Final costate/, 'Costate at the end of the cycle; along an unconstrained optimal path it matches the marginal pumping energy of the last m³.'],
+    ['Hamiltonian drift along the path', 'Check of the optimality conditions:'],
+    ['Terminal-volume error', 'Check that the cycle delivers exactly the required permeate volume.'],
+    ['Euler–Lagrange vs Hamiltonian path', 'Cross-check of two independent optimal-control formulations.'],
+    ['NLP vs Pontryagin energy', 'Difference between the energy of a direct numerical optimisation and the Pontryagin solution; near zero confirms the optimum.'],
+    ['Time on the flux limit', 'Share of the cycle during which the optimal flux sits on its upper limit (a constrained arc).'],
+    ['Peak feed pressure', 'Highest feed pressure reached during the optimal cycle, at the end when the brine is most concentrated; check it against the pump and vessel rating.'],
+    ['Reversible minimum energy', 'Thermodynamic least work to remove this permeate volume from the batch — the lower bound no cycle can beat.'],
+  ],
+  lp: [
+    ['Optimal daily energy cost', 'Lowest daily electricity cost of running the RO trains to meet demand from the tank, from mixed-integer linear programming (simplex + branch and bound).'],
+    ['Saving against constant load', 'Cost reduction compared with running the trains at a constant load around the clock.'],
+    ['LP relaxation (lower bound)', 'Cost of the same problem with the on/off decisions relaxed to fractions — a lower bound that the integer schedule cannot beat.'],
+    ['Integrality gap', 'How much the on/off restriction costs:'],
+    ['Optimality gap', 'Proven distance from the best possible schedule:'],
+    ['Branch-and-bound nodes', 'Number of sub-problems explored by branch and bound.'],
+    ['Simplex pivots', 'Number of simplex iterations over all linear programmes solved.'],
+    ['Energy used', 'Electricity used per day by the optimal schedule.'],
+    ['Water produced', 'Water produced per day by the optimal schedule; it must cover the demand.'],
+    ['Production in peak periods', 'Share of the day’s production made in the expensive tariff periods.'],
+    ['Value of one more m³ of storage', 'How much the daily cost would fall with one more m³ of tank volume:'],
+    ['Marginal cost of the end-of-day level', 'Dual value of the requirement to end the day at the starting tank level: the cost of one more m³ in the tank at midnight.'],
+  ],
+  node: [
+    ['Held-out trajectory RMSE', 'Accuracy of the neural ODE on a run it was not trained on — the honest test.'],
+    ['Training RMSE', 'Error of the neural ODE on the trajectories it was trained on; much lower than the held-out error indicates over-fitting.'],
+    ['Baseline held-out RMSE', 'Error of a simple mechanistic law on the held-out run, for comparison.'],
+    ['Improvement on baseline', 'Error reduction of the neural ODE compared with the first-order baseline, in per cent. Positive means the network learned dynamics the simple law misses.'],
+    ['Adjoint gradient check', 'Verification of the training gradients.'],
+    ['Network parameters', 'Number of weights and biases of the network that forms the right-hand side dy/dt = f(y).'],
+    ['Final training loss (scaled)', 'Mean squared trajectory error at the end of training, on scaled data.'],
+    ['Gradient norm at the end', 'Size of the loss gradient when training stopped; small values mean the training has settled.'],
+    ['Baseline rate constant', 'Rate constant r of the fitted first-order baseline law.'],
+    ['Baseline plateau y∞', 'Long-time plateau of the fitted first-order baseline law.'],
+  ],
+  npde: [
+    ['Unseen-experiment field error', 'RMS error of the transport model with the learned reaction closure on an experiment not used for training, as % of the inlet concentration — the honest test.'],
+    ['Training field error', 'RMS error on the training experiments, as % of the inlet concentration.'],
+    ['First-order closure, unseen error', 'Error on the unseen experiment if the reaction is assumed first order — the conventional alternative.'],
+    ['No-reaction model, unseen error', 'Error on the unseen experiment if the reaction is ignored entirely.'],
+    ['Closure error against the hidden law', 'How well the learned reaction term matches the law that generated the data.'],
+    ['Closure inside the finite-volume solver', 'Check that the learned closure works inside an independent solver.'],
+    ['Fitted first-order rate', 'Rate constant of the best first-order reaction law, for comparison with the learned closure.'],
+    ['Outlet concentration, unseen case', 'Predicted outlet concentration for the unseen experiment.'],
+  ],
+  rom: [
+    ['Modes retained', 'Number of proper-orthogonal-decomposition modes kept in the reduced model — each mode is one spatial pattern extracted from the full-model snapshots.'],
+    ['Energy captured', 'Share of the snapshot variance (“energy”) represented by the retained modes; above 99.9 % usually gives an accurate reduced model.'],
+    ['Reduced-model error at the unseen flux', 'Accuracy of the reduced model for a flux it was not built from:'],
+    ['Projection error of the training snapshots', 'How well the retained modes can represent the snapshots they were built from.'],
+    ['Projection error of the unseen solution', 'How well the retained modes can represent the unseen case:'],
+    ['Polarisation factor, reduced model', 'Wall-to-bulk concentration ratio at the end of the transient from the reduced model.'],
+    ['Polarisation factor, full model', 'The same ratio from the full finite-volume model.'],
+    ['Steady film-theory value exp(J·δ/D)', 'Analytical steady-state polarisation factor that both models approach.'],
+    ['Unknowns per time step', 'Number of unknowns solved per time step by the reduced model (the full model solves one per cell) — the source of its speed.'],
+    ['Operator consistency with the finite-volume solver', 'Check of the reduced model’s operator:'],
+  ],
+  ens: [
+    ['Ensemble test RMSE', `Error of the bagged ensemble (average of models trained on resampled data) on unseen test points. ${SURR_RMSE}`],
+    ['Single-model test RMSE', 'Test error of one model trained on all the data, for comparison with the ensemble.'],
+    ['Mean member test RMSE', 'Average test error of the individual ensemble members; the ensemble is better than its average member.'],
+    ['Out-of-bag RMSE', 'Free validation error from bagging:'],
+    ['Mean member spread', 'Average disagreement between members — the ensemble’s own estimate of its uncertainty.'],
+    ['Test points inside ± 2 spreads', 'Share of test points whose true value lies within two member-spreads of the ensemble prediction; it shows whether the spread is a usable error bar.'],
+    ['Rank correlation of spread and error', 'Whether points with larger member disagreement also have larger errors; positive values mean the spread flags unreliable predictions.'],
+    ['Ambiguity decomposition residual', 'Check of the error decomposition:'],
+    ['Averaged surrogate families, test RMSE', 'Test error of averaging different model types:'],
+    ['Test RMSE of the mean (no model)', 'Error of always predicting the mean — the benchmark every model must beat.'],
+    ['Ensemble error relative to the data range', 'Ensemble test error as % of the range of the target; a few per cent is a useful surrogate.'],
+  ],
+  mf: [
+    ['Multi-fidelity test RMSE', 'Error of the co-kriging model, which combines many cheap low-fidelity runs with a few expensive high-fidelity runs, on unseen high-fidelity test points.'],
+    ['Single fidelity, same high-fidelity runs', 'Error of a Gaussian process trained only on the same few high-fidelity runs — what the cheap runs add.'],
+    ['Single fidelity, equal cost', 'Error of a high-fidelity-only model given the same total computing budget.'],
+    ['Low-fidelity model alone', 'Error of the cheap model used directly.'],
+    ['Error reduction at equal cost', 'How much more accurate the multi-fidelity model is than spending the same budget on high-fidelity runs only, in per cent.'],
+    ['Scaling factor ρ', 'Fitted factor linking the fidelities:'],
+    ['Discrepancy model', 'How the difference between the fidelities is represented.'],
+    ['Test points inside ± 2 σ', 'Share of test points inside the model’s ±2σ band; about 95 % means its uncertainty is honest.'],
+    ['Equivalent high-fidelity cost', 'Computing cost of all runs expressed as a number of high-fidelity runs.'],
+    ['Multi-fidelity error relative to range', 'Test error as % of the range of the target.'],
+    ['High / low fidelity runs', 'Number of expensive and cheap model runs used for training.'],
+  ],
+  rob: [
+    [/^Robust design: .* at nominal conditions/, 'Objective of the robust design evaluated at the nominal (expected) feed conditions — what you give up there to be safe elsewhere.'],
+    [/^Nominal optimum: /, 'Objective of the design optimised for nominal conditions only (ignoring uncertainty).'],
+    ['Price of robustness', 'Extra cost of robustness:'],
+    [/^Robust design: expected /, 'Average objective of the robust design over the uncertain scenarios.'],
+    [/^Robust design: worst/, 'Objective of the robust design in its worst scenario.'],
+    ['Robust recovery', 'Recovery of the design that stays feasible in the required share of the uncertain scenarios (chance constraint) or in all of them (worst case).'],
+    ['Robust average flux', 'Average flux of the robust design.'],
+    ['Nominal recovery', 'Recovery of the nominal optimum, for comparison.'],
+    ['Nominal average flux', 'Average flux of the nominal optimum.'],
+    [/^Violation probability, robust/, 'Share of fresh, unseen scenarios in which the robust design violates a limit — the out-of-sample check that the robustness is real.'],
+    [/^Violation probability, nominal/, 'Share of the same fresh scenarios in which the nominal optimum violates a limit; usually much higher than for the robust design.'],
+    ['Worker threads used', 'Number of parallel worker threads used to simulate the scenarios.'],
+    ['Measured parallel speed-up', 'How many times faster the scenario simulations ran in parallel than one after the other.'],
+  ],
+};
+const KPI_FALLBACK = 'Result of this study computed by the engine described in the Equations tab; the tables and charts below show how it was obtained.';
+const PLOT_NOTES = {
+  opt: [
+    [/^Convergence history/, 'Best penalised objective (objective + constraint penalty, relative to the base case) against the number of objective evaluations, one line per start. Lines that flatten early and end at the same level show the search has converged to the same optimum; a step late in the run means more evaluations could still help.'],
+    [/^Cost of water breakdown/, 'Cost of water of the base case and of the optimum split into energy, membranes and vessels, chemicals and pre-treatment, and brine disposal. It shows where the optimiser found its saving.'],
+    [/versus recovery through the optimum$/, 'Objective re-evaluated along recovery with every other decision variable held at its optimum. A clear minimum (or a limit) at the marked optimum confirms it; a flat curve means recovery can be chosen on other grounds.'],
+    [/^Most critical constraint versus recovery/, 'Largest normalised constraint along the same recovery sweep: below the zero line every limit is met. Where it crosses zero is the recovery at which a limit (pressure, quality, flux, scaling …) starts to bind.'],
+    [/^Multi-start results/, 'Objective reached by each independent start of the optimiser. Equal bars mean the optimum is found reliably; different bars point to several local optima — use more starts or the global algorithm.'],
+  ],
+  mo: [
+    [/^Pareto front: specific energy versus recovery/, 'Each point is a non-dominated design: none of the others is better in every objective. The curve shows the price of recovery in energy; the knee marks the balanced compromise and the base case shows how far the current design is from the front.'],
+    [/^Pareto front: product TDS versus recovery/, 'Permeate salinity of the non-dominated designs against recovery: higher recovery concentrates the feed and raises salt passage. Check the knee and the end points against the quality limit.'],
+    [/^Cost of water along the front/, 'Simple cost of water of each non-dominated design against its recovery. The cheapest point of the front is a single-objective answer; the knee balances cost with energy and quality.'],
+    [/^Product quality versus energy/, 'Trade-off between permeate quality and energy across the front: moving left saves energy, moving down improves quality.'],
+    [/^Convergence of the front by generation/, 'Lowest energy, highest recovery (÷ 10) and number of non-dominated designs (÷ 10) after each NSGA-II generation. Flat lines at the end show the front has converged; still-moving lines call for more generations.'],
+  ],
+  sa: [
+    [/^Tornado/, 'Change of the output when each factor alone moves from its low to its high value with the others at nominal; factors sorted by the size of the swing. Simple and intuitive, but blind to interactions — compare with the Sobol indices.'],
+    [/^Morris screening/, 'Mean absolute elementary effect μ* of each factor from Morris trajectories: a cheap global screening of which inputs matter. Large bars are influential; near-zero bars can be fixed at nominal.'],
+    [/^Sobol indices of /, 'Variance-based sensitivity: the first-order index is the share of output variance caused by a factor alone, the total index adds its interactions. A large gap between the two bars of a factor means it acts through interactions.'],
+    [/^Total Sobol index for every output/, 'Total Sobol index of each factor for each studied output — which inputs matter for energy, pressure, quality and cost. A factor that matters for one output may be irrelevant for another.'],
+  ],
+  uq: [
+    [/^Cumulative probability of /, 'Probability that the output stays below the value on the horizontal axis over the Monte-Carlo sample. Read percentiles where the curve crosses 0.5, 0.9 or 0.95, and the probability of meeting a limit where it crosses the limit.'],
+    [/^Convergence of the mean/, 'Running mean of the specific energy as samples are added, with its ±2 standard-error band. The band narrows as 1/√n; when it is narrower than the precision you need, the sample is large enough.'],
+    [/^Rank correlation between uncertain inputs and outputs/, 'Spearman rank correlation of each uncertain input with each output across the sample: +1 means the output always rises with the input, −1 always falls, 0 no monotonic link. It shows which uncertainty drives which result.'],
+  ],
+  ml: [
+    [/^Parity plot/, 'Predicted against true values on the test set. Points on the diagonal are perfect predictions; a systematic bend shows a missing trend, scattered outliers show regions the model has not learned.'],
+    [/^Test residuals/, 'Prediction error (predicted − true) of each test point. Residuals scattered evenly around zero with no pattern are what a good surrogate leaves.'],
+    [/^Neural-network training history/, 'Training and validation loss against epochs. Both falling together is healthy learning; a validation curve that turns up while training keeps falling is over-fitting, which early stopping guards against.'],
+    [/^Learning curve/, 'Test error as more training rows are used. A still-falling curve means more data would improve the surrogate; a flat one means the model form, not the data, limits accuracy.'],
+    [/^Slice along /, 'Prediction of the surrogate(s) along one input with the others held at the reference point, with uncertainty where available. It shows the shape of the learned response and where models disagree.'],
+    [/cross-validation RMSE by fold$/, 'Error of the selected model on each cross-validation fold. Similar bars mean the accuracy is consistent across the data; one tall bar flags a region of the data that is hard to predict.'],
+    [/^Bayesian optimisation/, 'Best target value found against the number of expected-improvement iterations on the surrogate. A curve that levels off shows the search has found the optimum of the surrogate.'],
+  ],
+  pinn: [
+    [/^Concentration profile across the polarisation layer/, 'Salt concentration from the membrane wall into the bulk: exact film-theory solution, the physics-informed network and a finite-difference solution. The network is trained on the differential equation alone; matching curves show it has learned the physics.'],
+    [/^Relative error against the analytical solution/, 'Error of the network and of the finite-difference solution against the exact profile across the film. Errors well below 1 % everywhere verify the network.'],
+    [/^Training loss/, 'Equation-residual loss plus weighted boundary term against training iterations (log scale). A steady fall by several orders of magnitude shows healthy training.'],
+    [/^Equation residual of the trained network/, 'Residual of the differential equation evaluated between the training (collocation) points. Small values there show the network satisfies the physics everywhere, not only where it was trained.'],
+  ],
+  ts: [
+    [/^Forecast over the held-out test period/, 'Measured series with the forecasts of each model over the period held back for testing, and the Holt–Winters 95 % interval. Forecasts that follow the measurements and stay inside the band are trustworthy.'],
+    [/^State estimate and projection/, 'Kalman-filter estimate of the true performance (smoothing out measurement noise) and its projection forward to the cleaning threshold with an uncertainty band. Where the band meets the threshold is when cleaning is due.'],
+    [/^Estimated fouling-rate constant/, 'Fouling rate estimated on-line by the filter as each measurement arrives, with its ±2σ band. A rising rate is an early warning of accelerated fouling.'],
+    [/^Standardised innovations/, 'Difference between each measurement and the filter’s prediction, divided by its expected spread. Values beyond ±3 are flagged as anomalies; a long run on one side means the model no longer fits.'],
+    [/^EWMA control chart/, 'Exponentially weighted moving average of the one-step forecast residuals with its control limits. Points outside the limits signal a shift in the process — a fault, an upset or the start of rapid fouling.'],
+    [/^Rolling-origin error by lead time/, 'Forecast error of each model against how far ahead it forecasts, averaged over many start points. Errors grow with lead time; the model with the lowest curve at your planning horizon is the one to use.'],
+  ],
+  ctl: [
+    [/^Tank level: set-point tracking/, 'Product-tank level under model-predictive control and under PI control after a set-point step and a demand disturbance. Faster return to the set-point without overshoot is better control.'],
+    [/^Permeate flux deviation/, 'Flux change applied by each controller with the flux limit. MPC anticipates the limit and stays within it; the PI controller may push past it.'],
+    [/^Manipulated variable/, 'Feed-pressure change commanded by each controller. Smooth, bounded moves protect the membranes and the pump.'],
+    [/^Q-learning curve/, 'Daily cost of the schedule the reinforcement-learning agent follows against training episodes, with the dynamic-programming optimum. The curve should fall towards the optimum and settle.'],
+    [/^Pump schedule over the day/, 'Number of trains running each hour under the learned, level-band and optimal schedules, with the tariff. A good schedule shifts running hours to the cheap periods.'],
+    [/^Tank level over the day/, 'Tank level through the day under each schedule. Storage is filled off-peak and drawn down at peak; the level must stay within the tank limits.'],
+  ],
+  wb: [
+    [/^Solution$/, 'Your states (or unknowns) as computed by the solver. Check that they behave physically (no negative concentrations, expected trends).'],
+    [/^Solution scaled/, 'Each state divided by its largest magnitude so that states of very different size can be compared on one axis.'],
+    [/^Phase plane/, 'One state plotted against another: spirals mean oscillation, a curve ending at a point means a steady state is reached.'],
+    [/^Fixed-step RK/, 'Fixed-step and adaptive Runge–Kutta solutions of the same system. Curves that overlap show the fixed time step is small enough.'],
+    [/^Residual norm along /, 'Size of the equation residuals as one unknown is moved through the solution with the others fixed. The dip to zero marks the root; several dips mean several solutions.'],
+    [/^Parameter elasticities/, 'Per-cent change of each unknown for a 1 % change of each parameter. Large bars mark the parameters the solution is most sensitive to.'],
+    [/^Solutions reached from scattered starting points/, 'Which solution Newton’s method reached from each of the scattered starting points. One bar means a unique, robust root; several bars mean multiple roots.'],
+    [/^Augmented-Lagrangian iterations/, 'Objective and constraint violation at each outer iteration of the augmented-Lagrangian method. Both settle when the constrained optimum is reached.'],
+    [/^Objective over /, 'Your objective over two variables with the infeasible region masked; contour lines show levels of equal objective and the marker the optimum found.'],
+    [/^Constraint values at the optimum/, 'Value of each constraint at the optimum: g ≤ 0 is feasible, values at zero are active constraints.'],
+    [/^Profiles at selected times/, 'Solution u along x at several times: watch the profile develop from the initial condition towards its final shape.'],
+    [/^Solution u\(x, t\)/, 'Solution over space (across) and time (up) as a colour map; diagonal bands are features carried by advection, spreading bands are diffusion.'],
+    [/^History at the boundaries/, 'Solution at the two boundaries and mid-domain against time; it shows when the solution approaches a steady state.'],
+    [/^Code verification by a manufactured solution/, 'Error against an exact manufactured solution on successively finer grids (log–log). A slope matching the scheme’s order (about 2) verifies the implementation.'],
+  ],
+  pe: [
+    [/^Fit with /, 'Data with the fitted model, its confidence band (where the true curve lies) and its wider prediction band (where new measurements will fall). Points scattered evenly around the curve and inside the prediction band indicate a good fit.'],
+    [/^Residuals$/, 'Data minus model at each point. Random scatter around zero is a good fit; a trend or curve in the residuals means the model form is missing something.'],
+    [/^Profile likelihood/, 'Sum of squares as each parameter is fixed at values around its optimum and the others re-fitted. A sharp valley means the parameter is well identified; a flat valley means the data cannot pin it down.'],
+    [/^Markov-chain traces/, 'Values visited by each Markov chain of the Bayesian sampler. Well-mixed chains look like overlapping noise bands around the same level; drifts or separated chains mean the sampling has not converged.'],
+  ],
+  oc: [
+    [/^Control: permeate flux/, 'Optimal permeate withdrawal rate along the batch cycle compared with constant flux. Pumping is cheaper while the batch is dilute, so the optimum front-loads production and slows down as the brine concentrates.'],
+    [/^State: tank volume/, 'Batch volume along the cycle for the optimal and constant-flux strategies; both must reach the same final volume.'],
+    [/^Hamiltonian/, 'Hamiltonian along the optimal path; for this time-invariant problem it must stay constant, so a flat line verifies the solution.'],
+    [/^Feed pressure/, 'Feed pressure along the cycle: it rises as the batch concentrates. Check the peak against the pump and vessel rating.'],
+  ],
+  lp: [
+    [/^Optimal production per period/, 'Production of each train in every period of the optimal schedule. Trains run hard in cheap periods and back off when power is expensive, within their minimum-load limits.'],
+    [/^Tank level and tariff/, 'Product-tank level through the day with the electricity tariff: the tank is filled when power is cheap and drawn down at peak, within its limits.'],
+    [/^Demand and production/, 'Hourly demand against the optimal production; the difference is taken from or added to the tank.'],
+    [/^Shadow prices of the storage constraints/, 'Dual values of the tank-full limits in the linear relaxation: how much the daily cost would fall per m³ of extra storage in each period. Non-zero bars mark when storage is the bottleneck.'],
+  ],
+  node: [
+    [/^Trajectories: data and neural ODE/, 'Measured trajectories with the neural-ODE predictions from the same initial conditions, including the run held back for testing. Close agreement on the held-out run shows the learned dynamics generalise.'],
+    [/^Learned right-hand side/, 'The rate dy/dt learned by the network against y, with the first-order baseline. Where they differ, the network has found behaviour the simple law misses.'],
+    [/^Training loss/, 'Trajectory loss against training epochs (log scale); it should fall steadily and level off.'],
+  ],
+  npde: [
+    [/^Reaction term: learned closure and hidden law/, 'Reaction rate against concentration: the closure learned by the network inside the transport equation, the law that generated the data, and a first-order fit. Overlap with the hidden law shows the physics was recovered from field data alone.'],
+    [/^Final profiles: data and model/, 'Concentration along the channel at the end of each experiment: data and the model with the learned closure, including the unseen experiment.'],
+    [/^Predicted field for the unseen inlet concentration/, 'Concentration over space (across) and time (up) predicted for an inlet concentration not used in training.'],
+  ],
+  rom: [
+    [/^Energy not captured and error/, 'Share of snapshot energy left out and the reduced-model error against the number of retained modes (log scale). Both fall quickly; pick the smallest number of modes that meets your accuracy.'],
+    [/^POD modes/, 'The leading spatial patterns extracted from the full-model snapshots; the reduced model represents every solution as a combination of these shapes.'],
+    [/^Wall concentration at the unseen flux/, 'Concentration at the membrane wall against time for a flux not used to build the basis: full model and reduced model. Overlap verifies the reduced model.'],
+    [/^Final profile at the unseen flux/, 'Concentration across the layer at the end of the transient: full and reduced model.'],
+  ],
+  ens: [
+    [/^Test error versus ensemble size/, 'Test error as members are added to the ensemble. The error falls and levels off; beyond that point more members cost time without improving accuracy.'],
+    [/^Predicted against actual/, 'Ensemble predictions against true values on the test set, with error bars of ±2 member spreads. Points on the diagonal are perfect predictions.'],
+    [/^Member spread against absolute error/, 'Disagreement between members against the actual error of each test point. A rising trend means the spread is a useful warning of unreliable predictions.'],
+    [/^Ensemble along /, 'Ensemble prediction along one input with the others at their mean, with the individual members. Where members fan out, the prediction is uncertain.'],
+    [/^Test RMSE of members and combinations/, 'Test error of each member, of their average and of averaging surrogate families. Averaging usually beats the typical member.'],
+  ],
+  mf: [
+    [/^Predicted against high-fidelity test runs/, 'Predictions of the multi-fidelity, single-fidelity and low-fidelity models against unseen high-fidelity runs; points on the diagonal are exact.'],
+    [/^Fidelity levels along /, 'Low-fidelity model, high-fidelity runs and the co-kriging prediction along one input. The multi-fidelity curve follows the cheap model’s shape but is corrected to the accurate runs.'],
+    [/^Test RMSE by model/, 'Test error of each modelling choice on the same unseen high-fidelity runs; the lowest bar is the most accurate use of the computing budget.'],
+    [/^Discrepancy/, 'Difference between the high-fidelity result and the scaled low-fidelity result at the test points, with the discrepancy model fitted to it. A small, smooth discrepancy is what makes multi-fidelity modelling work.'],
+  ],
+  rob: [
+    [/^Probability of violating a limit/, 'Share of fresh scenarios in which each design violates a limit. The robust design should stay at or below the accepted risk; the nominal optimum often does not.'],
+    [/^Most critical constraint in every design scenario/, 'Largest normalised constraint of the robust and nominal designs in each scenario used for the design (above zero = a limit is exceeded).'],
+    [/^Worst constraint utilisation/, 'For each constraint, the highest utilisation over the design scenarios (100 % = at the limit) for the robust and nominal designs.'],
+    [/^Convergence of the two searches/, 'Best objective against iterations for the nominal and robust searches; both should level off.'],
+    [/^Cost of water over the fresh scenarios/, 'Objective of the robust and nominal designs in each fresh scenario, sorted; the gap is the price of robustness, the tail shows the downside each design faces.'],
+  ],
+};
+/** Give every KPI and chart of a task result its plain-language meaning (KPIs keep their own detail text after it). */
+function explainResult(res, v) {
+  const task = TASKS[v.task] ? v.task : 'opt', H = KPI_HELP[task] || [], N = PLOT_NOTES[task] || [];
+  const find = (L, s) => L.find(([p]) => (typeof p === 'string' ? s === p || s.startsWith(p) : p.test(s)));
+  for (const k of res.kpis || []) { const m = find(H, k.label), t = m ? (typeof m[1] === 'function' ? m[1](k, v) : m[1]) : k.help ? '' : KPI_FALLBACK; if (t) k.help = k.help ? `${t} ${k.help}` : t; }
+  for (const p of res.plots || []) if (!p.note) { const m = find(N, p.title); if (m) p.note = m[1]; }
+  return res;
+}
+
 const suite = {
   id: 'opt', num: 11, title: 'Optimization, AI & Custom Numerical Modelling', short: 'Optimise & AI', icon: '🧠',
   tagline: 'Optimise, rank, quantify, learn, forecast, control and build your own models — eighteen verified studies in one workspace.',
@@ -3218,6 +3659,8 @@ const suite = {
     'numerical equation solving', 'ordinary- and partial-differential-equation solving', 'nonlinear-system solving', 'parameter estimation', 'model calibration', 'model validation', 'sensitivity analysis', 'uncertainty quantification', 'monte carlo simulation', 'deterministic optimisation', 'nonlinear optimisation', 'mixed-integer optimisation', 'global optimisation', 'multi-objective optimisation',
     'surrogate modelling', 'machine learning', 'deep learning', 'physics-informed machine learning', 'time-series forecasting', 'anomaly detection', 'predictive maintenance', 'reinforcement learning', 'model-predictive control', 'digital-twin modelling', 'automated data processing', 'scenario analysis', 'custom-model development'],
   equationsNote: 'Everything runs in the browser, so problem sizes are deliberately small: networks have one or two hidden layers and a few hundred weights, Gaussian processes a few hundred points, NSGA-II a few hundred plant simulations, the reinforcement-learning agent is tabular and the predictive controller linear. Surrogates trained on the RO model reproduce that model, not plant reality, and must not be extrapolated. The newer studies are genuine but small-scale forms of their methods: optimal control (Euler–Lagrange boundary-value problem, Hamiltonian state–costate system and Pontryagin\'s principle with a bounded control) is solved for one state — a batch RO cycle with a lumped polarisation law; linear programmes use a dense two-phase simplex and integer variables a depth-first branch and bound, suitable for a few hundred variables; the neural ODE has one state and is trained by back-propagation through RK4; the neural PDE is a learned scalar reaction closure R(u) inside the 1-D finite-volume transport solver, trained on synthetic experiments by the discrete adjoint (it is not a neural operator for an arbitrary PDE); the reduced-order model is a POD–Galerkin projection of that 1-D convection–diffusion solver, not of a Navier–Stokes field; ensembles are bagged response surfaces or small networks; the multi-fidelity model is two-level recursive co-kriging; robust design uses a sample-average approximation with a few dozen scenarios, so its violation probabilities carry sampling error (compare the out-of-sample figure); the scaling constraint uses the Pitzer speciation of suite 2 on the simulated concentrate with an estimated concentrate pH and no antiscalant kinetics. Parallel computing means worker threads that evaluate chunks of plant simulations: it needs the multi-file edition served over http(s) or Node; where threads cannot start the same chunks run sequentially and the result says so. Deep reinforcement learning is not included. User expressions are parsed by a built-in arithmetic evaluator; no user text is ever executed as code.',
+
+  predict: { inputs: ['T', 'elecPrice', 'limTDS', 'limP', 'limFlux', 'ff', 'etaPump', 'elemPrice'], outputs: ['Optimal ', 'Optimal recovery', 'Optimal average flux', 'Specific energy', 'Cost of water', 'Feed pressure', 'Product TDS', 'Improvement on base case'] },
 
   inputs: [
     { group: 'Study', help: 'Choose what to compute. Each task has its own inputs, shown below and on the Model setup and Mesh tabs.', fields: [
@@ -3412,6 +3855,7 @@ const suite = {
       { key: 'dePop', label: 'Population size', unit: '', value: 10, min: 5, max: 80, step: 1, showIf: (v) => v.algo === 'de' }, { key: 'deGens', label: 'Generations', unit: '', value: 8, min: 1, max: 200, step: 1, showIf: (v) => v.algo === 'de' },
       { key: 'optPolish', label: 'Polish the best point with Nelder–Mead', type: 'bool', value: true, showIf: (v) => v.algo === 'de' },
       { key: 'nmIter', label: 'Nelder–Mead iterations', unit: '', value: 25, min: 5, max: 500, step: 1, showIf: (v) => v.algo !== 'sqp' }, { key: 'sqpIter', label: 'SQP iterations', unit: '', value: 12, min: 2, max: 100, step: 1, showIf: (v) => v.algo === 'sqp' },
+      { key: 'optViews', label: 'Animated and 3-D views', type: 'bool', value: true, help: 'Adds the animated search paths on the objective landscape and the 3-D objective surface, from 64 extra runs of the RO model around the optimum (about a fifth more computing time). The optimum itself is not affected.' },
     ] },
     { group: 'NSGA-II settings', tab: 'setup', showIf: is('mo'), fields: [
       { key: 'moThird', label: 'Third objective', type: 'select', value: 'tds', options: [{ value: 'tds', label: 'Minimise product TDS' }, { value: 'cost', label: 'Minimise cost of water' }, { value: 'none', label: 'None (energy versus recovery only)' }], help: 'Energy (minimise) and recovery (maximise) are always objectives.' },
@@ -3552,7 +3996,7 @@ const suite = {
     await ctx.tick();
     const res = await T.run(v, ctx);
     ctx.progress(1, 'Done');
-    return res;
+    return explainResult(res, v);
   },
 
   mesh: [
