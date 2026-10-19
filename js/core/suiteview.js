@@ -21,12 +21,23 @@ const lastResult = new Map(); // suite id -> full result of the last run (kept i
 const prevResult = new Map(); // suite id -> the run before it (for “compared with the previous run”)
 const history = new Map(); // suite id -> snapshots of the stored inputs taken before bulk changes (for Undo)
 /** Restore the inputs saved by the last snapshot of a suite; returns the reason text or null. */
-export function undoLast(suite) { const st = history.get(suite.id); if (!st?.length) return null; const s0 = st.pop(); store.setInputs(suite.id, JSON.parse(s0.json)); return s0.reason; }
+export function undoLast(suite) {
+  const st = history.get(suite.id); if (!st?.length) return null; const s0 = st.pop(); store.setInputs(suite.id, JSON.parse(s0.json));
+  if (s0.results) { // a reset or a cleared result also took the results away: bring them back as they were
+    if (s0.results.last) lastResult.set(suite.id, s0.results.last); else lastResult.delete(suite.id);
+    if (s0.results.prev) prevResult.set(suite.id, s0.results.prev); else prevResult.delete(suite.id);
+    store.restoreOutputs(suite.id, s0.results.out);
+  }
+  return s0.reason;
+}
+/** Take this suite back to its state before any run: no results on screen, none stored for the linked suites. */
+function clearResults(suite) { lastResult.delete(suite.id); prevResult.delete(suite.id); store.clearOutputs(suite.id); }
 /** Remember the inputs before a bulk change (example loaded, reset, run with linked values, fitted parameters applied). */
-export function snapshot(suite, reason) {
+export function snapshot(suite, reason, withResults = false) {
   const st = history.get(suite.id) || [], cur = JSON.stringify(store.inputs(suite.id) || {});
-  if (st.length && st[st.length - 1].json === cur) { st[st.length - 1].reason = reason; return; }
-  st.push({ json: cur, reason, at: Date.now() }); if (st.length > 25) st.shift(); history.set(suite.id, st);
+  const results = withResults ? { last: lastResult.get(suite.id) || null, prev: prevResult.get(suite.id) || null, out: store.case.outputs[suite.id] ? JSON.parse(JSON.stringify(store.case.outputs[suite.id])) : null } : null;
+  if (!results && st.length && st[st.length - 1].json === cur && !st[st.length - 1].results) { st[st.length - 1].reason = reason; return; }
+  st.push({ json: cur, reason, at: Date.now(), results }); if (st.length > 25) st.shift(); history.set(suite.id, st);
 }
 const bigValues = new Map(); // `${suite}.${key}` -> large imported objects (geometry) kept out of localStorage
 
@@ -241,7 +252,7 @@ export function renderSuite(suite, root, app) {
     const back = fromTab && defs.find((d) => d.id === fromTab);
     box.append(h('div', { class: 'backbar' },
       back ? btn(`← Back to ${back.label}`, () => tabset.show(back.id), 'mini', 'Return to the tab you were on before the run') : null,
-      btn('Clear results', () => { lastResult.delete(suite.id); tabset.show(back ? back.id : 'inputs'); toast('Results cleared. Your inputs are unchanged.'); }, 'mini ghost', 'Remove these results from the screen and return to the inputs (nothing else changes)'),
+      btn('Clear results', () => { snapshot(suite, 'before the results were cleared', true); clearResults(suite); status.textContent = ''; tabset.show(back ? back.id : 'inputs'); refreshTools(); toast('Results cleared (also for the linked suites). Your inputs are unchanged — Undo brings the results back.'); }, 'mini ghost', 'Remove the results of this suite, as before the run; your inputs stay'),
       dynSpecs.length ? btn(`▶ ${dynSpecs.length} animation${dynSpecs.length > 1 ? 's' : ''} and 3-D view${dynSpecs.length > 1 ? 's' : ''} ↓`, () => dynSec?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 'mini primary', 'Jump to the dynamic simulations and 3-D views of this run') : null,
       btn(`Predict & what-if →`, () => tabset.show('predict'), 'mini', 'Ask how the results would change under other conditions')));
     if (res.warnings.length) box.append(h('div', { class: 'warns' }, res.warnings.map((w) => h('div', { class: 'warn ' + (w.level || 'info') }, h('b', null, w.level === 'bad' ? 'Limit exceeded' : w.level === 'warn' ? 'Check' : 'Note'), ' ', w.msg))));
@@ -451,19 +462,19 @@ export function renderSuite(suite, root, app) {
   ].filter(Boolean);
 
   const undoBtn = btn('↶ Undo', () => {
-    const why = undoLast(suite); if (!why) return toast('Nothing to undo.');
+    const why = undoLast(suite); if (!why) return toast('Nothing to undo.'); if (!lastResult.get(suite.id)) status.textContent = '';
     toast(`Inputs restored to how they were ${why}.`, 'ok'); tabset.show(tabset.active()); refreshTools();
   }, 'mini ghost', 'Restore the inputs as they were before the last bulk change (example loaded, reset, run with linked values, fitted parameters applied)');
-  const resetAll = () => { snapshot(suite, 'before the reset'); store.clearInputs(suite.id); bigValues.forEach((_, k) => k.startsWith(suite.id + '.') && bigValues.delete(k)); toast('Inputs reset to the built-in example — Undo brings yours back.'); tabset.show(tabset.active()); refreshTools(); };
+  const resetAll = () => { snapshot(suite, 'before the reset', true); stopLive(); store.clearInputs(suite.id); bigValues.forEach((_, k) => k.startsWith(suite.id + '.') && bigValues.delete(k)); clearResults(suite); fromTab = null; status.textContent = ''; toast('Suite reset: inputs back to the built-in example and every result, animation and prediction cleared — Undo brings all of it back.'); tabset.show(tabset.active()); refreshTools(); };
   const refreshTools = () => { const st = history.get(suite.id) || []; undoBtn.disabled = !st.length; undoBtn.title = st.length ? `Restore the inputs as they were ${st[st.length - 1].reason}` : 'Nothing to undo yet'; };
-  const tools = h('div', { class: 'tabtools' }, undoBtn, btn('Reset', resetAll, 'mini ghost reset-t', 'Restore the built-in example inputs of this suite (Undo brings yours back)'), btn('▶ ' + L.run, () => doRun(), 'mini primary', 'Solve with the current inputs (Ctrl/⌘ + Enter)'));
+  const tools = h('div', { class: 'tabtools' }, undoBtn, btn('Reset', resetAll, 'mini ghost reset-t', 'Take this suite back to how it was before any run: built-in example inputs, no results (Undo brings yours back)'), btn('▶ ' + L.run, () => doRun(), 'mini primary', 'Solve with the current inputs (Ctrl/⌘ + Enter)'));
   tabset = tabs(defs, store.pref('tab.' + suite.id) || 'guide', (id) => { store.pref('tab.' + suite.id, id); refreshTools(); }, tools);
   const onKey = (e) => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && root.isConnected) { e.preventDefault(); doRun(); } };
   document.addEventListener('keydown', onKey);
   fill(root, 
     h('header', { class: 'suite-head' },
       h('div', { class: 'suite-title' }, h('span', { class: 'suite-num' }, suite.num), h('div', null, h('h1', null, suite.title), h('p', null, suite.tagline))),
-      h('div', { class: 'actions' }, presetSel, btn('Reset', resetAll, 'ghost', 'Restore the built-in example inputs of this suite (Undo brings yours back)'), cancelBtn, runBtn)),
+      h('div', { class: 'actions' }, presetSel, btn('Reset', resetAll, 'ghost', 'Take this suite back to how it was before any run: built-in example inputs, no results (Undo brings yours back)'), cancelBtn, runBtn)),
     h('div', { class: 'statusline' }, status, bar), tabset);
   return () => { document.removeEventListener('keydown', onKey); stopLive(); };
 }

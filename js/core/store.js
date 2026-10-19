@@ -84,6 +84,8 @@ export const store = {
   setInputs(id, values) { current.inputs[id] = { ...values }; persist(); },
   clearInputs(id) { delete current.inputs[id]; persist(); },
   outputs(id) { return current.outputs[id]; },
+  clearOutputs(id) { if (current.outputs[id] === undefined) return; delete current.outputs[id]; persist(); emit('outputs', id); },
+  restoreOutputs(id, o) { if (o) current.outputs[id] = o; else delete current.outputs[id]; persist(); emit('outputs', id); },
   setOutputs(id, o) { current.outputs[id] = { ...sanitize(o), _at: new Date().toISOString() }; persist(); emit('outputs', id); },
   reset() { current = blankCase(); persist(); emit('case', current); },
   exportJSON(build) { return JSON.stringify({ app: 'BrineLab', exportedWithBuild: build || buildIdNow(), exportedAt: new Date().toISOString(), ...current }, null, 1); },
