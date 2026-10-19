@@ -142,7 +142,7 @@ export function msmprDynamic(K, tau, MT, seed, tEnd = 12) {
  * Finite volumes on a uniform size grid, upwind or van Leer-limited fluxes, Heun (SSP-RK2) time stepping.
  * Growth and nucleation histories come from the moment solution.
  */
-export function pbeFV(K, tau, dyn, seed, { nL = 80, Lmax, scheme = 'vanleer', tEnd = 12 } = {}) {
+export function pbeFV(K, tau, dyn, seed, { nL = 80, Lmax, scheme = 'vanleer', tEnd = 12, nSnap = 0 } = {}) {
   const N = Math.max(4, Math.round(nL)), dL = Lmax / N, n = new Float64Array(N), a = new Float64Array(N), b = new Float64Array(N), F = new Float64Array(N + 1);
   n[Math.min(N - 1, Math.floor(seed.L / dL))] = seed.mass / (K.rhoc * K.kv * seed.L ** 3) / dL;
   const hi = scheme === 'vanleer';
@@ -156,7 +156,8 @@ export function pbeFV(K, tau, dyn, seed, { nL = 80, Lmax, scheme = 'vanleer', tE
     for (let i = 0; i < N; i++) out[i] = -(F[i + 1] - F[i]) / dL - u[i] / tau;
   };
   let t = 0, nSteps = 0;
-  const T = tEnd * tau;
+  const T = tEnd * tau, snaps = [], tSnap = (k) => (k * T) / Math.max(nSnap - 1, 1); // optional copies of n(L) at evenly spaced times, for the animated size distribution
+  if (nSnap > 1) snaps.push({ th: 0, n: Array.from(n) });
   while (t < T - 1e-9 * T && nSteps < 400000) {
     const G = interp1(dyn.th, dyn.G, t / tau), dt = Math.min((0.4 * dL) / Math.max(G, 1e-30), 0.04 * tau, T - t), t1 = (t + dt) / tau;
     rhs(n, G, interp1(dyn.th, dyn.B, t / tau), a);
@@ -164,12 +165,13 @@ export function pbeFV(K, tau, dyn, seed, { nL = 80, Lmax, scheme = 'vanleer', tE
     rhs(b, interp1(dyn.th, dyn.G, t1), interp1(dyn.th, dyn.B, t1), a);
     for (let i = 0; i < N; i++) n[i] = Math.max(0, 0.5 * n[i] + 0.5 * (b[i] + dt * a[i]));
     t += dt; nSteps++;
+    if (nSnap > 1 && snaps.length < nSnap && (t >= tSnap(snaps.length) - 1e-9 * T || !(t < T - 1e-9 * T))) snaps.push({ th: t / tau, n: Array.from(n) });
   }
   const edge = (i) => i * dL, mom = (j) => { let s = 0; for (let i = 0; i < N; i++) s += (n[i] * (edge(i + 1) ** (j + 1) - edge(i) ** (j + 1))) / (j + 1); return s; };
   const mu = [0, 1, 2, 3, 4, 5].map(mom), cm = [0];
   for (let i = 0; i < N; i++) cm.push(cm[i] + (n[i] * (edge(i + 1) ** 4 - edge(i) ** 4)) / 4);
   const q = (p) => { const target = p * cm[N]; for (let i = 0; i < N; i++) if (cm[i + 1] >= target) return edge(i) + (dL * (target - cm[i])) / Math.max(cm[i + 1] - cm[i], 1e-300); return Lmax; };
-  return { L: Array.from({ length: N }, (_, i) => (i + 0.5) * dL), n: Array.from(n), dL, mu, L10: q(0.1), L50: q(0.5), L90: q(0.9), L43: mu[3] > 0 ? mu[4] / mu[3] : 0, cv: mu[4] > 0 ? Math.sqrt(Math.max(0, (mu[5] * mu[3]) / (mu[4] * mu[4]) - 1)) : 0, mt: K.rhoc * K.kv * mu[3], nSteps, tail: n[N - 1] * dL / Math.max(mu[0], 1e-300) };
+  return { L: Array.from({ length: N }, (_, i) => (i + 0.5) * dL), n: Array.from(n), dL, mu, L10: q(0.1), L50: q(0.5), L90: q(0.9), L43: mu[3] > 0 ? mu[4] / mu[3] : 0, cv: mu[4] > 0 ? Math.sqrt(Math.max(0, (mu[5] * mu[3]) / (mu[4] * mu[4]) - 1)) : 0, mt: K.rhoc * K.kv * mu[3], nSteps, tail: n[N - 1] * dL / Math.max(mu[0], 1e-300), snaps };
 }
 const kin = (v, salt, cstar) => {
   const M = MINERALS[salt] || MINERALS.halite, kT = KB * (v.Tcx + KELVIN), vm = M.mw / 1000 / (M.rho * NA);
@@ -679,7 +681,7 @@ async function crystallizerFlowStudy(v, r, ph, ctx) {
     { ...base, title: 'Crystallizer body: relative supersaturation', zlabel: 'σ', zunit: '× 10⁻³', z: grid((P) => (1000 * p.x[P]) / cs), cmap: 'turbo', contours: 8, zmin: 0, note: `The flashed liquor enters at σ = ${fq(p.inlet.sigma, 3)} and is desupersaturated by growth on the circulating crystals; the ideal mixed crystallizer has σ = ${fq(id.sigma, 3)} everywhere.` },
     { ...base, title: 'Crystallizer body: nucleation rate relative to the ideal mixed crystallizer', zlabel: 'B / B_ideal', zunit: '–', z: grid((P) => p.B[P] / Math.max(id.B, 1e-300)), cmap: 'thermal', contours: 8, zmin: 0, note: `${fq(100 * p.hotNucleation, 3)} % of all nuclei form in the ${fq(100 * p.hotVolume, 3)} % of the volume where σ exceeds 1.5 times its mean.` },
     { ...base, title: 'Crystallizer body: local mass-mean crystal size L₄₃', zlabel: 'L₄₃', zunit: 'µm', z: grid((P) => (p.m[3][P] > 0 ? (um * p.m[4][P]) / p.m[3][P] : 0)), cmap: 'viridis', contours: 6, note: `The slurry passes the body about ${fq(1 / p.eps, 3)} times before it is drawn off, so the crystal population is almost uniform while the supersaturation is not.` },
-    { type: 'bar', title: 'Product mass-mean size: ideal, two-zone and flow-field model', ylabel: 'L₄₃ (µm)', categories: ['Ideal mixed (MSMPR)', ...(zs ? ['Two-zone model'] : []), 'Flow field'], series: [{ name: 'L₄₃ (µm)', values: [id.L43 * um, ...(zs ? [zRel * id.L43 * um] : []), p.out.L43 * um] }] },
+    { type: 'bar', title: 'Product mass-mean size: ideal, two-zone and flow-field model', ylabel: 'L₄₃ (µm)', categories: ['Ideal mixed (MSMPR)', ...(zs ? ['Two-zone model'] : []), 'Flow field'], series: [{ name: 'L₄₃ (µm)', values: [id.L43 * um, ...(zs ? [zRel * id.L43 * um] : []), p.out.L43 * um] }], note: 'Mass-mean product size from three crystallizer models of increasing detail. Differences show how much non-uniform supersaturation in the real vessel changes the product compared with the ideal mixed crystallizer.' },
   ];
   const zv = (x) => (zs ? x : null), TB = [{ title: 'Crystallizer flow field coupled to the population balance', columns: ['Quantity', 'Flow-field model', 'Two-zone model', 'Ideal mixed (MSMPR)', 'Unit'], rows: [
     ['Mass-mean size L₄₃ of the product', p.out.L43 * um, zv(zRel * id.L43 * um), id.L43 * um, 'µm'], ['L₄₃ relative to the ideal mixed crystallizer', p.out.L43 / id.L43, zv(zRel), 1, '–'], ['Sauter mean size L₃₂', p.out.L32 * um, null, id.L32 * um, 'µm'], ['Coefficient of variation (mass basis)', p.out.cv, zv(zs?.cv), id.cv, '–'],
@@ -695,6 +697,43 @@ async function crystallizerFlowStudy(v, r, ph, ctx) {
     out: { cfdL43um: p.out.L43 * um, cfdL32um: p.out.L32 * um, cfdCv: p.out.cv, cfdSigmaOut: p.out.sigma, cfdSigmaMax: p.sigmaMax, cfdSigmaRatio: ratio, cfdNucleationRatio: id.B > 0 ? p.Bavg / id.B : 1, cfdBalanceError: Math.abs(errBal), cfdL43Ratio: p.out.L43 / id.L43, cfdZoneL43Ratio: zRel, cfdCells: nx * ny, cfdConverged: f.converged && p.converged } };
 }
 const needCfd = (x) => { if (x == null) throw new Error('select the task “Solve the flow field of the crystallizer body” on the Setup tab before running this study'); return x; };
+
+// Purity map: the whole engine solved on a 6 × 5 grid of mother-liquor purge and crystallizer temperature (30 solutions).
+// Cached on every other input, so changing only the purge or the temperature redraws it at once.
+const MAP_CACHE = new Map();
+async function purityMap(v, r, ctx) {
+  const key = JSON.stringify({ ...v, purge: 0, Tcx: 0, views3d: 0, cfdOn: 0 });
+  let g = MAP_CACHE.get(key);
+  if (!g) {
+    const P = [2, 5, 10, 18, 30, 45], T = linspace(clamp(v.Tcx - 30, 35, 90), clamp(v.Tcx + 30, 65, 120), 5), pur = [], tpd = [];
+    for (let j = 0; j < T.length; j++) {
+      pur.push([]); tpd.push([]);
+      for (let i = 0; i < P.length; i++) {
+        ctx?.progress?.(0.92 + (0.07 * (j * P.length + i)) / (P.length * T.length), `Purity map: purge ${P[i]} %, ${fmt(T[j], 3)} °C…`);
+        await ctx?.tick?.();
+        let q = null;
+        try { q = simulateZLD({ ...v, purge: P[i], Tcx: T[j] }); } catch { q = null; }
+        const ok = q && q.prod > 0 && Number.isFinite(q.purity);
+        pur[j].push(ok ? 100 * q.purity : NaN); tpd[j].push(ok ? (q.prod * 24) / 1000 : NaN);
+      }
+    }
+    g = { P, T, pur, tpd };
+    MAP_CACHE.set(key, g); if (MAP_CACHE.size > 4) MAP_CACHE.delete(MAP_CACHE.keys().next().value);
+  }
+  const { P, T, pur, tpd } = g, all = pur.flat().filter(Number.isFinite);
+  if (all.length < 4) return [];
+  const lo = Math.min(...all), hi = Math.max(...all), mask = pur.map((row) => row.map((x) => !Number.isFinite(x))), fill = (a, d) => a.map((row) => row.map((x) => (Number.isFinite(x) ? x : d)));
+  const salt = (MINERALS[r.main]?.name || 'salt').toLowerCase(), here = { x: clamp(v.purge, P[0], P[P.length - 1]), y: clamp(v.Tcx, T[0], T[T.length - 1]) };
+  const how = `Each point is a full solution of this suite’s engine (evaporation path, crystallizer and cake) at that purge and crystallizer temperature with every other input as entered (${P.length * T.length} solutions, kept while only these two inputs change).`;
+  return [
+    { type: 'surface3d', title: `Salt-cake purity over mother-liquor purge and crystallizer temperature (3-D)`, x: P, y: T, z: T.map(() => P.map(() => lo - 0.02 * Math.max(hi - lo, 1))), cmap: 'salinity', zmax: hi + 1e3, xlabel: 'Purge (%)', ylabel: 'Crystallizer (°C)', zlabel: 'Purity (%)',
+      layers: [{ name: 'Purity', z: fill(pur, lo), c: fill(tpd, Math.min(...tpd.flat().filter(Number.isFinite))), cmap: 'viridis', clabel: `${MINERALS[r.main]?.name || 'Salt'} product`, cunit: 't/d', opacity: 0.95 }],
+      planes: v.purityMin > lo && v.purityMin < hi ? [{ z: v.purityMin, name: `sales grade ${v.purityMin} %`, color: '#dc2626' }] : [], markers: [{ ...here, z0: lo, z1: hi, label: 'this design' }], azimuth: 150, elevation: 30,
+      note: `Height: purity of the ${salt} cake; colour: ${salt} produced (t/d). One horizontal axis is the mother-liquor purge (${P[0]}–${P[P.length - 1]} % of the crystallizer feed water), the other the crystallizer temperature (${fmt(T[0], 3)}–${fmt(T[T.length - 1], 3)} °C). More purge carries the bittern salts out with the liquor, so purity rises while the product falls; temperature shifts which double salts co-crystallise. Where the surface rises above the red plane the cake meets the sales grade. ${how}` },
+    { type: 'field', title: 'Salt-cake purity map: purge × crystallizer temperature', xlabel: 'Mother-liquor purge (% of crystallizer feed water)', ylabel: 'Crystallizer temperature (°C)', zlabel: 'Cake purity', zunit: '%', x: P, y: T, z: fill(pur, lo), mask, cmap: 'viridis', contours: 8, markers: [{ ...here, label: 'this design' }],
+      note: `The same ${P.length * T.length} engine solutions as a contour map: read the purge needed for the ${v.purityMin} % sales grade at any crystallizer temperature. ${how}` },
+  ];
+}
 
 const D = () => Object.fromEntries(suite.inputs.flatMap((g) => g.fields).map((f) => [f.key, f.value]));
 
@@ -813,7 +852,7 @@ export function simulateZLD(v) {
     const cstar = Number.isFinite(lim) && lim > 0 ? Math.max(20, (lim * M.mw * end.rho) / (1000 + end.gPerKgw)) : 300; // kg of the salt per m³ of liquor at saturation
     const K = kin(v, main, cstar), tau = v.tau * 3600, MT = v.MT, ss = msmprSteady(K, tau, MT), seed = { mass: Math.max(1e-6, v.seedMass), L: v.seedL * 1e-6, sigma: v.sigma0 / 100 };
     const dyn = msmprDynamic(K, tau, MT, seed, v.tEnd), Gend = dyn.G[dyn.G.length - 1];
-    const fv = pbeFV(K, tau, dyn, seed, { nL: v.nL, Lmax: Math.max(v.lmaxMult * Gend * tau, 2 * seed.L), scheme: v.scheme, tEnd: v.tEnd });
+    const fv = pbeFV(K, tau, dyn, seed, { nL: v.nL, Lmax: Math.max(v.lmaxMult * Gend * tau, 2 * seed.L), scheme: v.scheme, tEnd: v.tEnd, nSnap: 31 });
     if (!dyn.complete) W.push({ level: 'warn', msg: 'The crystallizer start-up integration stopped before the requested time (very stiff kinetics); the size distribution may not be at steady state.' });
     csd = { K, tau, MT, ss, dyn, fv, salt: main, cstar, volume: (cxSolids[main] * v.tau) / MT, slurryQ: cxSolids[main] / MT, solidVol: MT / K.rhoc, Gend, Bend: dyn.B[dyn.B.length - 1], sigEnd: dyn.sigma[dyn.sigma.length - 1] };
     if (csd.solidVol > 0.35) W.push({ level: 'warn', msg: `Magma density ${v.MT} kg/m³ is ${fmt(100 * csd.solidVol, 3)} % solids by volume — above about 30 % the slurry becomes difficult to circulate.` });
@@ -981,6 +1020,9 @@ const suite = {
       { key: 'seedMass', label: 'Seed loading', unit: 'kg/m³', value: 20, min: 0, max: 400 }, { key: 'seedL', label: 'Seed size', unit: 'µm', value: 100, min: 5, max: 1000 },
       { key: 'sigma0', label: 'Initial supersaturation', unit: '%', value: 0.5, min: 0, max: 50 }, { key: 'tEnd', label: 'Simulated time', unit: 'residence times', value: 12, min: 3, max: 40 },
     ] },
+    { group: 'Animated and 3-D views', tab: 'setup', help: 'The animated evaporation path and crystal-size evolution are always shown (they reuse the main solution). The 3-D purity map solves the whole engine 30 more times.', fields: [
+      { key: 'views3d', label: 'Animated and 3-D views: purity map over purge and crystallizer temperature', type: 'bool', value: false, help: 'Adds a 3-D surface and a contour map of the salt-cake purity (and the salt produced) over the mother-liquor purge and the crystallizer temperature, each point a full solution of this engine (30 solutions, typically 5–20 s; cached while only the purge or the temperature changes).' },
+    ] },
     { group: 'Crystallizer flow field and population balance', tab: 'setup', help: 'Optional study: the steady two-dimensional flow in a vertical section of the crystallizer body is solved with the Navier–Stokes solver of suite 4, and the supersaturation and the moments of the crystal population are transported on that field with the nucleation and growth laws entered above. It shows where the supersaturation is generated and consumed and what that does to the product size. Takes a few seconds.', fields: [
       { key: 'cfdOn', label: 'Solve the flow field of the crystallizer body', type: 'bool', value: false, help: 'Adds field plots of velocity, supersaturation, nucleation rate and local crystal size and compares the product size with the ideal mixed crystallizer and the two-zone model.' },
       { key: 'cfdBaffle', label: 'Baffle height', unit: '% of liquid height', value: 55, min: 0, max: 85, help: 'Bottom-mounted baffle between the return nozzle and the suction nozzle; 0 = no baffle.', showIf: (v) => v.cfdOn },
@@ -1018,6 +1060,9 @@ const suite = {
     site?.data?.electricityPrice != null ? { key: 'elecPrice', value: site.data.electricityPrice, from: 'Electricity price at site' } : null,
   ].filter(Boolean),
 
+  // Predict tab: the design choices that move recovery, purity, energy and cost most
+  predict: { inputs: ['purge', 'Tcx', 'bcTDS', 'roTDS', 'Q', 'elecPrice', 'tau', 'MT'], outputs: ['Overall water recovery', 'Product-cake purity', 'Electricity per m³ recovered', 'Heat per m³ recovered', 'Levelised cost of brine treatment', 'Total dry solids', 'Crystal median size L50', 'Liquid discharge'] },
+
   run(v, ctx) {
     ctx?.progress?.(0.1, 'Evaporation path and mineral equilibria…');
     const r = simulateZLD(v), { path, ro, bc, cx, csd, water, end } = r, W = r.W, steps = path.steps;
@@ -1051,8 +1096,8 @@ const suite = {
           ['Median size L50 (mass)', P1.L50 * um, P2.L50 * um, R0.L50 * um, 'µm'], ['Mass-mean size L₄₃', P1.L43 * um, P2.L43 * um, R0.L43 * um, 'µm'], ['L10 / L90', `${fq(P1.L10 * um, 3)} / ${fq(P1.L90 * um, 3)}`, `${fq(P2.L10 * um, 3)} / ${fq(P2.L90 * um, 3)}`, `${fq(R0.L10 * um, 3)} / ${fq(R0.L90 * um, 3)}`, 'µm'],
           ['Coefficient of variation', P1.cv, P2.cv, R0.cv, '–'], ['Magma density', P1.mt, P2.mt, R0.mt, 'kg/m³'], ['Crystal number', P1.mu[0], P2.mu[0], R0.mu[0], '#/m³']],
           note: `Compartment form of a coupled flow / population-balance model: ${fq(100 * z.phi[0], 3)} % of the volume is the boiling zone, the slurry turns over every ${fq(ph.theta, 3)} s (circulation ${fq(ph.Qc * 3600, 3)} m³/h from the heat duty and ${v.dTpass} K rise per pass). ${v.gtOn !== false ? 'Growth is size dependent (Gibbs–Thomson) and crystals below the critical size dissolve.' : 'Size-independent growth.'} Wall: ${v.wallBC === 'deposit' ? `crystals deposit at ${v.kDep} µm/s on ${fq(ph.aWall, 3)} m² of wall per m³` : 'no flux'}. ${z.L.length} size cells, ${z.nSteps} implicit time steps; the last column is the ideal mixed crystallizer on the same size grid, so differences between the columns are physical, not numerical.` });
-        X.PL.push({ type: 'line', title: 'Two-zone crystallizer: product size distribution (mass basis)', xlabel: 'Crystal size L (µm)', ylabel: 'Mass density (% per µm)', logx: true, series: [{ name: 'Product zone (body and loop)', x: z.L.map((L) => L * um), y: md(z.n[1]) }, { name: 'Boiling zone', x: z.L.map((L) => L * um), y: md(z.n[0]), dash: true }, { name: 'Ideal single zone on the same grid', x: z.L.map((L) => L * um), y: md(R0.pop), dash: true }], vlines: z.Lcrit[1] > 0 && Number.isFinite(z.Lcrit[1]) ? [{ x: Math.max(z.Lcrit[1] * um, z.L[0] * um), label: 'critical size' }] : [] });
-        X.PL.push({ type: 'line', title: 'Two-zone crystallizer: supersaturation in the zones during start-up', xlabel: 'Time (residence times)', ylabel: 'Relative supersaturation σ × 10⁴', series: [{ name: 'Boiling zone', x: z.hist.th, y: z.hist.s1.map((q) => q * 1e4) }, { name: 'Body and heater loop', x: z.hist.th, y: z.hist.s2.map((q) => q * 1e4) }], hlines: [{ y: R0.sigma * 1e4, label: 'ideal mixed' }] });
+        X.PL.push({ type: 'line', title: 'Two-zone crystallizer: product size distribution (mass basis)', xlabel: 'Crystal size L (µm)', ylabel: 'Mass density (% per µm)', logx: true, series: [{ name: 'Product zone (body and loop)', x: z.L.map((L) => L * um), y: md(z.n[1]) }, { name: 'Boiling zone', x: z.L.map((L) => L * um), y: md(z.n[0]), dash: true }, { name: 'Ideal single zone on the same grid', x: z.L.map((L) => L * um), y: md(R0.pop), dash: true }], vlines: z.Lcrit[1] > 0 && Number.isFinite(z.Lcrit[1]) ? [{ x: Math.max(z.Lcrit[1] * um, z.L[0] * um), label: 'critical size' }] : [], note: 'Product size distribution of the two-zone crystallizer (body and heater loop) against the boiling zone and an ideal mixed vessel on the same grid. Crystals smaller than the critical size dissolve; a shift of the product curve to the left of the ideal one means fines from the boiling surface.' });
+        X.PL.push({ type: 'line', title: 'Two-zone crystallizer: supersaturation in the zones during start-up', xlabel: 'Time (residence times)', ylabel: 'Relative supersaturation σ × 10⁴', series: [{ name: 'Boiling zone', x: z.hist.th, y: z.hist.s1.map((q) => q * 1e4) }, { name: 'Body and heater loop', x: z.hist.th, y: z.hist.s2.map((q) => q * 1e4) }], hlines: [{ y: R0.sigma * 1e4, label: 'ideal mixed' }], note: 'Supersaturation of the two zones from start-up to steady state. The boiling zone, where vapour leaves, runs at a higher supersaturation than the body; the larger the gap, the more nuclei and encrustation form at the boiling surface.' });
         X.BAL.push({ name: 'Two-zone crystallizer: salt made by evaporation vs crystals + dissolved excess + product + wall (kg/m³)', in: z.balance.in, out: z.balance.out });
         X.K.push({ label: 'Product L50, two-zone model', value: P2.L50 * um, unit: 'µm', help: `Ideal mixed crystallizer on the same grid: ${fq(R0.L50 * um, 4)} µm` }, { label: 'Supersaturation, boiling zone / body', value: z.sigma[1] > 0 ? z.sigma[0] / z.sigma[1] : 1, unit: '×', status: z.sigma[1] > 0 && z.sigma[0] / z.sigma[1] > 4 ? 'warn' : 'ok', help: 'Ratio of the relative supersaturation in the two compartments; high values favour fines and encrustation at the boiling surface' });
         X.out.zoneL50um = P2.L50 * um; X.out.zoneSigmaRatio = z.sigma[1] > 0 ? z.sigma[0] / z.sigma[1] : 1;
@@ -1082,7 +1127,7 @@ const suite = {
     }
     X.TB.push({ title: 'Process economics', columns: ['Item', 'Capital ($)', 'Annual cost ($/y)', 'Basis'], rows: [...eco.items.map((q) => [q.name, q.cost, null, q.basis]), ['Indirect costs and contingency', eco.capex - eco.direct, null, `${v.capexIndirect ?? 35} % of direct cost`], ['Total capital', eco.capex, eco.capexY, `Capital-recovery factor ${fq(eco.crf, 4)} (${v.rate} %, ${v.life} y)`], ...eco.opex.map(([n, x]) => [n, null, x, '']), ['Total annual cost', null, eco.annual, `${fq(eco.brineY, 4)} m³/y of brine at ${v.avail} % availability`]],
       note: `Levelised cost ${fq(eco.perBrine, 3)} $ per m³ of brine treated, ${fq(eco.perWater, 3)} $ per m³ of water recovered. Installed-cost correlations scale with capacity^${v.capexScale}; treat the result as ± 40 %.` });
-    X.PL.push({ type: 'bar', title: 'Annual cost of the train', ylabel: '$/y', categories: ['Capital charge', ...eco.opex.map((q) => q[0])], series: [{ name: '$/y', values: [eco.capexY, ...eco.opex.map((q) => q[1])] }] });
+    X.PL.push({ type: 'bar', title: 'Annual cost of the train', ylabel: '$/y', categories: ['Capital charge', ...eco.opex.map((q) => q[0])], series: [{ name: '$/y', values: [eco.capexY, ...eco.opex.map((q) => q[1])] }], note: 'Yearly cost items of the train: the capital charge (capital × capital-recovery factor) and each operating item. The tallest bars are where savings matter most — usually energy and the capital of the evaporators.' });
     X.BAL.push({ name: 'Annual cost: capital charge + operating items vs total ($/y, scaled)', in: 1, out: eco.annual !== 0 ? (eco.capexY + sum(eco.opex.map((q) => q[1]))) / eco.annual : 1 });
     X.K.push({ label: 'Levelised cost of brine treatment', value: eco.perBrine, unit: '$/m³ brine', help: `${fq(eco.perWater, 3)} $ per m³ of water recovered` }, { label: 'Capital cost', value: eco.capex / 1e6, unit: 'M$' });
     Object.assign(X.out, { levelisedCostPerM3Brine: eco.perBrine, levelisedCostPerM3Water: eco.perWater, capex: eco.capex, opex: eco.opexY });
@@ -1094,6 +1139,32 @@ const suite = {
     const fx = linspace(Math.max(40, steps[0].S), Math.max(Math.max(40, steps[0].S) + 20, Math.min(300, Math.max(...steps.map((s) => s.S)))), 12), fy = linspace(1.5, 9, 9), Ss = steps.map((s) => s.S), aws = steps.map((s) => s.aw);
     const mono = Ss.every((x, i) => i === 0 || x > Ss[i - 1]), awAt = (S) => (mono ? interp1(Ss, aws, S) : clamp(1 - 0.00095 * S, 0.3, 1));
     const fz = fy.map((dT) => fx.map((S) => compressorWork(v.Tbc, bpeFromAw(v.Tbc, awAt(S)), dT, v.etaComp / 100) / 3.6e6 * 1000 / (v.etaMotor / 100)));
+    // animated evaporation path: the curves are revealed step by step (frames over the concentration factor); the title carries the liquor state
+    const nSt = steps.length, KF = Math.min(36, nSt - 1), fIdx = Array.from({ length: KF }, (_, k) => Math.max(1, Math.round(((k + 1) * (nSt - 1)) / KF))), unitName = { feed: 'feed', ro: 'membrane step', bc: 'brine concentrator', cx: 'crystallizer' };
+    const r5 = (x) => +x.toPrecision(5), cfR = cf.map(r5), trk = TRACK.filter((id) => r.minerals.includes(id) && steps.some((s) => s.SI[id] > -90));
+    const solSeries = (i) => seqOrder.map((id) => ({ name: MINERALS[id].name, x: cfR.slice(0, i + 1), y: steps.slice(0, i + 1).map((s) => r5(Math.max(1e-4, kgm3(s.cum[id], id)))) }));
+    const siSeries = (i) => trk.map((id) => ({ name: MINERALS[id].name, x: cfR.slice(0, i + 1), y: steps.slice(0, i + 1).map((s) => r5(clamp(s.SI[id], -5, 2.5))) }));
+    const stTitle = (st) => `concentration factor ${fmt(st.cf, 3)} × in the ${unitName[st.unit] || st.unit}, ${fmt(st.S, 3)} g/kg, ${fmt(st.T, 3)} °C`;
+    const liq = (st) => ['Na', 'Mg', 'K', 'Ca', 'Cl', 'SO4'].map((k) => `${IONS[k].label} ${fmt(st.m[k], 2)}`).join(' · ');
+    const here = (i) => [...bounds.filter((b) => b.x <= cf[i]), { x: cf[i], label: unitName[steps[i].unit] || steps[i].unit }];
+    const sMax = seqOrder.length ? Math.max(...seqOrder.map((id) => kgm3(path.cum[id], id))) : 1e-3;
+    const pathAnim = nSt > 2 ? [
+      ...(seqOrder.length ? [{ type: 'line', title: `Evaporation path animated: solids at ${stTitle(steps[nSt - 1])}`, xlabel: 'Concentration factor relative to feed (water basis)', ylabel: 'Solids formed (kg per m³ of feed brine)', logx: true, logy: true, xmin: cf[0], xmax: cf[nSt - 1], ymin: 1e-3, ymax: Math.max(3 * sMax, 1e-2), series: solSeries(nSt - 1), vlines: bounds,
+        frames: fIdx.map((i) => ({ label: `CF ${fmt(cf[i], 3)} ×`, title: `Evaporation path animated: solids at ${stTitle(steps[i])}`, series: solSeries(i), vlines: here(i) })), frameLabel: 'Concentration factor', frame: 0, fps: 4, autoplay: true,
+        note: `Water is removed step by step (${nSt - 1} equilibrium steps from the feed to the end of the crystallizer, press ▶ Play or drag the slider); at each step the activity model finds the minerals above saturation and precipitates them. Watch each salt appear at its onset and the totals build up: scale formers first (calcium carbonate and sulphate), then sodium chloride, and last the magnesium and potassium bittern salts that the purge must carry away. The vertical line follows the current concentration factor and unit.` }] : []),
+      { type: 'line', title: `Evaporation path animated: saturation at ${stTitle(steps[nSt - 1])}`, xlabel: 'Concentration factor', ylabel: 'Saturation index', logx: true, xmin: cf[0], xmax: cf[nSt - 1], ymin: -5, ymax: 2.5, series: siSeries(nSt - 1), hlines: [{ y: 0, label: 'saturation' }], vlines: bounds,
+        frames: fIdx.map((i) => ({ label: `CF ${fmt(cf[i], 3)} × · liquor (mol/kg) ${liq(steps[i])}`, title: `Evaporation path animated: saturation at ${stTitle(steps[i])}`, series: siSeries(i), vlines: here(i) })), frameLabel: 'Concentration factor', frame: KF - 1, fps: 4,
+        note: 'The saturation index of each mineral as the brine concentrates, revealed step by step, with the liquor composition (molality of the major ions) of the current step beside the slider. A curve climbs towards zero as its ions concentrate, reaches zero where that mineral starts to crystallise and then stays there; a mineral whose ions are consumed by another salt can fall back. The order in which the curves reach zero is the precipitation sequence.' },
+    ] : [];
+    // animated crystal-size distribution during start-up, from snapshots of the finite-volume population balance
+    const csdAnim = csd && csd.fv.snaps?.length > 2 ? (() => {
+      const sn = csd.fv.snaps, Lu = csd.fv.L.map((L) => r5(L * 1e6)), md = (n) => csd.fv.L.map((L, i) => { const y = csd.K.rhoc * csd.K.kv * n[i] * L ** 3 * 1e-6; return y > 1e-12 ? r5(y) : 0; }), last = md(sn[sn.length - 1].n), yM = Math.max(...sn.slice(Math.floor(sn.length / 4)).flatMap((q) => md(q.n)));
+      const at = (th, a) => interp1(csd.dyn.th, a, th), frameT = (q) => `Crystal-size distribution during start-up: ${fmt(q.th, 3)} residence times, L₄₃ ${fmt(at(q.th, csd.dyn.L43) * 1e6, 3)} µm, ${fmt(at(q.th, csd.dyn.mt), 3)} kg/m³ of crystals`;
+      return [{ type: 'line', title: frameT(sn[sn.length - 1]), xlabel: 'Crystal size L (µm)', ylabel: 'Crystal mass per µm of size (kg/m³ per µm)', xmin: 0, xmax: Lu[Lu.length - 1], ymin: 0, ymax: 1.1 * Math.max(yM, 1e-12), zeroY: true,
+        series: [{ name: 'Population balance now', x: Lu, y: last }, { name: 'End of start-up', x: Lu, y: last, dash: true }],
+        frames: sn.map((q) => ({ label: `${fmt(q.th, 3)} τ`, title: frameT(q), series: [{ name: 'Population balance now', x: Lu, y: md(q.n) }, { name: 'End of start-up', x: Lu, y: last, dash: true }] })), frameLabel: 'Time since start-up (residence times τ)', frame: 0, fps: 5,
+        note: `How the ${MINERALS[csd.salt].name.toLowerCase()} crystals in the crystallizer evolve from the ${v.seedL} µm seed charge to the steady product (${sn.length} snapshots of the finite-volume population balance ∂n/∂t + G·∂n/∂L = −n/τ, press ▶ Play). Nuclei enter at size zero, every crystal grows at the rate G set by the supersaturation, and the slurry draw-off removes crystals of all sizes; the seeds wash out after a few residence times and the distribution settles on the dashed steady shape. The narrow peak of the first frames is the seed charge.` }];
+    })() : [];
     const kpis = [
       { label: 'Water recovered', value: r.recovered, unit: 'm³/h' }, { label: 'Overall water recovery', value: recPct, unit: '%', status: recPct > 90 ? 'ok' : 'warn' },
       { label: 'Liquid discharge', value: r.liquid, unit: 'm³/h', status: zld ? 'ok' : 'warn', help: zld ? 'Zero liquid discharge achieved' : 'Mother-liquor purge sent to liquid disposal' },
@@ -1132,19 +1203,21 @@ const suite = {
       ].filter(Boolean),
       plots: [
         { type: 'line', title: 'Precipitation sequence: cumulative solids along the evaporation path', xlabel: 'Concentration factor relative to feed (water basis)', ylabel: 'Solids formed (kg per m³ of feed brine)', logx: true, logy: true, ymin: 1e-3, series: seqOrder.length ? seqOrder.map((id) => ({ name: MINERALS[id].name, x: cf, y: steps.map((s) => Math.max(1e-4, kgm3(s.cum[id], id))) })) : [{ name: 'no solids form', x: cf, y: cf.map(() => 1e-4) }], vlines: bounds, note: 'Fractional crystallisation: each salt appears where its saturation index reaches zero.' },
-        { type: 'line', title: 'Saturation indices along the path', xlabel: 'Concentration factor', ylabel: 'Saturation index', logx: true, ymin: -5, ymax: 2.5, series: TRACK.filter((id) => r.minerals.includes(id) && steps.some((s) => s.SI[id] > -90)).map((id) => ({ name: MINERALS[id].name, x: cf, y: steps.map((s) => clamp(s.SI[id], -5, 2.5)) })), hlines: [{ y: 0, label: 'saturation' }], vlines: bounds },
-        { type: 'line', title: 'Dissolved major ions in the liquor', xlabel: 'Concentration factor', ylabel: 'Molality (mol/kg water)', logx: true, logy: true, ymin: 1e-4, series: ['Na', 'Cl', 'Mg', 'K', 'SO4', 'Ca'].map((k) => ({ name: IONS[k].label, x: cf, y: steps.map((s) => Math.max(1e-5, s.m[k])) })), vlines: bounds },
-        { type: 'line', title: 'Water activity, salinity and boiling-point elevation', xlabel: 'Concentration factor', ylabel: 'aw × 100 (–) · salinity (g/kg ÷ 10) · BPE (K)', logx: true, series: [{ name: 'Water activity × 100', x: cf, y: steps.map((s) => 100 * s.aw) }, { name: 'Salinity ÷ 10 (g/kg)', x: cf, y: steps.map((s) => s.S / 10) }, { name: 'BPE at 100 °C (K)', x: cf, y: steps.map((s) => bpeFromAw(100, s.aw)), mode: 'both' }], vlines: bounds },
-        { type: 'bar', title: 'Where the water goes', ylabel: 't/h', categories: ['Membrane permeate', 'Concentrator distillate', 'Crystallizer condensate', 'Water of hydration in salts', 'Cake moisture (dryer vapour)', v.purgeFate === 'discharge' ? 'Liquid purge' : 'Purge water (evaporated)'], series: [{ name: 'Water', values: [water.perm, water.dist, water.cond, water.hydration, water.cake, water.purge].map((x) => x / 1000) }] },
-        { type: 'bar', title: 'Energy by unit', ylabel: 'kW', stacked: true, categories: ['Membranes', 'Brine concentrator', 'Crystallizer', 'Dryers'], series: [{ name: 'Electricity', values: [ro.kW, bc.kWe, cx.kWe, 0] }, { name: 'Heat', values: [0, bc.kWt, cx.kWt, r.dryer.kWt + r.purgeDry.kWt] }] },
+        { type: 'line', title: 'Saturation indices along the path', xlabel: 'Concentration factor', ylabel: 'Saturation index', logx: true, ymin: -5, ymax: 2.5, series: TRACK.filter((id) => r.minerals.includes(id) && steps.some((s) => s.SI[id] > -90)).map((id) => ({ name: MINERALS[id].name, x: cf, y: steps.map((s) => clamp(s.SI[id], -5, 2.5)) })), hlines: [{ y: 0, label: 'saturation' }], vlines: bounds, note: 'Saturation index log₁₀(IAP/K) of each mineral as water is removed, from the activity model at each unit’s temperature. Below 0 the mineral stays dissolved; at 0 it starts to crystallise and then stays pinned at 0 while it forms. Vertical lines mark where each unit ends.' },
+        { type: 'line', title: 'Dissolved major ions in the liquor', xlabel: 'Concentration factor', ylabel: 'Molality (mol/kg water)', logx: true, logy: true, ymin: 1e-4, series: ['Na', 'Cl', 'Mg', 'K', 'SO4', 'Ca'].map((k) => ({ name: IONS[k].label, x: cf, y: steps.map((s) => Math.max(1e-5, s.m[k])) })), vlines: bounds, note: 'Dissolved amount of each major ion per kg of remaining water. An ion that does not crystallise rises in proportion to the concentration factor (slope 1 on these log axes); one that leaves as a salt levels off or falls — sodium and chloride once halite forms, calcium once gypsum forms — while magnesium and potassium accumulate in the bittern.' },
+        ...pathAnim,
+        { type: 'line', title: 'Water activity, salinity and boiling-point elevation', xlabel: 'Concentration factor', ylabel: 'aw × 100 (–) · salinity (g/kg ÷ 10) · BPE (K)', logx: true, series: [{ name: 'Water activity × 100', x: cf, y: steps.map((s) => 100 * s.aw) }, { name: 'Salinity ÷ 10 (g/kg)', x: cf, y: steps.map((s) => s.S / 10) }, { name: 'BPE at 100 °C (K)', x: cf, y: steps.map((s) => bpeFromAw(100, s.aw)), mode: 'both' }], vlines: bounds, note: 'Three quantities on one axis: water activity (× 100) falls as salt concentrates, salinity (÷ 10) rises, and with them the boiling-point elevation, which the evaporator and crystallizer must overcome. The flat salinity at the end is a saturated liquor from which salt is crystallising.' },
+        { type: 'bar', title: 'Where the water goes', ylabel: 't/h', categories: ['Membrane permeate', 'Concentrator distillate', 'Crystallizer condensate', 'Water of hydration in salts', 'Cake moisture (dryer vapour)', v.purgeFate === 'discharge' ? 'Liquid purge' : 'Purge water (evaporated)'], series: [{ name: 'Water', values: [water.perm, water.dist, water.cond, water.hydration, water.cake, water.purge].map((x) => x / 1000) }], note: 'Fate of the feed water in tonnes per hour, from the closed water balance. The first three bars are recovered water; water of hydration and cake moisture leave with the solids; the purge is evaporated in a dryer or pond, or discharged as liquid.' },
+        { type: 'bar', title: 'Energy by unit', ylabel: 'kW', stacked: true, categories: ['Membranes', 'Brine concentrator', 'Crystallizer', 'Dryers'], series: [{ name: 'Electricity', values: [ro.kW, bc.kWe, cx.kWe, 0] }, { name: 'Heat', values: [0, bc.kWt, cx.kWt, r.dryer.kWt + r.purgeDry.kWt] }], note: 'Electric and heat demand of each unit. Water removed by membranes is far cheaper than water evaporated, so the membrane bar is small even when it removes most of the water; the crystallizer and dryers dominate per tonne of water.' },
         ...(csd ? [
           { type: 'line', title: `Crystal-size distribution of ${MINERALS[csd.salt].name.toLowerCase()} (mass basis)`, xlabel: 'Crystal size L (µm)', ylabel: 'Mass density (% per µm)', series: [
             { name: `Finite-volume PBE (${csd.fv.L.length} cells)`, x: csd.fv.L.map((L) => L * 1e6), y: csd.fv.L.map((L, i) => (100 * csd.fv.n[i] * L ** 3) / Math.max(csd.fv.mu[3], 1e-300) / 1e6), mode: 'both' },
-            { name: 'Analytical MSMPR at the final growth rate', x: csd.fv.L.map((L) => L * 1e6), y: csd.fv.L.map((L) => { const g = csd.Gend * csd.tau, z = L / g; return (100 * z ** 3 * Math.exp(-z)) / 6 / g / 1e6; }), dash: true }], vlines: [{ x: csd.fv.L50 * 1e6, label: 'L50' }] },
-          { type: 'line', title: 'Crystallizer start-up (method of moments)', xlabel: 'Time (residence times)', ylabel: 'L₄₃ (µm) · magma density (kg/m³) · σ × 10⁴', series: [{ name: 'Mass-mean size L₄₃ (µm)', x: csd.dyn.th, y: csd.dyn.L43.map((x) => x * 1e6) }, { name: 'Magma density (kg/m³)', x: csd.dyn.th, y: csd.dyn.mt }, { name: 'Supersaturation σ × 10⁴', x: csd.dyn.th, y: csd.dyn.sigma.map((x) => x * 1e4) }], hlines: [{ y: csd.ss.L43 * 1e6, label: 'steady L₄₃' }] },
+            { name: 'Analytical MSMPR at the final growth rate', x: csd.fv.L.map((L) => L * 1e6), y: csd.fv.L.map((L) => { const g = csd.Gend * csd.tau, z = L / g; return (100 * z ** 3 * Math.exp(-z)) / 6 / g / 1e6; }), dash: true }], vlines: [{ x: csd.fv.L50 * 1e6, label: 'L50' }], note: 'Share of the crystal mass per micrometre of size at the end of start-up, from the finite-volume population balance; the dashed curve is the analytical mixed-suspension, mixed-product-removal (MSMPR) result at the same growth rate. Agreement checks the numerics; the peak and L50 set how well the cake drains and washes.' },
+          { type: 'line', title: 'Crystallizer start-up (method of moments)', xlabel: 'Time (residence times)', ylabel: 'L₄₃ (µm) · magma density (kg/m³) · σ × 10⁴', series: [{ name: 'Mass-mean size L₄₃ (µm)', x: csd.dyn.th, y: csd.dyn.L43.map((x) => x * 1e6) }, { name: 'Magma density (kg/m³)', x: csd.dyn.th, y: csd.dyn.mt }, { name: 'Supersaturation σ × 10⁴', x: csd.dyn.th, y: csd.dyn.sigma.map((x) => x * 1e4) }], hlines: [{ y: csd.ss.L43 * 1e6, label: 'steady L₄₃' }], note: 'Start-up of the crystallizer from the seed charge, in residence times, by the method of moments: supersaturation first peaks (nucleation burst), then falls as the crystal surface grows, and the mean size and magma density settle at their steady values after about 5–8 residence times.' },
+          ...csdAnim,
         ] : []),
         { type: 'field', title: 'MVC compressor energy versus brine salinity and tube ΔT', xlabel: 'Brine salinity in the evaporator (g/kg)', ylabel: 'Tube temperature difference (K)', zlabel: 'Compressor electricity', zunit: 'kWh/t', x: fx, y: fy, z: fz, cmap: 'thermal', contours: 8, markers: bc.on && v.bcType === 'mvc' && lastOf('bc') ? [{ x: clamp(lastOf('bc').S, fx[0], fx[fx.length - 1]), y: clamp(v.dT, 1.5, 9), label: 'design' }] : [], note: 'Salinity acts through the boiling-point elevation, which the compressor must overcome in addition to the tube temperature difference.' },
-        { type: 'bar', title: 'Solids produced', ylabel: 't/d', categories: r.salts.length ? r.salts.map((s) => `${s.name} · ${s.unit}`) : ['none'], series: [{ name: 't/d', values: r.salts.length ? r.salts.map((s) => td(s.kg)) : [0] }] },
+        { type: 'bar', title: 'Solids produced', ylabel: 't/d', categories: r.salts.length ? r.salts.map((s) => `${s.name} · ${s.unit}`) : ['none'], series: [{ name: 't/d', values: r.salts.length ? r.salts.map((s) => td(s.kg)) : [0] }], note: 'Each solid with the unit where it forms, in tonnes per day: softening sludge, scale-forming seed solids in the concentrator, the crystallizer salt and the purge salts.' },
         ...X.PL,
       ],
       tables: [
@@ -1184,12 +1257,15 @@ const suite = {
       })(),
       outputs: out,
     };
+    explainKpis(result.kpis);
+    // optional 3-D purity map over purge and crystallizer temperature (30 further solutions, asynchronous, cached)
+    const map = v.views3d && cx.on && r.prod > 0 ? purityMap(v, r, ctx) : null, withMap = (res) => (map ? map.then((m) => { res.plots.push(...m); return res; }) : res);
     // optional study: flow field of the crystallizer body coupled to the population balance (asynchronous)
-    if (!v.cfdOn) return result;
-    if (!ph || !csd) { W.push({ level: 'info', msg: 'The crystallizer flow study was requested, but the crystallizer is idle for this case — nothing to solve.' }); return result; }
+    if (!v.cfdOn) return withMap(result);
+    if (!ph || !csd) { W.push({ level: 'info', msg: 'The crystallizer flow study was requested, but the crystallizer is idle for this case — nothing to solve.' }); return withMap(result); }
     return crystallizerFlowStudy(v, r, ph, ctx).then((cf) => {
-      result.kpis.push(...cf.K); result.plots.push(...cf.PL); result.tables.push(...cf.TB); result.balances.push(...cf.BAL); W.push(...cf.W); Object.assign(result.outputs, cf.out);
-      return result;
+      result.kpis.push(...explainKpis(cf.K)); result.plots.push(...cf.PL); result.tables.push(...cf.TB); result.balances.push(...cf.BAL); W.push(...cf.W); Object.assign(result.outputs, cf.out);
+      return withMap(result);
     });
   },
 
@@ -1329,6 +1405,42 @@ const HELP = {
   nL: 'Uniform cells of the reference population balance; the two-zone model uses 1.25 times as many (at least 100) on a geometric grid.', scheme: 'The limiter removes most of the numerical diffusion of the upwind scheme.',
 };
 for (const g of suite.inputs) for (const f of g.fields) if (!f.help && HELP[f.key]) f.help = HELP[f.key];
+
+// Plain-language meaning of every key result: what it is, how it is obtained and what is good or the limit. A run-specific
+// detail already attached to a KPI is kept after the general meaning.
+const KPI_HELP = {
+  'Water recovered': 'Clean water leaving the train per hour: membrane permeate + concentrator distillate + crystallizer condensate, from the water balance of each unit.',
+  'Overall water recovery': 'Recovered water divided by the water in the feed brine. True zero liquid discharge plants reach 95–99 %; the rest leaves bound in the salts, as cake moisture or with the purge.',
+  'Liquid discharge': 'Liquid that still leaves the battery limit, i.e. the mother-liquor purge when it is sent to disposal. Zero means true zero liquid discharge; a pond or a dryer evaporates the purge instead.',
+  'Total dry solids': 'All solids leaving the train per day: softening sludge, seed-slurry solids, the crystallizer salt cake and the dried purge salts, from the precipitation along the evaporation path.',
+  ' product': 'Main salt in the crystallizer cake per day: the mass of that mineral crystallised between the concentrator outlet and the end point set by the purge, as computed by the equilibrium path.',
+  'Product-cake purity': 'Mass of the main salt divided by all dry solids in the centrifuge cake; impurities are other minerals that crystallise with it (bittern salts, calcium sulphate). Industrial salt grades need 97–99.5 %; a larger purge raises purity.',
+  'Electric power': 'Electricity of the whole train: membrane pumps, vapour compressors, circulation pumps and auxiliaries, from the unit energy balances.',
+  'Thermal power': 'Heat (steam) of the whole train: steam-driven evaporator effects, steam-driven crystallizer and dryers. Zero when every unit is electrically driven.',
+  'Electricity per m³ recovered': 'Electric power divided by the water recovered. Membrane steps use 3–8 kWh/m³, mechanical vapour compression 15–30 kWh/m³; the mix decides the total.',
+  'Heat per m³ recovered': 'Heat divided by the water recovered. A single-effect steam crystallizer needs about 700 kWh per m³ evaporated; each extra effect cuts this roughly in proportion.',
+  'Halite onset': 'Concentration factor (feed water / remaining water) at which the saturation index of sodium chloride reaches zero along the evaporation path, from the activity model. Seawater reaches it near 10–11 ×.',
+  'CaSO₄ onset': 'Concentration factor at which gypsum or anhydrite first saturates. Below this point the membranes and evaporator tubes are safe from calcium-sulphate scale; above it a seeded slurry or softening is needed.',
+  'Concentrator BPE': 'Boiling-point elevation of the concentrator brine: how much hotter the brine boils than pure water at the same pressure, from its water activity. It adds directly to the temperature lift the compressor or steam must supply.',
+  'Crystallizer BPE': 'Boiling-point elevation of the mother liquor in the crystallizer, from its water activity. Above about 15–20 K vapour recompression becomes uneconomic and a steam drive is used.',
+  'Concentrator area': 'Heat-transfer area of the brine concentrator: duty / (U·ΔT) for the evaporator, or membrane area for membrane distillation. It is the main capital cost of the unit.',
+  'Concentrator specific energy': 'Electricity per tonne of distillate of the brine concentrator. Mechanical vapour compression typically needs 15–30 kWh/t, rising with the boiling-point elevation.',
+  'Crystal median size L50': 'Mass-median crystal size of the product from the finite-volume population balance (growth, nucleation and withdrawal). Commercial vacuum salt is 300–600 µm; larger crystals dewater and wash better.',
+  'Crystallizer volume': 'Active slurry volume of the crystallizer: salt production × residence time / magma density.',
+  'Salt revenue less disposal': 'Indicative daily value of the salts: saleable salts at the entered prices minus disposal of mixed solids. It does not include energy, reagents or capital.',
+  'Product L50, two-zone model': 'Median product crystal size when the crystallizer is split into a boiling zone and a body with heater loop, each with its own supersaturation and size distribution. Smaller than the ideal-mixed value when the boiling zone nucleates fines.',
+  'Supersaturation, boiling zone / body': 'Relative supersaturation in the boiling zone divided by that in the body. Values well above 1 mean nucleation and encrustation at the boiling surface; above about 4 the circulation should be raised.',
+  'Hold tank: crystals surviving ripening': 'Share of crystals still present after the slurry hold time: small crystals are more soluble (Gibbs–Thomson) and dissolve to feed the large ones (Ostwald ripening). Fewer fines give a better-draining cake.',
+  'Wall deposit growth': 'Thickness of salt deposit growing on the crystallizer walls per month, from the crystal flux to the wall. Above about 5 mm per month boil-outs become frequent.',
+  'Electrodialysis cell-pair voltage': 'Voltage per cell pair of the electrodialysis concentrator: ohmic drop plus membrane potential. Lower is more efficient; it rises with current density and concentrate strength.',
+  'Membrane-distillation flux': 'Water vapour passing per m² of membrane per hour, driven by the vapour-pressure difference across the membrane; it falls as the brine’s water activity drops. A reversed flux means the brine is too concentrated for the temperatures.',
+  'Filter-press area': 'Filter area needed for the softening sludge and seed-slurry solids, from the cake-filtration (Ruth) equation at the entered pressure and cycle time.',
+  'Levelised cost of brine treatment': 'All capital and running costs of the train per m³ of brine treated, with capital annualised by the capital-recovery factor. ZLD typically costs 5–25 $ per m³ of brine; treat as ± 40 %.',
+  'Capital cost': 'Installed cost of all units plus indirect costs and contingency, from capacity-scaled cost correlations (order of magnitude, ± 40 %).',
+  'Product L₄₃, flow-field model': 'Mass-mean product size when the population balance is solved on the computed flow field of the crystallizer body, so supersaturation and nucleation vary in space. Compare with the ideal mixed crystallizer.',
+  'Supersaturation, return nozzle / draw-off (flow field)': 'Highest local supersaturation in the flow field (at the return nozzle of the heated liquor) divided by the value at the suction nozzle. High values mean local nucleation of fines.',
+};
+const explainKpis = (kpis) => { for (const k of kpis) { const base = KPI_HELP[k.label] || Object.entries(KPI_HELP).find(([p]) => k.label.startsWith(p) || (p.startsWith(' ') && k.label.endsWith(p)))?.[1]; if (base) k.help = k.help ? `${base} This run: ${k.help}.` : base; } return kpis; };
 
 /** Synthetic plant data: the steady-state MSMPR model with different true kinetics plus deterministic noise. */
 function synth(seed, pts) {

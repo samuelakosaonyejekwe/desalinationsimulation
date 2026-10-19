@@ -742,7 +742,7 @@ function porousCDICore(p, c0, model) {
   let Y = new Float64Array(NY);
   { const s0 = (clamp(p.cdiQ0, 0, 100) / 100) * eq.sigma, th0 = (clamp(p.lgTheta0, 0, 100) / 100) * thEq; for (let j = 0; j < n; j++) Y[j] = s0; Y[n] = Math.log(c0); Y[n + 1] = th0; Y[n + 2] = inventory(Y, c0, th0).M; }
   const legacy = (Yv) => [...Array.from(Yv.subarray(0, n)), Math.exp(Yv[n]), Yv[n + 1], Yv[n + 3], Yv[n + 4], Yv[n + 5]];
-  const tt = [], cEff = [], cur = [], volt = [], snaps = [];
+  const tt = [], cEff = [], cur = [], volt = [], snaps = [], film = []; // film: denser snapshots of the charging step for the animated view
   let last = null, tOff = 0;
   for (let cyc = 0; cyc < nCyc; cyc++) {
     const keep = cyc === nCyc - 1, half = (V, dur, tag) => {
@@ -758,7 +758,7 @@ function porousCDICore(p, c0, model) {
         if (depth >= 6 || nNewton > 60000) { nFail++; if (nFail > 24) abort = true; return; } // keep the last converged state (reported as a warning); balances stay closed
         Yp = null; adv(h / 2, depth + 1); adv(h / 2, depth + 1);
       };
-      const rec = (k, t) => { if (!keep) return; const c = Math.exp(Y[n]); tt.push((tOff + t) / 60); cEff.push(c); cur.push(k === 0 ? clamp((V - dphi(Y[0], c)) / ((0.5 * hsp) / (ksp * c) + 0.5 * Rc + dx / (2 * kp * edlState(Y[0], c, eo).ceff)), -Imax, Imax) : Y.I0); volt.push(k === 0 ? 2 * V - (Number.isFinite(Imax) ? 2 * (V - dphi(Y[0], c)) - 2 * cur[cur.length - 1] * ((0.5 * hsp) / (ksp * c) + 0.5 * Rc + dx / (2 * kp * edlState(Y[0], c, eo).ceff)) : 0) : Y.Vcell); if (tag === 'c' && k % Math.ceil(nOut / 5) === 0) snaps.push({ t, sigma: Array.from(Y.subarray(0, n)), phi: Array.from(Y.subarray(0, n), (s) => dphi(s, c)) }); };
+      const rec = (k, t) => { if (!keep) return; const c = Math.exp(Y[n]); tt.push((tOff + t) / 60); cEff.push(c); cur.push(k === 0 ? clamp((V - dphi(Y[0], c)) / ((0.5 * hsp) / (ksp * c) + 0.5 * Rc + dx / (2 * kp * edlState(Y[0], c, eo).ceff)), -Imax, Imax) : Y.I0); volt.push(k === 0 ? 2 * V - (Number.isFinite(Imax) ? 2 * (V - dphi(Y[0], c)) - 2 * cur[cur.length - 1] * ((0.5 * hsp) / (ksp * c) + 0.5 * Rc + dx / (2 * kp * edlState(Y[0], c, eo).ceff)) : 0) : Y.Vcell); if (tag === 'c' && k % Math.ceil(nOut / 30) === 0) film.push({ t, sigma: Array.from(Y.subarray(0, n)), c }); if (tag === 'c' && k % Math.ceil(nOut / 5) === 0) snaps.push({ t, sigma: Array.from(Y.subarray(0, n)), phi: Array.from(Y.subarray(0, n), (s) => dphi(s, c)) }); };
       rec(0, 0);
       // first output interval: steps graded geometrically from the fastest time constant
       const g = 1.4, d0 = Math.min(Math.max(dtFast, 1e-7 * Dt), Dt / sub), m = Math.max(sub, Math.ceil(Math.log(1 + ((g - 1) * Dt) / d0) / Math.log(g))), sc = (Dt * (g - 1)) / (g ** m - 1);
@@ -776,7 +776,7 @@ function porousCDICore(p, c0, model) {
     if (abort) break;
   }
   const { ch, dis } = last, salt = ch.flow, charge = ch.Q, Enet = ch.E - (clamp(p.cdiRecov, 0, 95) / 100) * Math.max(0, -dis.E), vol = qA * tc, e0 = edlState(0, c0, eo), cEnd = ch.y1[n];
-  return { p, T, c0, n, nAsk, Le, dx, av, mE, eq, thEq, tt, cEff, cur, volt, snaps, x: Array.from({ length: n }, (_, j) => (j + 0.5) * dx), ch, dis, salt, charge, Enet, vol, lamD: lam(c0), tauRC, dtStab: Number.isFinite(dtMin) ? dtMin : 0,
+  return { p, T, c0, n, nAsk, Le, dx, av, mE, eq, thEq, tt, cEff, cur, volt, snaps, film, x: Array.from({ length: n }, (_, j) => (j + 0.5) * dx), ch, dis, salt, charge, Enet, vol, lamD: lam(c0), tauRC, dtStab: Number.isFinite(dtMin) ? dtMin : 0,
     cAvg: Math.max(0, c0 - salt / vol), removal: salt / (vol * c0), sac: (salt * 58.44e3) / mE, eff: charge > 0 ? (F * salt) / charge : 0, sec: Enet / 3.6e6 / vol, ePerMol: Enet / Math.max(Math.abs(salt), 1e-30) / 1000, waterRec: tc / (tc + tdis), prod: (qA * 3.6e6 * tc) / (tc + tdis),
     thick, sigmaEnd: ch.y1.slice(0, n), cEnd, thetaEnd: ch.y1[n + 1], storedEDL: ch.s1.edl - ch.s0.edl, storedLang: ch.s1.lang - ch.s0.lang, storedMix: ch.s1.mix - ch.s0.mix, chargeStored: ch.s1.charge - ch.s0.charge, pdOf, wOf, dphi,
     edlModel: model, muEff, hPore: hP, poreRatio: hP / lam(c0), thetaFeed: e0.theta, thetaMin: thMin, thetaEnd2: edlState(ch.y1[0], cEnd, eo).theta, regime: e0.theta >= 0.999 ? 'thin double layers (Gouy–Chapman–Stern)' : e0.theta <= 0.001 ? 'overlapping double layers (modified Donnan)' : 'transition (blended)', steps: nSteps, newton: nNewton, failedSteps: nFail, fallback: null, edl: (s, c) => edlState(s, c, eo) };
@@ -1157,6 +1157,9 @@ const suite = {
       { key: 'gbFO', label: 'FO test data', type: 'table', columns: [{ key: 'cDraw', label: 'Draw concentration', unit: 'mol/L' }, { key: 'uF', label: 'Cross-flow velocity', unit: 'cm/s' }, { key: 'Jw', label: 'Measured water flux', unit: 'L/m²·h' }], value: GB_FO, showIf: (v) => v.greybox && v.process === 'fo', help: 'Coupon tests with the present feed and membrane.' },
       { key: 'gbMD', label: 'MD test data', type: 'table', columns: [{ key: 'Tf', label: 'Hot-feed temperature', unit: '°C' }, { key: 'uFm', label: 'Feed velocity', unit: 'm/s' }, { key: 'Jw', label: 'Measured flux', unit: 'L/m²·h' }], value: GB_MD, showIf: (v) => v.greybox && v.process === 'md', help: 'Flat-sheet tests at the present coolant temperature and feed salinity.' },
     ] },
+    { group: 'Animated and 3-D views', tab: 'setup', showIf: (v) => ['fo', 'pro', 'md'].includes(v.process), help: 'The animated membrane cross-sections along the module are always shown (they reuse the main solution). The 3-D view solves the whole module six more times.', fields: [
+      { key: 'views3d', label: 'Animated and 3-D views: local flux over module position and draw strength (FO, PRO) or feed temperature (MD)', type: 'bool', value: false, help: 'Adds a 3-D surface of the local water flux along the module for six draw concentrations (FO, PRO) or six hot-feed temperatures (MD), each a full module solution of this engine (about 0.5–1 s in all).' },
+    ] },
     { group: 'Pumps', tab: 'setup', help: 'For the electrical energy of circulation.', fields: [
       { key: 'etaPump', label: 'Pump + motor efficiency', unit: '%', value: 70, min: 20, max: 92, help: 'Applied to all circulation pumps and fans.' },
     ] },
@@ -1199,10 +1202,13 @@ const suite = {
     { key: 'ghi', value: site?.data?.ghiDaily, from: 'Daily solar irradiation at site' },
   ],
 
+  // Predict tab: the draw, membrane and temperature choices that set flux, recovery and energy (results not produced by the chosen process are skipped)
+  predict: { inputs: ['cDraw', 'Qd', 'areaFO', 'Sfo', 'Tf', 'Tp', 'Qf', 'uFm'], outputs: ['Average water flux', 'Water transferred', 'Feed recovery', 'Regeneration electricity', 'Average flux', 'Thermal efficiency', 'Gain-output ratio', 'Specific heat'] },
+
   run(v0, ctx) { // synchronous by default; with the Pareto search or the pore network it yields once first (when the caller can) so the interface shows progress
     const v = applyMaterial(v0), pr = v.process, go = () => {
       const res = pr === 'md' ? runMD(v) : pr === 'ro_md' ? runROMD(v) : pr === 'hdh' ? runHDH(v) : pr === 'cdi' ? runCDI(v) : pr === 'cdi_ro' ? runCDIRO(v) : pr === 'md_cr' ? runMDC(v) : pr === 'fo_md' || pr === 'ed_fo' ? runFOChain(v) : runFO(v);
-      return addExtras(res, v);
+      return explainResult(addExtras(res, v));
     };
     if ((v.pareto || (isMD(v) && v.poreDist === 'network')) && ctx?.tick) return (async () => { ctx.progress?.(0.1, v.pareto ? 'Multi-objective search (NSGA-II)' : 'Solving the pore network'); await ctx.tick(); return go(); })();
     return go();
@@ -1458,6 +1464,7 @@ function runFO(v) {
     { type: 'line', title: 'Flux versus draw concentration and orientation', xlabel: 'Draw concentration (mol/L)', ylabel: 'Water flux (L/m²·h)', series: [{ name: 'Active layer facing feed', x: cds, y: sweepC({ orient: 'alfs', process: 'fo' }), mode: 'both' }, { name: 'Active layer facing draw', x: cds, y: sweepC({ orient: 'alds', process: 'fo' }), mode: 'both' }, { name: 'No polarisation: A·Δπ', x: cds, y: cds.map((c) => Math.max(0, r.m.A * (drawOsmotic(p.draw, c * 1000, T) - r.m.piF(1))) * 3.6e6), dash: true }], vlines: [{ x: p.cDraw, label: 'operating' }], note: 'Inlet conditions, no applied pressure. The flux flattens with concentration because internal polarisation grows exponentially with flux.' },
     { type: 'line', title: 'Effect of the structural parameter and cross-flow velocity', xlabel: 'Structural parameter S (µm) · velocity × 30 (cm/s)', ylabel: 'Water flux (L/m²·h)', series: [{ name: 'Flux versus S', x: Ss, y: Ss.map((S) => tryOr(() => flux({ Sfo: S }).Jw * 3.6e6)), mode: 'both' }, { name: 'Flux versus velocity (x = 30 × cm/s)', x: us.map((u) => u * 30), y: us.map((u) => tryOr(() => flux({ uF: u, uD: u }).Jw * 3.6e6)), mode: 'both' }], vlines: [{ x: p.Sfo, label: 'S' }] },
     { type: 'field', title: 'Flux versus structural parameter and draw concentration', xlabel: 'Structural parameter S (µm)', ylabel: 'Draw concentration (mol/L)', zlabel: 'Water flux', zunit: 'L/m²·h', x: fS, y: fC, z: fC.map((c) => fS.map((S) => tryOr(() => flux({ Sfo: S, cDraw: c }, c * 1000).Jw * 3.6e6, 0))), cmap: 'viridis', contours: 8, markers: [{ x: clamp(p.Sfo, 100, 1300), y: clamp(p.cDraw, fC[0], fC[5]), label: 'operating' }] },
+    ...foProfileAnim(r),
   ];
   if (pro) {
     const dpi = (coupon.piDb - coupon.piFb) / 1e5, Pb = linspace(0, Math.max(dpi, 1), 25), wd = Pb.map((P) => tryOr(() => flux({}, r.cD0, P * 1e5).Jw * P * 1e5, 0));
@@ -1527,6 +1534,31 @@ function mdWarnings(r, p, W) {
   if (!W.some((w) => w.level !== 'info')) W.unshift({ level: 'info', msg: `Vapour transport is in the ${dg.regime} regime (Kn = ${fmt(dg.Kn, 3)}); energy and mass balances close.` });
 }
 
+/**
+ * Animated cross-section of the FO membrane in every module segment (frames along the module): osmotic pressure from the feed
+ * bulk through the boundary layer, the active layer and the porous support to the draw bulk, from the segment solution.
+ */
+function foProfileAnim(r) {
+  const g = r.segs; if (!g || g.length < 3) return [];
+  const alds = r.alds, bar = (x) => +(x / 1e5).toPrecision(5), X = alds ? [-1, 0, 1, 1.15, 1.5, 2.15] : [-1, -0.35, 0, 0.15, 1.15, 2.15], prof = (q) => [q.piFb, q.piFb, q.piFm + q.piR, q.piDm, q.piDb, q.piDb].map(bar);
+  const top = Math.max(...g.map((q) => Math.max(q.piDb, q.piFm + q.piR))) / 1e5, layers = alds ? [{ x: 0, label: 'support' }, { x: 1, label: 'active layer' }, { x: 1.15, label: 'draw' }] : [{ x: 0, label: 'active layer' }, { x: 0.15, label: 'support' }, { x: 1.15, label: 'draw' }];
+  const ttl = (q) => `FO membrane cross-section ${fmt(100 * q.x, 3)} % along the module: flux ${fmt(q.Jw * 3.6e6, 3)} L/m²·h, ${fmt(q.Jw / r.m.A / 1e5, 3)} of ${fmt((q.piDb - q.piFb) / 1e5, 3)} bar drives water`;
+  const ser = (q) => [{ name: 'Osmotic pressure', x: X, y: prof(q), mode: 'both' }, { name: 'At the module inlet', x: X, y: prof(g[0]), dash: true }];
+  return [{ type: 'line', title: ttl(g[0]), xlabel: 'Across the membrane (schematic): feed channel → membrane → draw channel', ylabel: 'Osmotic pressure (bar)', xmin: -1, xmax: 2.15, ymin: 0, ymax: 1.08 * top, series: ser(g[0]), vlines: layers,
+    frames: g.map((q) => ({ label: `${fmt(100 * q.x, 3)} % along`, title: ttl(q), series: ser(q) })), frameLabel: 'Position along the module', frame: 0, fps: 4,
+    note: `Osmotic pressure across the membrane in each of the ${g.length} module segments (press ▶ Play to travel from the feed inlet to the outlet). Left: the feed${alds ? '' : ' and its boundary layer, where rejected salt piles up (external polarisation)'}; ${alds ? 'the porous support facing the feed, where feed salt is trapped (concentrative internal polarisation)' : 'right of the thin active layer: the porous support, where the draw is diluted by the water passing through it (dilutive internal polarisation)'}; then the draw. Only the drop across the active layer drives water, so watch it shrink along the module as the draw dilutes and the feed concentrates; the dashed profile is the module inlet. The layer widths are schematic.` }];
+}
+/** Animated cross-section of the MD membrane in every module segment: temperatures from the hot bulk to the cold bulk. */
+function mdProfileAnim(m) {
+  const g = m.segs; if (!g || g.length < 3) return [];
+  const vmd = m.c.type === 'vmd', agmd = m.c.type === 'agmd', X = vmd ? [-1, -0.35, 0, 1] : [-1, -0.35, 0, 1, 1.35, 2], r4 = (x) => +x.toPrecision(5), prof = (q) => (vmd ? [q.Tf, q.Tf, q.Tfm, q.Tc] : [q.Tf, q.Tf, q.Tfm, q.Tc, q.Tb, q.Tb]).map(r4);
+  const all = g.flatMap(prof), L = m.c.L, cold = agmd ? 'condensing surface' : vmd ? 'saturation at the permeate pressure' : m.c.type === 'sgmd' ? 'sweep-gas side' : 'cold-side surface';
+  const ttl = (q) => `MD membrane cross-section ${fmt(q.x, 3)} m from the feed inlet: flux ${fmt(q.N * 3600, 3)} L/m²·h, salinity ${fmt(q.S, 3)} → ${fmt(q.Sm, 3)} g/kg at the membrane`;
+  const ser = (q) => [{ name: 'Temperature', x: X, y: prof(q), mode: 'both' }, { name: 'At the feed inlet', x: X, y: prof(g[0]), dash: true }];
+  return [{ type: 'line', title: ttl(g[0]), xlabel: `Across the membrane (schematic): hot channel → membrane${agmd ? ' + air gap' : ''} → ${vmd ? 'vacuum' : 'cold channel'}`, ylabel: '°C', xmin: -1, xmax: vmd ? 1 : 2, ymin: Math.min(...all) - 2, ymax: Math.max(...all) + 2, series: ser(g[0]), vlines: [{ x: 0, label: 'membrane' }, { x: 1, label: cold }],
+    frames: g.map((q) => ({ label: `${fmt(q.x, 3)} m (${fmt((100 * q.x) / L, 3)} %)`, title: ttl(q), series: ser(q) })), frameLabel: 'Position along the module', frame: 0, fps: 4,
+    note: `Temperature across the membrane in each of the ${g.length} module segments (press ▶ Play to travel from the hot-feed inlet to the outlet): hot bulk, the hot boundary layer, the membrane surface, the ${cold}${vmd ? '' : ' and the cold bulk'}. Only the temperature drop across the membrane drives vapour; the drops in the boundary layers are temperature polarisation. Watch the hot side cool and the driving difference shrink along the module; the title gives the local flux and the salt build-up at the membrane (concentration polarisation). The dashed profile is the feed inlet; layer widths are schematic.` }];
+}
 function mdPlots(r, p) {
   const m = r.m, xs = m.segs.map((g) => g.x), Sl = r.rec > 0 ? r.Sloop : r.Sfeed, one = (ov, S = Sl) => { const q = { ...p, ...ov }, c = mdConfig(q, q.Tf, q.Tp, S); return mdLocal(c, q.Tf, S, { T: q.Tp, pg: (0.622 * 0 + (q.rhGas / 100) * psat(q.Tp)) }); };
   const Ts = linspace(Math.max(p.Tp + 8, 35), 90, 12), us = [0.05, 0.1, 0.2, 0.35, 0.5, 0.8, 1.2], Ss = [0, 35, 70, 120, 180, 240, 300], fT = linspace(Math.max(p.Tp + 10, 40), 90, 6), fU = [0.05, 0.15, 0.3, 0.6, 1];
@@ -1539,6 +1571,7 @@ function mdPlots(r, p) {
     { type: 'line', title: 'Flux versus cross-flow velocity', xlabel: 'Feed velocity (m/s)', ylabel: 'L/m²·h · –', series: [{ name: 'Flux (L/m²·h)', x: us, y: us.map((u) => tryOr(() => one({ uFm: u, uPm: u }).N * 3600)), mode: 'both' }, { name: 'Temperature-polarisation coefficient × 50', x: us, y: us.map((u) => tryOr(() => 50 * one({ uFm: u, uPm: u }).tpc)), mode: 'both' }], vlines: [{ x: p.uFm, label: 'operating' }] },
     { type: 'line', title: 'Flux versus feed salinity', xlabel: 'Salinity (g/kg)', ylabel: 'L/m²·h', series: [{ name: 'Flux', x: Ss, y: Ss.map((S) => tryOr(() => one({}, S).N * 3600)), mode: 'both' }], vlines: [{ x: Sl, label: 'loop' }, { x: 264, label: 'NaCl saturation' }], note: 'MD loses little flux with salinity, unlike pressure-driven membranes — its niche is brine concentration.' },
     { type: 'field', title: 'Flux versus feed temperature and velocity', xlabel: 'Hot-feed temperature (°C)', ylabel: 'Feed velocity (m/s)', zlabel: 'Flux', zunit: 'L/m²·h', x: fT, y: fU, z: fU.map((u) => fT.map((T) => tryOr(() => one({ Tf: T, uFm: u, uPm: u }).N * 3600, 0))), cmap: 'thermal', contours: 8, markers: [{ x: clamp(p.Tf, fT[0], 90), y: clamp(p.uFm, 0.05, 1), label: 'operating' }] },
+    ...mdProfileAnim(m),
   ];
 }
 
@@ -1684,6 +1717,14 @@ function cdiResult(r, p, W, name = 'CDI') {
   plots.push({ type: 'line', title: 'Effluent concentration during the last cycle', xlabel: 'Time (min)', ylabel: 'mg/L as NaCl', series: [{ name: 'Effluent', x: r.tt, y: r.cEff.map((c) => c * 58.44) }], hlines: [{ y: r.c0 * 58.44, label: 'feed' }], vlines: [{ x: p.cdiTc, label: 'discharge starts' }] },
     { type: 'line', title: 'Cell current and voltage', xlabel: 'Time (min)', ylabel: 'A/m² · V', series: [{ name: 'Current density (A/m²)', x: r.tt, y: r.cur }, { name: 'Cell voltage × 10 (V)', x: r.tt, y: r.volt.map((x) => 10 * x) }], note: p.cdiMode === 'cc' ? `Prescribed current ${p.cdiI} A/m² until the cell reaches ${p.cdiV} V, then constant voltage.` : `Prescribed voltage ${p.cdiV} V; the current is limited by the spacer, contact and pore-electrolyte resistances.` },
     { type: 'line', title: 'Charge penetrating the porous electrode (transmission-line charging)', xlabel: 'Depth from the spacer (µm)', ylabel: 'Surface charge (mC/m²)', series: prof.map((q) => ({ name: `t = ${fmt(q.t, 3)} s`, x: r.x.map((x) => x * 1e6), y: q.sigma.map((s) => s * F * 1000) })), note: 'No ionic flux at the current collector (right edge); the charging front diffuses in with the time constant L²·a·C/κ.' });
+  // animated charging of the porous electrode: the surface-charge profile across the electrode at about 30 instants of the charging step
+  if (r.film?.length > 2) {
+    const fm = r.film, xs = r.x.map((x) => +(x * 1e6).toPrecision(5)), mc = (q) => q.sigma.map((s) => +(s * F * 1000).toPrecision(5)), endP = mc(fm[fm.length - 1]), all = fm.flatMap(mc), lo = Math.min(0, ...all), hi = Math.max(...all, 1e-9);
+    const ttl = (q) => `Charging the porous electrode: ${fmt(q.t, 3)} s into the charging step, effluent ${fmt(q.c * 58.44, 3)} mg/L`;
+    plots.push({ type: 'line', title: ttl(fm[fm.length - 1]), xlabel: 'Depth from the spacer (µm)', ylabel: 'Surface charge (mC/m²)', xmin: 0, xmax: xs[xs.length - 1], ymin: lo, ymax: lo + 1.05 * (hi - lo), series: [{ name: 'Surface charge now', x: xs, y: endP }, { name: 'End of the charging step', x: xs, y: endP, dash: true }],
+      frames: fm.map((q) => ({ label: `${fmt(q.t, 3)} s`, title: ttl(q), series: [{ name: 'Surface charge now', x: xs, y: mc(q) }, { name: 'End of the charging step', x: xs, y: endP, dash: true }] })), frameLabel: 'Time into the charging step', frame: 0, fps: 5,
+      note: `Surface charge stored in the double layers of the carbon across the electrode, from the spacer side (left) to the current collector (right), at ${fm.length} instants of the last charging step from the transmission-line (porous-electrode) model (press ▶ Play). ${r.tauRC < 0.05 * fm[fm.length - 1].t ? `The electrode time constant (${fmt(r.tauRC, 3)} s) is far shorter than the step, so the charge is almost uniform across the depth; it rises as long as the spacer supplies salt and levels off at the dashed end state, when the electrode is full and the effluent salinity in the title climbs back towards the feed.` : `The charge enters from the spacer side and moves in with the electrode time constant ${fmt(r.tauRC, 3)} s; when the profile reaches the dashed end state the electrode is full and the effluent salinity in the title climbs back towards the feed.`}` });
+  }
   if (edl) plots.push({ type: 'line', title: 'Double layer at the carbon surface: Poisson–Nernst–Planck versus Gouy–Chapman', xlabel: 'Distance from the surface (nm)', ylabel: 'mV · c/c_bulk', series: [{ name: 'Potential, Poisson–Nernst–Planck (mV)', x: edl.x.map((x) => x * 1e9), y: edl.psi.map((q) => 1000 * q) }, { name: 'Potential, Gouy–Chapman (mV)', x: edl.x.map((x) => x * 1e9), y: edl.gc.map((q) => 1000 * q), mode: 'points' }, { name: 'Counter-ion c/c_bulk', x: edl.x.map((x) => x * 1e9), y: edl.c[1].map((c) => c / r.cEnd) }, { name: 'Co-ion c/c_bulk × 10', x: edl.x.map((x) => x * 1e9), y: edl.c[0].map((c) => (10 * c) / r.cEnd) }], vlines: [{ x: edl.lam * 1e9, label: 'Debye length' }], note: 'Diffuse part of the double layer at the end of charging, resolved on a Debye-graded mesh; the Stern layer carries the rest of the electrode potential.' });
   tables.push({ title: `${name} cycle`, columns: ['Quantity', 'Value', 'Unit'], rows: [['Feed concentration (1:1 equivalent)', r.c0, 'mol/m³'], ['Average product concentration', r.cAvg, 'mol/m³'], ['Salt removed per cycle', r.salt * 1000, 'mmol/m²'], ['— stored in the double layers', r.storedEDL * 1000, 'mmol/m²'], ['— adsorbed (Langmuir)', r.storedLang * 1000, 'mmol/m²'], ['— change of spacer and macropore inventory', r.storedMix * 1000, 'mmol/m²'], ['Charge passed on charging', r.charge, 'C/m²'], ['Charge stored in the double layers', r.chargeStored, 'C/m²'], ['Charge efficiency', 100 * r.eff, '%'], ['Net energy', r.Enet, 'J/m²'], ['Water recovery', 100 * r.waterRec, '%'], ['Productivity', r.prod, 'L/m²·h']] },
     { title: 'Double layer and electrode', columns: ['Quantity', 'Value', 'Unit'], rows: [['Double-layer model used', r.edlModel === 'auto' ? `unified — ${r.regime}` : r.edlModel === 'gcs' ? 'Gouy–Chapman–Stern (forced)' : 'modified Donnan (forced)', ''], ['Pore half-width (pore volume ÷ wall area)', r.hPore * 1e9, 'nm'], ['Pore half-width ÷ Debye length in the feed', r.poreRatio, '–'], ['Thin-layer weight θ in the feed / lowest during the cycle', `${fmt(r.thetaFeed, 3)} / ${fmt(r.thetaMin, 3)}`, '–'], ['Attraction term applied', r.muEff, 'kT'], ['Equilibrium surface charge at the charging voltage', r.eq.sigma * F * 1000, 'mC/m²'], ['Surface charge at the spacer side, end of charge', r.sigmaEnd[0] * F * 1000, 'mC/m²'], ['Surface charge at the collector side, end of charge', r.sigmaEnd[r.n - 1] * F * 1000, 'mC/m²'], ['Diffuse-layer potential', 1000 * psiD, 'mV'], ['Stern-layer potential', 1000 * stern, 'mV'], ['Debye length in the feed', r.lamD * 1e9, 'nm'], ['Surface charge from the Poisson–Nernst–Planck profile', edl ? edl.sigmaLeft * 1000 : null, 'mC/m²'], ['Diffuse charge, Gouy–Chapman (Grahame)', edl ? edl.sigmaGC * 1000 : null, 'mC/m²'],
@@ -1925,9 +1966,182 @@ function addExtras(res, v) {
     Tb.push({ title: 'Grey-box (physics-informed) correction', columns: ['Quantity', 'Value', 'Unit'], rows: [['Test rows used', gb.n, ''], ['β₀ (overall bias, ln)', gb.beta[0], '–'], [md ? 'β₁ per 20 K of feed temperature' : 'β₁ per ln(draw concentration)', gb.beta[1], '–'], ['β₂ per ln(velocity)', gb.beta[2], '–'], ['RMSE of the mechanistic model', gb.rmseMech, 'L/m²·h'], ['RMSE of the grey-box fit', gb.rmseFit, 'L/m²·h'], ['RMSE of the grey-box, leave-one-out', gb.rmseLoo, 'L/m²·h'], ['Correction factor at the operating point', fac, '–'], ['Corrected inlet flux', mNow * fac, 'L/m²·h']], note: 'The correction is bounded to a factor of two either way. Edit the test data on Model setup.' });
     O.greyBoxFactor = fac;
   } catch (e) { W.push({ level: 'warn', msg: `The grey-box correction could not be fitted: ${e.message}` }); }
+  // ---- 3-D view (optional): local flux along the module for six draw strengths (FO, PRO) or six hot-feed temperatures (MD)
+  if (v.views3d && ['fo', 'pro', 'md'].includes(v.process)) try { const sf3 = fluxSurface(v); if (sf3) P.push(sf3); } catch (e) { W.push({ level: 'info', msg: `The 3-D flux view could not be computed: ${e.message}` }); }
   res.plots = [...res.plots, ...clean(P)];
   return res;
 }
+/** Local flux over (position along the module × draw osmotic pressure or hot-feed temperature): six full module solutions. */
+function fluxSurface(v) {
+  const md = v.process === 'md', r4 = (x) => +x.toPrecision(5), tryRun = (f) => { try { return f(); } catch { return null; } };
+  if (md) {
+    const Ts = linspace(Math.max(v.Tp + 10, 35), Math.min(95, Math.max(v.Tf + 15, 70)), 6), runs = Ts.map((T) => tryRun(() => simulateMD(v, { Tf: T }).m));
+    if (runs.some((q) => !q || !q.segs?.length) || new Set(runs.map((q) => q.segs.length)).size > 1) return null;
+    const L = runs[0].c.L, x = runs[0].segs.map((q) => r4((100 * q.x) / L)), z = runs.map((q) => q.segs.map((g) => r4(g.N * 3600))), c = runs.map((q) => q.segs.map((g) => r4(g.tpc))), lo = Math.min(0, ...z.flat());
+    return { type: 'surface3d', title: 'MD local flux over position along the module and hot-feed temperature (3-D)', x, y: Ts.map(r4), z: z.map((row) => row.map(() => lo)), cmap: 'salinity', zmax: lo + 1e3, xlabel: 'Position (% of length)', ylabel: 'Hot feed (°C)', zlabel: 'Flux (L/m²·h)',
+      layers: [{ name: 'Flux', z, c, cmap: 'turbo', clabel: 'Temperature-polarisation coefficient', cunit: '–', opacity: 0.95 }], azimuth: 220, elevation: 30,
+      note: `Height: local vapour flux in each module segment; colour: temperature-polarisation coefficient. One horizontal axis runs from the hot-feed inlet (0 %) to the outlet (100 %) of the ${fmt(L, 3)} m module, the other over six hot-feed inlet temperatures (${fmt(Ts[0], 3)}–${fmt(Ts[Ts.length - 1], 3)} °C), each a full module solution with every other input as entered. The flux grows steeply with temperature (vapour pressure is exponential in temperature) and falls along the module as the hot stream cools. Drag to rotate.` };
+  }
+  const d = DRAWS[v.draw] || DRAWS.nacl, cs = linspace(Math.max(0.2, 0.4 * v.cDraw), Math.min(d.sol, Math.max(1.6 * v.cDraw, v.cDraw + 0.5)), 6), runs = cs.map((c0) => tryRun(() => simulateFO(v, { cDraw: c0 })));
+  if (runs.some((q) => !q || !q.segs?.length) || new Set(runs.map((q) => q.segs.length)).size > 1) return null;
+  const y = cs.map((c0) => r4(drawOsmotic(v.draw, c0 * 1000, v.T) / 1e5)), x = runs[0].segs.map((q) => r4(100 * q.x)), z = runs.map((q) => q.segs.map((g) => r4(g.Jw * 3.6e6))), c = runs.map((q) => q.segs.map((g) => r4((100 * g.Jw) / Math.max(q.m.A * Math.abs(g.piDb - g.piFb), 1e-30)))), lo = Math.min(0, ...z.flat());
+  if (y.some((q, i) => i && !(q > y[i - 1]))) return null;
+  return { type: 'surface3d', title: `${v.process === 'pro' ? 'PRO' : 'FO'} local water flux over position along the module and draw strength (3-D)`, x, y, z: z.map((row) => row.map(() => lo)), cmap: 'salinity', zmax: lo + 1e3, xlabel: 'Position (% of length)', ylabel: 'Draw π (bar)', zlabel: 'Flux (L/m²·h)',
+    layers: [{ name: 'Water flux', z, c, cmap: 'turbo', clabel: 'Flux ÷ A·Δπ bulk', cunit: '%', opacity: 0.95 }], azimuth: 220, elevation: 30,
+    note: `Height: local water flux in each module segment; colour: the share of the bulk osmotic difference that actually drives water (the rest is lost to polarisation). One horizontal axis runs from the feed inlet (0 %) to the outlet (100 %), the other over six draw inlet strengths (${fmt(cs[0], 3)}–${fmt(cs[cs.length - 1], 3)} mol/L of ${d.name}, shown as their osmotic pressure), each a full module solution with every other input as entered. A stronger draw raises the flux less than proportionally because internal polarisation grows with the flux (colour falls); along the module the flux falls as the draw dilutes. Drag to rotate.` };
+}
+
+// ---- plain-language meaning of every key result and chart ---------------------------------------------------------
+// What the number is, how it is obtained and what is typical; a run-specific detail already on a KPI is kept after it.
+const KPI_HELP = {
+  'Average water flux': 'Water passing per m² of FO membrane per hour, averaged along the module: J = A·(π_draw − π_feed) reduced by internal and external concentration polarisation, solved segment by segment. FO membranes typically give 5–20 L/m²·h.',
+  'Water transferred': 'Water drawn from the feed into the draw solution per hour: average flux × membrane area. It is the product water before draw regeneration.',
+  'Feed recovery': 'Share of the feed water transferred to the draw. Above about 85 % the concentrated feed risks scaling.',
+  'Draw dilution factor': 'Draw outlet flow divided by draw inlet flow: how much the draw is diluted by the water it picks up. A larger factor means less driving force at the module outlet.',
+  'Draw outlet concentration': 'Concentration of the diluted draw leaving the module, from the draw solute and water balances. Regeneration must bring it back to the inlet strength.',
+  'Reverse solute flux': 'Draw solute leaking back through the membrane into the feed per m² and hour: J_s = B·(c_draw,m − c_feed,m) at each segment. It costs make-up chemicals and contaminates the feed concentrate.',
+  'Specific reverse solute flux': 'Draw solute lost per litre of water transferred, J_s/J_w. It depends mainly on the membrane selectivity; below about 0.5 g/L is good.',
+  'Feed concentration factor': 'Feed outlet salinity divided by feed inlet salinity, from the feed water balance. It sets the scaling risk of the feed concentrate.',
+  'Flux ÷ ideal flux (inlet)': 'Water flux at the module inlet divided by A·Δπ of the bulk solutions: the share of the osmotic driving force that survives polarisation. Typical FO membranes keep only 20–50 % because of internal polarisation in the support.',
+  'Feed osmotic pressure': 'Osmotic pressure of the feed at the module inlet, from its ion composition (Pitzer-type activity model). The draw must exceed it.',
+  'Draw osmotic pressure': 'Osmotic pressure of the draw at the module inlet, from its concentration. Its excess over the feed is the driving force for water.',
+  'Membrane area': 'Membrane area of the module as entered or sized for the duty.',
+  'Draw-solute loss': 'Draw solute lost per hour by reverse leakage into the feed; it must be made up.',
+  'Regeneration electricity': 'Electricity per m³ of product for regenerating the draw (RO of the diluted draw, or pumps of a thermal step), from the regeneration model.',
+  'Regeneration heat': 'Heat per m³ of product for thermal or thermolytic regeneration of the draw. Zero for RO regeneration.',
+  'FO pumping energy': 'Electricity per m³ of transferred water to pump feed and draw through the module channels: flow × pressure drop ÷ pump efficiency.',
+  'Power density': 'Pressure-retarded osmosis: hydraulic power per m² of membrane, W = J_w·ΔP. About 5 W/m² is usually quoted as the threshold for economic PRO.',
+  'Gross turbine power': 'Power the turbine recovers from the permeating water at the applied pressure: flux × area × ΔP × turbine efficiency.',
+  'Net power after pumping': 'Turbine power minus the power to pump feed and draw. Negative means the plant consumes more than it produces.',
+  'Energy per m³ of permeate': 'Net energy per m³ of water crossing the PRO membrane (negative = produced).',
+  'Average flux': 'Distillate per m² of MD membrane per hour, averaged along the module: vapour flux driven by the vapour-pressure difference between the hot and cold membrane surfaces (dusty-gas transport through the pores). DCMD typically gives 5–30 L/m²·h.',
+  'Distillate': 'Clean water produced per hour.',
+  'Overall recovery': 'Product water divided by the feed (or brine) supplied.',
+  'Thermal efficiency': 'Share of the heat crossing the membrane that carries vapour (latent heat) rather than leaking by conduction. 60–80 % is good for MD; it rises with temperature.',
+  'Gain-output ratio': 'Latent heat of the water produced divided by the heat supplied. Single-pass MD is around 0.5–1; heat recovery and multi-stage designs reach 3–10.',
+  'Specific heat': 'Heat per m³ of distillate: heat supplied ÷ distillate. It is the main running cost of MD unless waste or solar heat is used.',
+  'Specific electricity': 'Electricity per m³ of distillate, mainly for the pumps; usually below 1–2 kWh/m³ for MD.',
+  'Temperature-polarisation coefficient': 'Temperature difference across the membrane surfaces divided by that between the bulk streams. Close to 1 means the boundary layers waste little driving force; 0.4–0.7 is typical.',
+  'Concentration-polarisation factor': 'Salinity at the hot membrane surface divided by the bulk salinity, from film theory. It lowers the vapour pressure and raises the scaling risk.',
+  'Liquid-entry pressure': 'Pressure at which liquid enters the largest pores (Laplace–Cantor: 2γ|cos θ|/r). It must stay above the feed-side pressure, or the membrane wets and salt passes.',
+  'Knudsen number': 'Mean free path of the vapour molecules divided by the pore diameter. It selects the transport regime: Knudsen (> 1), transition (0.01–1) or molecular diffusion.',
+  'Brine salinity': 'Salinity of the brine leaving the MD loop. Sodium chloride saturates near 264 g/kg; MD can concentrate far beyond RO.',
+  'Heat demand': 'Heat input to the MD loop: feed heating minus heat recovered.',
+  'Feed outlet temperature': 'Temperature of the hot stream leaving the module; the heater must lift it back to the inlet temperature.',
+  'Total product': 'RO permeate plus MD distillate per hour.',
+  'RO product': 'Permeate of the reverse-osmosis stage, from the element-by-element RO model of suite 1.',
+  'MD distillate': 'Distillate of the membrane-distillation stage treating the RO brine.',
+  'Combined electricity': 'Electricity of the whole hybrid per m³ of total product.',
+  'Combined heat': 'Heat of the whole hybrid per m³ of total product.',
+  'RO feed pressure': 'Feed pressure the RO stage needs for its recovery, from the RO model.',
+  'RO specific energy': 'Electricity of the RO stage per m³ of RO permeate.',
+  'MD flux': 'Average flux of the membrane-distillation stage.',
+  'MD thermal efficiency': 'Share of the heat crossing the MD membrane that carries vapour.',
+  'MD gain-output ratio': 'Latent heat of the MD distillate divided by the heat supplied to MD.',
+  'MD membrane area': 'Membrane area of the MD stage needed for its duty.',
+  'RO membrane area': 'Membrane area of the RO stage.',
+  'Final brine flow': 'Brine left after RO and MD per hour — what must still be disposed of.',
+  'Final brine salinity': 'Salinity of the final brine; near 264 g/kg sodium chloride saturates.',
+  'Brine volume reduction': 'How much smaller the final brine is than the RO brine alone would be.',
+  'Product TDS': 'Dissolved solids in the product water, from the salt passage of each step.',
+  'Recovery ratio': 'HDH: distillate divided by the seawater fed to the humidifier.',
+  'Heater duty': 'Heat added to the seawater before the humidifier.',
+  'Air temperature, humidifier outlet': 'Temperature of the saturated air leaving the humidifier (top of the air loop).',
+  'Air temperature, dehumidifier outlet': 'Temperature of the air leaving the dehumidifier after condensing the product.',
+  'Seawater preheat temperature': 'Seawater temperature after it is preheated in the dehumidifier by the condensing vapour.',
+  'Brine temperature': 'Temperature of the brine leaving the humidifier.',
+  'Dry-air flow': 'Circulating dry-air flow of the HDH loop.',
+  'Product (MD distillate)': 'Product water of the FO–MD chain: the MD distillate that regenerates the draw.',
+  'FO water flux': 'Average water flux of the forward-osmosis step.',
+  'Water transferred by FO': 'Water moved from the feed into the draw by FO per hour.',
+  'FO feed recovery': 'Share of the feed water taken up by the draw.',
+  'Draw salinity in the MD loop': 'Salinity of the diluted draw that MD re-concentrates.',
+  'Product (ED diluate)': 'Product water of the FO–electrodialysis chain: the desalted diluate.',
+  'Combined specific energy': 'Electricity of the whole chain per m³ of product.',
+  'ED specific energy': 'Electricity of the electrodialysis step per m³ of product, from the stack model of suite 7.',
+  'ED stages × cell pairs': 'Electrodialysis stack layout needed to reach the product target.',
+  'ED membrane area': 'Total cell-pair membrane area of the electrodialysis stack.',
+  'ED current efficiency': 'Share of the electric current that moves salt; the rest is lost to back-diffusion and co-ion leakage.',
+  'Regenerated draw strength': 'Concentration of the draw after electrodialysis has pulled the salt back into it.',
+  'Solids': 'Crystals produced by the MD–crystalliser per day, from the salt balance of the loop.',
+  'Water recovery': 'Water recovered divided by the water fed.',
+  'MD flux at saturation': 'MD flux with the loop at the salt saturation of the crystalliser; lower than for dilute feed because the vapour pressure is reduced.',
+  'Supersaturation in the crystalliser': 'Relative supersaturation (c/c_sat − 1) in the crystalliser from the MSMPR population balance; it drives crystal growth and nucleation.',
+  'Crystal growth rate': 'Linear growth rate of the crystals at the crystalliser supersaturation, G = k_g·σ^g.',
+  'Mass-mean crystal size': 'Mass-weighted mean crystal size of the product from the MSMPR distribution (4·G·τ).',
+  'Crystalliser volume': 'Active volume of the crystalliser for the residence time.',
+  'Loop salinity': 'Salinity of the MD–crystalliser loop.',
+  'Wall saturation ratio (membrane)': 'Salt concentration at the membrane wall divided by saturation. Above 1 crystals can form on the membrane (scaling).',
+  'Product TDS (cycle average)': 'Average salinity of the CDI product over the charging step.',
+  'CDI salt removal': 'Share of the feed salt removed during the charging step.',
+  'Salt adsorption per cycle': 'Salt stored in the electrodes per cycle per gram of carbon (mg/g). Activated-carbon CDI typically reaches 5–20 mg/g.',
+  'Charge efficiency': 'Salt removed divided by the charge passed (as moles of electrons). Below 1 because co-ions are expelled from the double layers.',
+  'CDI specific energy': 'Electricity per m³ of product for charging minus what discharge recovers.',
+  'Energy per mole of salt': 'Electric energy per mole of salt removed.',
+  'Electrode time constant L²·a·C/κ': 'Time for the charge to penetrate the porous electrode (transmission-line charging). Charging steps several times longer use the whole electrode.',
+  'Diffuse-layer potential at end of charge': 'Potential across the diffuse part of the double layer at the end of charging, from the double-layer model.',
+  'Langmuir coverage at end of charge': 'Share of the chemical adsorption sites occupied at the end of charging.',
+  'Cell area required': 'Electrode area needed for the product flow at this cycle.',
+  'Productivity': 'Product water per m² of electrode per hour.',
+  'Polished product': 'Product of the RO + CDI polishing hybrid.',
+  'RO permeate TDS': 'Salinity of the RO permeate before polishing.',
+  'CDI polishing salt removal': 'Share of the RO-permeate salt removed by capacitive polishing.',
+  'CDI polishing specific energy': 'Electricity of the CDI polishing step per m³.',
+  'CDI cell area': 'Electrode area of the polishing CDI.',
+  'Product flow': 'Product water of the FO–RO hybrid: the RO permeate that regenerates the draw.',
+  'RO pressure': 'Feed pressure of the regeneration RO, set by the osmotic pressure of the diluted draw.',
+  'Batch flux, start → end': 'Water flux at the end of the batch run; the start value is given below.',
+  'Batch feed recovery': 'Feed water transferred over the batch run.',
+  'Draw concentration at the end': 'Draw concentration at the end of the batch, after dilution by the transferred water.',
+  'Draw solute lost to the feed': 'Draw solute leaked into the feed over the batch.',
+  'Grey-box corrected flux (module inlet)': 'Mechanistic flux multiplied by a data-driven correction factor fitted to the test rows.',
+  'Flux error, grey-box (leave-one-out)': 'Prediction error of the grey-box model on test rows left out of the fit; smaller than the mechanistic error means the correction generalises.',
+  'Flux decline over the batch': 'Fall of the MD flux over the batch run from fouling, scaling and the rising tank salinity.',
+  'Batch recovery': 'Water recovered over the batch run.',
+  'Wetted pore area at the end': 'Share of the membrane pores flooded by liquid at the end of the batch. Wetting lets salt through; zero is the target.',
+  'Distillate salinity (batch average)': 'Average salinity of the distillate over the batch; rises when pores wet.',
+  'Membrane coefficient ÷ single-pore value': 'Vapour permeability of the membrane with a pore-size distribution divided by that of uniform pores of the mean size.',
+  'Network membrane coefficient ÷ single-pore value': 'Vapour permeability of a pore network (connected throats) divided by the single-pore value; bottlenecks in series lower it.',
+  'Wetted throats (invasion percolation)': 'Share of pore throats invaded by liquid at the feed pressure (invasion percolation). A connected path through the membrane means salt passage.',
+  'Network breakthrough pressure': 'Feed pressure at which liquid first forms a connected path through the pore network.',
+  'Pareto-optimal designs': 'Designs for which no other design has both more flux and less energy (multi-objective search with NSGA-II).',
+  'Knee of the Pareto front': 'Best-compromise design on the Pareto front, where extra flux starts to cost disproportionately more energy.',
+  'Flux ÷ flux of the fully hydrated, unpressurised membrane': 'Effect of incomplete support wetting and feed pressure on the FO flux, relative to a fully wetted membrane without applied pressure.',
+};
+const PLOT_NOTES = {
+  'Water flux and reverse solute flux along the module': 'Local water flux and draw-solute leakage in each module segment from the feed inlet (0) to the outlet (1). Both fall where the draw has been diluted and the feed concentrated; a steep fall means the outlet part of the module adds little.',
+  'Flows and concentrations along the module': 'Feed and draw flows and concentrations in each segment (scaled to share one axis): the feed loses water and concentrates while the draw gains water and dilutes, which shrinks the osmotic driving force along the module.',
+  'Where the osmotic driving force goes (module inlet)': 'Breakdown of the bulk osmotic-pressure difference at the module inlet: polarisation inside the support (ICP) and in the boundary layers (ECP) and reverse solute leakage eat into it, leaving the effective driving pressure that moves water.',
+  'Effect of the structural parameter and cross-flow velocity': 'Inlet water flux as the support structural parameter S grows (thicker, more tortuous support → more internal polarisation) and as the cross-flow velocity rises (thinner boundary layers). S matters far more than velocity in FO.',
+  'Flux versus structural parameter and draw concentration': 'Inlet water flux over the support structural parameter and the draw concentration. Contours flatten at high draw strength: internal polarisation grows with the flux, so a stronger draw gains less than proportionally.',
+  'Water flux of the library materials (module inlet)': 'Inlet water flux of typical published FO membranes at these operating conditions; select a material on the setup tab to use it in the whole calculation.',
+  'PRO power density versus applied pressure (module inlet)': 'Power per m² of membrane as the applied pressure rises: zero at no pressure and at the osmotic difference, with a maximum near half of it. The dashed curve is an ideal membrane without polarisation.',
+  'Flux and thermal efficiency along the module': 'Local vapour flux, thermal efficiency and temperature-polarisation coefficient from the feed inlet onward. The flux falls as the hot stream cools and the cold stream warms along the module.',
+  'Heat-transfer resistances at the feed inlet': 'Thermal resistances in series at the module inlet: the feed boundary layer, the membrane (vapour and conduction in parallel) and the cold side. The largest bar is where better mixing or a thinner membrane pays most.',
+  'Flux versus cross-flow velocity': 'Inlet flux and temperature-polarisation coefficient as the channel velocity rises: thinner boundary layers raise both, with diminishing returns and rising pumping energy.',
+  'Flux versus feed temperature and velocity': 'Inlet flux over the hot-feed temperature and channel velocity. Temperature dominates because the vapour pressure grows exponentially with it.',
+  'Flux and thermal efficiency of the library materials': 'Inlet flux and thermal efficiency of typical published MD membranes at these operating conditions.',
+  'Product and energy contribution of each process': 'How the product, electricity and heat divide between RO and MD in the hybrid.',
+  'Effect of the MD loop recovery': 'Overall recovery, MD flux and final brine salinity as the MD stage takes more water from the RO brine: recovery rises while the flux falls as the brine nears saturation.',
+  'Gain-output ratio versus mass ratio': 'Energy efficiency (GOR) and recovery of the HDH cycle over the seawater-to-air mass ratio; the GOR peaks where the heat-capacity flows of air and water are balanced in the dehumidifier.',
+  'Effect of the top temperature': 'GOR and recovery of the HDH cycle as the top seawater temperature rises: hotter air carries much more vapour.',
+  'Energy flows': 'Heat flows of the HDH cycle: heater input, heat recovered in the dehumidifier and heat leaving with brine and product.',
+  'Gain-output ratio versus mass ratio and top temperature': 'GOR of the HDH cycle over the mass ratio and the top temperature; the ridge marks the balanced design at each temperature.',
+  'Membrane area and energy of each process': 'Membrane area, electricity and heat of the FO and MD steps of the chain.',
+  'FO water flux and osmotic pressures along the module': 'FO water flux and the bulk osmotic pressures of draw and feed along the module; their gap is the driving force before polarisation.',
+  'Membrane area and electricity of each process': 'Membrane area and electricity of the FO and electrodialysis steps of the chain.',
+  'Electrodialysis of the diluted draw: stage by stage': 'Diluate salinity and current density in each electrodialysis stage, from the stack model of suite 7.',
+  'Effect of the crystalliser residence time': 'Mean crystal size and supersaturation over the crystalliser residence time: longer residence gives larger crystals at lower supersaturation.',
+  'Effluent concentration during the last cycle': 'Salinity leaving the CDI cell over the last charge–discharge cycle: low during charging (salt stored in the electrodes), high during discharge (salt released to the brine).',
+  'Contribution of each process': 'Product and energy of the RO and CDI steps of the hybrid.',
+  'Batch operation: flux, recovery and draw strength': 'Batch FO over time: flux falls as the draw dilutes, the feed concentrates and foulant accumulates; the dashed curve shows the flux without fouling.',
+  'Batch operation: flux and tank salinity': 'Batch MD over time: flux falls as the tank salinity rises and deposits form; the wall saturation ratio warns of scaling above 10 on this axis (ratio 1).',
+};
+const explainResult = (res) => {
+  for (const k of res.kpis || []) { const base = KPI_HELP[k.label] || Object.entries(KPI_HELP).find(([p]) => k.label.startsWith(p))?.[1]; if (base) k.help = k.help ? `${base} This run: ${k.help}.` : base; }
+  for (const p of res.plots || []) if (!p.note) { const n = PLOT_NOTES[p.title] || Object.entries(PLOT_NOTES).find(([t]) => p.title.startsWith(t))?.[1]; if (n) p.note = n; }
+  return res;
+};
 
 /** Synthetic FO coupon data: the model with slightly different true parameters plus deterministic noise. */
 function synth(seed, pts) {
