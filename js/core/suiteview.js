@@ -383,10 +383,10 @@ export function renderSuite(suite, root, app) {
 
   const verifyTab = () => {
     const out = h('div');
-    const run = async () => {
+    const run = async (opts) => {
       fill(out, h('p', { class: 'note' }, 'Running verification checks…'));
       try {
-        const checks = (await suite.verify?.()) || [];
+        const checks = (await (opts ? suite.verify?.(opts) : suite.verify?.())) || [];
         const pass = checks.filter((c) => c.pass).length;
         fill(out, 
           h('p', { class: 'summary' }, badge(`${pass} / ${checks.length} passed`, pass === checks.length ? 'ok' : 'bad'), ' Code and equation verification: conservation, limiting cases and independent hand calculations, executed live on this device.'),
@@ -395,7 +395,7 @@ export function renderSuite(suite, root, app) {
     };
     const res = lastResult.get(suite.id);
     return h('div', { class: 'groups' },
-      h('fieldset', { class: 'group' }, h('legend', null, 'Verification — is the model solved correctly?'), h('div', { class: 'row-tools' }, btn('Run verification checks', run, 'primary')), out),
+      h('fieldset', { class: 'group' }, h('legend', null, 'Verification — is the model solved correctly?'), h('div', { class: 'row-tools' }, btn('Run verification checks', () => run(), 'primary'), suite.verifyTiers?.full ? btn(suite.verifyTiers.full.label, () => run({ full: true }), '', suite.verifyTiers.full.note) : null), out),
       res?.balances ? dataTable({ title: 'Conservation closure of the last run', columns: ['Balance', 'In', 'Out', 'Closure error %'], rows: res.balances.map((b) => [b.name, b.in, b.out, b.in ? (100 * (b.in - b.out)) / b.in : 0]) }) : null,
       cat.verification ? h('details', { class: 'ref', open: true }, h('summary', null, 'Verification practice for this suite'), h('p', null, cat.verification)) : null,
       h('p', { class: 'note' }, `Validation against measured data and calibration live on the “${L.cal}” tab. Numerical uncertainty lives on the “${L.mesh}” tab.`));
